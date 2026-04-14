@@ -2,7 +2,7 @@
 
 High-performance TLS termination proxy with SNI-based routing, written in Rust (via [napi-rs](https://napi.rs/)) and exposed as a Node.js native module.
 
-**Linux only** (x64 + arm64, glibc + musl). Pre-built binaries are published for all four targets.
+**Designed for Linux** (x64 + arm64, glibc + musl), and will run on MacOS as well. Pre-built binaries are published for all targets.
 
 ---
 
