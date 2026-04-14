@@ -1,0 +1,35 @@
+[package]
+name = "symphony"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi        = { version = "2.16", features = ["napi4", "tokio_rt", "async"] }
+napi-derive = "2.16"
+tokio       = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+rustls      = { version = "0.23", features = ["ring"] }
+rustls-pemfile   = "2.1"
+rustls-pki-types = "1.7"
+tokio-rustls     = "0.26"
+arc-swap    = "1.7"
+dashmap     = "6"
+ipnetwork   = "0.20"
+thiserror   = "1.0"
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc        = "0.2"
+socket2     = { version = "0.5", features = ["all"] }
+ring        = "0.17"
+md-5        = "0.10"
+
+[build-dependencies]
+napi-build = "2.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
+opt-level = 3

@@ -1,0 +1,399 @@
+# symphony
+
+High-performance TLS termination proxy with SNI-based routing, written in Rust (via [napi-rs](https://napi.rs/)) and exposed as a Node.js native module.
+
+**Linux only** (x64 + arm64, glibc + musl). Pre-built binaries are published for all four targets.
+
+---
+
+## Overview
+
+symphony sits in front of your services and:
+
+- **Terminates TLS** per route using per-route certificates (falls back to a listener-level default cert)
+- **Routes by SNI** hostname — exact matches, wildcard prefixes (`*.example.com`), and a catch-all default
+- **Proxies TCP** — either terminating TLS (decrypt + forward plaintext) or passing raw TLS bytes through
+- **Balances over Unix Domain Sockets** (UDS) using least-connections, with optional IP session affinity
+- **Protects** connections with token-bucket rate limiting, concurrency limits, CIDR allowlist/blocklist, JA3 fingerprint blocking, TLS handshake timeout, and SNI-required enforcement
+- **Suspends** routes — hold incoming connections and fire an event; your code decides whether to proxy or reject each one
+- **Hot-swaps** routes and protection config without restarting or dropping existing connections
+- Scales to **~1 million concurrent connections** via `SO_REUSEPORT`, tokio's multi-thread runtime, and lock-free data structures
+
+---
+
+## Installation
+
+```bash
+npm install symphony
+```
+
+Pre-built binaries are downloaded automatically for your platform during install. No Rust toolchain required.
+
+---
+
+## Quick start
+
+```typescript
+import { SymphonyProxy } from 'symphony';
+import { readFileSync } from 'node:fs';
+
+const proxy = new SymphonyProxy({
+  listeners: [{ port: 443 }],
+  routes: [
+    {
+      sni: 'api.example.com',
+      upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: 3000 }],
+      terminateTls: true,
+      cert: {
+        certChain: readFileSync('/etc/ssl/api.pem', 'utf8'),
+        privateKey: readFileSync('/etc/ssl/api-key.pem', 'utf8'),
+      },
+    },
+  ],
+});
+
+await proxy.start();
+console.log('proxy listening on :443');
+```
+
+---
+
+## Configuration reference
+
+### `ProxyConfig`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `listeners` | `ListenerConfig[]` | required | One entry per listening address |
+| `routes` | `RouteConfig[]` | required | SNI routing table |
+| `workerThreads` | `number` | CPU count | Tokio worker threads; also controls `SO_REUSEPORT` socket count per listener |
+| `readBufferSize` | `number` | `65536` | Internal copy buffer size in bytes |
+
+### `ListenerConfig`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `host` | `string` | `'0.0.0.0'` | Bind address |
+| `port` | `number` | required | Bind port |
+| `defaultCert` | `CertConfig` | — | Fallback cert for routes without their own cert |
+| `mtls` | `MtlsConfig` | — | Listener-level mTLS, used when a route doesn't override it |
+| `maxConnections` | `number` | `0` (unlimited) | Drop new connections when active count reaches this |
+| `idleTimeoutMs` | `number` | `60000` | Close connections silent for this many ms |
+| `protection` | `ProtectionConfig` | — | IP-level protection |
+
+### `RouteConfig`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `sni` | `string` | required | Hostname for exact match, or `'*.suffix'` for wildcard, or `''` for default |
+| `upstreams` | `Upstream[]` | required | Destination(s); multiple UDS upstreams are load-balanced |
+| `terminateTls` | `boolean` | required | `true` = decrypt TLS; `false` = TCP passthrough |
+| `cert` | `CertConfig` | — | Per-route cert, overrides listener `defaultCert` |
+| `mtls` | `MtlsConfig` | — | Per-route mTLS, overrides listener `mtls` |
+| `suspended` | `boolean` | `false` | Hold connections and emit `'suspended'` events |
+| `suspendTimeoutMs` | `number` | `30000` | Drop held connections after this ms if not resolved |
+
+### `Upstream`
+
+```typescript
+// TCP upstream
+{ kind: 'tcp', host: string, port: number }
+
+// Unix Domain Socket upstream
+{
+  kind: 'uds',
+  path: string,
+  ipAffinity?: boolean,      // route same-IP connections to same socket
+  ipAffinityTtlMs?: number,  // evict affinity entry after this ms idle (default 300000)
+}
+```
+
+### `CertConfig`
+
+```typescript
+{ certChain: string | Buffer, privateKey: string | Buffer }
+```
+
+Both fields accept PEM-encoded strings or `Buffer`. The cert chain may include intermediate certificates.
+
+### `MtlsConfig`
+
+```typescript
+{ clientCaCert: string | Buffer, requireClientCert?: boolean }
+```
+
+`requireClientCert` defaults to `true`. Set to `false` to accept connections without a client cert while still validating those that do present one.
+
+### `ProtectionConfig`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `rateLimit` | `{ connectionsPerSecond, burst? }` | — | Token bucket per source IP |
+| `maxConcurrentPerIp` | `number` | `0` (unlimited) | Max simultaneous connections per source IP |
+| `allowlist` | `string[]` | `[]` | CIDRs that bypass all checks |
+| `blocklist` | `string[]` | `[]` | CIDRs that are always blocked |
+| `ja3Blocklist` | `string[]` | `[]` | JA3 MD5 hex fingerprints to block (32 chars each) |
+| `tlsHandshakeTimeoutMs` | `number` | `10000` | Abort slow TLS handshakes |
+| `requireSni` | `boolean` | `false` | Reject connections without an SNI extension |
+
+---
+
+## TLS & mTLS
+
+### Per-route certificates
+
+Each route can have its own certificate. Routes without a cert use the listener's `defaultCert`.
+
+```typescript
+const proxy = new SymphonyProxy({
+  listeners: [{
+    port: 443,
+    defaultCert: { certChain: wildcardCert, privateKey: wildcardKey },
+  }],
+  routes: [
+    // Uses its own cert
+    { sni: 'special.example.com', cert: { certChain: specialCert, privateKey: specialKey }, ... },
+    // Falls back to listener defaultCert
+    { sni: '*.example.com', ... },
+  ],
+});
+```
+
+### mTLS
+
+```typescript
+const proxy = new SymphonyProxy({
+  listeners: [{
+    port: 443,
+    mtls: { clientCaCert: readFileSync('ca.pem', 'utf8'), requireClientCert: true },
+  }],
+  routes: [
+    {
+      sni: 'internal.example.com',
+      terminateTls: true,
+      cert: { certChain, privateKey },
+      // Inherits listener mTLS; or override per-route:
+      // mtls: { clientCaCert: ..., requireClientCert: false },
+    },
+  ],
+});
+```
+
+### TLS passthrough
+
+Set `terminateTls: false` to forward raw TLS bytes to the upstream without decryption. No cert needed.
+
+```typescript
+{ sni: 'passthrough.example.com', terminateTls: false, upstreams: [{ kind: 'tcp', host: '10.0.0.5', port: 443 }] }
+```
+
+---
+
+## Routing
+
+Routes are checked in order: **exact match** → **wildcard suffix** → **default** (empty `sni`).
+
+```typescript
+routes: [
+  { sni: 'api.example.com', ... },        // exact
+  { sni: '*.example.com', ... },          // matches foo.example.com, bar.example.com
+  { sni: '', ... },                        // catch-all default
+]
+```
+
+### Suspended routes
+
+Use suspended routes to inspect or authorize connections before proxying them:
+
+```typescript
+proxy.on('suspended', async (conn) => {
+  // conn.id, conn.sni, conn.peerIp, conn.peerPort, conn.listener
+  const allowed = await checkAuthority(conn);
+
+  if (allowed) {
+    proxy.resolveConnection(conn.id, {
+      upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: 3000 }],
+      terminateTls: false,
+    });
+  } else {
+    proxy.resolveConnection(conn.id, null); // reject — TCP close
+  }
+});
+
+// Route declared as suspended
+{ sni: 'gated.example.com', suspended: true, upstreams: [], terminateTls: true, cert: { ... } }
+```
+
+Connections not resolved within `suspendTimeoutMs` are dropped automatically. Calling `resolveConnection` with an unknown or already-expired ID is a no-op.
+
+---
+
+## UDS load balancing
+
+Provide multiple `uds` upstreams for a route. symphony picks the socket with the fewest active connections:
+
+```typescript
+upstreams: [
+  { kind: 'uds', path: '/run/app/worker-0.sock' },
+  { kind: 'uds', path: '/run/app/worker-1.sock' },
+  { kind: 'uds', path: '/run/app/worker-2.sock' },
+]
+```
+
+### IP session affinity
+
+Add `ipAffinity: true` to any UDS upstream entry to pin source IPs to the same socket:
+
+```typescript
+upstreams: [
+  { kind: 'uds', path: '/run/app/worker-0.sock', ipAffinity: true, ipAffinityTtlMs: 300000 },
+  { kind: 'uds', path: '/run/app/worker-1.sock', ipAffinity: true },
+]
+```
+
+The same `ipAffinity` / `ipAffinityTtlMs` values apply to all sockets in the set (values from the first entry are used for the shared balancer).
+
+---
+
+## Protection
+
+### Recommended starting values for public-facing deployments
+
+```typescript
+protection: {
+  rateLimit: { connectionsPerSecond: 50, burst: 100 },
+  maxConcurrentPerIp: 200,
+  allowlist: ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'],
+  requireSni: true,
+  tlsHandshakeTimeoutMs: 5000,
+}
+```
+
+### JA3 blocking
+
+Collect JA3 fingerprints from your logs (the `ja3` field is available in future log integrations) and add known-bad clients:
+
+```typescript
+ja3Blocklist: [
+  'e7d705a3286e19ea42f587b344ee6865', // example known-bad scanner
+]
+```
+
+### Hot-swapping protection config
+
+Protection config is per-listener and not currently hot-swappable via `updateConfig` (listeners would need to restart). To update protection, restart with a new config. Route changes do not require listener restarts.
+
+---
+
+## Metrics & monitoring
+
+```typescript
+const m = proxy.metrics();
+// m.activeConnections — connections being proxied right now
+// m.blockedConnections — total blocked since start
+// m.pendingSuspended — connections currently held waiting for resolveConnection()
+
+const blocked = proxy.blockedIps();
+// blocked.rateLimited — IPs with depleted token buckets
+// blocked.concurrencyLimited — IPs at their maxConcurrentPerIp limit
+// blocked.cidrBlocklist — the configured static CIDR blocklist
+
+setInterval(() => {
+  console.log('active:', proxy.metrics().activeConnections);
+}, 10_000);
+```
+
+---
+
+## Hot config updates
+
+```typescript
+// Replace the entire route table atomically — in-flight connections are unaffected.
+proxy.updateConfig({
+  routes: newRoutes,
+});
+```
+
+**What can be hot-swapped:** routes (destinations, TLS certs, suspension state).
+
+**What requires a restart:** listeners (bind address, port, protection config, idle timeout).
+
+---
+
+## Building from source
+
+Requirements: Rust stable (1.70+), Node.js 18+, `@napi-rs/cli`.
+
+```bash
+npm install
+npm run build:debug    # builds a dev .node file
+npm run build          # release build (LTO, stripped)
+```
+
+### Cross-compilation
+
+Use the napi-rs Docker images (same ones used in CI):
+
+```bash
+# x64 musl (Alpine)
+docker run --rm -v $(pwd):/build -w /build \
+  ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine \
+  npm run build -- --target x86_64-unknown-linux-musl
+
+# arm64 glibc
+docker run --rm -v $(pwd):/build -w /build \
+  ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian-aarch64 \
+  npm run build -- --target aarch64-unknown-linux-gnu
+```
+
+---
+
+## Linux kernel tuning
+
+To reach ~1 million concurrent connections, the following system settings are required.
+
+### File descriptor limits
+
+```bash
+# Per-process (set before starting Node)
+ulimit -n 2097152
+
+# System-wide persistent — /etc/security/limits.conf
+*  soft  nofile  2097152
+*  hard  nofile  2097152
+```
+
+symphony attempts to raise `RLIMIT_NOFILE` automatically at startup (to `2 × maxConnections + 1024`), but the hard limit must be raised by the OS first.
+
+### Kernel networking
+
+```bash
+# /etc/sysctl.d/99-symphony.conf
+
+# TCP connection tracking
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+
+# Socket buffers (tune to your bandwidth)
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# Accept queue depth per socket
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# Max open files system-wide
+fs.file-max = 4194304
+```
+
+Apply with:
+
+```bash
+sudo sysctl --system
+```
+
+### musl note
+
+On musl-libc systems (Alpine), the hard `RLIMIT_NOFILE` is often capped at 1048576 rather than the glibc default of 1073741816. symphony will log a warning if the desired limit exceeds the hard limit and fall back to the hard limit.

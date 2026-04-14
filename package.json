@@ -1,0 +1,43 @@
+{
+	"name": "symphony",
+	"version": "0.1.0",
+	"description": "High-performance TLS proxy with SNI routing — Rust/napi-rs, Linux",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"files": [
+		"dist/",
+		"symphony.*.node"
+	],
+	"napi": {
+		"name": "symphony",
+		"triples": {
+			"defaults": false,
+			"additional": [
+				"x86_64-unknown-linux-gnu",
+				"x86_64-unknown-linux-musl",
+				"aarch64-unknown-linux-gnu",
+				"aarch64-unknown-linux-musl"
+			]
+		}
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.json && napi build --platform --js false --dts ts/addon.d.ts --release",
+		"build:debug": "tsc -p tsconfig.json && napi build --platform --js false --dts ts/addon.d.ts",
+		"artifacts": "napi artifacts",
+		"prepublishOnly": "npm run build && napi prepublish -t npm",
+		"version": "napi version",
+		"test": "tsc -p tsconfig.test.json && node --test dist-test/**/*.spec.js"
+	},
+	"devDependencies": {
+		"@napi-rs/cli": "^2.18.0",
+		"@types/node": "^20.0.0",
+		"typescript": "^5.8.0"
+	},
+	"engines": {
+		"node": ">= 18"
+	},
+	"os": [
+		"linux"
+	],
+	"license": "MIT"
+}

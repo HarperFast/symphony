@@ -1,0 +1,10 @@
+{
+	"name": "@symphony/linux-arm64-gnu",
+	"version": "0.1.0",
+	"description": "symphony native binary for linux arm64 glibc",
+	"os": ["linux"],
+	"cpu": ["arm64"],
+	"main": "symphony.linux-arm64-gnu.node",
+	"files": ["symphony.linux-arm64-gnu.node"],
+	"license": "MIT"
+}
