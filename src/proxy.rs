@@ -153,6 +153,17 @@ pub struct SymphonyProxyWrap {
 impl SymphonyProxyWrap {
 	#[napi(constructor)]
 	pub fn new(config: JsProxyConfig, emit_fn: JsFunction) -> Result<Self> {
+		// Install ring as the process-level CryptoProvider for rustls 0.23.
+		// When aws-lc-rs is also present as a transitive dep, rustls cannot
+		// auto-select — we must choose explicitly. The `let _ =` makes this
+		// idempotent (no-op if already installed by a previous call or test).
+		let _ = rustls::crypto::ring::default_provider().install_default();
+
+		// Initialise tracing subscriber (honours RUST_LOG). Idempotent.
+		let _ = tracing_subscriber::fmt()
+			.with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+			.try_init();
+
 		// ── Convert all napi types to plain Rust before storing ───────────────
 		let default_listener_tls = config
 			.listeners

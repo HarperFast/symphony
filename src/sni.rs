@@ -10,10 +10,10 @@ pub struct PeekInfo {
 	pub ja3: String,
 }
 
-/// Peek at the first 512 bytes of the stream and parse the TLS ClientHello.
+/// Peek at the first 4096 bytes of the stream and parse the TLS ClientHello.
 /// Does NOT consume any bytes from the stream.
 pub async fn peek(stream: &TcpStream) -> PeekInfo {
-	let mut buf = [0u8; 512];
+	let mut buf = [0u8; 4096];
 	let n = match stream.peek(&mut buf).await {
 		Ok(n) => n,
 		Err(_) => return PeekInfo::default(),
@@ -131,12 +131,14 @@ impl<'a> Parser<'a> {
 		let cm_len = self.read_u8()? as usize;
 		self.skip(cm_len)?;
 
-		// Extensions: 2-byte length + data (may be absent in very short hellos)
+		// Extensions: 2-byte length + data (may be absent or truncated in short peeks)
 		if self.remaining() < 2 {
 			return Some(ClientHello { legacy_version, cipher_suites, extensions: &[] });
 		}
 		let ext_len = self.read_u16()? as usize;
-		let extensions = self.read_bytes(ext_len)?;
+		// Use however many extension bytes are available (peek may be truncated)
+		let available = ext_len.min(self.remaining());
+		let extensions = self.read_bytes(available)?;
 
 		Some(ClientHello { legacy_version, cipher_suites, extensions })
 	}

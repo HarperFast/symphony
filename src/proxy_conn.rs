@@ -141,7 +141,13 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 			let acceptor = TlsAcceptor::from(tls_cfg);
 			match timeout(hs_timeout, acceptor.accept(stream)).await {
 				Ok(Ok(tls_stream)) => proxy_via_tls(tls_stream, &effective_route.destination, peer_ip, &ctx).await,
-				_ => {
+				Ok(Err(e)) => {
+					tracing::debug!("TLS handshake error from {peer_ip}: {e}");
+					ctx.listener_metrics.inc_error();
+					return;
+				}
+				Err(_) => {
+					tracing::debug!("TLS handshake timeout from {peer_ip}");
 					ctx.listener_metrics.inc_error();
 					return;
 				}

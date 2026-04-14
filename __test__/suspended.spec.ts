@@ -1,5 +1,14 @@
 /**
  * Tests for suspended routes: hold → resolveConnection → proxy, and timeout → drop.
+ *
+ * IMPORTANT: For suspended routes, the TLS handshake happens AFTER resolveConnection()
+ * is called. The connection flow is:
+ *   TCP connect → peek → route lookup → suspended (emit event, wait) →
+ *   resolveConnection() → TLS handshake → proxy to upstream
+ *
+ * Tests must therefore NOT wait for secureConnect before calling resolveConnection.
+ * Instead: initiate the raw TCP/TLS connect, wait for the 'suspended' event,
+ * call resolveConnection, THEN wait for secureConnect.
  */
 
 import assert from 'node:assert/strict';
@@ -10,13 +19,35 @@ import { SymphonyProxy } from '../ts/proxy.js';
 import type { SuspendedConnection } from '../ts/types.js';
 import { generateSelfSignedCert, getFreePort, startEchoServer, sleep } from './util.js';
 
-/** Open a TLS connection to the proxy without sending data, returns socket + close fn. */
-function openTlsSocket(port: number, servername: string, ca: string): Promise<tls.TLSSocket> {
+/**
+ * Open a TLS connection. Returns the socket (NOT awaiting secureConnect,
+ * since the handshake may be deferred until after resolveConnection).
+ */
+function startTlsSocket(port: number, servername: string, ca: string): tls.TLSSocket {
+	return tls.connect({ port, host: '127.0.0.1', servername, ca, rejectUnauthorized: false });
+}
+
+/** Wait for secureConnect or error/close — whichever comes first. */
+function waitForSecureConnect(socket: tls.TLSSocket, timeoutMs = 5000): Promise<void> {
 	return new Promise((resolve, reject) => {
-		const socket = tls.connect({ port, host: '127.0.0.1', servername, ca, rejectUnauthorized: false });
-		socket.on('secureConnect', () => resolve(socket));
-		socket.on('error', reject);
-		setTimeout(() => reject(new Error('openTlsSocket timeout')), 3000);
+		if (socket.authorized || (socket as any).encrypted) {
+			resolve();
+			return;
+		}
+		socket.once('secureConnect', resolve);
+		socket.once('error', reject);
+		socket.once('close', () => reject(new Error('socket closed before secureConnect')));
+		setTimeout(() => reject(new Error('secureConnect timeout')), timeoutMs);
+	});
+}
+
+/** Wait for socket to close (destroyed or ended). */
+function waitForClose(socket: tls.TLSSocket | net.Socket, timeoutMs = 3000): Promise<void> {
+	return new Promise((resolve) => {
+		if (socket.destroyed) { resolve(); return; }
+		socket.once('close', resolve);
+		socket.once('error', resolve);
+		setTimeout(resolve, timeoutMs);
 	});
 }
 
@@ -40,7 +71,7 @@ describe('Suspended routes – hold then resolve', () => {
 					terminateTls: true,
 					cert: { certChain: cert.cert, privateKey: cert.key },
 					suspended: true,
-					suspendTimeoutMs: 2000,
+					suspendTimeoutMs: 5000,
 				},
 			],
 		});
@@ -58,38 +89,51 @@ describe('Suspended routes – hold then resolve', () => {
 		await echo.close();
 	});
 
-	it('emits suspended event and holds the connection', async () => {
-		const socket = await openTlsSocket(proxyPort, 'localhost', cert.cert);
-		await sleep(100);
+	it('emits suspended event and holds the connection, then proxies after resolve', async () => {
+		// 1. Initiate TLS connection — do NOT await secureConnect yet.
+		//    The handshake will only complete after resolveConnection().
+		const socket = startTlsSocket(proxyPort, 'localhost', cert.cert);
 
+		// 2. Wait for the proxy to peek the ClientHello and emit 'suspended'
+		await sleep(200);
 		assert.ok(capturedConn !== null, 'expected suspended event to have fired');
 		assert.equal(capturedConn!.sni, 'localhost');
 		assert.ok(capturedConn!.id, 'expected non-empty id');
 		assert.ok(capturedConn!.peerIp, 'expected non-empty peerIp');
 		assert.ok(capturedConn!.listener, 'expected non-empty listener');
 
-		// Resolve and proxy to the echo server
+		// 3. Resolve the connection — this triggers the TLS handshake + proxying.
+		//    terminateTls: true = proxy terminates TLS from the client, then forwards
+		//    plaintext to the upstream. The cert must be provided here because the
+		//    resolved route builds its own TLS config (the original route's config
+		//    is not reused for resolved connections).
 		proxy.resolveConnection(capturedConn!.id, {
 			upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
-			terminateTls: false, // upstream is plain TCP
+			terminateTls: true,
+			cert: { certChain: cert.cert, privateKey: cert.key },
 		});
 
-		// Now the socket should be connected — send data and expect echo
-		await new Promise<void>((resolve, reject) => {
-			const payload = Buffer.from('suspended-resolved');
-			socket.write(payload);
+		// 4. Now the TLS handshake should complete
+		await waitForSecureConnect(socket);
+
+		// 5. Send data and expect it echoed back
+		const payload = Buffer.from('suspended-resolved');
+		socket.write(payload);
+
+		const response = await new Promise<Buffer>((resolve, reject) => {
 			const chunks: Buffer[] = [];
 			socket.on('data', (chunk: Buffer) => {
 				chunks.push(chunk);
 				if (Buffer.concat(chunks).length >= payload.length) {
-					assert.deepEqual(Buffer.concat(chunks), payload);
-					socket.end();
-					resolve();
+					resolve(Buffer.concat(chunks));
 				}
 			});
 			socket.on('error', reject);
-			setTimeout(() => reject(new Error('data timeout after resolve')), 3000);
+			setTimeout(() => reject(new Error('data timeout after resolve')), 5000);
 		});
+
+		assert.deepEqual(response, payload);
+		socket.end();
 	});
 });
 
@@ -124,15 +168,11 @@ describe('Suspended routes – timeout drops connection', () => {
 	});
 
 	it('drops the connection after suspend timeout', async () => {
-		const socket = await openTlsSocket(proxyPort, 'localhost', cert.cert);
+		// Initiate the TCP connection. The TLS handshake won't happen (no resolve).
+		const socket = startTlsSocket(proxyPort, 'localhost', cert.cert);
 
-		// Don't call resolveConnection — wait for the timeout to drop the connection
-		await new Promise<void>((resolve) => {
-			socket.on('close', resolve);
-			socket.on('end', resolve);
-			socket.on('error', resolve);
-			setTimeout(resolve, 1000); // safety: don't hang if socket stays open
-		});
+		// Wait longer than suspendTimeoutMs (200ms) for the proxy to drop it.
+		await waitForClose(socket, 2000);
 
 		assert.ok(socket.destroyed || !socket.writable, 'socket should be destroyed after timeout');
 	});
@@ -174,21 +214,17 @@ describe('Suspended routes – reject with null', () => {
 	});
 
 	it('closes connection when resolveConnection called with null', async () => {
-		const socket = await openTlsSocket(proxyPort, 'localhost', cert.cert);
-		await sleep(100);
+		// Initiate the connection (no secureConnect expected)
+		const socket = startTlsSocket(proxyPort, 'localhost', cert.cert);
+		await sleep(200);
 
-		assert.ok(capturedConn !== null);
+		assert.ok(capturedConn !== null, 'expected suspended event to have fired');
 
 		// Reject the connection
 		proxy.resolveConnection(capturedConn!.id, null);
 
-		await new Promise<void>((resolve) => {
-			socket.on('close', resolve);
-			socket.on('end', resolve);
-			socket.on('error', resolve);
-			setTimeout(resolve, 2000);
-		});
-
+		// Socket should close shortly after
+		await waitForClose(socket, 2000);
 		assert.ok(socket.destroyed || !socket.writable, 'socket should be closed after rejection');
 	});
 });

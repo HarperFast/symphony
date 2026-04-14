@@ -1,7 +1,6 @@
 import { EventEmitter } from 'node:events';
-import { createRequire } from 'node:module';
 import * as path from 'node:path';
-import type { SymphonyProxyWrap, JsUpstream, JsCertConfig, JsMtlsConfig, JsRouteConfig, JsListenerConfig } from './addon.d.ts';
+import type { SymphonyProxyWrap, JsUpstream, JsCertConfig, JsMtlsConfig, JsRouteConfig, JsListenerConfig } from './addon';
 import type {
 	ProxyConfig,
 	HotConfig,
@@ -14,29 +13,38 @@ import type {
 	RouteConfig,
 	ProxyEvent,
 	SuspendedConnection,
-} from './types.js';
+} from './types';
 
 // Load the native addon. Supports both the flat-file (dev) and npm scoped
 // package (published) layouts that napi-rs produces.
 function loadAddon(): { SymphonyProxyWrap: typeof SymphonyProxyWrap } {
-	const req = createRequire(import.meta.url);
-	// Attempt 1: flat .node file alongside the package root (dev / local build)
-	const candidates = [
-		path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', `symphony.${process.platform}-${process.arch}.node`),
-		path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', `symphony.${process.platform}-${process.arch}-gnu.node`),
-		// Published binary via @symphony/linux-x64-gnu style scoped packages
-		`@symphony/linux-${process.arch === 'x64' ? 'x64' : 'arm64'}-gnu`,
-		`@symphony/linux-${process.arch === 'x64' ? 'x64' : 'arm64'}-musl`,
+	// __dirname is the compiled output dir (e.g. dist/ts/ or dist-test/ts/).
+	// The package root (where .node files live) is two levels up.
+	const pkgRoot = path.resolve(__dirname, '..', '..');
+	const arch = process.arch; // 'x64' or 'arm64'
+	const platform = process.platform; // 'linux' or 'darwin'
+
+	const candidates: string[] = [
+		// Dev / local build: flat .node file in package root
+		path.join(pkgRoot, `symphony.${platform}-${arch}.node`),
+		path.join(pkgRoot, `symphony.${platform}-${arch}-gnu.node`),
 	];
+
+	// Published scoped packages
+	if (platform === 'linux') {
+		candidates.push(`@symphony/linux-${arch}-gnu`, `@symphony/linux-${arch}-musl`);
+	} else if (platform === 'darwin') {
+		candidates.push(`@symphony/darwin-${arch}`);
+	}
 
 	for (const c of candidates) {
 		try {
-			return req(c);
+			return require(c);
 		} catch {
 			// try next
 		}
 	}
-	throw new Error('symphony: could not load native addon. Run `npm run build` first.');
+	throw new Error('symphony: could not load native addon. Run `npm run build:debug` first.');
 }
 
 // Convert public Upstream → JsUpstream (the flat struct the Rust side expects)
