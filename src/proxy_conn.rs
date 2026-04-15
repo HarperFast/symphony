@@ -92,6 +92,14 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		}
 	};
 
+	// ── 3b. Per-route rate limit ──────────────────────────────────────────────
+	if let Some(rl) = &route.rate_limiter {
+		if !rl.try_acquire() {
+			ctx.listener_metrics.inc_error();
+			return;
+		}
+	}
+
 	// ── 4. Suspended route handling ───────────────────────────────────────────
 	let effective_route: EffectiveRoute = if route.suspended {
 		ctx.global_metrics.inc_suspended();

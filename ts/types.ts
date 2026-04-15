@@ -14,6 +14,15 @@ export interface UdsUpstream {
 	ipAffinity?: boolean;
 	/** How long (ms) an IP→socket mapping is retained with no new connections. Default: 300000. */
 	ipAffinityTtlMs?: number;
+	/**
+	 * Linux process ID of the worker serving this socket.
+	 * When provided alongside `tid`, symphony samples /proc/{pid}/task/{tid}/stat
+	 * every 250 ms and uses the measured CPU utilisation as a secondary tiebreaker
+	 * in socket selection (active connections remain the primary factor).
+	 */
+	pid?: number;
+	/** Linux thread ID (TID) of the worker serving this socket. Must be set together with `pid`. */
+	tid?: number;
 }
 
 export type Upstream = TcpUpstream | UdsUpstream;
@@ -57,6 +66,14 @@ export interface RouteConfig {
 	suspended?: boolean;
 	/** Max ms to wait for resolveConnection() before dropping the connection. Default: 30000. */
 	suspendTimeoutMs?: number;
+	/**
+	 * Global rate limit for this route (new connections per second, route-wide — not per IP).
+	 * Connections are silently dropped (TCP RST) when the token bucket is exhausted.
+	 * Use this to prevent one route from starving others under high load.
+	 */
+	maxConnectionsPerSecond?: number;
+	/** Token bucket burst ceiling (connections). Defaults to maxConnectionsPerSecond. */
+	burst?: number;
 }
 
 // ── Protection ────────────────────────────────────────────────────────────────

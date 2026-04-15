@@ -13,8 +13,9 @@ symphony sits in front of your services and:
 - **Terminates TLS** per route using per-route certificates (falls back to a listener-level default cert)
 - **Routes by SNI** hostname — exact matches, wildcard prefixes (`*.example.com`), and a catch-all default
 - **Proxies TCP** — either terminating TLS (decrypt + forward plaintext) or passing raw TLS bytes through
-- **Balances over Unix Domain Sockets** (UDS) using least-connections, with optional IP session affinity
-- **Protects** connections with token-bucket rate limiting, concurrency limits, CIDR allowlist/blocklist, JA3 fingerprint blocking, TLS handshake timeout, and SNI-required enforcement
+- **Balances over Unix Domain Sockets** (UDS) using least-connections weighted by thread CPU utilisation, with optional IP session affinity
+- **Limits** routes with per-route token-bucket rate caps to prevent any one route from starving others
+- **Protects** connections with per-IP token-bucket rate limiting, concurrency limits, CIDR allowlist/blocklist, JA3 fingerprint blocking, TLS handshake timeout, and SNI-required enforcement
 - **Suspends** routes — hold incoming connections and fire an event; your code decides whether to proxy or reject each one
 - **Hot-swaps** routes and protection config without restarting or dropping existing connections
 - Scales to **~1 million concurrent connections** via `SO_REUSEPORT`, tokio's multi-thread runtime, and lock-free data structures
@@ -92,6 +93,8 @@ console.log('proxy listening on :443');
 | `mtls` | `MtlsConfig` | — | Per-route mTLS, overrides listener `mtls` |
 | `suspended` | `boolean` | `false` | Hold connections and emit `'suspended'` events |
 | `suspendTimeoutMs` | `number` | `30000` | Drop held connections after this ms if not resolved |
+| `maxConnectionsPerSecond` | `number` | — | Route-wide new-connection rate cap (token bucket). Connections are silently dropped when exhausted. |
+| `burst` | `number` | `maxConnectionsPerSecond` | Token bucket burst ceiling for the route rate limit |
 
 ### `Upstream`
 
@@ -105,6 +108,8 @@ console.log('proxy listening on :443');
   path: string,
   ipAffinity?: boolean,      // route same-IP connections to same socket
   ipAffinityTtlMs?: number,  // evict affinity entry after this ms idle (default 300000)
+  pid?: number,              // Linux PID of the worker process (enables CPU monitoring)
+  tid?: number,              // Linux TID of the worker thread (must be set with pid)
 }
 ```
 
@@ -230,7 +235,13 @@ Connections not resolved within `suspendTimeoutMs` are dropped automatically. Ca
 
 ## UDS load balancing
 
-Provide multiple `uds` upstreams for a route. symphony picks the socket with the fewest active connections:
+Provide multiple `uds` upstreams for a route. symphony picks the socket with the lowest score, where score is:
+
+```
+score = active_connections × 1000 + cpu_utilisation_permille
+```
+
+Active connections are the primary factor; CPU utilisation (0–1000, representing 0–100%) is a tiebreaker that steers new connections away from overloaded threads when connection counts are equal.
 
 ```typescript
 upstreams: [
@@ -252,6 +263,48 @@ upstreams: [
 ```
 
 The same `ipAffinity` / `ipAffinityTtlMs` values apply to all sockets in the set (values from the first entry are used for the shared balancer).
+
+### Thread CPU utilisation monitoring
+
+When each UDS upstream serves a known worker thread, symphony can read its CPU utilisation from `/proc/{pid}/task/{tid}/stat` and incorporate it into socket selection:
+
+```typescript
+upstreams: [
+  { kind: 'uds', path: '/run/app/worker-0.sock', pid: 12345, tid: 12346 },
+  { kind: 'uds', path: '/run/app/worker-1.sock', pid: 12345, tid: 12347 },
+  { kind: 'uds', path: '/run/app/worker-2.sock', pid: 12345, tid: 12348 },
+]
+```
+
+Symphony samples `/proc/{pid}/task/{tid}/stat` every 250 ms and computes the thread's CPU utilisation over the interval. Sockets without `pid`/`tid` keep a CPU score of 0 and fall back to pure least-connections. Sampling stops gracefully when `pid` is gone (process exit, crash) — those slots simply keep their last measured value.
+
+---
+
+## Per-route rate limiting
+
+Use `maxConnectionsPerSecond` on a route to cap the rate of new connections accepted for that route, independent of source IP. This prevents a single busy route from starving other routes under high load:
+
+```typescript
+routes: [
+  {
+    sni: 'api.example.com',
+    maxConnectionsPerSecond: 500,  // route-wide cap; burst defaults to this value
+    burst: 1000,                   // allow short bursts up to 1000 conn/s
+    upstreams: [{ kind: 'uds', path: '/run/app/api.sock' }],
+    terminateTls: true,
+    cert: { certChain, privateKey },
+  },
+  {
+    sni: 'admin.example.com',
+    maxConnectionsPerSecond: 20,
+    upstreams: [{ kind: 'uds', path: '/run/app/admin.sock' }],
+    terminateTls: true,
+    cert: { certChain, privateKey },
+  },
+]
+```
+
+Connections that exceed the limit are silently dropped (TCP RST). This is a global token bucket per route — not per IP. For per-IP rate limiting use `protection.rateLimit`.
 
 ---
 

@@ -10,6 +10,10 @@ export interface JsUpstream {
   path?: string
   ipAffinity?: boolean
   ipAffinityTtlMs?: number
+  /** Linux process ID of the worker thread (UDS upstreams only). */
+  pid?: number
+  /** Linux thread ID of the worker thread (UDS upstreams only). */
+  tid?: number
 }
 export interface JsCertConfig {
   certChain: string | Buffer
@@ -27,6 +31,13 @@ export interface JsRouteConfig {
   mtls?: JsMtlsConfig
   suspended?: boolean
   suspendTimeoutMs?: number
+  /**
+   * Global rate limit for this route (new connections per second).
+   * Connections are silently dropped (RST) when the token bucket is exhausted.
+   */
+  maxConnectionsPerSecond?: number
+  /** Token bucket burst ceiling (defaults to `maxConnectionsPerSecond`). */
+  burst?: number
 }
 export interface JsRateLimitConfig {
   connectionsPerSecond: number

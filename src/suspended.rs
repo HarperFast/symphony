@@ -1,4 +1,4 @@
-use crate::balancer::UdsBalancer;
+use crate::balancer::{UdsBalancer, UdsSlotSpec};
 use crate::router::Destination;
 use dashmap::DashMap;
 use rustls::ServerConfig;
@@ -107,7 +107,11 @@ pub fn build_resolved_route(spec: &ResolveSpec) -> crate::error::Result<Resolved
 	let destination = match &spec.upstream {
 		ResolveUpstream::Tcp(addr) => Destination::Tcp(*addr),
 		ResolveUpstream::Uds { paths, ip_affinity, affinity_ttl_ms } => {
-			Destination::UdsSet(Arc::new(UdsBalancer::new(paths.clone(), *ip_affinity, *affinity_ttl_ms)))
+			let slots = paths
+				.iter()
+				.map(|p| UdsSlotSpec { path: p.clone(), pid: None, tid: None })
+				.collect();
+			Destination::UdsSet(Arc::new(UdsBalancer::new(slots, *ip_affinity, *affinity_ttl_ms)))
 		}
 	};
 

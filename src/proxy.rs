@@ -25,6 +25,10 @@ pub struct JsUpstream {
 	pub path: Option<String>,
 	pub ip_affinity: Option<bool>,
 	pub ip_affinity_ttl_ms: Option<f64>,
+	/// Linux process ID of the worker thread (UDS upstreams only).
+	pub pid: Option<u32>,
+	/// Linux thread ID of the worker thread (UDS upstreams only).
+	pub tid: Option<u32>,
 }
 
 #[napi(object)]
@@ -48,6 +52,11 @@ pub struct JsRouteConfig {
 	pub mtls: Option<JsMtlsConfig>,
 	pub suspended: Option<bool>,
 	pub suspend_timeout_ms: Option<f64>,
+	/// Global rate limit for this route (new connections per second).
+	/// Connections are silently dropped (RST) when the token bucket is exhausted.
+	pub max_connections_per_second: Option<f64>,
+	/// Token bucket burst ceiling (defaults to `maxConnectionsPerSecond`).
+	pub burst: Option<f64>,
 }
 
 #[napi(object)]
@@ -297,6 +306,26 @@ impl SymphonyProxyWrap {
 			});
 		}
 
+		// Spawn a background task that samples /proc/{pid}/task/{tid}/stat every
+		// 250 ms for UDS upstreams that have pid/tid configured.  This is a no-op
+		// loop iteration when no routes have such upstreams.
+		let monitor_table = self.route_table.clone();
+		let mut monitor_rx = tx.subscribe();
+		tokio::spawn(async move {
+			let interval = Duration::from_millis(250);
+			loop {
+				tokio::select! {
+					_ = monitor_rx.recv() => break,
+					_ = tokio::time::sleep(interval) => {
+						let table = monitor_table.0.load();
+						for balancer in &table.monitored_balancers {
+							balancer.update_cpu_stats();
+						}
+					}
+				}
+			}
+		});
+
 		Ok(())
 	}
 
@@ -408,6 +437,8 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 		require_client_cert: r.mtls.as_ref().and_then(|m| m.require_client_cert).unwrap_or(true),
 		suspended: r.suspended.unwrap_or(false),
 		suspend_timeout_ms: r.suspend_timeout_ms.unwrap_or(30_000.0) as u64,
+		max_cps: r.max_connections_per_second,
+		burst: r.burst,
 	})
 }
 
@@ -430,6 +461,8 @@ fn parse_upstream_spec(u: &JsUpstream, sni: &str) -> Result<UpstreamSpec> {
 				.ok_or_else(|| napi::Error::from_reason(format!("uds upstream for '{sni}' missing path")))?;
 			Ok(UpstreamSpec::Uds {
 				paths: vec![path],
+				pids: vec![u.pid],
+				tids: vec![u.tid],
 				ip_affinity: u.ip_affinity.unwrap_or(false),
 				affinity_ttl_ms: u.ip_affinity_ttl_ms.unwrap_or(300_000.0) as u64,
 			})
@@ -452,7 +485,7 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 					.map_err(|e| napi::Error::from_reason(format!("invalid address: {e}")))?;
 				Ok(ResolveUpstream::Tcp(addr))
 			}
-			UpstreamSpec::Uds { paths, ip_affinity, affinity_ttl_ms } => {
+			UpstreamSpec::Uds { paths, ip_affinity, affinity_ttl_ms, .. } => {
 				Ok(ResolveUpstream::Uds { paths, ip_affinity, affinity_ttl_ms })
 			}
 		})?;
