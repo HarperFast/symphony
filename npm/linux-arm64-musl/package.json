@@ -1,10 +1,10 @@
 {
-	"name": "@symphony/linux-arm64-musl",
+	"name": "@harperfast/symphony-linux-arm64-musl",
 	"version": "0.1.0",
 	"description": "symphony native binary for linux arm64 musl",
 	"os": ["linux"],
 	"cpu": ["arm64"],
 	"main": "symphony.linux-arm64-musl.node",
 	"files": ["symphony.linux-arm64-musl.node"],
-	"license": "MIT"
+	"license": "Elastic-2.0"
 }

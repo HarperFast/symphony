@@ -1,5 +1,5 @@
 {
-	"name": "symphony",
+	"name": "@harperfast/symphony",
 	"version": "0.1.0",
 	"description": "High-performance TLS proxy with SNI routing — Rust/napi-rs, Linux",
 	"main": "dist/index.js",
@@ -42,5 +42,5 @@
 		"linux",
 		"darwin"
 	],
-	"license": "MIT"
+	"license": "Elastic-2.0"
 }

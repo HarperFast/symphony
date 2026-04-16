@@ -1,10 +1,10 @@
 {
-	"name": "@symphony/linux-x64-gnu",
+	"name": "@harperfast/symphony-linux-x64-gnu",
 	"version": "0.1.0",
 	"description": "symphony native binary for linux x64 glibc",
 	"os": ["linux"],
 	"cpu": ["x64"],
 	"main": "symphony.linux-x64-gnu.node",
 	"files": ["symphony.linux-x64-gnu.node"],
-	"license": "MIT"
+	"license": "Elastic-2.0"
 }
