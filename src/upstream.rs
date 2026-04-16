@@ -1,7 +1,8 @@
 use crate::balancer::{BalancerGuard, UdsBalancer};
 use crate::router::Destination;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 
 /// An established connection to an upstream server.
@@ -38,6 +39,20 @@ async fn connect_uds(balancer: &Arc<UdsBalancer>, peer_ip: Option<IpAddr>) -> cr
 	let guard = BalancerGuard::new(balancer.clone(), path.to_string());
 
 	Ok(UpstreamStream::Uds { stream, _guard: guard })
+}
+
+/// Write a PROXY protocol v1 header to a Unix domain socket upstream so the
+/// backend can recover the real client IP and port despite the UDS transport.
+///
+/// Format: `PROXY TCP4 <src-ip> <dst-ip> <src-port> <dst-port>\r\n`
+pub async fn write_proxy_v1_header(stream: &mut UnixStream, peer_addr: SocketAddr) -> std::io::Result<()> {
+	let (proto, src_ip, dst_ip) = match peer_addr.ip() {
+		IpAddr::V4(ip) => ("TCP4", ip.to_string(), "127.0.0.1".to_string()),
+		IpAddr::V6(ip) => ("TCP6", ip.to_string(), "::1".to_string()),
+	};
+	// dst-port is 0 — a placeholder; the backend only reads src-ip and src-port.
+	let header = format!("PROXY {proto} {src_ip} {dst_ip} {} 0\r\n", peer_addr.port());
+	stream.write_all(header.as_bytes()).await
 }
 
 // ── tokio::io::AsyncRead + AsyncWrite impls via delegation ────────────────────

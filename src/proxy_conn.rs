@@ -148,7 +148,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		if let Some(tls_cfg) = effective_route.tls_config {
 			let acceptor = TlsAcceptor::from(tls_cfg);
 			match timeout(hs_timeout, acceptor.accept(stream)).await {
-				Ok(Ok(tls_stream)) => proxy_via_tls(tls_stream, &effective_route.destination, peer_ip, &ctx).await,
+				Ok(Ok(tls_stream)) => proxy_via_tls(tls_stream, &effective_route.destination, peer_addr, &ctx).await,
 				Ok(Err(e)) => {
 					tracing::debug!("TLS handshake error from {peer_ip}: {e}");
 					ctx.listener_metrics.inc_error();
@@ -166,7 +166,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		}
 	} else {
 		// Passthrough — proxy raw TCP
-		proxy_raw(stream, &effective_route.destination, peer_ip, &ctx).await
+		proxy_raw(stream, &effective_route.destination, peer_addr, &ctx).await
 	};
 
 	if upstream_result.is_err() {
@@ -179,10 +179,10 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 async fn proxy_via_tls(
 	mut client: tokio_rustls::server::TlsStream<TcpStream>,
 	dest: &Destination,
-	peer_ip: IpAddr,
+	peer_addr: SocketAddr,
 	ctx: &ConnContext,
 ) -> std::io::Result<()> {
-	let mut upstream = upstream::connect(dest, Some(peer_ip))
+	let mut upstream = upstream::connect(dest, Some(peer_addr.ip()))
 		.await
 		.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
@@ -195,6 +195,7 @@ async fn proxy_via_tls(
 				.map(|_| ())
 		}
 		UpstreamStream::Uds { ref mut stream, .. } => {
+			upstream::write_proxy_v1_header(stream, peer_addr).await?;
 			timeout(idle, copy_bidirectional(&mut client, stream))
 				.await
 				.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout"))?
@@ -206,10 +207,10 @@ async fn proxy_via_tls(
 async fn proxy_raw(
 	mut client: TcpStream,
 	dest: &Destination,
-	peer_ip: IpAddr,
+	peer_addr: SocketAddr,
 	ctx: &ConnContext,
 ) -> std::io::Result<()> {
-	let mut upstream = upstream::connect(dest, Some(peer_ip))
+	let mut upstream = upstream::connect(dest, Some(peer_addr.ip()))
 		.await
 		.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
@@ -222,6 +223,7 @@ async fn proxy_raw(
 				.map(|_| ())
 		}
 		UpstreamStream::Uds { ref mut stream, .. } => {
+			upstream::write_proxy_v1_header(stream, peer_addr).await?;
 			timeout(idle, copy_bidirectional(&mut client, stream))
 				.await
 				.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout"))?
