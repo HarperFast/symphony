@@ -32,9 +32,9 @@ function loadAddon(): { SymphonyProxyWrap: typeof SymphonyProxyWrap } {
 
 	// Published scoped packages
 	if (platform === 'linux') {
-		candidates.push(`@symphony/linux-${arch}-gnu`, `@symphony/linux-${arch}-musl`);
+		candidates.push(`@harperfast/symphony-linux-${arch}-gnu`, `@harperfast/symphony-linux-${arch}-musl`);
 	} else if (platform === 'darwin') {
-		candidates.push(`@symphony/darwin-${arch}`);
+		candidates.push(`@harperfast/symphony-darwin-${arch}`);
 	}
 
 	for (const c of candidates) {

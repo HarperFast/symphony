@@ -1,0 +1,10 @@
+{
+	"name": "@harperfast/symphony-darwin-arm64",
+	"version": "0.1.0",
+	"description": "symphony native binary for macOS arm64 (Apple Silicon)",
+	"os": ["darwin"],
+	"cpu": ["arm64"],
+	"main": "symphony.darwin-arm64.node",
+	"files": ["symphony.darwin-arm64.node"],
+	"license": "Elastic-2.0"
+}
