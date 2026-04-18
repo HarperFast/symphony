@@ -28,12 +28,16 @@
 		"artifacts": "napi artifacts",
 		"prepublishOnly": "npm run build && napi prepublish -t npm",
 		"version": "napi version",
-		"test": "tsc -p tsconfig.test.json && node --test --test-force-exit dist-test/__test__/*.spec.js"
+		"test": "tsc -p tsconfig.test.json && node --test --test-force-exit dist-test/__test__/protection.spec.js dist-test/__test__/proxy.spec.js dist-test/__test__/suspended.spec.js",
+		"test:integration": "tsc -p tsconfig.test.json && node --test --test-force-exit dist-test/__test__/harper-integration.spec.js"
 	},
 	"devDependencies": {
+		"@harperfast/integration-testing": "^0.2.0",
 		"@napi-rs/cli": "^2.18.0",
 		"@types/node": "^20.0.0",
-		"typescript": "^5.8.0"
+		"harper": "*",
+		"typescript": "^5.8.0",
+		"yaml": "^2.0.0"
 	},
 	"engines": {
 		"node": ">= 18"
