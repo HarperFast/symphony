@@ -2,7 +2,7 @@ use crate::balancer::{BalancerGuard, UdsBalancer};
 use crate::router::Destination;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 
 /// An established connection to an upstream server.
@@ -41,11 +41,14 @@ async fn connect_uds(balancer: &Arc<UdsBalancer>, peer_ip: Option<IpAddr>) -> cr
 	Ok(UpstreamStream::Uds { stream, _guard: guard })
 }
 
-/// Write a PROXY protocol v1 header to a Unix domain socket upstream so the
-/// backend can recover the real client IP and port despite the UDS transport.
+/// Write a PROXY protocol v1 header so the backend can recover the real client
+/// IP and port.
 ///
 /// Format: `PROXY TCP4 <src-ip> <dst-ip> <src-port> <dst-port>\r\n`
-pub async fn write_proxy_v1_header(stream: &mut UnixStream, peer_addr: SocketAddr) -> std::io::Result<()> {
+pub async fn write_proxy_v1_header<W: tokio::io::AsyncWrite + Unpin>(
+	stream: &mut W,
+	peer_addr: SocketAddr,
+) -> std::io::Result<()> {
 	let (proto, src_ip, dst_ip) = match peer_addr.ip() {
 		IpAddr::V4(ip) => ("TCP4", ip.to_string(), "127.0.0.1".to_string()),
 		IpAddr::V6(ip) => ("TCP6", ip.to_string(), "::1".to_string()),
@@ -53,6 +56,45 @@ pub async fn write_proxy_v1_header(stream: &mut UnixStream, peer_addr: SocketAdd
 	// dst-port is 0 — a placeholder; the backend only reads src-ip and src-port.
 	let header = format!("PROXY {proto} {src_ip} {dst_ip} {} 0\r\n", peer_addr.port());
 	stream.write_all(header.as_bytes()).await
+}
+
+/// Read the first chunk of HTTP data from `client`, insert an
+/// `X-Forwarded-For` header after the request line, write the modified
+/// data to `upstream`, then return so the caller can proceed with
+/// bidirectional copy for the remaining data.
+///
+/// If the initial read contains no `\r\n` (not a valid HTTP request),
+/// the header is prepended before the data as a best-effort fallback.
+pub async fn inject_x_forwarded_for<C, U>(
+	client: &mut C,
+	upstream: &mut U,
+	peer_addr: SocketAddr,
+) -> std::io::Result<()>
+where
+	C: tokio::io::AsyncRead + Unpin,
+	U: tokio::io::AsyncWrite + Unpin,
+{
+	let mut buf = vec![0u8; 8192];
+	let n = client.read(&mut buf).await?;
+	if n == 0 {
+		return Ok(());
+	}
+	let data = &buf[..n];
+
+	let xff = format!("X-Forwarded-For: {}\r\n", peer_addr.ip());
+
+	// Find the end of the HTTP request line (first \r\n)
+	let insert_pos = data
+		.windows(2)
+		.position(|w| w == b"\r\n")
+		.map(|p| p + 2) // insert after the \r\n
+		.unwrap_or(0); // no \r\n found — prepend
+
+	upstream.write_all(&data[..insert_pos]).await?;
+	upstream.write_all(xff.as_bytes()).await?;
+	upstream.write_all(&data[insert_pos..]).await?;
+
+	Ok(())
 }
 
 // ── tokio::io::AsyncRead + AsyncWrite impls via delegation ────────────────────

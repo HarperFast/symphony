@@ -3,7 +3,7 @@ use crate::metrics::{GlobalMetrics, ListenerMetrics};
 use crate::protection::ProtectionState;
 use crate::proxy_conn::{ConnContext, JsEvent};
 use crate::router::{
-	build_route_table, ListenerTlsSpec, LiveRouteTable, RouteSpec, UpstreamSpec,
+	build_route_table, ListenerTlsSpec, LiveRouteTable, RouteSpec, SourceAddressMode, UpstreamSpec,
 };
 use crate::suspended::{build_resolved_route, ResolveSpec, ResolveUpstream, SuspendedRegistry};
 use ipnetwork::IpNetwork;
@@ -57,6 +57,9 @@ pub struct JsRouteConfig {
 	pub max_connections_per_second: Option<f64>,
 	/// Token bucket burst ceiling (defaults to `maxConnectionsPerSecond`).
 	pub burst: Option<f64>,
+	/// How the real client IP is forwarded to the upstream.
+	/// "proxyProtocol" (default for UDS), "xForwardedFor", or "none" (default for TCP).
+	pub source_address_header: Option<String>,
 }
 
 #[napi(object)]
@@ -120,6 +123,7 @@ pub struct JsResolveRoute {
 	pub terminate_tls: bool,
 	pub cert: Option<JsCertConfig>,
 	pub mtls: Option<JsMtlsConfig>,
+	pub source_address_header: Option<String>,
 }
 
 // ── Plain Rust internal config (all Send + Sync) ──────────────────────────────
@@ -427,6 +431,9 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 		.map(|u| parse_upstream_spec(u, &r.sni))
 		.collect::<Result<Vec<_>>>()?;
 
+	let has_uds = upstreams.iter().any(|u| matches!(u, UpstreamSpec::Uds { .. }));
+	let source_address_mode = parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
+
 	Ok(RouteSpec {
 		sni: r.sni.clone(),
 		upstreams,
@@ -439,6 +446,7 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 		suspend_timeout_ms: r.suspend_timeout_ms.unwrap_or(30_000.0) as u64,
 		max_cps: r.max_connections_per_second,
 		burst: r.burst,
+		source_address_mode,
 	})
 }
 
@@ -490,6 +498,9 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 			}
 		})?;
 
+	let has_uds = matches!(&upstream, ResolveUpstream::Uds { .. });
+	let source_address_mode = parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
+
 	Ok(ResolveSpec {
 		upstream,
 		terminate_tls: r.terminate_tls,
@@ -497,6 +508,7 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 		key_pem: r.cert.as_ref().map(|c| pem_bytes(&c.private_key)),
 		mtls_ca_pem: r.mtls.as_ref().map(|m| pem_bytes(&m.client_ca_cert)),
 		require_client_cert: r.mtls.as_ref().and_then(|m| m.require_client_cert).unwrap_or(true),
+		source_address_mode,
 	})
 }
 
@@ -561,6 +573,26 @@ fn pem_bytes(v: &Either<String, Buffer>) -> Vec<u8> {
 	match v {
 		Either::A(s) => s.as_bytes().to_vec(),
 		Either::B(b) => b.to_vec(),
+	}
+}
+
+fn parse_source_address_mode(
+	value: Option<&str>,
+	has_uds_upstreams: bool,
+) -> Result<SourceAddressMode> {
+	match value {
+		Some("proxyProtocol") => Ok(SourceAddressMode::ProxyProtocol),
+		Some("xForwardedFor") => Ok(SourceAddressMode::XForwardedFor),
+		Some("none") => Ok(SourceAddressMode::None),
+		Some(other) => Err(napi::Error::from_reason(format!(
+			"unknown sourceAddressHeader value '{other}'; expected 'proxyProtocol', 'xForwardedFor', or 'none'"
+		))),
+		// Default: proxyProtocol for UDS upstreams, none for TCP
+		None => Ok(if has_uds_upstreams {
+			SourceAddressMode::ProxyProtocol
+		} else {
+			SourceAddressMode::None
+		}),
 	}
 }
 

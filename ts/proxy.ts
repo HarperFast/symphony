@@ -86,6 +86,7 @@ function toJsRoute(r: RouteConfig): JsRouteConfig {
 		mtls: r.mtls ? toJsMtls(r.mtls) : undefined,
 		suspended: r.suspended,
 		suspendTimeoutMs: r.suspendTimeoutMs,
+		sourceAddressHeader: r.sourceAddressHeader,
 	};
 }
 
@@ -230,6 +231,7 @@ export class SymphonyProxy extends EventEmitter {
 			terminateTls: route.terminateTls,
 			cert: route.cert ? toJsCert(route.cert) : undefined,
 			mtls: route.mtls ? toJsMtls(route.mtls) : undefined,
+			sourceAddressHeader: route.sourceAddressHeader,
 		});
 	}
 }
