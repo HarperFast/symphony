@@ -38,6 +38,11 @@ export interface JsRouteConfig {
   maxConnectionsPerSecond?: number
   /** Token bucket burst ceiling (defaults to `maxConnectionsPerSecond`). */
   burst?: number
+  /**
+   * How the real client IP is forwarded to the upstream.
+   * "proxyProtocol" (default for UDS), "xForwardedFor", or "none" (default for TCP).
+   */
+  sourceAddressHeader?: string
 }
 export interface JsRateLimitConfig {
   connectionsPerSecond: number
@@ -85,6 +90,7 @@ export interface JsResolveRoute {
   terminateTls: boolean
   cert?: JsCertConfig
   mtls?: JsMtlsConfig
+  sourceAddressHeader?: string
 }
 export declare class SymphonyProxyWrap {
   constructor(config: JsProxyConfig, emitFn: (...args: any[]) => any)

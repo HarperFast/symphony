@@ -1,5 +1,5 @@
 use crate::balancer::{UdsBalancer, UdsSlotSpec};
-use crate::router::Destination;
+use crate::router::{Destination, SourceAddressMode};
 use dashmap::DashMap;
 use rustls::ServerConfig;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,6 +11,7 @@ pub struct ResolvedRoute {
 	pub destination: Destination,
 	pub tls_config: Option<Arc<ServerConfig>>,
 	pub terminate_tls: bool,
+	pub source_address_mode: SourceAddressMode,
 }
 
 /// Registry of suspended connections waiting for `resolveConnection()`.
@@ -67,6 +68,7 @@ pub struct ResolveSpec {
 	pub key_pem: Option<Vec<u8>>,
 	pub mtls_ca_pem: Option<Vec<u8>>,
 	pub require_client_cert: bool,
+	pub source_address_mode: SourceAddressMode,
 }
 
 #[derive(Debug)]
@@ -115,5 +117,10 @@ pub fn build_resolved_route(spec: &ResolveSpec) -> crate::error::Result<Resolved
 		}
 	};
 
-	Ok(ResolvedRoute { destination, tls_config, terminate_tls: spec.terminate_tls })
+	Ok(ResolvedRoute {
+		destination,
+		tls_config,
+		terminate_tls: spec.terminate_tls,
+		source_address_mode: spec.source_address_mode,
+	})
 }

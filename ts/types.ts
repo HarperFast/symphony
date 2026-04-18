@@ -74,6 +74,17 @@ export interface RouteConfig {
 	maxConnectionsPerSecond?: number;
 	/** Token bucket burst ceiling (connections). Defaults to maxConnectionsPerSecond. */
 	burst?: number;
+	/**
+	 * How the real client IP is forwarded to the upstream.
+	 *
+	 * - `'proxyProtocol'` — Send a PROXY protocol v1 header before application data.
+	 *   Default for UDS upstreams.
+	 * - `'xForwardedFor'` — Parse the beginning of the HTTP request and insert an
+	 *   `X-Forwarded-For` header. Use this for backends (e.g. Bun) that do not
+	 *   support the PROXY protocol.
+	 * - `'none'` — Do not forward source address information. Default for TCP upstreams.
+	 */
+	sourceAddressHeader?: 'proxyProtocol' | 'xForwardedFor' | 'none';
 }
 
 // ── Protection ────────────────────────────────────────────────────────────────
@@ -174,6 +185,8 @@ export interface ResolveRoute {
 	terminateTls: boolean;
 	cert?: CertConfig;
 	mtls?: MtlsConfig;
+	/** How the real client IP is forwarded to the upstream. See RouteConfig.sourceAddressHeader. */
+	sourceAddressHeader?: 'proxyProtocol' | 'xForwardedFor' | 'none';
 }
 
 // ── Event payloads ────────────────────────────────────────────────────────────
