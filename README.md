@@ -95,6 +95,7 @@ console.log('proxy listening on :443');
 | `suspendTimeoutMs` | `number` | `30000` | Drop held connections after this ms if not resolved |
 | `maxConnectionsPerSecond` | `number` | — | Route-wide new-connection rate cap (token bucket). Connections are silently dropped when exhausted. |
 | `burst` | `number` | `maxConnectionsPerSecond` | Token bucket burst ceiling for the route rate limit |
+| `sourceAddressHeader` | `'proxyProtocol' \| 'xForwardedFor' \| 'none'` | `'proxyProtocol'` for UDS, `'none'` for TCP | How the real client IP is forwarded to the upstream. See [Source address forwarding](#source-address-forwarding). |
 
 ### `Upstream`
 
@@ -305,6 +306,58 @@ routes: [
 ```
 
 Connections that exceed the limit are silently dropped (TCP RST). This is a global token bucket per route — not per IP. For per-IP rate limiting use `protection.rateLimit`.
+
+---
+
+## Source address forwarding
+
+Use `sourceAddressHeader` on a route to control how the real client IP is communicated to the upstream. This only applies when `terminateTls: true` (TLS is terminated by the proxy).
+
+| Value | Behaviour |
+|---|---|
+| `'proxyProtocol'` | Sends a PROXY protocol v1 header (`PROXY TCP4 <src-ip> <dst-ip> <src-port> 0\r\n`) before any application data. Default for UDS upstreams. |
+| `'xForwardedFor'` | Reads the first chunk of the HTTP request, inserts an `X-Forwarded-For` header after the request line, then copies the rest verbatim. No per-request parsing overhead for keep-alive connections. Default for TCP upstreams (disabled). |
+| `'none'` | Does not forward source address information. Default for TCP upstreams. |
+
+### PROXY protocol (default for UDS)
+
+Most backends that consume PROXY protocol (nginx, HAProxy, HarperDB) read the header once per connection before parsing application data.
+
+```typescript
+{
+  sni: 'api.example.com',
+  upstreams: [{ kind: 'uds', path: '/run/app/worker.sock' }],
+  terminateTls: true,
+  cert: { certChain, privateKey },
+  // sourceAddressHeader: 'proxyProtocol',  // this is already the default for UDS
+}
+```
+
+### X-Forwarded-For (for Bun and other HTTP backends)
+
+Bun's built-in HTTP server does not support PROXY protocol. Use `'xForwardedFor'` instead — symphony injects the header into the first HTTP request of each connection:
+
+```typescript
+{
+  sni: 'app.example.com',
+  upstreams: [{ kind: 'uds', path: '/run/bun/worker.sock' }],
+  terminateTls: true,
+  cert: { certChain, privateKey },
+  sourceAddressHeader: 'xForwardedFor',
+}
+```
+
+In your Bun server:
+
+```typescript
+Bun.serve({
+  unix: '/run/bun/worker.sock',
+  fetch(req) {
+    const clientIp = req.headers.get('x-forwarded-for');
+    // ...
+  },
+});
+```
 
 ---
 
