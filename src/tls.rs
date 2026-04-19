@@ -74,7 +74,7 @@ fn build_server_config(cert: &CertSpec, mtls: Option<&MtlsSpec>) -> Result<Arc<S
 			.ok_or_else(|| SymphonyError::Config("private key PEM contains no key".into()))?
 	};
 
-	let cfg = if let Some(m) = mtls {
+	let mut cfg = if let Some(m) = mtls {
 		let verifier = SymphonyClientVerifier::build(&m.client_ca_pem, m.require_client_cert)?;
 		ServerConfig::builder()
 			.with_client_cert_verifier(verifier)
@@ -86,6 +86,21 @@ fn build_server_config(cert: &CertSpec, mtls: Option<&MtlsSpec>) -> Result<Arc<S
 			.with_single_cert(certs, key)
 			.map_err(SymphonyError::Tls)?
 	};
+
+	// Enable TLS session resumption.
+	//
+	// rustls defaults to NeverProducesTickets (no TLS 1.3 tickets) and
+	// NoServerSessionStorage (no TLS 1.2 session IDs). Without session
+	// resumption, every new connection requires a full TLS handshake (~2ms).
+	// Clients like Node.js cache session tickets and reuse them, cutting
+	// handshake cost to ~0.1ms for resumed sessions.
+	//
+	// - session_storage: handles TLS 1.2 session ID resumption.
+	// - ticketer: handles TLS 1.3 PSK-based session ticket resumption (primary
+	//   path for modern clients).
+	cfg.session_storage = rustls::server::ServerSessionMemoryCache::new(1024);
+	cfg.ticketer = rustls::crypto::ring::Ticketer::new()
+		.map_err(SymphonyError::Tls)?;
 
 	Ok(Arc::new(cfg))
 }

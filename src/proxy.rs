@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::runtime::{Handle as RtHandle, Runtime};
 use tokio::sync::broadcast;
 
 // ── JS-facing config types (in / out of NAPI boundary only) ──────────────────
@@ -160,6 +161,14 @@ pub struct SymphonyProxyWrap {
 	// Interior mutability for start/stop
 	shutdown_tx: Mutex<Option<broadcast::Sender<()>>>,
 	js_emit: Arc<ThreadsafeFunction<JsEvent>>,
+	// Dedicated multi-thread runtime for all proxy I/O.
+	// napi's tokio_rt runs a single-threaded executor; spawning proxy tasks there
+	// would serialise all connections onto one OS thread.  By creating our own
+	// multi-thread runtime and using its Handle to spawn, every accept loop and
+	// connection handler gets distributed across the full CPU count.
+	// Handle is Send+Sync; Runtime is Send-only, so it lives in a Mutex.
+	rt: Mutex<Option<Runtime>>,
+	rt_handle: RtHandle,
 }
 
 #[napi]
@@ -264,6 +273,14 @@ impl SymphonyProxyWrap {
 				Ok(vec![obj])
 			})?;
 
+		// Build a dedicated multi-thread runtime for all proxy I/O work.
+		let rt = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(worker_threads)
+			.enable_all()
+			.build()
+			.map_err(|e| napi::Error::from_reason(format!("failed to create proxy runtime: {e}")))?;
+		let rt_handle = rt.handle().clone();
+
 		Ok(Self {
 			listeners: internal_listeners,
 			default_listener_tls,
@@ -276,6 +293,8 @@ impl SymphonyProxyWrap {
 			listener_states,
 			shutdown_tx: Mutex::new(None),
 			js_emit: Arc::new(js_emit),
+			rt: Mutex::new(Some(rt)),
+			rt_handle,
 		})
 	}
 
@@ -303,7 +322,7 @@ impl SymphonyProxyWrap {
 			let addr = listener.addr;
 			let rx = tx.subscribe();
 
-			tokio::spawn(async move {
+			self.rt_handle.spawn(async move {
 				if let Err(e) = spawn_listeners(addr, workers, max_conn, ctx, rx).await {
 					tracing::error!("listener {addr} failed: {e}");
 				}
@@ -315,7 +334,7 @@ impl SymphonyProxyWrap {
 		// loop iteration when no routes have such upstreams.
 		let monitor_table = self.route_table.clone();
 		let mut monitor_rx = tx.subscribe();
-		tokio::spawn(async move {
+		self.rt_handle.spawn(async move {
 			let interval = Duration::from_millis(250);
 			loop {
 				tokio::select! {
