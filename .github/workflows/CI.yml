@@ -48,8 +48,8 @@ jobs:
           image: ${{ matrix.image }}
           options: >-
             -v ${{ github.workspace }}:/build
-            -v $HOME/.cargo/registry:/root/.cargo/registry
-            -v $HOME/.cargo/git:/root/.cargo/git
+            -v ${{ env.HOME }}/.cargo/registry:/root/.cargo/registry
+            -v ${{ env.HOME }}/.cargo/git:/root/.cargo/git
             -w /build
           run: |
             set -e
