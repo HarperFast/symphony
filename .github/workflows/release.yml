@@ -145,13 +145,24 @@ jobs:
         with:
           path: artifacts
 
-      - name: Move artifacts
+      - name: Move artifacts into npm/ packages
         run: npx napi artifacts --dir artifacts --dist npm
 
       - name: Compile TypeScript
         run: tsc -p tsconfig.json
 
-      - name: Publish
-        run: npm publish --provenance --access public
+      - name: Set optionalDependencies in package.json
+        run: npx napi prepublish -t npm --skip-gh-release
+
+      - name: Publish platform packages
+        run: |
+          for dir in npm/*/; do
+            npm publish "$dir" --provenance --access public
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish main package
+        run: npm publish --provenance --access public --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
