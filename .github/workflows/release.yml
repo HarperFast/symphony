@@ -136,7 +136,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install -g npm@latest && npm ci
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -150,7 +150,19 @@ jobs:
         run: tsc -p tsconfig.json || true
 
       - name: Set optionalDependencies in package.json
-        run: npx napi prepublish -t npm --skip-gh-release
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('./package.json', 'utf8'));
+            pkg.optionalDependencies = {};
+            const dirs = fs.readdirSync('./npm').filter(d => fs.statSync('./npm/' + d).isDirectory());
+            for (const dir of dirs) {
+              const sub = JSON.parse(fs.readFileSync('./npm/' + dir + '/package.json', 'utf8'));
+              pkg.optionalDependencies[sub.name] = sub.version;
+            }
+            fs.writeFileSync('./package.json', JSON.stringify(pkg, null, '\t') + '\n');
+            console.log('optionalDependencies:', JSON.stringify(pkg.optionalDependencies, null, 2));
+          "
 
       - name: Publish platform packages
         run: |
