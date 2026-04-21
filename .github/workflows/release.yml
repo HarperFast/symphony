@@ -136,7 +136,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Install dependencies
-        run: npm install -g npm@latest && npm ci
+        run: npm ci
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
