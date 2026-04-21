@@ -54,7 +54,7 @@ jobs:
           run: |
             set -e
             rustup update stable
-            npm ci --omit=optional
+            npm ci --ignore-scripts
             if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
               rustup target add aarch64-unknown-linux-musl
               export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
@@ -97,7 +97,7 @@ jobs:
           restore-keys: macos-cargo-
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Build aarch64-apple-darwin
         run: npm run build -- --target aarch64-apple-darwin
