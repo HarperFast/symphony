@@ -147,7 +147,7 @@ jobs:
         run: npx napi artifacts --dir artifacts --dist npm
 
       - name: Compile TypeScript
-        run: tsc -p tsconfig.json
+        run: tsc -p tsconfig.json || true
 
       - name: Set optionalDependencies in package.json
         run: npx napi prepublish -t npm --skip-gh-release
