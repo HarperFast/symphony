@@ -53,8 +53,7 @@ jobs:
           run: |
             set -e
             rustup update stable
-            npm install -g npm@latest
-            npm ci
+            npm ci --omit=optional
             if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
               rustup target add aarch64-unknown-linux-musl
               export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
