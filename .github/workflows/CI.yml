@@ -97,7 +97,7 @@ jobs:
           restore-keys: macos-cargo-
 
       - name: Install dependencies
-        run: npm install -g npm@latest && npm ci --ignore-scripts
+        run: npm install --ignore-scripts
 
       - name: Build aarch64-apple-darwin
         run: npm run build -- --target aarch64-apple-darwin
@@ -178,7 +178,7 @@ jobs:
           name: symphony.linux-x64-gnu.node
 
       - name: Install dependencies
-        run: npm install -g npm@latest && npm ci
+        run: npm install --ignore-scripts
 
       - name: Checkout harper-pro
         uses: actions/checkout@v4
