@@ -71,19 +71,8 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    name: Build – ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            runner: macos-13
-            artifact: symphony.darwin-x64.node
-
-          - target: aarch64-apple-darwin
-            runner: macos-14
-            artifact: symphony.darwin-arm64.node
+    name: Build – macOS (arm64 + x64)
+    runs-on: macos-14
 
     steps:
       - uses: actions/checkout@v4
@@ -93,8 +82,10 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Install Rust target
-        run: rustup target add ${{ matrix.target }}
+      - name: Install Rust targets
+        run: |
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -102,23 +93,30 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ matrix.target }}-cargo-
+          key: macos-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-cargo-
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Build (${{ matrix.target }})
-        run: npm run build -- --target ${{ matrix.target }}
+      - name: Build aarch64-apple-darwin
+        run: npm run build -- --target aarch64-apple-darwin
 
-      - name: Strip binary
-        run: strip ${{ matrix.artifact }} 2>/dev/null || true
+      - name: Build x86_64-apple-darwin
+        run: npm run build -- --target x86_64-apple-darwin
 
-      - name: Upload artifact
+      - name: Upload aarch64 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          name: symphony.darwin-arm64.node
+          path: symphony.darwin-arm64.node
+          if-no-files-found: error
+
+      - name: Upload x64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: symphony.darwin-x64.node
+          path: symphony.darwin-x64.node
           if-no-files-found: error
 
   test:
