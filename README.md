@@ -95,6 +95,7 @@ console.log('proxy listening on :443');
 | `suspendTimeoutMs` | `number` | `30000` | Drop held connections after this ms if not resolved |
 | `maxConnectionsPerSecond` | `number` | — | Route-wide new-connection rate cap (token bucket). Connections are silently dropped when exhausted. |
 | `burst` | `number` | `maxConnectionsPerSecond` | Token bucket burst ceiling for the route rate limit |
+| `http2` | `boolean` | `false` | Advertise `h2` in ALPN so clients negotiate HTTP/2. Raw H2 frames flow through to the upstream unchanged. Requires `terminateTls: true`. |
 | `sourceAddressHeader` | `'proxyProtocol' \| 'xForwardedFor' \| 'none'` | `'proxyProtocol'` for UDS, `'none'` for TCP | How the real client IP is forwarded to the upstream. See [Source address forwarding](#source-address-forwarding). |
 
 ### `Upstream`

@@ -43,6 +43,8 @@ export interface JsRouteConfig {
    * "proxyProtocol" (default for UDS), "xForwardedFor", or "none" (default for TCP).
    */
   sourceAddressHeader?: string
+  /** Advertise h2 in ALPN so clients can negotiate HTTP/2. Default: false. */
+  http2?: boolean
 }
 export interface JsRateLimitConfig {
   connectionsPerSecond: number
@@ -91,6 +93,7 @@ export interface JsResolveRoute {
   cert?: JsCertConfig
   mtls?: JsMtlsConfig
   sourceAddressHeader?: string
+  http2?: boolean
 }
 export declare class SymphonyProxyWrap {
   constructor(config: JsProxyConfig, emitFn: (...args: any[]) => any)
