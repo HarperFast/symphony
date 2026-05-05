@@ -69,6 +69,7 @@ pub struct ResolveSpec {
 	pub mtls_ca_pem: Option<Vec<u8>>,
 	pub require_client_cert: bool,
 	pub source_address_mode: SourceAddressMode,
+	pub http2: bool,
 }
 
 #[derive(Debug)]
@@ -101,7 +102,7 @@ pub fn build_resolved_route(spec: &ResolveSpec) -> crate::error::Result<Resolved
 		});
 
 		let mut cache = TlsConfigCache::new();
-		Some(cache.get_or_build(&cert_spec, mtls_spec.as_ref())?)
+		Some(cache.get_or_build(&cert_spec, mtls_spec.as_ref(), spec.http2)?)
 	} else {
 		None
 	};

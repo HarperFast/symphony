@@ -199,6 +199,8 @@ pub struct RouteSpec {
 	pub burst: Option<f64>,
 	/// How the real client IP is forwarded to the upstream.
 	pub source_address_mode: SourceAddressMode,
+	/// Advertise h2 in ALPN so clients can negotiate HTTP/2.
+	pub http2: bool,
 }
 
 /// Listener-level fallback cert/mTLS spec.
@@ -297,7 +299,7 @@ fn build_route(
 			},
 		});
 
-		Some(cache.get_or_build(&cert_spec, mtls_spec.as_ref())?)
+		Some(cache.get_or_build(&cert_spec, mtls_spec.as_ref(), spec.http2)?)
 	} else {
 		None
 	};

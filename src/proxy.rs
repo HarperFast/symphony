@@ -61,6 +61,8 @@ pub struct JsRouteConfig {
 	/// How the real client IP is forwarded to the upstream.
 	/// "proxyProtocol" (default for UDS), "xForwardedFor", or "none" (default for TCP).
 	pub source_address_header: Option<String>,
+	/// Advertise h2 in ALPN so clients can negotiate HTTP/2. Default: false.
+	pub http2: Option<bool>,
 }
 
 #[napi(object)]
@@ -125,6 +127,7 @@ pub struct JsResolveRoute {
 	pub cert: Option<JsCertConfig>,
 	pub mtls: Option<JsMtlsConfig>,
 	pub source_address_header: Option<String>,
+	pub http2: Option<bool>,
 }
 
 // ── Plain Rust internal config (all Send + Sync) ──────────────────────────────
@@ -453,7 +456,7 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 	let has_uds = upstreams.iter().any(|u| matches!(u, UpstreamSpec::Uds { .. }));
 	let source_address_mode = parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
 
-	Ok(RouteSpec {
+	let result = Ok(RouteSpec {
 		sni: r.sni.clone(),
 		upstreams,
 		terminate_tls: r.terminate_tls,
@@ -466,7 +469,15 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 		max_cps: r.max_connections_per_second,
 		burst: r.burst,
 		source_address_mode,
-	})
+		http2: r.http2.unwrap_or(false),
+	});
+
+	if let Ok(ref spec) = result {
+		if spec.http2 && !spec.terminate_tls {
+			eprintln!("symphony: route '{}': http2=true has no effect when terminateTls=false (passthrough mode)", spec.sni);
+		}
+	}
+	result
 }
 
 fn parse_upstream_spec(u: &JsUpstream, sni: &str) -> Result<UpstreamSpec> {
@@ -528,6 +539,7 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 		mtls_ca_pem: r.mtls.as_ref().map(|m| pem_bytes(&m.client_ca_cert)),
 		require_client_cert: r.mtls.as_ref().and_then(|m| m.require_client_cert).unwrap_or(true),
 		source_address_mode,
+		http2: r.http2.unwrap_or(false),
 	})
 }
 
