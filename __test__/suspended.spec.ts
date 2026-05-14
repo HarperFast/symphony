@@ -108,7 +108,7 @@ describe('Suspended routes – hold then resolve', () => {
 		//    resolved route builds its own TLS config (the original route's config
 		//    is not reused for resolved connections).
 		proxy.resolveConnection(capturedConn!.id, {
-			upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+			upstream: { kind: 'tcp', host: '127.0.0.1', port: echo.port },
 			terminateTls: true,
 			cert: { certChain: cert.cert, privateKey: cert.key },
 		});

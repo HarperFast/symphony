@@ -25,6 +25,7 @@ libc        = "0.2"
 socket2     = { version = "0.5", features = ["all"] }
 ring        = "0.17"
 md-5        = "0.10"
+zeroize     = "1"
 
 [build-dependencies]
 napi-build = "2.1"

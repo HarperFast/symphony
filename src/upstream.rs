@@ -2,8 +2,10 @@ use crate::balancer::{BalancerGuard, UdsBalancer};
 use crate::router::Destination;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
+use tokio::time::timeout;
 
 /// An established connection to an upstream server.
 pub enum UpstreamStream {
@@ -17,23 +19,46 @@ pub enum UpstreamStream {
 
 /// Connect to an upstream destination.
 /// `peer_ip` is passed to UDS balancers for IP affinity.
-pub async fn connect(destination: &Destination, peer_ip: Option<IpAddr>) -> crate::error::Result<UpstreamStream> {
+/// `connect_timeout` caps the time spent waiting for the initial connection.
+pub async fn connect(
+	destination: &Destination,
+	peer_ip: Option<IpAddr>,
+	connect_timeout: Duration,
+) -> crate::error::Result<UpstreamStream> {
 	match destination {
 		Destination::Tcp(addr) => {
-			let stream = TcpStream::connect(addr).await?;
+			let stream = timeout(connect_timeout, TcpStream::connect(addr))
+				.await
+				.map_err(|_| {
+					crate::error::SymphonyError::Io(std::io::Error::new(
+						std::io::ErrorKind::TimedOut,
+						"upstream connect timeout",
+					))
+				})??;
 			stream.set_nodelay(true)?;
 			Ok(UpstreamStream::Tcp(stream))
 		}
-		Destination::UdsSet(balancer) => connect_uds(balancer, peer_ip).await,
+		Destination::UdsSet(balancer) => connect_uds(balancer, peer_ip, connect_timeout).await,
 	}
 }
 
-async fn connect_uds(balancer: &Arc<UdsBalancer>, peer_ip: Option<IpAddr>) -> crate::error::Result<UpstreamStream> {
+async fn connect_uds(
+	balancer: &Arc<UdsBalancer>,
+	peer_ip: Option<IpAddr>,
+	connect_timeout: Duration,
+) -> crate::error::Result<UpstreamStream> {
 	let path = balancer
 		.pick(peer_ip)
 		.ok_or_else(|| crate::error::SymphonyError::Config("UDS balancer has no sockets configured".into()))?;
 
-	let stream = UnixStream::connect(path.as_ref()).await?;
+	let stream = timeout(connect_timeout, UnixStream::connect(path.as_ref()))
+		.await
+		.map_err(|_| {
+			crate::error::SymphonyError::Io(std::io::Error::new(
+				std::io::ErrorKind::TimedOut,
+				"upstream connect timeout",
+			))
+		})??;
 
 	// The guard increments the counter on construction and decrements on drop.
 	let guard = BalancerGuard::new(balancer.clone(), path.to_string());
@@ -48,7 +73,12 @@ async fn connect_uds(balancer: &Arc<UdsBalancer>, peer_ip: Option<IpAddr>) -> cr
 pub async fn write_proxy_v1_header(stream: &mut UnixStream, peer_addr: SocketAddr) -> std::io::Result<()> {
 	let (proto, src_ip, dst_ip) = match peer_addr.ip() {
 		IpAddr::V4(ip) => ("TCP4", ip.to_string(), "127.0.0.1".to_string()),
-		IpAddr::V6(ip) => ("TCP6", ip.to_string(), "::1".to_string()),
+		// Unwrap IPv4-mapped IPv6 (::ffff:1.2.3.4) to plain TCP4 so backends that
+		// parse the PROXY header (HAProxy, nginx) receive a well-formed IPv4 address.
+		IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+			Some(v4) => ("TCP4", v4.to_string(), "127.0.0.1".to_string()),
+			None => ("TCP6", ip.to_string(), "::1".to_string()),
+		},
 	};
 	// dst-port is 0 — a placeholder; the backend only reads src-ip and src-port.
 	let header = format!("PROXY {proto} {src_ip} {dst_ip} {} 0\r\n", peer_addr.port());

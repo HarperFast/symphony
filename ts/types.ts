@@ -36,7 +36,7 @@ export interface CertConfig {
 
 export interface MtlsConfig {
 	clientCaCert: string | Buffer;
-	/** Whether to reject clients that do not present a certificate. Default: true. */
+	/** Whether to reject clients that do not present a certificate. Default: false (optional client cert). */
 	requireClientCert?: boolean;
 }
 
@@ -170,7 +170,7 @@ export interface SuspendedConnection {
 
 /** Route spec passed to resolveConnection() to forward the held connection. */
 export interface ResolveRoute {
-	upstreams: Upstream[];
+	upstream: Upstream;
 	terminateTls: boolean;
 	cert?: CertConfig;
 	mtls?: MtlsConfig;

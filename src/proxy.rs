@@ -116,7 +116,7 @@ pub struct JsBlockedIpsInfo {
 
 #[napi(object)]
 pub struct JsResolveRoute {
-	pub upstreams: Vec<JsUpstream>,
+	pub upstream: JsUpstream,
 	pub terminate_tls: bool,
 	pub cert: Option<JsCertConfig>,
 	pub mtls: Option<JsMtlsConfig>,
@@ -181,13 +181,17 @@ impl SymphonyProxyWrap {
 			.unwrap_or_else(ListenerTlsSpec::empty);
 
 		let worker_threads = config.worker_threads.unwrap_or(num_cpus()) as usize;
-		let idle_timeout = Duration::from_millis(
-			config
-				.listeners
-				.first()
-				.and_then(|l| l.idle_timeout_ms)
-				.unwrap_or(60_000.0) as u64,
-		);
+		// 0 means "no idle timeout" — stored as Duration::ZERO and checked in proxy_conn.rs.
+		let idle_timeout_ms = config
+			.listeners
+			.first()
+			.and_then(|l| l.idle_timeout_ms)
+			.unwrap_or(60_000.0);
+		let idle_timeout = if idle_timeout_ms > 0.0 {
+			Duration::from_millis(idle_timeout_ms as u64)
+		} else {
+			Duration::ZERO
+		};
 		let read_buffer_size = config.read_buffer_size.unwrap_or(65_536) as usize;
 
 		let mut internal_listeners = Vec::new();
@@ -282,6 +286,14 @@ impl SymphonyProxyWrap {
 
 		for (i, listener) in self.listeners.iter().enumerate() {
 			let state = &self.listener_states[i];
+			// Use the TLS handshake timeout as the upstream connect timeout when
+			// protection is configured; otherwise fall back to 30 s.
+			let upstream_connect_timeout = state
+				.protection
+				.as_ref()
+				.map(|p| p.config.load().tls_handshake_timeout())
+				.unwrap_or(std::time::Duration::from_secs(30));
+
 			let ctx = Arc::new(ConnContext {
 				route_table: self.route_table.clone(),
 				protection: state.protection.clone(),
@@ -290,6 +302,7 @@ impl SymphonyProxyWrap {
 				listener_metrics: state.metrics.clone(),
 				listener_addr: state.addr.clone(),
 				idle_timeout: self.idle_timeout,
+				upstream_connect_timeout,
 				read_buffer_size: self.read_buffer_size,
 				js_emit: self.js_emit.clone(),
 			});
@@ -434,7 +447,7 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 		cert_pem: r.cert.as_ref().map(|c| pem_bytes(&c.cert_chain)),
 		key_pem: r.cert.as_ref().map(|c| pem_bytes(&c.private_key)),
 		mtls_ca_pem: r.mtls.as_ref().map(|m| pem_bytes(&m.client_ca_cert)),
-		require_client_cert: r.mtls.as_ref().and_then(|m| m.require_client_cert).unwrap_or(true),
+		require_client_cert: r.mtls.as_ref().and_then(|m| m.require_client_cert).unwrap_or(false),
 		suspended: r.suspended.unwrap_or(false),
 		suspend_timeout_ms: r.suspend_timeout_ms.unwrap_or(30_000.0) as u64,
 		max_cps: r.max_connections_per_second,
@@ -474,21 +487,17 @@ fn parse_upstream_spec(u: &JsUpstream, sni: &str) -> Result<UpstreamSpec> {
 }
 
 fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
-	let upstream = r
-		.upstreams
-		.first()
-		.ok_or_else(|| napi::Error::from_reason("resolveConnection: upstreams must not be empty".to_string()))
-		.and_then(|u| match parse_upstream_spec(u, "<resolved>")? {
-			UpstreamSpec::Tcp { host, port } => {
-				let addr = format!("{host}:{port}")
-					.parse()
-					.map_err(|e| napi::Error::from_reason(format!("invalid address: {e}")))?;
-				Ok(ResolveUpstream::Tcp(addr))
-			}
-			UpstreamSpec::Uds { paths, ip_affinity, affinity_ttl_ms, .. } => {
-				Ok(ResolveUpstream::Uds { paths, ip_affinity, affinity_ttl_ms })
-			}
-		})?;
+	let upstream = match parse_upstream_spec(&r.upstream, "<resolved>")? {
+		UpstreamSpec::Tcp { host, port } => {
+			let addr = format!("{host}:{port}")
+				.parse()
+				.map_err(|e| napi::Error::from_reason(format!("invalid address: {e}")))?;
+			ResolveUpstream::Tcp(addr)
+		}
+		UpstreamSpec::Uds { paths, ip_affinity, affinity_ttl_ms, .. } => {
+			ResolveUpstream::Uds { paths, ip_affinity, affinity_ttl_ms }
+		}
+	};
 
 	Ok(ResolveSpec {
 		upstream,
@@ -496,7 +505,7 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 		cert_pem: r.cert.as_ref().map(|c| pem_bytes(&c.cert_chain)),
 		key_pem: r.cert.as_ref().map(|c| pem_bytes(&c.private_key)),
 		mtls_ca_pem: r.mtls.as_ref().map(|m| pem_bytes(&m.client_ca_cert)),
-		require_client_cert: r.mtls.as_ref().and_then(|m| m.require_client_cert).unwrap_or(true),
+		require_client_cert: r.mtls.as_ref().and_then(|m| m.require_client_cert).unwrap_or(false),
 	})
 }
 
@@ -532,8 +541,11 @@ fn parse_protection_config(
 		.as_deref()
 		.unwrap_or(&[])
 		.iter()
-		.filter_map(|s| s.parse().ok())
-		.collect();
+		.map(|s| {
+			s.parse::<IpNetwork>()
+				.map_err(|e| napi::Error::from_reason(format!("invalid allowlist CIDR '{s}': {e}")))
+		})
+		.collect::<Result<Vec<_>>>()?;
 
 	let blocklist_strings: Vec<String> = prot
 		.blocklist
@@ -543,7 +555,13 @@ fn parse_protection_config(
 		.cloned()
 		.collect();
 
-	let blocklist: Vec<IpNetwork> = blocklist_strings.iter().filter_map(|s| s.parse().ok()).collect();
+	let blocklist: Vec<IpNetwork> = blocklist_strings
+		.iter()
+		.map(|s| {
+			s.parse::<IpNetwork>()
+				.map_err(|e| napi::Error::from_reason(format!("invalid blocklist CIDR '{s}': {e}")))
+		})
+		.collect::<Result<Vec<_>>>()?;
 
 	Ok((cfg, allowlist, blocklist, blocklist_strings))
 }

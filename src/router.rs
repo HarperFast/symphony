@@ -61,7 +61,9 @@ impl RouteTokenBucket {
 				.compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed)
 				.is_ok()
 			{
-				self.last_refill_ns.store(now, Ordering::Relaxed);
+				let _ = self.last_refill_ns.compare_exchange(
+					last, now, Ordering::Relaxed, Ordering::Relaxed,
+				);
 				break;
 			}
 			// CAS lost a race — retry
@@ -133,13 +135,17 @@ impl RouteTable {
 			return Some(r);
 		}
 
-		// Wildcard: match left-most label against stored suffixes
-		// e.g. sni="foo.example.com" matches suffix="example.com"
+		// Wildcard: match exactly one left-most label against stored suffixes.
+		// e.g. "foo.example.com" matches "*.example.com" but "a.b.example.com" does not.
 		for (suffix, route) in &self.wildcard {
 			if sni.len() > suffix.len() + 1 {
-				let rest = &sni[sni.len() - suffix.len()..];
 				let dot_pos = sni.len() - suffix.len() - 1;
-				if rest == suffix.as_ref() && sni.as_bytes()[dot_pos] == b'.' {
+				let rest = &sni[sni.len() - suffix.len()..];
+				let prefix = &sni[..dot_pos];
+				if !prefix.contains('.')
+					&& rest == suffix.as_ref()
+					&& sni.as_bytes()[dot_pos] == b'.'
+				{
 					return Some(route);
 				}
 			}
@@ -264,7 +270,7 @@ fn build_route(
 			})?;
 		let cert_spec = CertSpec {
 			cert_chain_pem: cert_pem.to_vec(),
-			private_key_pem: key_pem.to_vec(),
+			private_key_pem: key_pem.to_vec().into(),
 		};
 
 		let mtls_ca = spec

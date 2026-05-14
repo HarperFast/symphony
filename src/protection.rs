@@ -103,7 +103,10 @@ impl BlockReason {
 
 #[derive(Debug)]
 pub enum Decision {
+	/// Connection allowed and active counter incremented — release() must be called on close.
 	Allow,
+	/// Connection allowed via allowlist — active counter was NOT incremented; release() is a no-op.
+	AllowBypassed,
 	Block(BlockReason),
 }
 
@@ -135,10 +138,10 @@ impl ProtectionState {
 	pub fn check(&self, peer_ip: IpAddr, peek_info: &PeekInfo) -> Decision {
 		let cfg = self.config.load();
 
-		// 1. Allowlist — skip all other checks
+		// 1. Allowlist — skip all other checks; active counter is NOT incremented
 		for network in &self.allowlist {
 			if network.contains(peer_ip) {
-				return Decision::Allow;
+				return Decision::AllowBypassed;
 			}
 		}
 
@@ -187,7 +190,11 @@ impl ProtectionState {
 					.compare_exchange(old_tokens, new_tokens, Ordering::Relaxed, Ordering::Relaxed)
 					.is_ok()
 				{
-					state.last_refill_ns.store(now, Ordering::Relaxed);
+					// CAS on the timestamp so only the first winner advances the refill window.
+					// A losing compare_exchange here is harmless — another thread already wrote it.
+					let _ = state.last_refill_ns.compare_exchange(
+						last, now, Ordering::Relaxed, Ordering::Relaxed,
+					);
 					break;
 				}
 				// CAS failed — another thread beat us; retry
@@ -210,16 +217,19 @@ impl ProtectionState {
 			}
 		}
 
-		// 6. Concurrency limit
+		// 6. Concurrency limit — atomic test-and-increment to avoid TOCTOU
 		if cfg.max_concurrent_per_ip > 0 {
-			let active = state.active.load(Ordering::Relaxed);
-			if active >= cfg.max_concurrent_per_ip {
+			let max = cfg.max_concurrent_per_ip;
+			let result = state.active.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+				if v < max { Some(v + 1) } else { None }
+			});
+			if result.is_err() {
 				return Decision::Block(BlockReason::TooManyConnections);
 			}
+			// fetch_update already incremented the counter
+		} else {
+			state.active.fetch_add(1, Ordering::Relaxed);
 		}
-
-		// Allow — increment active counter
-		state.active.fetch_add(1, Ordering::Relaxed);
 		Decision::Allow
 	}
 
