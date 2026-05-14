@@ -3,7 +3,7 @@ use crate::metrics::{GlobalMetrics, ListenerMetrics};
 use crate::protection::ProtectionState;
 use crate::proxy_conn::{ConnContext, JsEvent};
 use crate::router::{
-	build_route_table, ListenerTlsSpec, LiveRouteTable, RouteSpec, UpstreamSpec,
+	build_route_table, ListenerTlsSpec, LiveRouteTable, RouteSpec, SourceAddressMode, UpstreamSpec,
 };
 use crate::suspended::{build_resolved_route, ResolveSpec, ResolveUpstream, SuspendedRegistry};
 use ipnetwork::IpNetwork;
@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::runtime::{Handle as RtHandle, Runtime};
 use tokio::sync::broadcast;
 
 // ── JS-facing config types (in / out of NAPI boundary only) ──────────────────
@@ -57,6 +58,11 @@ pub struct JsRouteConfig {
 	pub max_connections_per_second: Option<f64>,
 	/// Token bucket burst ceiling (defaults to `maxConnectionsPerSecond`).
 	pub burst: Option<f64>,
+	/// How the real client IP is forwarded to the upstream.
+	/// "proxyProtocol" (default for UDS), "xForwardedFor", or "none" (default for TCP).
+	pub source_address_header: Option<String>,
+	/// Advertise h2 in ALPN so clients can negotiate HTTP/2. Default: false.
+	pub http2: Option<bool>,
 }
 
 #[napi(object)]
@@ -120,6 +126,8 @@ pub struct JsResolveRoute {
 	pub terminate_tls: bool,
 	pub cert: Option<JsCertConfig>,
 	pub mtls: Option<JsMtlsConfig>,
+	pub source_address_header: Option<String>,
+	pub http2: Option<bool>,
 }
 
 // ── Plain Rust internal config (all Send + Sync) ──────────────────────────────
@@ -156,6 +164,14 @@ pub struct SymphonyProxyWrap {
 	// Interior mutability for start/stop
 	shutdown_tx: Mutex<Option<broadcast::Sender<()>>>,
 	js_emit: Arc<ThreadsafeFunction<JsEvent>>,
+	// Dedicated multi-thread runtime for all proxy I/O.
+	// napi's tokio_rt runs a single-threaded executor; spawning proxy tasks there
+	// would serialise all connections onto one OS thread.  By creating our own
+	// multi-thread runtime and using its Handle to spawn, every accept loop and
+	// connection handler gets distributed across the full CPU count.
+	// Handle is Send+Sync; Runtime is Send-only, so it lives in a Mutex.
+	rt: Mutex<Option<Runtime>>,
+	rt_handle: RtHandle,
 }
 
 #[napi]
@@ -264,6 +280,14 @@ impl SymphonyProxyWrap {
 				Ok(vec![obj])
 			})?;
 
+		// Build a dedicated multi-thread runtime for all proxy I/O work.
+		let rt = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(worker_threads)
+			.enable_all()
+			.build()
+			.map_err(|e| napi::Error::from_reason(format!("failed to create proxy runtime: {e}")))?;
+		let rt_handle = rt.handle().clone();
+
 		Ok(Self {
 			listeners: internal_listeners,
 			default_listener_tls,
@@ -276,6 +300,8 @@ impl SymphonyProxyWrap {
 			listener_states,
 			shutdown_tx: Mutex::new(None),
 			js_emit: Arc::new(js_emit),
+			rt: Mutex::new(Some(rt)),
+			rt_handle,
 		})
 	}
 
@@ -312,7 +338,7 @@ impl SymphonyProxyWrap {
 			let addr = listener.addr;
 			let rx = tx.subscribe();
 
-			tokio::spawn(async move {
+			self.rt_handle.spawn(async move {
 				if let Err(e) = spawn_listeners(addr, workers, max_conn, ctx, rx).await {
 					tracing::error!("listener {addr} failed: {e}");
 				}
@@ -324,7 +350,7 @@ impl SymphonyProxyWrap {
 		// loop iteration when no routes have such upstreams.
 		let monitor_table = self.route_table.clone();
 		let mut monitor_rx = tx.subscribe();
-		tokio::spawn(async move {
+		self.rt_handle.spawn(async move {
 			let interval = Duration::from_millis(250);
 			loop {
 				tokio::select! {
@@ -440,7 +466,10 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 		.map(|u| parse_upstream_spec(u, &r.sni))
 		.collect::<Result<Vec<_>>>()?;
 
-	Ok(RouteSpec {
+	let has_uds = upstreams.iter().any(|u| matches!(u, UpstreamSpec::Uds { .. }));
+	let source_address_mode = parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
+
+	let result = Ok(RouteSpec {
 		sni: r.sni.clone(),
 		upstreams,
 		terminate_tls: r.terminate_tls,
@@ -452,7 +481,16 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 		suspend_timeout_ms: r.suspend_timeout_ms.unwrap_or(30_000.0) as u64,
 		max_cps: r.max_connections_per_second,
 		burst: r.burst,
-	})
+		source_address_mode,
+		http2: r.http2.unwrap_or(false),
+	});
+
+	if let Ok(ref spec) = result {
+		if spec.http2 && !spec.terminate_tls {
+			eprintln!("symphony: route '{}': http2=true has no effect when terminateTls=false (passthrough mode)", spec.sni);
+		}
+	}
+	result
 }
 
 fn parse_upstream_spec(u: &JsUpstream, sni: &str) -> Result<UpstreamSpec> {
@@ -499,6 +537,9 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 		}
 	};
 
+	let has_uds = matches!(&upstream, ResolveUpstream::Uds { .. });
+	let source_address_mode = parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
+
 	Ok(ResolveSpec {
 		upstream,
 		terminate_tls: r.terminate_tls,
@@ -506,6 +547,8 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 		key_pem: r.cert.as_ref().map(|c| pem_bytes(&c.private_key)),
 		mtls_ca_pem: r.mtls.as_ref().map(|m| pem_bytes(&m.client_ca_cert)),
 		require_client_cert: r.mtls.as_ref().and_then(|m| m.require_client_cert).unwrap_or(false),
+		source_address_mode,
+		http2: r.http2.unwrap_or(false),
 	})
 }
 
@@ -579,6 +622,26 @@ fn pem_bytes(v: &Either<String, Buffer>) -> Vec<u8> {
 	match v {
 		Either::A(s) => s.as_bytes().to_vec(),
 		Either::B(b) => b.to_vec(),
+	}
+}
+
+fn parse_source_address_mode(
+	value: Option<&str>,
+	has_uds_upstreams: bool,
+) -> Result<SourceAddressMode> {
+	match value {
+		Some("proxyProtocol") => Ok(SourceAddressMode::ProxyProtocol),
+		Some("xForwardedFor") => Ok(SourceAddressMode::XForwardedFor),
+		Some("none") => Ok(SourceAddressMode::None),
+		Some(other) => Err(napi::Error::from_reason(format!(
+			"unknown sourceAddressHeader value '{other}'; expected 'proxyProtocol', 'xForwardedFor', or 'none'"
+		))),
+		// Default: proxyProtocol for UDS upstreams, none for TCP
+		None => Ok(if has_uds_upstreams {
+			SourceAddressMode::ProxyProtocol
+		} else {
+			SourceAddressMode::None
+		}),
 	}
 }
 

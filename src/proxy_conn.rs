@@ -1,6 +1,6 @@
 use crate::metrics::{GlobalMetrics, ListenerMetrics};
 use crate::protection::ProtectionState;
-use crate::router::{Destination, LiveRouteTable};
+use crate::router::{Destination, LiveRouteTable, SourceAddressMode};
 use crate::sni;
 use crate::suspended::SuspendedRegistry;
 use crate::upstream::{self, UpstreamStream};
@@ -139,12 +139,14 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 			destination: resolved.destination,
 			tls_config: resolved.tls_config,
 			terminate_tls: resolved.terminate_tls,
+			source_address_mode: resolved.source_address_mode,
 		}
 	} else {
 		EffectiveRoute {
 			destination: route.destination.clone(),
 			tls_config: route.tls_config.clone(),
 			terminate_tls: route.terminate_tls,
+			source_address_mode: route.source_address_mode,
 		}
 	};
 
@@ -155,11 +157,12 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		.map(|c| c.tls_handshake_timeout())
 		.unwrap_or(Duration::from_secs(10));
 
+	let source_mode = effective_route.source_address_mode;
 	let upstream_result = if effective_route.terminate_tls {
 		if let Some(tls_cfg) = effective_route.tls_config {
 			let acceptor = TlsAcceptor::from(tls_cfg);
 			match timeout(hs_timeout, acceptor.accept(stream)).await {
-				Ok(Ok(tls_stream)) => proxy_via_tls(tls_stream, &effective_route.destination, peer_addr, &ctx).await,
+				Ok(Ok(tls_stream)) => proxy_via_tls(tls_stream, &effective_route.destination, peer_addr, source_mode, &ctx).await,
 				Ok(Err(e)) => {
 					tracing::debug!("TLS handshake error from {peer_ip}: {e}");
 					ctx.listener_metrics.inc_error();
@@ -177,7 +180,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		}
 	} else {
 		// Passthrough — proxy raw TCP
-		proxy_raw(stream, &effective_route.destination, peer_addr, &ctx).await
+		proxy_raw(stream, &effective_route.destination, peer_addr, source_mode, &ctx).await
 	};
 
 	if upstream_result.is_err() {
@@ -191,6 +194,7 @@ async fn proxy_via_tls(
 	mut client: tokio_rustls::server::TlsStream<TcpStream>,
 	dest: &Destination,
 	peer_addr: SocketAddr,
+	source_mode: SourceAddressMode,
 	ctx: &ConnContext,
 ) -> std::io::Result<()> {
 	let mut upstream = upstream::connect(dest, Some(peer_addr.ip()), ctx.upstream_connect_timeout)
@@ -199,10 +203,11 @@ async fn proxy_via_tls(
 
 	match &mut upstream {
 		UpstreamStream::Tcp(ref mut up) => {
+			apply_source_header(&mut client, up, peer_addr, source_mode).await?;
 			copy_with_idle_timeout(ctx.idle_timeout, &mut client, up).await
 		}
 		UpstreamStream::Uds { ref mut stream, .. } => {
-			upstream::write_proxy_v1_header(stream, peer_addr).await?;
+			apply_source_header(&mut client, stream, peer_addr, source_mode).await?;
 			copy_with_idle_timeout(ctx.idle_timeout, &mut client, stream).await
 		}
 	}
@@ -212,6 +217,7 @@ async fn proxy_raw(
 	mut client: TcpStream,
 	dest: &Destination,
 	peer_addr: SocketAddr,
+	source_mode: SourceAddressMode,
 	ctx: &ConnContext,
 ) -> std::io::Result<()> {
 	let mut upstream = upstream::connect(dest, Some(peer_addr.ip()), ctx.upstream_connect_timeout)
@@ -220,10 +226,11 @@ async fn proxy_raw(
 
 	match &mut upstream {
 		UpstreamStream::Tcp(ref mut up) => {
+			apply_source_header(&mut client, up, peer_addr, source_mode).await?;
 			copy_with_idle_timeout(ctx.idle_timeout, &mut client, up).await
 		}
 		UpstreamStream::Uds { ref mut stream, .. } => {
-			upstream::write_proxy_v1_header(stream, peer_addr).await?;
+			apply_source_header(&mut client, stream, peer_addr, source_mode).await?;
 			copy_with_idle_timeout(ctx.idle_timeout, &mut client, stream).await
 		}
 	}
@@ -246,12 +253,35 @@ where
 	}
 }
 
+/// Apply the configured source address forwarding before bidirectional copy.
+async fn apply_source_header<C, U>(
+	client: &mut C,
+	upstream: &mut U,
+	peer_addr: SocketAddr,
+	mode: SourceAddressMode,
+) -> std::io::Result<()>
+where
+	C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+	match mode {
+		SourceAddressMode::None => Ok(()),
+		SourceAddressMode::ProxyProtocol => {
+			upstream::write_proxy_v1_header(upstream, peer_addr).await
+		}
+		SourceAddressMode::XForwardedFor => {
+			upstream::inject_x_forwarded_for(client, upstream, peer_addr).await
+		}
+	}
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 struct EffectiveRoute {
 	destination: Destination,
 	tls_config: Option<Arc<rustls::ServerConfig>>,
 	terminate_tls: bool,
+	source_address_mode: SourceAddressMode,
 }
 
 struct ActiveGuard {

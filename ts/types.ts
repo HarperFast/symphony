@@ -74,6 +74,24 @@ export interface RouteConfig {
 	maxConnectionsPerSecond?: number;
 	/** Token bucket burst ceiling (connections). Defaults to maxConnectionsPerSecond. */
 	burst?: number;
+	/**
+	 * How the real client IP is forwarded to the upstream.
+	 *
+	 * - `'proxyProtocol'` — Send a PROXY protocol v1 header before application data.
+	 *   Default for UDS upstreams.
+	 * - `'xForwardedFor'` — Parse the beginning of the HTTP request and insert an
+	 *   `X-Forwarded-For` header. Use this for backends (e.g. Bun) that do not
+	 *   support the PROXY protocol.
+	 * - `'none'` — Do not forward source address information. Default for TCP upstreams.
+	 */
+	sourceAddressHeader?: 'proxyProtocol' | 'xForwardedFor' | 'none';
+	/**
+	 * Advertise HTTP/2 (`h2`) in the TLS ALPN extension so clients can negotiate
+	 * HTTP/2. When true, symphony declares `['h2', 'http/1.1']` in ALPN and the
+	 * upstream receives raw HTTP/2 frames over the plaintext socket — no translation.
+	 * Requires `terminateTls: true`. Default: false.
+	 */
+	http2?: boolean;
 }
 
 // ── Protection ────────────────────────────────────────────────────────────────
@@ -174,6 +192,10 @@ export interface ResolveRoute {
 	terminateTls: boolean;
 	cert?: CertConfig;
 	mtls?: MtlsConfig;
+	/** How the real client IP is forwarded to the upstream. See RouteConfig.sourceAddressHeader. */
+	sourceAddressHeader?: 'proxyProtocol' | 'xForwardedFor' | 'none';
+	/** Advertise h2 in ALPN for this resolved connection. See RouteConfig.http2. */
+	http2?: boolean;
 }
 
 // ── Event payloads ────────────────────────────────────────────────────────────

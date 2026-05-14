@@ -18,16 +18,19 @@ import type {
 // Load the native addon. Supports both the flat-file (dev) and npm scoped
 // package (published) layouts that napi-rs produces.
 function loadAddon(): { SymphonyProxyWrap: typeof SymphonyProxyWrap } {
-	// __dirname is the compiled output dir (e.g. dist/ts/ or dist-test/ts/).
-	// The package root (where .node files live) is two levels up.
-	const pkgRoot = path.resolve(__dirname, '..', '..');
+	// __dirname varies by build layout:
+	//   dist/proxy.js        → one level below package root (outDir: "dist", rootDir: "ts")
+	//   dist-test/ts/proxy.js → two levels below package root (outDir: "dist-test", rootDir: ".")
+	// Try both so the same source works for production and test builds.
 	const arch = process.arch; // 'x64' or 'arm64'
 	const platform = process.platform; // 'linux' or 'darwin'
 
 	const candidates: string[] = [
-		// Dev / local build: flat .node file in package root
-		path.join(pkgRoot, `symphony.${platform}-${arch}.node`),
-		path.join(pkgRoot, `symphony.${platform}-${arch}-gnu.node`),
+		// Dev / local build: flat .node file in package root (try both possible depths)
+		path.join(__dirname, '..', `symphony.${platform}-${arch}.node`),
+		path.join(__dirname, '..', `symphony.${platform}-${arch}-gnu.node`),
+		path.join(__dirname, '..', '..', `symphony.${platform}-${arch}.node`),
+		path.join(__dirname, '..', '..', `symphony.${platform}-${arch}-gnu.node`),
 	];
 
 	// Published scoped packages
@@ -85,6 +88,7 @@ function toJsRoute(r: RouteConfig): JsRouteConfig {
 		suspendTimeoutMs: r.suspendTimeoutMs,
 		maxConnectionsPerSecond: r.maxConnectionsPerSecond,
 		burst: r.burst,
+		sourceAddressHeader: r.sourceAddressHeader,
 	};
 }
 
@@ -229,6 +233,7 @@ export class SymphonyProxy extends EventEmitter {
 			terminateTls: route.terminateTls,
 			cert: route.cert ? toJsCert(route.cert) : undefined,
 			mtls: route.mtls ? toJsMtls(route.mtls) : undefined,
+			sourceAddressHeader: route.sourceAddressHeader,
 		});
 	}
 }

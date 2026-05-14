@@ -90,6 +90,19 @@ impl RouteTokenBucket {
 	}
 }
 
+// ── Source address forwarding mode ────────────────────────────────────────────
+
+/// How the real client IP is communicated to the upstream.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SourceAddressMode {
+	/// No source address forwarding.
+	None,
+	/// Send a PROXY protocol v1 header before any application data.
+	ProxyProtocol,
+	/// Parse the beginning of the HTTP request and insert an X-Forwarded-For header.
+	XForwardedFor,
+}
+
 // ── Route destination ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -110,6 +123,8 @@ pub struct Route {
 	pub suspend_timeout: Duration,
 	/// Optional global rate limiter for this route.
 	pub rate_limiter: Option<Arc<RouteTokenBucket>>,
+	/// How the real client IP is forwarded to the upstream.
+	pub source_address_mode: SourceAddressMode,
 }
 
 // ── Route table ───────────────────────────────────────────────────────────────
@@ -188,6 +203,10 @@ pub struct RouteSpec {
 	pub max_cps: Option<f64>,
 	/// Token bucket burst ceiling (defaults to `max_cps` if not set).
 	pub burst: Option<f64>,
+	/// How the real client IP is forwarded to the upstream.
+	pub source_address_mode: SourceAddressMode,
+	/// Advertise h2 in ALPN so clients can negotiate HTTP/2.
+	pub http2: bool,
 }
 
 /// Listener-level fallback cert/mTLS spec.
@@ -286,7 +305,7 @@ fn build_route(
 			},
 		});
 
-		Some(cache.get_or_build(&cert_spec, mtls_spec.as_ref())?)
+		Some(cache.get_or_build(&cert_spec, mtls_spec.as_ref(), spec.http2)?)
 	} else {
 		None
 	};
@@ -304,6 +323,7 @@ fn build_route(
 		suspended: spec.suspended,
 		suspend_timeout: Duration::from_millis(spec.suspend_timeout_ms.max(1)),
 		rate_limiter,
+		source_address_mode: spec.source_address_mode,
 	})
 }
 

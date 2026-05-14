@@ -22,8 +22,8 @@ pub struct MtlsSpec {
 /// Builds and deduplicates Arc<ServerConfig> instances.
 /// Routes sharing identical cert + mTLS config share one allocation.
 pub struct TlsConfigCache {
-	// key: (cert_sha256, mtls_sha256_or_zeros) -> Arc<ServerConfig>
-	cache: HashMap<([u8; 32], [u8; 32]), Arc<ServerConfig>>,
+	// key: (cert_sha256, mtls_sha256_or_zeros, http2) -> Arc<ServerConfig>
+	cache: HashMap<([u8; 32], [u8; 32], bool), Arc<ServerConfig>>,
 }
 
 impl TlsConfigCache {
@@ -35,6 +35,7 @@ impl TlsConfigCache {
 		&mut self,
 		cert: &CertSpec,
 		mtls: Option<&MtlsSpec>,
+		http2: bool,
 	) -> Result<Arc<ServerConfig>> {
 		// Hash both chain and private key so routes sharing a cert but using different
 		// keys (e.g. mid-rotation) get distinct ServerConfig allocations.
@@ -47,18 +48,18 @@ impl TlsConfigCache {
 			})
 			.unwrap_or([0u8; 32]);
 
-		let cache_key = (cert_key, mtls_key);
+		let cache_key = (cert_key, mtls_key, http2);
 		if let Some(cfg) = self.cache.get(&cache_key) {
 			return Ok(cfg.clone());
 		}
 
-		let cfg = build_server_config(cert, mtls)?;
+		let cfg = build_server_config(cert, mtls, http2)?;
 		self.cache.insert(cache_key, cfg.clone());
 		Ok(cfg)
 	}
 }
 
-fn build_server_config(cert: &CertSpec, mtls: Option<&MtlsSpec>) -> Result<Arc<ServerConfig>> {
+fn build_server_config(cert: &CertSpec, mtls: Option<&MtlsSpec>, http2: bool) -> Result<Arc<ServerConfig>> {
 	// Parse certificate chain
 	let certs: Vec<_> = {
 		let mut reader = std::io::BufReader::new(cert.cert_chain_pem.as_slice());
@@ -78,7 +79,7 @@ fn build_server_config(cert: &CertSpec, mtls: Option<&MtlsSpec>) -> Result<Arc<S
 			.ok_or_else(|| SymphonyError::Config("private key PEM contains no key".into()))?
 	};
 
-	let cfg = if let Some(m) = mtls {
+	let mut cfg = if let Some(m) = mtls {
 		let verifier = SymphonyClientVerifier::build(&m.client_ca_pem, m.require_client_cert)?;
 		ServerConfig::builder()
 			.with_client_cert_verifier(verifier)
@@ -90,6 +91,25 @@ fn build_server_config(cert: &CertSpec, mtls: Option<&MtlsSpec>) -> Result<Arc<S
 			.with_single_cert(certs, key)
 			.map_err(SymphonyError::Tls)?
 	};
+
+	// Enable TLS session resumption.
+	//
+	// rustls defaults to NeverProducesTickets (no TLS 1.3 tickets) and
+	// NoServerSessionStorage (no TLS 1.2 session IDs). Without session
+	// resumption, every new connection requires a full TLS handshake (~2ms).
+	// Clients like Node.js cache session tickets and reuse them, cutting
+	// handshake cost to ~0.1ms for resumed sessions.
+	//
+	// - session_storage: handles TLS 1.2 session ID resumption.
+	// - ticketer: handles TLS 1.3 PSK-based session ticket resumption (primary
+	//   path for modern clients).
+	if http2 {
+		cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+	}
+
+	cfg.session_storage = rustls::server::ServerSessionMemoryCache::new(1024);
+	cfg.ticketer = rustls::crypto::ring::Ticketer::new()
+		.map_err(SymphonyError::Tls)?;
 
 	Ok(Arc::new(cfg))
 }

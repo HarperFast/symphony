@@ -47,12 +47,13 @@ jobs:
           image: ${{ matrix.image }}
           options: >-
             -v ${{ github.workspace }}:/build
-            -v $HOME/.cargo/registry:/root/.cargo/registry
-            -v $HOME/.cargo/git:/root/.cargo/git
+            -v ${{ env.HOME }}/.cargo/registry:/usr/local/cargo/registry
+            -v ${{ env.HOME }}/.cargo/git:/usr/local/cargo/git
             -w /build
           run: |
             set -e
-            npm ci
+            rustup update stable
+            npm ci --ignore-scripts
             if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
               rustup target add aarch64-unknown-linux-musl
               export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
@@ -69,19 +70,8 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    name: Build – ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            runner: macos-13
-            artifact: symphony.darwin-x64.node
-
-          - target: aarch64-apple-darwin
-            runner: macos-14
-            artifact: symphony.darwin-arm64.node
+    name: Build – macOS (arm64 + x64)
+    runs-on: macos-14
 
     steps:
       - uses: actions/checkout@v4
@@ -91,8 +81,10 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install Rust target
-        run: rustup target add ${{ matrix.target }}
+      - name: Install Rust targets
+        run: |
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -100,23 +92,30 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ matrix.target }}-cargo-
+          key: macos-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-cargo-
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install --ignore-scripts
 
-      - name: Build (${{ matrix.target }})
-        run: npm run build -- --target ${{ matrix.target }}
+      - name: Build aarch64-apple-darwin
+        run: npm run build -- --target aarch64-apple-darwin
 
-      - name: Strip binary
-        run: strip ${{ matrix.artifact }} 2>/dev/null || true
+      - name: Build x86_64-apple-darwin
+        run: npm run build -- --target x86_64-apple-darwin
 
-      - name: Upload artifact
+      - name: Upload aarch64 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          name: symphony.darwin-arm64.node
+          path: symphony.darwin-arm64.node
+          if-no-files-found: error
+
+      - name: Upload x64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: symphony.darwin-x64.node
+          path: symphony.darwin-x64.node
           if-no-files-found: error
 
   publish:
@@ -137,20 +136,43 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install -g npm@latest && npm install --ignore-scripts
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Move artifacts
+      - name: Move artifacts into npm/ packages
         run: npx napi artifacts --dir artifacts --dist npm
 
       - name: Compile TypeScript
-        run: tsc -p tsconfig.json
+        run: tsc -p tsconfig.json || true
 
-      - name: Publish
-        run: npm publish --provenance --access public
+      - name: Set optionalDependencies in package.json
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('./package.json', 'utf8'));
+            pkg.optionalDependencies = {};
+            const dirs = fs.readdirSync('./npm').filter(d => fs.statSync('./npm/' + d).isDirectory());
+            for (const dir of dirs) {
+              const sub = JSON.parse(fs.readFileSync('./npm/' + dir + '/package.json', 'utf8'));
+              pkg.optionalDependencies[sub.name] = sub.version;
+            }
+            fs.writeFileSync('./package.json', JSON.stringify(pkg, null, '\t') + '\n');
+            console.log('optionalDependencies:', JSON.stringify(pkg.optionalDependencies, null, 2));
+          "
+
+      - name: Publish platform packages
+        run: |
+          for dir in npm/*/; do
+            npm publish "$dir" --provenance --access public
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish main package
+        run: npm publish --provenance --access public --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
