@@ -154,7 +154,7 @@ jobs:
           name: ${{ matrix.artifact }}
 
       - name: Install dependencies
-        run: npm install -g npm@latest && npm ci
+        run: npm ci
 
       - name: Run tests
         run: npm test
