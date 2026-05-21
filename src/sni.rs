@@ -165,8 +165,15 @@ fn extract_sni(extensions: &[u8]) -> Option<String> {
 			let name_len = sp.read_u16()? as usize;
 			let name_data = sp.read_bytes(name_len)?;
 			if name_type == 0x00 {
-				// host_name
-				return String::from_utf8(name_data.to_vec()).ok();
+				// host_name — normalize and validate per RFC 6066 §3
+				let raw = String::from_utf8(name_data.to_vec()).ok()?;
+				// Trim trailing dot (absolute domain name form)
+				let sni = raw.trim_end_matches('.').to_string();
+				// Reject empty, oversized, or structurally invalid values
+				if sni.is_empty() || sni.len() > 253 || sni.contains(':') || sni.contains('/') {
+					return None;
+				}
+				return Some(sni);
 			}
 		}
 	}

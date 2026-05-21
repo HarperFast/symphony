@@ -86,6 +86,8 @@ function toJsRoute(r: RouteConfig): JsRouteConfig {
 		mtls: r.mtls ? toJsMtls(r.mtls) : undefined,
 		suspended: r.suspended,
 		suspendTimeoutMs: r.suspendTimeoutMs,
+		maxConnectionsPerSecond: r.maxConnectionsPerSecond,
+		burst: r.burst,
 		sourceAddressHeader: r.sourceAddressHeader,
 	};
 }
@@ -227,7 +229,7 @@ export class SymphonyProxy extends EventEmitter {
 			return;
 		}
 		this._inner.resolveConnection(id, {
-			upstreams: route.upstreams.map(toJsUpstream),
+			upstream: toJsUpstream(route.upstream),
 			terminateTls: route.terminateTls,
 			cert: route.cert ? toJsCert(route.cert) : undefined,
 			mtls: route.mtls ? toJsMtls(route.mtls) : undefined,

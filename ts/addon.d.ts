@@ -88,7 +88,7 @@ export interface JsBlockedIpsInfo {
   cidrBlocklist: Array<string>
 }
 export interface JsResolveRoute {
-  upstreams: Array<JsUpstream>
+  upstream: JsUpstream
   terminateTls: boolean
   cert?: JsCertConfig
   mtls?: JsMtlsConfig

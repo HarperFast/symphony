@@ -3,12 +3,14 @@ use crate::mtls::SymphonyClientVerifier;
 use rustls::ServerConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 /// Inputs for building a ServerConfig, used as a deduplication key.
 #[derive(Debug)]
 pub struct CertSpec {
 	pub cert_chain_pem: Vec<u8>,
-	pub private_key_pem: Vec<u8>,
+	/// Automatically zeroed on drop via `Zeroizing`.
+	pub private_key_pem: Zeroizing<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -35,7 +37,9 @@ impl TlsConfigCache {
 		mtls: Option<&MtlsSpec>,
 		http2: bool,
 	) -> Result<Arc<ServerConfig>> {
-		let cert_key = sha256(&cert.cert_chain_pem);
+		// Hash both chain and private key so routes sharing a cert but using different
+		// keys (e.g. mid-rotation) get distinct ServerConfig allocations.
+		let cert_key = sha256(&[cert.cert_chain_pem.as_slice(), cert.private_key_pem.as_slice()].concat());
 		let mtls_key = mtls
 			.map(|m| {
 				let mut buf = m.client_ca_pem.clone();

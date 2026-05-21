@@ -94,7 +94,7 @@ pub fn build_resolved_route(spec: &ResolveSpec) -> crate::error::Result<Resolved
 
 		let cert_spec = CertSpec {
 			cert_chain_pem: cert_pem.to_vec(),
-			private_key_pem: key_pem.to_vec(),
+			private_key_pem: key_pem.to_vec().into(),
 		};
 		let mtls_spec = spec.mtls_ca_pem.as_deref().map(|ca| MtlsSpec {
 			client_ca_pem: ca.to_vec(),

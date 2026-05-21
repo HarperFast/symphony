@@ -8,6 +8,7 @@ use napi::threadsafe_function::ThreadsafeFunction;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use std::marker::Unpin;
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -41,7 +42,10 @@ pub struct ConnContext {
 	pub global_metrics: Arc<GlobalMetrics>,
 	pub listener_metrics: Arc<ListenerMetrics>,
 	pub listener_addr: String,
+	/// Idle timeout for the bidirectional copy phase. Zero means no timeout.
 	pub idle_timeout: Duration,
+	/// Timeout for establishing upstream connections (TCP connect / UDS connect).
+	pub upstream_connect_timeout: Duration,
 	pub read_buffer_size: usize,
 	pub js_emit: Arc<ThreadsafeFunction<JsEvent>>,
 }
@@ -53,7 +57,9 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	let peek_info = sni::peek(&stream).await;
 
 	// ── 2. Protection checks ─────────────────────────────────────────────────
-	if let Some(protection) = &ctx.protection {
+	// `protection_counted` is true when check() incremented the active counter,
+	// meaning the ActiveGuard must call release() on drop.
+	let protection_counted = if let Some(protection) = &ctx.protection {
 		match protection.check(peer_ip, &peek_info) {
 			crate::protection::Decision::Block(reason) => {
 				ctx.listener_metrics.inc_blocked();
@@ -65,19 +71,24 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 				});
 				return;
 			}
-			crate::protection::Decision::Allow => {}
+			// Allowlisted: active counter was not incremented; guard must not call release().
+			crate::protection::Decision::AllowBypassed => false,
+			crate::protection::Decision::Allow => true,
 		}
-	}
+	} else {
+		false
+	};
 
 	// ── Connection is allowed — track it ─────────────────────────────────────
 	ctx.listener_metrics.inc_active();
 	ctx.global_metrics.inc_active();
 
-	// RAII: decrement counts on scope exit
+	// RAII: decrement counts on scope exit.
+	// Pass protection only when the active counter was incremented so release() is correct.
 	let _active_guard = ActiveGuard {
 		global: ctx.global_metrics.clone(),
 		listener: ctx.listener_metrics.clone(),
-		protection: ctx.protection.clone(),
+		protection: if protection_counted { ctx.protection.clone() } else { None },
 		peer_ip,
 	};
 
@@ -186,25 +197,18 @@ async fn proxy_via_tls(
 	source_mode: SourceAddressMode,
 	ctx: &ConnContext,
 ) -> std::io::Result<()> {
-	let mut upstream = upstream::connect(dest, Some(peer_addr.ip()))
+	let mut upstream = upstream::connect(dest, Some(peer_addr.ip()), ctx.upstream_connect_timeout)
 		.await
 		.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-	let idle = ctx.idle_timeout;
 	match &mut upstream {
 		UpstreamStream::Tcp(ref mut up) => {
 			apply_source_header(&mut client, up, peer_addr, source_mode).await?;
-			timeout(idle, copy_bidirectional(&mut client, up))
-				.await
-				.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout"))?
-				.map(|_| ())
+			copy_with_idle_timeout(ctx.idle_timeout, &mut client, up).await
 		}
 		UpstreamStream::Uds { ref mut stream, .. } => {
 			apply_source_header(&mut client, stream, peer_addr, source_mode).await?;
-			timeout(idle, copy_bidirectional(&mut client, stream))
-				.await
-				.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout"))?
-				.map(|_| ())
+			copy_with_idle_timeout(ctx.idle_timeout, &mut client, stream).await
 		}
 	}
 }
@@ -216,26 +220,36 @@ async fn proxy_raw(
 	source_mode: SourceAddressMode,
 	ctx: &ConnContext,
 ) -> std::io::Result<()> {
-	let mut upstream = upstream::connect(dest, Some(peer_addr.ip()))
+	let mut upstream = upstream::connect(dest, Some(peer_addr.ip()), ctx.upstream_connect_timeout)
 		.await
 		.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-	let idle = ctx.idle_timeout;
 	match &mut upstream {
 		UpstreamStream::Tcp(ref mut up) => {
 			apply_source_header(&mut client, up, peer_addr, source_mode).await?;
-			timeout(idle, copy_bidirectional(&mut client, up))
-				.await
-				.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout"))?
-				.map(|_| ())
+			copy_with_idle_timeout(ctx.idle_timeout, &mut client, up).await
 		}
 		UpstreamStream::Uds { ref mut stream, .. } => {
 			apply_source_header(&mut client, stream, peer_addr, source_mode).await?;
-			timeout(idle, copy_bidirectional(&mut client, stream))
-				.await
-				.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout"))?
-				.map(|_| ())
+			copy_with_idle_timeout(ctx.idle_timeout, &mut client, stream).await
 		}
+	}
+}
+
+/// Bidirectional copy with an optional idle timeout.
+/// A zero `idle` means no timeout.
+async fn copy_with_idle_timeout<A, B>(idle: Duration, a: &mut A, b: &mut B) -> std::io::Result<()>
+where
+	A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+	if idle.is_zero() {
+		copy_bidirectional(a, b).await.map(|_| ())
+	} else {
+		timeout(idle, copy_bidirectional(a, b))
+			.await
+			.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout"))?
+			.map(|_| ())
 	}
 }
 
