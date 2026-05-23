@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/symphony",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "High-performance TLS proxy with SNI routing — Rust/napi-rs, Linux",
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",
