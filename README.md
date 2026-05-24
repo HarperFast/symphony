@@ -76,6 +76,7 @@ console.log('proxy listening on :443');
 |---|---|---|---|
 | `host` | `string` | `'0.0.0.0'` | Bind address |
 | `port` | `number` | required | Bind port |
+| `mode` | `'tls' \| 'http'` | `'tls'` | Listener protocol. `'http'` serves plaintext for ACME HTTP-01 challenges; everything else gets a 301 to `https://<host><uri>`. See [HTTP listener](#http-listener-acme--https-redirect). |
 | `defaultCert` | `CertConfig` | — | Fallback cert for routes without their own cert |
 | `mtls` | `MtlsConfig` | — | Listener-level mTLS, used when a route doesn't override it |
 | `maxConnections` | `number` | `0` (unlimited) | Drop new connections when active count reaches this |
@@ -232,6 +233,36 @@ proxy.on('suspended', async (conn) => {
 ```
 
 Connections not resolved within `suspendTimeoutMs` are dropped automatically. Calling `resolveConnection` with an unknown or already-expired ID is a no-op.
+
+---
+
+## HTTP listener (ACME + HTTPS redirect)
+
+Setting `mode: 'http'` on a listener switches it from the default SNI-routed TLS proxy to a plaintext HTTP/1.1 handler intended for port 80. It serves two purposes:
+
+* **ACME HTTP-01 challenges** — requests under `/.well-known/acme-challenge/` are proxied to the route matched by the `Host` header (using the same wildcard rules as SNI matching). The upstream is the route's first upstream, so a single route table covers both `:443` TLS routing and `:80` ACME proxying.
+* **HTTPS redirect** — every other request gets `HTTP/1.1 301 Moved Permanently` with `Location: https://<host><request-target>`.
+
+Requests with no `Host` header return `400 Bad Request`. ACME requests for hosts with no matching route return `404 Not Found`.
+
+```typescript
+new SymphonyProxy({
+  listeners: [
+    { host: '0.0.0.0', port: 443 },                         // TLS proxy
+    { host: '0.0.0.0', port: 80, mode: 'http' },            // ACME + redirect
+  ],
+  routes: [
+    {
+      sni: 'api.example.com',
+      upstreams: [{ kind: 'uds', path: '/var/harper/api.sock' }],
+      terminateTls: true,
+      cert: { certChain, privateKey },
+    },
+  ],
+});
+```
+
+`defaultCert`, `mtls`, and `protection` on an HTTP-mode listener are ignored.
 
 ---
 

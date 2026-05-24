@@ -96,6 +96,7 @@ function toJsListenerConfig(l: import('./types.js').ListenerConfig): JsListenerC
 	return {
 		host: l.host,
 		port: l.port,
+		mode: l.mode,
 		defaultCert: l.defaultCert ? toJsCert(l.defaultCert) : undefined,
 		mtls: l.mtls ? toJsMtls(l.mtls) : undefined,
 		maxConnections: l.maxConnections,

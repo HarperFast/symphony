@@ -124,6 +124,16 @@ export interface ProtectionConfig {
 export interface ListenerConfig {
 	host?: string;
 	port: number;
+	/**
+	 * Listener protocol:
+	 * - `'tls'` (default) — SNI-routed TLS proxy (termination or passthrough).
+	 * - `'http'` — plaintext HTTP/1.1. Requests under `/.well-known/acme-challenge/` are
+	 *   proxied to the route matched by the `Host` header; every other request returns
+	 *   `301 Moved Permanently` to `https://<host><uri>`. Intended for serving ACME
+	 *   HTTP-01 challenges on port 80 alongside the TLS listener on port 443.
+	 *   `defaultCert`, `mtls`, and `protection` are ignored in this mode.
+	 */
+	mode?: 'tls' | 'http';
 	/** Fallback certificate for routes that don't specify their own cert. */
 	defaultCert?: CertConfig;
 	/** Listener-level mTLS config, used when a route doesn't specify its own. */

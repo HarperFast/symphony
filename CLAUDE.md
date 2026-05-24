@@ -28,7 +28,9 @@ TCP accept (SO_REUSEPORT per worker thread)
 |---|---|
 | `src/lib.rs` | Crate root; `mod` declarations; `#[macro_use] napi_derive` |
 | `src/proxy.rs` | All `#[napi]`-exposed types and methods; config parsing helpers |
-| `src/listener.rs` | TCP accept loop; SO_REUSEPORT per worker; RLIMIT_NOFILE |
+| `src/listener.rs` | TCP accept loop for TLS listeners; SO_REUSEPORT per worker; RLIMIT_NOFILE |
+| `src/http_listener.rs` | Plaintext HTTP/1.1 accept loop (`mode: 'http'`): ACME-proxy or 301 redirect |
+| `src/http_proxy.rs` | HTTP/1.1 header framing and rewrite helpers shared by the HTTP listener |
 | `src/sni.rs` | MSG_PEEK ClientHello parser; SNI extraction; JA3 fingerprint |
 | `src/router.rs` | RouteTable (exact + wildcard HashMap); ArcSwap hot-swap |
 | `src/upstream.rs` | UpstreamStream enum (Tcp/Uds); connect(); TCP_NODELAY |
