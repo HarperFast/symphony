@@ -5,6 +5,8 @@ extern crate napi_derive;
 
 mod balancer;
 mod error;
+mod http_listener;
+mod http_proxy;
 mod listener;
 mod metrics;
 mod mtls;

@@ -62,6 +62,8 @@ export interface JsProtectionConfig {
 export interface JsListenerConfig {
   host?: string
   port: number
+  /** Listener protocol: "tls" (default) or "http". */
+  mode?: string
   defaultCert?: JsCertConfig
   mtls?: JsMtlsConfig
   maxConnections?: number

@@ -123,6 +123,47 @@ pub fn request_method(headers: &[u8]) -> &[u8] {
 	&headers[..end]
 }
 
+/// Byte slice of the HTTP request target (the path between the first two spaces
+/// of the request line). Returns an empty slice if malformed.
+pub fn request_target(headers: &[u8]) -> &[u8] {
+	let Some(first_sp) = headers.iter().position(|&b| b == b' ') else {
+		return &[];
+	};
+	let rest = &headers[first_sp + 1..];
+	let end = rest
+		.iter()
+		.position(|&b| b == b' ' || b == b'\r' || b == b'\n')
+		.unwrap_or(rest.len());
+	&rest[..end]
+}
+
+/// Return the trimmed value of the `Host` header (case-insensitive), or `None`
+/// if absent or the headers aren't valid UTF-8.  Strips any `:port` suffix.
+/// IPv6 literals such as `[::1]:80` are returned as `[::1]`.
+///
+/// Returns `None` if the value contains a CR, LF, or NUL byte — guarding
+/// against response-splitting attacks when the result is interpolated into
+/// a redirect `Location` header.
+pub fn host_header(headers: &[u8]) -> Option<&str> {
+	let text = std::str::from_utf8(headers).ok()?;
+	let value = header_value(text, "host")?;
+	if value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+		return None;
+	}
+	let host_only = if value.starts_with('[') {
+		let close = value.find(']')?;
+		&value[..=close]
+	} else if let Some(colon) = value.find(':') {
+		&value[..colon]
+	} else {
+		value
+	};
+	if host_only.is_empty() {
+		return None;
+	}
+	Some(host_only)
+}
+
 /// Return `true` if the HTTP response should include a body.
 /// (Per RFC 7230 §3.3: 1xx, 204, 304 and HEAD responses have no body.)
 pub fn response_has_body(status: u16, req_method: &[u8]) -> bool {
@@ -135,10 +176,58 @@ pub fn response_has_body(status: u16, req_method: &[u8]) -> bool {
 // ── Response header rewriting ─────────────────────────────────────────────────
 
 /// Return a copy of `headers` with the `Connection` field replaced by (or
+/// inserted as) `Connection: close`.  Used when forwarding an ACME request to
+/// the upstream so the response stream has a clean EOF and the proxy doesn't
+/// turn into a keep-alive tunnel.
+///
+/// `headers` must include the trailing `\r\n\r\n`.
+pub fn with_connection_close(headers: &[u8]) -> Vec<u8> {
+	rewrite_connection_header(headers, b"Connection: close\r\n")
+}
+
+/// Return a copy of `headers` with the `Connection` field replaced by (or
 /// inserted as) `Connection: keep-alive`.
 ///
 /// `headers` must include the trailing `\r\n\r\n`.
 pub fn with_connection_keep_alive(headers: &[u8]) -> Vec<u8> {
+	rewrite_connection_header(headers, b"Connection: keep-alive\r\n")
+}
+
+/// Return a copy of `headers` with any `Content-Length` and `Transfer-Encoding`
+/// fields removed.  Intended for ACME proxy requests which we treat as
+/// body-less GETs — stripping these headers avoids deadlocking the upstream if
+/// a client lies about a body and never sends it.
+pub fn strip_body_framing(headers: &[u8]) -> Vec<u8> {
+	let text = match std::str::from_utf8(headers) {
+		Ok(t) => t,
+		Err(_) => return headers.to_vec(),
+	};
+
+	let mut out = Vec::with_capacity(headers.len());
+
+	for (i, line) in text.split("\r\n").enumerate() {
+		if line.is_empty() {
+			continue;
+		}
+		if i == 0 {
+			out.extend_from_slice(line.as_bytes());
+			out.extend_from_slice(b"\r\n");
+			continue;
+		}
+		if let Some(colon) = line.find(':') {
+			let name = line[..colon].trim().to_ascii_lowercase();
+			if name == "content-length" || name == "transfer-encoding" {
+				continue;
+			}
+		}
+		out.extend_from_slice(line.as_bytes());
+		out.extend_from_slice(b"\r\n");
+	}
+	out.extend_from_slice(b"\r\n");
+	out
+}
+
+fn rewrite_connection_header(headers: &[u8], replacement: &[u8]) -> Vec<u8> {
 	let text = match std::str::from_utf8(headers) {
 		Ok(t) => t,
 		Err(_) => return headers.to_vec(), // not valid UTF-8 — return as-is
@@ -157,7 +246,7 @@ pub fn with_connection_keep_alive(headers: &[u8]) -> Vec<u8> {
 			out.extend_from_slice(b"\r\n");
 		} else if let Some(colon) = line.find(':') {
 			if line[..colon].trim().eq_ignore_ascii_case("connection") {
-				out.extend_from_slice(b"Connection: keep-alive\r\n");
+				out.extend_from_slice(replacement);
 				replaced = true;
 			} else {
 				out.extend_from_slice(line.as_bytes());
@@ -170,7 +259,7 @@ pub fn with_connection_keep_alive(headers: &[u8]) -> Vec<u8> {
 	}
 
 	if !replaced {
-		out.extend_from_slice(b"Connection: keep-alive\r\n");
+		out.extend_from_slice(replacement);
 	}
 	out.extend_from_slice(b"\r\n"); // end-of-headers blank line
 	out

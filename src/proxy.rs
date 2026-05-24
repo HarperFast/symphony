@@ -1,3 +1,4 @@
+use crate::http_listener::spawn_http_listeners;
 use crate::listener::spawn_listeners;
 use crate::metrics::{GlobalMetrics, ListenerMetrics};
 use crate::protection::ProtectionState;
@@ -86,6 +87,8 @@ pub struct JsProtectionConfig {
 pub struct JsListenerConfig {
 	pub host: Option<String>,
 	pub port: u16,
+	/// Listener protocol: "tls" (default) or "http".
+	pub mode: Option<String>,
 	pub default_cert: Option<JsCertConfig>,
 	pub mtls: Option<JsMtlsConfig>,
 	pub max_connections: Option<u32>,
@@ -132,10 +135,18 @@ pub struct JsResolveRoute {
 
 // ── Plain Rust internal config (all Send + Sync) ──────────────────────────────
 
+/// Listener protocol.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ListenerMode {
+	Tls,
+	Http,
+}
+
 /// Parsed listener config stored in the struct — no napi raw pointers.
 struct InternalListener {
 	addr: SocketAddr,
 	max_connections: u32,
+	mode: ListenerMode,
 }
 
 /// Per-listener runtime state.
@@ -190,9 +201,12 @@ impl SymphonyProxyWrap {
 			.try_init();
 
 		// ── Convert all napi types to plain Rust before storing ───────────────
+		// Use the first TLS-mode listener as the source for fallback cert/mTLS.
+		// HTTP-mode listeners don't carry TLS config.
 		let default_listener_tls = config
 			.listeners
-			.first()
+			.iter()
+			.find(|l| !matches!(l.mode.as_deref(), Some("http")))
 			.map(listener_tls_spec)
 			.unwrap_or_else(ListenerTlsSpec::empty);
 
@@ -220,9 +234,20 @@ impl SymphonyProxyWrap {
 				.parse()
 				.map_err(|e| napi::Error::from_reason(format!("invalid listener address '{addr_str}': {e}")))?;
 
+			let mode = match l.mode.as_deref() {
+				None | Some("tls") => ListenerMode::Tls,
+				Some("http") => ListenerMode::Http,
+				Some(other) => {
+					return Err(napi::Error::from_reason(format!(
+						"unknown listener mode '{other}'; expected 'tls' or 'http'"
+					)))
+				}
+			};
+
 			internal_listeners.push(InternalListener {
 				addr,
 				max_connections: l.max_connections.unwrap_or(0),
+				mode,
 			});
 
 			let (protection, protection_blocklist) = if let Some(prot_cfg) = &l.protection {
@@ -336,10 +361,15 @@ impl SymphonyProxyWrap {
 			let max_conn = listener.max_connections;
 			let workers = self.worker_threads;
 			let addr = listener.addr;
+			let mode = listener.mode;
 			let rx = tx.subscribe();
 
 			self.rt_handle.spawn(async move {
-				if let Err(e) = spawn_listeners(addr, workers, max_conn, ctx, rx).await {
+				let result = match mode {
+					ListenerMode::Tls => spawn_listeners(addr, workers, max_conn, ctx, rx).await,
+					ListenerMode::Http => spawn_http_listeners(addr, workers, max_conn, ctx, rx).await,
+				};
+				if let Err(e) = result {
 					tracing::error!("listener {addr} failed: {e}");
 				}
 			});

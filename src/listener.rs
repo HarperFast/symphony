@@ -88,7 +88,7 @@ async fn accept_loop(
 	}
 }
 
-fn make_reuseport_socket(addr: SocketAddr) -> crate::error::Result<std::net::TcpListener> {
+pub(crate) fn make_reuseport_socket(addr: SocketAddr) -> crate::error::Result<std::net::TcpListener> {
 	let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
 	let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
 
@@ -101,7 +101,7 @@ fn make_reuseport_socket(addr: SocketAddr) -> crate::error::Result<std::net::Tcp
 	Ok(socket.into())
 }
 
-fn set_rlimit_nofile(desired: u64) -> crate::error::Result<()> {
+pub(crate) fn set_rlimit_nofile(desired: u64) -> crate::error::Result<()> {
 	use libc::{getrlimit, rlimit, setrlimit, RLIMIT_NOFILE};
 
 	let mut rlim = rlimit { rlim_cur: 0, rlim_max: 0 };
