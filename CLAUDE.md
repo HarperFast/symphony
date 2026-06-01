@@ -8,6 +8,10 @@ This file is the primary entry point for any AI assistant working on this codeba
 
 symphony is a **napi-rs cdylib** loaded by Node.js. The tokio multi-thread runtime is embedded via napi's `tokio_rt` feature. The JS API is a thin `EventEmitter` wrapper (`ts/proxy.ts: SymphonyProxy`) over the napi class (`src/proxy.rs: SymphonyProxyWrap`).
 
+### Standalone server (`ts/server.ts` → `dist/server.js`, the `symphony-server` bin)
+
+For consumers that want symphony as its own OS process rather than embedded in their Node app, the package ships a `symphony-server` bin. It reads a JSON config file (`{ version, proxies: [{ listeners, routes }] }` — one entry per port-set, since the route table is per-proxy), constructs a `SymphonyProxy` per entry, and **watches the config file** to hot-reload (route change → `updateConfig`; listener change → recreate that proxy). Cert material may be given inline (`certChain`/`privateKey`) or by path (`certChainFile`/`privateKeyFile`) — the path form is resolved in `server.ts` only, so the napi `CertConfig` stays inline-only. It writes a `status.json` (`{ pid, version, ports, ... }`) for supervisors, and handles `SIGHUP` (reload) / `SIGTERM`/`SIGINT` (graceful stop). host-manager uses this to supervise symphony out-of-process.
+
 ### Data flow
 
 ```
