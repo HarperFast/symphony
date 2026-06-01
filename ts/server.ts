@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync, writeFileSync, unlinkSync, watch } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, unlinkSync, watch } from 'node:fs';
 import { dirname, isAbsolute, join, basename } from 'node:path';
 import { SymphonyProxy } from './index.js';
 import type { ProxyConfig, ListenerConfig, RouteConfig, CertConfig, MtlsConfig } from './index.js';
@@ -209,7 +209,11 @@ class ServerState {
 			ports,
 		};
 		try {
-			writeFileSync(this.statusPath, JSON.stringify(status, null, 2));
+			// Atomic write (temp + rename): the status file is rewritten on every reload, and a
+			// supervisor polling it concurrently must never read a half-written document.
+			const tmp = `${this.statusPath}.tmp`;
+			writeFileSync(tmp, JSON.stringify(status, null, 2));
+			renameSync(tmp, this.statusPath);
 		} catch (err) {
 			logErr(`could not write status ${this.statusPath}:`, (err as Error).message);
 		}
