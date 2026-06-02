@@ -71,13 +71,22 @@ function resolvePath(p: string, baseDir: string): string {
 }
 
 function resolveCert(c: FileCertConfig, baseDir: string): CertConfig {
-	const certChain = c.certChain ?? readFileSync(resolvePath(c.certChainFile!, baseDir), 'utf8');
-	const privateKey = c.privateKey ?? readFileSync(resolvePath(c.privateKeyFile!, baseDir));
+	const certChain =
+		c.certChain ?? (c.certChainFile ? readFileSync(resolvePath(c.certChainFile, baseDir), 'utf8') : undefined);
+	const privateKey =
+		c.privateKey ?? (c.privateKeyFile ? readFileSync(resolvePath(c.privateKeyFile, baseDir)) : undefined);
+	if (certChain === undefined || privateKey === undefined) {
+		throw new Error('route cert requires both a chain (certChain/certChainFile) and a key (privateKey/privateKeyFile)');
+	}
 	return { certChain, privateKey };
 }
 
 function resolveMtls(m: FileMtlsConfig, baseDir: string): MtlsConfig {
-	const clientCaCert = m.clientCaCert ?? readFileSync(resolvePath(m.clientCaCertFile!, baseDir), 'utf8');
+	const clientCaCert =
+		m.clientCaCert ?? (m.clientCaCertFile ? readFileSync(resolvePath(m.clientCaCertFile, baseDir), 'utf8') : undefined);
+	if (clientCaCert === undefined) {
+		throw new Error('route mtls requires a client CA (clientCaCert/clientCaCertFile)');
+	}
 	return { clientCaCert, requireClientCert: m.requireClientCert };
 }
 
@@ -117,6 +126,7 @@ class ServerState {
 	private readonly active = new Map<string, ActiveProxy>();
 	private startedAt = '';
 	private reloading: Promise<void> = Promise.resolve();
+	private watcher: ReturnType<typeof watch> | null = null;
 
 	constructor(configPath: string, statusPath: string) {
 		this.configPath = configPath;
@@ -225,15 +235,21 @@ class ServerState {
 		// Watch the directory (not the file) so atomic temp+rename writes keep firing events.
 		let timer: NodeJS.Timeout | null = null;
 		const base = basename(this.configPath);
-		watch(this.baseDir, (_event, filename) => {
+		this.watcher = watch(this.baseDir, (_event, filename) => {
 			if (filename && filename !== base) return;
 			if (timer) clearTimeout(timer);
 			timer = setTimeout(() => void this.reconcile(), 300);
 		});
+		// Without an 'error' listener an fs.watch error would throw as an unhandled exception.
+		this.watcher.on('error', (err) => logErr('config watcher error:', err));
 		log(`watching ${this.configPath} for changes`);
 	}
 
 	async stop(): Promise<void> {
+		if (this.watcher) {
+			this.watcher.close();
+			this.watcher = null;
+		}
 		await this.reloading.catch(() => {});
 		for (const [key, entry] of this.active) {
 			await entry.proxy.stop().catch((err) => logErr(`stopping proxy [${key}]:`, err));
