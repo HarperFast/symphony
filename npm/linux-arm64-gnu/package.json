@@ -1,6 +1,6 @@
 {
   "name": "@harperfast/symphony-linux-arm64-gnu",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "symphony native binary for linux arm64 glibc",
   "os": [
     "linux"
