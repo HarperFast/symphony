@@ -531,6 +531,114 @@ describe('symphony-server (route cert-file read failure is isolated)', () => {
 	});
 });
 
+describe('symphony-server (protection hot-swap via config file)', () => {
+	// Verifies that adding a protection block to a previously-unprotected listener forces
+	// a seamless recreate (fix 1: hasProtection in listenerSig), and that removing it
+	// recreates again without protection. Tests both transitions end-to-end.
+	const cert = generateSelfSignedCert('localhost');
+	let dir: string;
+	let configPath: string;
+	let statusPath: string;
+	let proxyPort: number;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	let server: RunningServer;
+
+	const baseRoute = () => ({
+		sni: 'localhost',
+		upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+		terminateTls: true,
+		cert: { certChain: cert.cert, privateKey: cert.key },
+	});
+
+	before(async () => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-prot-hot-'));
+		configPath = path.join(dir, 'config.json');
+		statusPath = path.join(dir, 'status.json');
+
+		echo = await startEchoServer();
+		proxyPort = await getFreePort();
+
+		// Start WITHOUT protection — 127.0.0.1 is allowed.
+		writeConfigAtomic(configPath, {
+			version: 1,
+			proxies: [{
+				listeners: [{ host: '127.0.0.1', port: proxyPort }],
+				routes: [baseRoute()],
+			}],
+		});
+
+		server = spawnServer(configPath, statusPath);
+		await waitFor(() => fs.existsSync(statusPath));
+	});
+
+	after(async () => {
+		await killServer(server);
+		await echo.close().catch(() => {});
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it('allows TLS connections before protection is added', async () => {
+		const data = Buffer.from('before-protection');
+		const res = await tlsRoundTrip({
+			port: proxyPort,
+			servername: 'localhost',
+			caCert: cert.cert,
+			data,
+			rejectUnauthorized: true,
+		});
+		assert.deepEqual(res, data);
+	});
+
+	it('blocks connections after adding a protection blocklist — none→some forces recreate', async () => {
+		// Adding a protection block to a listener that had none changes hasProtection in the
+		// signature → server recreates the proxy with protection enabled, covering 127.0.0.1/32.
+		writeConfigAtomic(configPath, {
+			version: 1,
+			proxies: [{
+				listeners: [{ host: '127.0.0.1', port: proxyPort, protection: { blocklist: ['127.0.0.1/32'] } }],
+				routes: [baseRoute()],
+			}],
+		});
+
+		// Poll until TLS from 127.0.0.1 is rejected (blocked pre-handshake).
+		await waitFor(
+			async () => {
+				try {
+					await tlsRoundTrip({ port: proxyPort, servername: 'localhost', caCert: cert.cert, data: Buffer.from('p'), rejectUnauthorized: true });
+					return false; // still allowed — recreate not picked up yet
+				} catch {
+					return true; // blocked
+				}
+			},
+			8000, 150
+		);
+	});
+
+	it('allows connections again after removing protection — some→none forces another recreate', async () => {
+		writeConfigAtomic(configPath, {
+			version: 1,
+			proxies: [{
+				listeners: [{ host: '127.0.0.1', port: proxyPort }], // no protection
+				routes: [baseRoute()],
+			}],
+		});
+
+		const data = Buffer.from('after-protection-removed');
+		let res: Buffer | null = null;
+		await waitFor(
+			async () => {
+				try {
+					const r = await tlsRoundTrip({ port: proxyPort, servername: 'localhost', caCert: cert.cert, data, rejectUnauthorized: true });
+					if (r.length === data.length && Buffer.compare(r, data) === 0) { res = r; return true; }
+					return false;
+				} catch { return false; }
+			},
+			8000, 150
+		);
+		assert.deepEqual(res, data, `traffic not unblocked. stderr:\n${server.getStderr()}`);
+	});
+});
+
 describe('symphony-server (status.json ownership guard)', () => {
 	// During a version upgrade the replacement starts first (SO_REUSEPORT overlap) and
 	// rewrites status.json with its own pid before the incumbent retires. stop() must only

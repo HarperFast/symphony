@@ -101,8 +101,8 @@ export interface JsListenerProtectionHotConfig {
 export interface JsHotConfig {
   routes?: Array<JsRouteConfig>
   /**
-   * Per-listener protection updates. Only applies to listeners that had protection
-   * configured at start; listeners constructed without protection are skipped.
+   * Per-listener protection updates. Each entry must reference a listener that was
+   * started WITH protection; a mismatched port or a port without protection is an error.
    */
   protection?: Array<JsListenerProtectionHotConfig>
 }
