@@ -90,18 +90,39 @@ function resolveMtls(m: FileMtlsConfig, baseDir: string): MtlsConfig {
 	return { clientCaCert, requireClientCert: m.requireClientCert };
 }
 
-// Resolve a file-backed proxy spec into the in-memory ProxyConfig the napi layer accepts.
+// A cert the Rust layer is guaranteed to reject at build time (empty PEM → "no
+// certificates"). Substituted for a route whose cert/key file can't be read, so the failure
+// is isolated inside build_route_table (which carries the route's last-good forward on a
+// hot-swap, or drops just that SNI on an initial build) instead of throwing out of
+// toProxyConfig and aborting the update for every route on the port-set.
+const UNRESOLVABLE_CERT: CertConfig = { certChain: '', privateKey: Buffer.alloc(0) };
+
+// Resolve one route's cert/mTLS from disk, isolating a file-read failure (e.g. ENOENT while a
+// cert rotates) to this route rather than letting it abort the whole port-set's reconcile.
+function resolveRoute(r: FileRouteConfig, baseDir: string): RouteConfig {
+	try {
+		return {
+			...r,
+			cert: r.cert ? resolveCert(r.cert, baseDir) : undefined,
+			mtls: r.mtls ? resolveMtls(r.mtls, baseDir) : undefined,
+		};
+	} catch (err) {
+		logErr(`failed to resolve cert material for route '${r.sni}' — isolating route:`, (err as Error).message);
+		return { ...r, cert: UNRESOLVABLE_CERT, mtls: undefined };
+	}
+}
+
+// Resolve a file-backed proxy spec into the in-memory ProxyConfig the napi layer accepts. A
+// listener-level cert failure is intentionally *not* isolated here — it throws, so the
+// per-proxy guard in doReconcile leaves the existing proxy running rather than recreating it
+// against an unbuildable default cert.
 function toProxyConfig(spec: FileProxyConfig, baseDir: string): ProxyConfig {
 	const listeners: ListenerConfig[] = spec.listeners.map((l) => ({
 		...l,
 		defaultCert: l.defaultCert ? resolveCert(l.defaultCert, baseDir) : undefined,
 		mtls: l.mtls ? resolveMtls(l.mtls, baseDir) : undefined,
 	}));
-	const routes: RouteConfig[] = spec.routes.map((r) => ({
-		...r,
-		cert: r.cert ? resolveCert(r.cert, baseDir) : undefined,
-		mtls: r.mtls ? resolveMtls(r.mtls, baseDir) : undefined,
-	}));
+	const routes: RouteConfig[] = spec.routes.map((r) => resolveRoute(r, baseDir));
 	return { listeners, routes, workerThreads: spec.workerThreads, readBufferSize: spec.readBufferSize };
 }
 
@@ -127,6 +148,12 @@ class ServerState {
 	private startedAt = '';
 	private reloading: Promise<void> = Promise.resolve();
 	private watcher: ReturnType<typeof watch> | null = null;
+	// Cert/key files referenced by the current config, watched for rotation. Keyed by
+	// parent directory (one fs.watch per dir, deduped) → the set of basenames we care about
+	// in that dir, so an unrelated file change in the same dir is ignored.
+	private readonly certWatchers = new Map<string, ReturnType<typeof watch>>();
+	private certFilesByDir = new Map<string, Set<string>>();
+	private debounceTimer: NodeJS.Timeout | null = null;
 
 	constructor(configPath: string, statusPath: string) {
 		this.configPath = configPath;
@@ -161,6 +188,80 @@ class ServerState {
 		return this.reloading;
 	}
 
+	// Debounce and coalesce fs events (config or cert files) into a single reconcile. The
+	// reconcile itself is serialized via `this.reloading`, so bursts collapse to one reload.
+	private scheduleReconcile(): void {
+		if (this.debounceTimer) clearTimeout(this.debounceTimer);
+		this.debounceTimer = setTimeout(() => {
+			this.debounceTimer = null;
+			void this.reconcile();
+		}, 300);
+	}
+
+	// Collect the cert/key files referenced by the current config, grouped by parent
+	// directory. Inline cert material (certChain/privateKey) has no file and is skipped.
+	private collectCertFiles(config: ConfigFile): Map<string, Set<string>> {
+		const byDir = new Map<string, Set<string>>();
+		const add = (p: string | undefined): void => {
+			if (!p) return;
+			const abs = resolvePath(p, this.baseDir);
+			const dir = dirname(abs);
+			let set = byDir.get(dir);
+			if (!set) byDir.set(dir, (set = new Set<string>()));
+			set.add(basename(abs));
+		};
+		for (const proxy of config.proxies) {
+			for (const l of proxy.listeners ?? []) {
+				add(l.defaultCert?.certChainFile);
+				add(l.defaultCert?.privateKeyFile);
+				add(l.mtls?.clientCaCertFile);
+			}
+			for (const r of proxy.routes ?? []) {
+				add(r.cert?.certChainFile);
+				add(r.cert?.privateKeyFile);
+				add(r.mtls?.clientCaCertFile);
+			}
+		}
+		return byDir;
+	}
+
+	// Reconcile the set of cert-file watchers against the current config: drop watchers for
+	// directories no longer referenced (so we don't leak them across reloads) and add one
+	// per newly-referenced directory. Watchers filter events against the live
+	// `certFilesByDir` set, so a config change that repoints cert files is honored without
+	// recreating the watcher.
+	private updateCertWatchers(config: ConfigFile): void {
+		const desired = this.collectCertFiles(config);
+		this.certFilesByDir = desired;
+
+		for (const [dir, w] of this.certWatchers) {
+			if (!desired.has(dir)) {
+				w.close();
+				this.certWatchers.delete(dir);
+			}
+		}
+
+		for (const dir of desired.keys()) {
+			if (this.certWatchers.has(dir)) continue;
+			let w: ReturnType<typeof watch>;
+			try {
+				w = watch(dir, (_event, filename) => {
+					// Ignore changes to files in this dir we don't reference (temp files, other
+					// tenants' unrelated material). A null filename (rare, platform-specific)
+					// falls through to a reconcile.
+					if (filename && !this.certFilesByDir.get(dir)?.has(filename)) return;
+					this.scheduleReconcile();
+				});
+			} catch (err) {
+				logErr(`could not watch cert directory ${dir}:`, (err as Error).message);
+				continue;
+			}
+			// Without an 'error' listener an fs.watch error would throw as an unhandled exception.
+			w.on('error', (err) => logErr(`cert watcher error (${dir}):`, err));
+			this.certWatchers.set(dir, w);
+		}
+	}
+
 	private async doReconcile(): Promise<void> {
 		const config = this.readConfig();
 		if (!config) return;
@@ -169,30 +270,40 @@ class ServerState {
 		for (const spec of config.proxies) {
 			const key = portKey(spec.listeners);
 			seen.add(key);
-			const listenerSig = JSON.stringify(spec.listeners);
 			const existing = this.active.get(key);
-			let proxyConfig: ProxyConfig;
+			// Guard the whole per-proxy reconcile — cert resolution, construction, and start().
+			// A failure here (unreadable cert file, listener bind error) must skip only this
+			// port-set and leave any already-running proxy for it untouched, not abort the loop
+			// and skip every remaining port-set. `seen` already holds `key`, so a skipped
+			// existing proxy is not torn down by the removal pass below.
 			try {
-				proxyConfig = toProxyConfig(spec, this.baseDir);
+				const proxyConfig = toProxyConfig(spec, this.baseDir);
+				// Signature over the *resolved* listeners (cert/key/CA contents included), not the
+				// raw spec: the listener-level default cert is frozen at construction (Rust
+				// default_listener_tls), so updateConfig can't hot-swap it. Keying off resolved
+				// content means a listener-cert rotation on disk (same paths, new bytes) changes
+				// the signature and forces a recreate, which route-only hot-swap would miss.
+				const listenerSig = JSON.stringify(proxyConfig.listeners);
+				if (existing && existing.listenerSig === listenerSig) {
+					// Same listeners → hot-swap the route table only.
+					existing.proxy.updateConfig({ routes: proxyConfig.routes });
+				} else {
+					// New port-set, or listener settings changed → (re)create. SO_REUSEPORT lets the
+					// new listener bind before the old one is dropped, so there is no bind gap.
+					const proxy = new SymphonyProxy(proxyConfig);
+					proxy.on('error', (err, ctx) =>
+						logErr(`proxy [${key}] error${ctx?.listener ? ` (${ctx.listener})` : ''}:`, err)
+					);
+					await proxy.start();
+					if (existing) await existing.proxy.stop().catch((err) => logErr(`stopping old proxy [${key}]:`, err));
+					this.active.set(key, { proxy, listenerSig });
+					log(`proxy listening on ports [${key}]`);
+				}
 			} catch (err) {
-				logErr(`failed to resolve certs for proxy [${key}] — skipping:`, (err as Error).message);
-				continue;
-			}
-
-			if (existing && existing.listenerSig === listenerSig) {
-				// Same listeners → hot-swap the route table only.
-				existing.proxy.updateConfig({ routes: proxyConfig.routes });
-			} else {
-				// New port-set, or listener settings changed → (re)create. SO_REUSEPORT lets the
-				// new listener bind before the old one is dropped, so there is no bind gap.
-				const proxy = new SymphonyProxy(proxyConfig);
-				proxy.on('error', (err, ctx) =>
-					logErr(`proxy [${key}] error${ctx?.listener ? ` (${ctx.listener})` : ''}:`, err)
+				logErr(
+					`failed to (re)configure proxy [${key}] — skipping, leaving any running listener in place:`,
+					(err as Error).message
 				);
-				await proxy.start();
-				if (existing) await existing.proxy.stop().catch((err) => logErr(`stopping old proxy [${key}]:`, err));
-				this.active.set(key, { proxy, listenerSig });
-				log(`proxy listening on ports [${key}]`);
 			}
 		}
 
@@ -204,6 +315,10 @@ class ServerState {
 				log(`proxy on ports [${key}] removed`);
 			}
 		}
+
+		// Re-derive which cert/key files to watch from the config we just applied, so a
+		// renewal on disk (no config.json write) triggers a reconcile and live reload.
+		this.updateCertWatchers(config);
 
 		this.writeStatus();
 	}
@@ -233,12 +348,10 @@ class ServerState {
 		this.startedAt = new Date().toISOString();
 		await this.reconcile();
 		// Watch the directory (not the file) so atomic temp+rename writes keep firing events.
-		let timer: NodeJS.Timeout | null = null;
 		const base = basename(this.configPath);
 		this.watcher = watch(this.baseDir, (_event, filename) => {
 			if (filename && filename !== base) return;
-			if (timer) clearTimeout(timer);
-			timer = setTimeout(() => void this.reconcile(), 300);
+			this.scheduleReconcile();
 		});
 		// Without an 'error' listener an fs.watch error would throw as an unhandled exception.
 		this.watcher.on('error', (err) => logErr('config watcher error:', err));
@@ -246,19 +359,31 @@ class ServerState {
 	}
 
 	async stop(): Promise<void> {
+		if (this.debounceTimer) {
+			clearTimeout(this.debounceTimer);
+			this.debounceTimer = null;
+		}
 		if (this.watcher) {
 			this.watcher.close();
 			this.watcher = null;
 		}
+		for (const w of this.certWatchers.values()) w.close();
+		this.certWatchers.clear();
 		await this.reloading.catch(() => {});
 		for (const [key, entry] of this.active) {
 			await entry.proxy.stop().catch((err) => logErr(`stopping proxy [${key}]:`, err));
 		}
 		this.active.clear();
+		// Only remove status.json if this process still owns it. During a version upgrade the
+		// replacement starts first (SO_REUSEPORT overlap) and rewrites status.json with its own
+		// pid before this incumbent is retired; an unconditional unlink here would delete the
+		// successor's file and make host-manager's health check read null → respawn a duplicate.
+		// Best-effort: a missing or garbage status file must not throw out of stop().
 		try {
-			unlinkSync(this.statusPath);
+			const current = JSON.parse(readFileSync(this.statusPath, 'utf8')) as { pid?: number };
+			if (current.pid === process.pid) unlinkSync(this.statusPath);
 		} catch {
-			// best effort
+			// status file missing, unreadable, or not ours — leave it alone
 		}
 	}
 }
