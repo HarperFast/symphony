@@ -236,4 +236,18 @@ describe('SymphonyProxy – one poisoned route does not sink the listener', () =
 		});
 		assert.deepEqual(response, payload);
 	});
+
+	it('does not serve the skipped (poisoned) route', async () => {
+		// The mismatched-cert route was dropped from the table, so its SNI has no route and the
+		// connection is refused rather than served with a broken/partial cert.
+		await assert.rejects(
+			tlsRoundTrip({
+				port: proxyPort,
+				servername: 'bad.example.com',
+				caCert: other.cert,
+				data: Buffer.from('should-fail'),
+				rejectUnauthorized: false,
+			})
+		);
+	});
 });

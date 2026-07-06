@@ -248,7 +248,7 @@ pub fn build_route_table(
 		let route = match build_route(spec, listener_tls, &mut cache) {
 			Ok(route) => route,
 			Err(e) => {
-				eprintln!("symphony: route '{}' skipped — failed to build: {e}", spec.sni);
+				tracing::error!("route '{}' skipped — failed to build: {e}", spec.sni);
 				continue;
 			}
 		};
