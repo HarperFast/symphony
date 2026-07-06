@@ -175,6 +175,7 @@ describe('symphony-server – status file ownership on shutdown', () => {
 	let configPath: string;
 	let statusPath: string;
 	let keyFile: string;
+	const children: ChildProcess[] = [];
 
 	before(() => {
 		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-status-test-'));
@@ -184,7 +185,14 @@ describe('symphony-server – status file ownership on shutdown', () => {
 		fs.writeFileSync(keyFile, cert.key);
 	});
 
-	after(() => {
+	after(async () => {
+		// Reap any child a failing/timed-out test left running, so it can't orphan and hold a port.
+		for (const child of children) {
+			if (child.exitCode === null) {
+				child.kill('SIGTERM');
+				await waitFor(() => child.exitCode !== null, 1000).catch(() => child.kill('SIGKILL'));
+			}
+		}
 		fs.rmSync(dir, { recursive: true, force: true });
 	});
 
@@ -208,6 +216,7 @@ describe('symphony-server – status file ownership on shutdown', () => {
 			],
 		});
 		const child = spawn(process.execPath, [SERVER_JS, '--config', configPath], { stdio: 'ignore' });
+		children.push(child);
 		await waitFor(() => fs.existsSync(statusPath));
 		return child;
 	}
