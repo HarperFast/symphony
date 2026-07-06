@@ -1,11 +1,11 @@
 use crate::metrics::{GlobalMetrics, ListenerMetrics};
-use crate::protection::ProtectionState;
+use crate::protection::{IpState, ProtectionState};
 use crate::router::{Destination, ForwardFingerprint, LiveRouteTable, SourceAddressMode};
 use crate::sni;
 use crate::suspended::SuspendedRegistry;
 use crate::upstream::{self, UpstreamStream};
 use napi::threadsafe_function::ThreadsafeFunction;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::marker::Unpin;
@@ -64,9 +64,10 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	let peek_info = sni::peek(&stream).await;
 
 	// ── 2. Protection checks ─────────────────────────────────────────────────
-	// `protection_counted` is true when check() incremented the active counter,
-	// meaning the ActiveGuard must call release() on drop.
-	let protection_counted = if let Some(protection) = &ctx.protection {
+	// On Allow, check() returns the Arc<IpState> that incremented the active counter.
+	// We hold it in ip_state_held so the ActiveGuard can decrement the SAME entry even
+	// if eviction removes it from the map between admission and connection close (fix 6).
+	let ip_state_held: Option<Arc<IpState>> = if let Some(protection) = &ctx.protection {
 		match protection.check(peer_ip, &peek_info) {
 			crate::protection::Decision::Block(reason) => {
 				ctx.listener_metrics.inc_blocked();
@@ -80,12 +81,12 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 				});
 				return;
 			}
-			// Allowlisted: active counter was not incremented; guard must not call release().
-			crate::protection::Decision::AllowBypassed => false,
-			crate::protection::Decision::Allow => true,
+			// Allowlisted: active counter was not incremented.
+			crate::protection::Decision::AllowBypassed => None,
+			crate::protection::Decision::Allow(state) => Some(state),
 		}
 	} else {
-		false
+		None
 	};
 
 	// ── Connection is allowed — track it ─────────────────────────────────────
@@ -93,12 +94,12 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	ctx.global_metrics.inc_active();
 
 	// RAII: decrement counts on scope exit.
-	// Pass protection only when the active counter was incremented so release() is correct.
+	// Decrement the active counter through the held Arc<IpState> so it always hits the
+	// same entry that was incremented, regardless of concurrent eviction.
 	let _active_guard = ActiveGuard {
 		global: ctx.global_metrics.clone(),
 		listener: ctx.listener_metrics.clone(),
-		protection: if protection_counted { ctx.protection.clone() } else { None },
-		peer_ip,
+		ip_state: ip_state_held,
 	};
 
 	// ── 3. Route lookup ───────────────────────────────────────────────────────
@@ -401,16 +402,18 @@ struct EffectiveRoute {
 struct ActiveGuard {
 	global: Arc<GlobalMetrics>,
 	listener: Arc<ListenerMetrics>,
-	protection: Option<Arc<ProtectionState>>,
-	peer_ip: IpAddr,
+	/// Held Arc<IpState> from check() — decrement always hits the same entry, even if
+	/// eviction removed it from the map between admission and connection close.
+	/// None for allowlisted connections (active counter was not incremented).
+	ip_state: Option<Arc<IpState>>,
 }
 
 impl Drop for ActiveGuard {
 	fn drop(&mut self) {
 		self.global.dec_active();
 		self.listener.dec_active();
-		if let Some(p) = &self.protection {
-			p.release(self.peer_ip);
+		if let Some(s) = &self.ip_state {
+			s.release();
 		}
 	}
 }

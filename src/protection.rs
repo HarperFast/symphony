@@ -5,13 +5,18 @@ use ipnetwork::IpNetwork;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+// Process-wide monotonic anchor. All timing uses monotonic offsets from process start.
+// Trade-off vs wall-clock: deadlines and bucket timestamps cannot be compared to unix time,
+// but forward NTP steps no longer release penalty-boxed IPs early and backward steps no
+// longer freeze legitimate bucket refills. Values are only compared internally.
+static START: OnceLock<Instant> = OnceLock::new();
 
 fn now_ns() -> u64 {
-	SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.unwrap_or(Duration::ZERO)
+	Instant::now()
+		.duration_since(*START.get_or_init(Instant::now))
 		.as_nanos() as u64
 }
 
@@ -51,52 +56,42 @@ pub struct ProtectionConfig {
 	pub allowlist: Vec<IpNetwork>,
 	/// CIDRs that are always blocked.
 	pub blocklist: Vec<IpNetwork>,
+
+	// Precomputed derived constants — populated by ProtectionConfig::precompute().
+	// These replace the method-based lookups on the hot check() path.
+	/// Per-second token refill rate (tokens per nanosecond). 0.0 = no limit.
+	pub tokens_per_ns: f64,
+	/// Per-second burst ceiling in fixed-point (×1000). 0 = no limit.
+	pub burst_fp: u32,
+	/// Sustained token refill rate (tokens per nanosecond). 0.0 = no limit.
+	pub sustained_tokens_per_ns: f64,
+	/// Sustained burst ceiling in fixed-point (×1000). 0 = no limit.
+	pub sustained_burst_fp: u32,
 }
 
 impl ProtectionConfig {
-	pub fn tls_handshake_timeout(&self) -> Duration {
-		let ms = if self.tls_handshake_timeout_ms == 0 {
-			10_000
-		} else {
-			self.tls_handshake_timeout_ms
-		};
-		Duration::from_millis(ms)
-	}
-
-	/// Per-second token refill rate (tokens per nanosecond), or None if no rate limit.
-	pub fn tokens_per_ns(&self) -> Option<f64> {
-		self.rate_limit_cps.map(|cps| cps / 1_000_000_000.0)
-	}
-
-	/// Per-second burst ceiling in fixed-point (×1000).
-	pub fn burst_fp(&self) -> u32 {
-		let burst = self
-			.rate_limit_burst
-			.or(self.rate_limit_cps)
-			.unwrap_or(0.0);
-		(burst * 1000.0) as u32
-	}
-
-	/// Sustained token refill rate (tokens per nanosecond), or None if no sustained limit.
-	pub fn sustained_tokens_per_ns(&self) -> Option<f64> {
+	/// Compute and cache float-derived constants from the source fields.
+	/// Must be called after setting all rate-limit fields, before ArcSwap storage.
+	pub fn precompute(mut self) -> Self {
+		self.burst_fp = (self.rate_limit_burst.or(self.rate_limit_cps).unwrap_or(0.0) * 1000.0) as u32;
+		self.tokens_per_ns = self.rate_limit_cps.map_or(0.0, |cps| cps / 1_000_000_000.0);
+		self.sustained_burst_fp =
+			(self.sustained_burst.or(self.sustained_cpm).unwrap_or(0.0) * 1000.0) as u32;
 		// 1 minute = 60_000_000_000 ns
-		self.sustained_cpm.map(|cpm| cpm / 60_000_000_000.0)
+		self.sustained_tokens_per_ns = self.sustained_cpm.map_or(0.0, |cpm| cpm / 60_000_000_000.0);
+		self
 	}
 
-	/// Sustained burst ceiling in fixed-point (×1000).
-	/// Max: 4,294,967 connections — far above any realistic sustained burst.
-	pub fn sustained_burst_fp(&self) -> u32 {
-		let burst = self
-			.sustained_burst
-			.or(self.sustained_cpm)
-			.unwrap_or(0.0);
-		(burst * 1000.0) as u32
+	pub fn tls_handshake_timeout(&self) -> Duration {
+		let ms = if self.tls_handshake_timeout_ms == 0 { 10_000 } else { self.tls_handshake_timeout_ms };
+		Duration::from_millis(ms)
 	}
 }
 
 // ── Per-IP state ──────────────────────────────────────────────────────────────
 
-struct IpState {
+#[derive(Debug)]
+pub(crate) struct IpState {
 	/// Per-second token count in fixed-point ×1000. Max = burst_fp.
 	tokens: AtomicU32,
 	last_refill_ns: AtomicU64,
@@ -104,8 +99,8 @@ struct IpState {
 	sustained_tokens: AtomicU32,
 	sustained_last_refill_ns: AtomicU64,
 	/// Current active connections from this IP.
-	active: AtomicU32,
-	/// Penalty box deadline in ns since UNIX_EPOCH. 0 = not penalized.
+	pub(crate) active: AtomicU32,
+	/// Penalty box deadline in monotonic ns (relative to START). 0 = not penalized.
 	penalty_deadline_ns: AtomicU64,
 }
 
@@ -120,6 +115,13 @@ impl IpState {
 			active: AtomicU32::new(0),
 			penalty_deadline_ns: AtomicU64::new(0),
 		}
+	}
+
+	/// Decrement the active counter. Called via the held Arc on connection close.
+	pub(crate) fn release(&self) {
+		self.active
+			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)))
+			.ok();
 	}
 }
 
@@ -201,9 +203,10 @@ impl BlockReason {
 
 #[derive(Debug)]
 pub enum Decision {
-	/// Connection allowed and active counter incremented — release() must be called on close.
-	Allow,
-	/// Connection allowed via allowlist — active counter was NOT incremented; release() is a no-op.
+	/// Connection allowed and active counter incremented.
+	/// The caller MUST hold this Arc until connection close and call ip_state.release() on drop.
+	Allow(Arc<IpState>),
+	/// Connection allowed via allowlist — active counter was NOT incremented.
 	AllowBypassed,
 	Block(BlockReason),
 }
@@ -219,19 +222,20 @@ pub struct ProtectionState {
 impl ProtectionState {
 	pub fn new(config: ProtectionConfig) -> Arc<Self> {
 		Arc::new(Self {
-			config: ArcSwap::new(Arc::new(config)),
+			config: ArcSwap::new(Arc::new(config.precompute())),
 			ip_table: DashMap::new(),
 		})
 	}
 
 	/// Check whether to allow or block a new connection.
-	/// If allowed, increments the IP's active counter.
+	/// On Allow, increments the IP's active counter and returns the IpState Arc the caller
+	/// must hold until connection close (call ip_state.release() on drop).
 	pub fn check(&self, peer_ip: IpAddr, peek_info: &PeekInfo) -> Decision {
 		self.check_at(peer_ip, peek_info, now_ns())
 	}
 
 	/// Internal: same as check() but accepts an explicit `now_ns` timestamp for testing.
-	fn check_at(&self, peer_ip: IpAddr, peek_info: &PeekInfo, now: u64) -> Decision {
+	pub(crate) fn check_at(&self, peer_ip: IpAddr, peek_info: &PeekInfo, now: u64) -> Decision {
 		let cfg = self.config.load();
 
 		// 1. Allowlist — skip all other checks; active counter is NOT incremented.
@@ -271,7 +275,7 @@ impl ProtectionState {
 		}
 
 		// 5–8: IP-state checks — access IpState once
-		let state = self.get_or_create_state(peer_ip, cfg.burst_fp(), cfg.sustained_burst_fp());
+		let state = self.get_or_create_state(peer_ip, cfg.burst_fp, cfg.sustained_burst_fp);
 
 		// 5. Penalty box — if the IP is currently penalized, debit buckets to detect continued
 		//    excess and extend the deadline if found, then block outright.
@@ -282,60 +286,68 @@ impl ProtectionState {
 				// Debit both rate buckets to measure "continues to exceed".
 				// If either bucket is exhausted, the attacker is still hitting hard → extend.
 				let mut exceeded = false;
-				if let Some(rate) = cfg.tokens_per_ns() {
-					if !refill_and_consume(&state.tokens, &state.last_refill_ns, now, rate, cfg.burst_fp()) {
-						exceeded = true;
-					}
+				if cfg.tokens_per_ns > 0.0
+					&& !refill_and_consume(
+						&state.tokens,
+						&state.last_refill_ns,
+						now,
+						cfg.tokens_per_ns,
+						cfg.burst_fp,
+					) {
+					exceeded = true;
 				}
-				if let Some(rate) = cfg.sustained_tokens_per_ns() {
-					if !refill_and_consume(
+				if cfg.sustained_tokens_per_ns > 0.0
+					&& !refill_and_consume(
 						&state.sustained_tokens,
 						&state.sustained_last_refill_ns,
 						now,
-						rate,
-						cfg.sustained_burst_fp(),
+						cfg.sustained_tokens_per_ns,
+						cfg.sustained_burst_fp,
 					) {
-						exceeded = true;
-					}
+					exceeded = true;
 				}
 				if exceeded {
 					// Reset the full penalty from now (extension).
-					state
-						.penalty_deadline_ns
-						.store(now + penalty_ms * 1_000_000, Ordering::Relaxed);
+					// saturating_add/mul guard against absurdly large configured durations.
+					state.penalty_deadline_ns.store(
+						now.saturating_add(penalty_ms.saturating_mul(1_000_000)),
+						Ordering::Relaxed,
+					);
 				}
 				return Decision::Block(BlockReason::PenaltyBoxed);
 			}
 		}
 
 		// 6. Per-second rate limit
-		if let Some(rate) = cfg.tokens_per_ns() {
-			if !refill_and_consume(&state.tokens, &state.last_refill_ns, now, rate, cfg.burst_fp()) {
-				if penalty_ms > 0 {
-					state
-						.penalty_deadline_ns
-						.store(now + penalty_ms * 1_000_000, Ordering::Relaxed);
-				}
-				return Decision::Block(BlockReason::RateLimited);
+		if cfg.tokens_per_ns > 0.0
+			&& !refill_and_consume(&state.tokens, &state.last_refill_ns, now, cfg.tokens_per_ns, cfg.burst_fp)
+		{
+			if penalty_ms > 0 {
+				state.penalty_deadline_ns.store(
+					now.saturating_add(penalty_ms.saturating_mul(1_000_000)),
+					Ordering::Relaxed,
+				);
 			}
+			return Decision::Block(BlockReason::RateLimited);
 		}
 
 		// 7. Sustained rate limit (per-minute)
-		if let Some(rate) = cfg.sustained_tokens_per_ns() {
-			if !refill_and_consume(
+		if cfg.sustained_tokens_per_ns > 0.0
+			&& !refill_and_consume(
 				&state.sustained_tokens,
 				&state.sustained_last_refill_ns,
 				now,
-				rate,
-				cfg.sustained_burst_fp(),
-			) {
-				if penalty_ms > 0 {
-					state
-						.penalty_deadline_ns
-						.store(now + penalty_ms * 1_000_000, Ordering::Relaxed);
-				}
-				return Decision::Block(BlockReason::RateLimited);
+				cfg.sustained_tokens_per_ns,
+				cfg.sustained_burst_fp,
+			)
+		{
+			if penalty_ms > 0 {
+				state.penalty_deadline_ns.store(
+					now.saturating_add(penalty_ms.saturating_mul(1_000_000)),
+					Ordering::Relaxed,
+				);
 			}
+			return Decision::Block(BlockReason::RateLimited);
 		}
 
 		// 8. Concurrency limit — atomic test-and-increment to avoid TOCTOU
@@ -351,16 +363,16 @@ impl ProtectionState {
 		} else {
 			state.active.fetch_add(1, Ordering::Relaxed);
 		}
-		Decision::Allow
+		Decision::Allow(state)
 	}
 
-	/// Decrement the active counter for a peer IP. Call on connection close.
+	/// Decrement the active counter for a peer IP. Used by tests; production code uses
+	/// the Arc<IpState> returned from check() so the decrement hits the same entry even
+	/// if an eviction ran between admission and close.
+	#[cfg(test)]
 	pub fn release(&self, peer_ip: IpAddr) {
 		if let Some(state) = self.ip_table.get(&peer_ip) {
-			state
-				.active
-				.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)))
-				.ok();
+			state.release();
 		}
 	}
 
@@ -377,18 +389,40 @@ impl ProtectionState {
 			let ip = *entry.key();
 			let state = entry.value();
 
-			// Penalty box takes precedence in reporting (skip rate-limited check for boxed IPs).
-			let deadline = state.penalty_deadline_ns.load(Ordering::Relaxed);
-			if deadline > 0 && now < deadline {
-				penalty_boxed.push(ip);
-				continue;
+			// Penalty box: only report when the feature is currently enabled in config.
+			// After a hot-swap that disables penaltyBox, check() stops enforcing it but
+			// stale deadlines remain on IpState until expiry — gate on config to avoid
+			// reporting IPs that are no longer actually blocked.
+			if cfg.penalty_box_duration_ms > 0 {
+				let deadline = state.penalty_deadline_ns.load(Ordering::Relaxed);
+				if deadline > 0 && now < deadline {
+					penalty_boxed.push(ip);
+					continue;
+				}
 			}
 
-			// Rate-limited: per-second OR sustained bucket depleted below one token
-			let is_rate_limited =
-				(cfg.tokens_per_ns().is_some() && state.tokens.load(Ordering::Relaxed) < 1000)
-				|| (cfg.sustained_tokens_per_ns().is_some()
-					&& state.sustained_tokens.load(Ordering::Relaxed) < 1000);
+			// Rate-limited: apply lazy projection (same logic as evict_at) so a recovered
+			// idle IP isn't falsely reported as still limited.
+			let mut is_rate_limited = false;
+			if cfg.tokens_per_ns > 0.0 {
+				let last = state.last_refill_ns.load(Ordering::Relaxed);
+				let current = state.tokens.load(Ordering::Relaxed);
+				let refill = ((now.saturating_sub(last) as f64) * cfg.tokens_per_ns * 1000.0) as u32;
+				let projected = current.saturating_add(refill).min(cfg.burst_fp);
+				if projected < 1000 {
+					is_rate_limited = true;
+				}
+			}
+			if !is_rate_limited && cfg.sustained_tokens_per_ns > 0.0 {
+				let last = state.sustained_last_refill_ns.load(Ordering::Relaxed);
+				let current = state.sustained_tokens.load(Ordering::Relaxed);
+				let refill =
+					((now.saturating_sub(last) as f64) * cfg.sustained_tokens_per_ns * 1000.0) as u32;
+				let projected = current.saturating_add(refill).min(cfg.sustained_burst_fp);
+				if projected < 1000 {
+					is_rate_limited = true;
+				}
+			}
 			if is_rate_limited {
 				rate_limited.push(ip);
 			}
@@ -398,6 +432,57 @@ impl ProtectionState {
 				if active >= max_concurrent {
 					concurrency_limited.push(ip);
 				}
+			}
+		}
+
+		(rate_limited, concurrency_limited, penalty_boxed)
+	}
+
+	/// Returns (rate_limited_ips, concurrency_limited_ips, penalty_boxed_ips) at a given time.
+	/// Test seam for fix 5 verification.
+	#[cfg(test)]
+	pub(crate) fn blocked_ips_at(&self, now: u64) -> (Vec<IpAddr>, Vec<IpAddr>, Vec<IpAddr>) {
+		let cfg = self.config.load();
+		let max_concurrent = cfg.max_concurrent_per_ip;
+		let mut rate_limited = Vec::new();
+		let mut concurrency_limited = Vec::new();
+		let mut penalty_boxed = Vec::new();
+
+		for entry in self.ip_table.iter() {
+			let ip = *entry.key();
+			let state = entry.value();
+
+			if cfg.penalty_box_duration_ms > 0 {
+				let deadline = state.penalty_deadline_ns.load(Ordering::Relaxed);
+				if deadline > 0 && now < deadline {
+					penalty_boxed.push(ip);
+					continue;
+				}
+			}
+
+			let mut is_rate_limited = false;
+			if cfg.tokens_per_ns > 0.0 {
+				let last = state.last_refill_ns.load(Ordering::Relaxed);
+				let current = state.tokens.load(Ordering::Relaxed);
+				let refill = ((now.saturating_sub(last) as f64) * cfg.tokens_per_ns * 1000.0) as u32;
+				if current.saturating_add(refill).min(cfg.burst_fp) < 1000 {
+					is_rate_limited = true;
+				}
+			}
+			if !is_rate_limited && cfg.sustained_tokens_per_ns > 0.0 {
+				let last = state.sustained_last_refill_ns.load(Ordering::Relaxed);
+				let current = state.sustained_tokens.load(Ordering::Relaxed);
+				let refill =
+					((now.saturating_sub(last) as f64) * cfg.sustained_tokens_per_ns * 1000.0) as u32;
+				if current.saturating_add(refill).min(cfg.sustained_burst_fp) < 1000 {
+					is_rate_limited = true;
+				}
+			}
+			if is_rate_limited {
+				rate_limited.push(ip);
+			}
+			if max_concurrent > 0 && state.active.load(Ordering::Relaxed) >= max_concurrent {
+				concurrency_limited.push(ip);
 			}
 		}
 
@@ -420,7 +505,7 @@ impl ProtectionState {
 	///
 	/// Lazy projection means an attacker cannot reset their sustained window by pausing
 	/// until eviction: the entry stays until the full burst_fp would be recovered.
-	fn evict_at(&self, now: u64) {
+	pub(crate) fn evict_at(&self, now: u64) {
 		let cfg = self.config.load();
 
 		self.ip_table.retain(|_, state| {
@@ -436,22 +521,23 @@ impl ProtectionState {
 			}
 
 			// Keep: per-second bucket would not yet be fully refilled
-			if let Some(rate) = cfg.tokens_per_ns() {
-				let burst_fp = cfg.burst_fp();
+			if cfg.tokens_per_ns > 0.0 {
+				let burst_fp = cfg.burst_fp;
 				let last = state.last_refill_ns.load(Ordering::Relaxed);
 				let current = state.tokens.load(Ordering::Relaxed);
-				let refill = ((now.saturating_sub(last) as f64) * rate * 1000.0) as u32;
+				let refill = ((now.saturating_sub(last) as f64) * cfg.tokens_per_ns * 1000.0) as u32;
 				if current.saturating_add(refill).min(burst_fp) < burst_fp {
 					return true;
 				}
 			}
 
 			// Keep: sustained bucket would not yet be fully refilled
-			if let Some(rate) = cfg.sustained_tokens_per_ns() {
-				let burst_fp = cfg.sustained_burst_fp();
+			if cfg.sustained_tokens_per_ns > 0.0 {
+				let burst_fp = cfg.sustained_burst_fp;
 				let last = state.sustained_last_refill_ns.load(Ordering::Relaxed);
 				let current = state.sustained_tokens.load(Ordering::Relaxed);
-				let refill = ((now.saturating_sub(last) as f64) * rate * 1000.0) as u32;
+				let refill =
+					((now.saturating_sub(last) as f64) * cfg.sustained_tokens_per_ns * 1000.0) as u32;
 				if current.saturating_add(refill).min(burst_fp) < burst_fp {
 					return true;
 				}
@@ -515,14 +601,17 @@ mod tests {
 		let peer = ip("10.0.0.1");
 
 		// Initially allowed
-		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
 		state.release(peer);
 
 		// Swap in a blocklist containing the peer
-		state.config.store(Arc::new(ProtectionConfig {
-			blocklist: vec!["10.0.0.0/24".parse().unwrap()],
-			..Default::default()
-		}));
+		state.config.store(Arc::new(
+			ProtectionConfig {
+				blocklist: vec!["10.0.0.0/24".parse().unwrap()],
+				..Default::default()
+			}
+			.precompute(),
+		));
 		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::CidrBlocked)));
 	}
 
@@ -537,8 +626,8 @@ mod tests {
 		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::CidrBlocked)));
 
 		// Remove the blocklist
-		state.config.store(Arc::new(ProtectionConfig::default()));
-		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+		state.config.store(Arc::new(ProtectionConfig::default().precompute()));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
 		state.release(peer);
 	}
 
@@ -554,11 +643,14 @@ mod tests {
 		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::CidrBlocked)));
 
 		// Add an allowlist covering that IP — allowlist check runs before blocklist
-		state.config.store(Arc::new(ProtectionConfig {
-			allowlist: vec!["10.0.0.0/24".parse().unwrap()],
-			blocklist: vec!["10.0.0.0/8".parse().unwrap()],
-			..Default::default()
-		}));
+		state.config.store(Arc::new(
+			ProtectionConfig {
+				allowlist: vec!["10.0.0.0/24".parse().unwrap()],
+				blocklist: vec!["10.0.0.0/8".parse().unwrap()],
+				..Default::default()
+			}
+			.precompute(),
+		));
 		assert!(matches!(state.check(peer, &no_peek()), Decision::AllowBypassed));
 	}
 
@@ -568,13 +660,13 @@ mod tests {
 		let peer = ip("1.2.3.4");
 		let hex = "e7d705a3286e19ea42f587b344ee6865";
 
-		assert!(matches!(state.check(peer, &peek_with_ja3(hex)), Decision::Allow));
+		assert!(matches!(state.check(peer, &peek_with_ja3(hex)), Decision::Allow(_)));
 		state.release(peer);
 
 		// Swap in a JA3 blocklist
 		let mut new_cfg = ProtectionConfig::default();
 		new_cfg.ja3_blocklist.insert(hex_to_bytes16(hex).unwrap());
-		state.config.store(Arc::new(new_cfg));
+		state.config.store(Arc::new(new_cfg.precompute()));
 		assert!(matches!(state.check(peer, &peek_with_ja3(hex)), Decision::Block(BlockReason::Ja3Blocked)));
 	}
 
@@ -584,17 +676,20 @@ mod tests {
 		let state = ProtectionState::new(ProtectionConfig::default());
 		let peer = ip("2.0.0.1");
 
-		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
 		state.release(peer);
 
 		// Enable rate limiting with burst < ONE_TOKEN (1000 fp), so the existing entry
 		// (tokens=0) will never accumulate enough to pass the consume step.
 		// burst_fp = (0.5 * 1000.0) as u32 = 500 < 1000 = ONE_TOKEN → always blocked.
-		state.config.store(Arc::new(ProtectionConfig {
-			rate_limit_cps: Some(10.0),
-			rate_limit_burst: Some(0.5),
-			..Default::default()
-		}));
+		state.config.store(Arc::new(
+			ProtectionConfig {
+				rate_limit_cps: Some(10.0),
+				rate_limit_burst: Some(0.5),
+				..Default::default()
+			}
+			.precompute(),
+		));
 		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::RateLimited)));
 	}
 
@@ -611,8 +706,8 @@ mod tests {
 		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::RateLimited)));
 
 		// Remove rate limit entirely — now unrestricted
-		state.config.store(Arc::new(ProtectionConfig::default()));
-		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+		state.config.store(Arc::new(ProtectionConfig::default().precompute()));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
 		state.release(peer);
 	}
 
@@ -628,21 +723,24 @@ mod tests {
 
 		// Consume 50 tokens — each check decrements by 1000 fp; 50 × 1000 = 50000 fp consumed
 		for _ in 0..50 {
-			assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+			assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
 			state.release(peer);
 		}
 		// tokens ≈ 50000 fp (remaining in bucket; negligible refill during fast loop)
 
 		// Reduce burst to 1 (burst_fp=1000). On next refill the bucket will be capped.
 		// Existing tokens (50000) remain until first refill; no underflow in consume step.
-		state.config.store(Arc::new(ProtectionConfig {
-			rate_limit_cps: Some(1.0),
-			rate_limit_burst: Some(1.0),
-			..Default::default()
-		}));
+		state.config.store(Arc::new(
+			ProtectionConfig {
+				rate_limit_cps: Some(1.0),
+				rate_limit_burst: Some(1.0),
+				..Default::default()
+			}
+			.precompute(),
+		));
 
 		// Consume step: tokens ≈ 50000 fp → 50000 - 1000 = 49000 fp; no underflow
-		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
 		state.release(peer);
 	}
 
@@ -657,7 +755,7 @@ mod tests {
 		let peer = ip("5.0.0.1");
 
 		// First connection: allowed and active counter incremented (not released yet).
-		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
 
 		// IP is now at the concurrency limit; blocked_ips() must report it.
 		let (rl, cl, _) = state.blocked_ips();
@@ -685,11 +783,11 @@ mod tests {
 		let peer = ip("4.0.0.1");
 
 		// All at the same timestamp so no refill occurs between calls.
-		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow));
+		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow(_)));
 		state.release(peer);
-		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow));
+		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow(_)));
 		state.release(peer);
-		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow));
+		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow(_)));
 		state.release(peer);
 
 		// Sustained burst exhausted — 4th is blocked
@@ -708,14 +806,14 @@ mod tests {
 		});
 		let peer = ip("4.0.0.2");
 
-		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow));
+		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow(_)));
 		state.release(peer);
 		// Sustained bucket exhausted
 		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Block(BlockReason::RateLimited)));
 
 		// 1.1 seconds later — bucket refilled by 1.1 tokens, capped at burst 1 → allows
 		let later = now + 1_100_000_000; // 1.1 s in ns
-		assert!(matches!(state.check_at(peer, &no_peek(), later), Decision::Allow));
+		assert!(matches!(state.check_at(peer, &no_peek(), later), Decision::Allow(_)));
 		state.release(peer);
 	}
 
@@ -732,7 +830,7 @@ mod tests {
 
 		// 5 connections drain the per-second burst, but no sustained limit → blocked on #6 by per-second only
 		for _ in 0..5 {
-			assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow));
+			assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow(_)));
 			state.release(peer);
 		}
 		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Block(BlockReason::RateLimited)));
@@ -752,7 +850,7 @@ mod tests {
 		let peer = ip("5.0.0.1");
 
 		// First connection consumes the only token
-		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow));
+		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow(_)));
 		state.release(peer);
 
 		// Second: bucket exhausted → RateLimited + penalty box entered
@@ -777,7 +875,7 @@ mod tests {
 		let peer = ip("5.0.0.2");
 
 		// Consumes the single sustained token
-		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow));
+		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow(_)));
 		state.release(peer);
 
 		// Sustained exhausted → RateLimited + penalty entered
@@ -829,7 +927,7 @@ mod tests {
 		// Deadline should be set to now + penalty_ms * 1_000_000
 		let state_entry = state.ip_table.get(&peer).unwrap();
 		let deadline_after_entry = state_entry.penalty_deadline_ns.load(Ordering::Relaxed);
-		assert_eq!(deadline_after_entry, now + penalty_ms * 1_000_000);
+		assert_eq!(deadline_after_entry, now.saturating_add(penalty_ms.saturating_mul(1_000_000)));
 		drop(state_entry);
 
 		// 5s later — still within penalty; bucket still empty → should extend
@@ -841,7 +939,7 @@ mod tests {
 		drop(state_entry);
 
 		// Deadline must have been pushed to t1 + penalty_ms * 1_000_000
-		assert_eq!(deadline_after_extend, t1 + penalty_ms * 1_000_000);
+		assert_eq!(deadline_after_extend, t1.saturating_add(penalty_ms.saturating_mul(1_000_000)));
 		assert!(deadline_after_extend > deadline_after_entry, "deadline must have been extended");
 	}
 
@@ -903,7 +1001,7 @@ mod tests {
 		// After penalty_ms + some margin, deadline has passed → readmitted
 		// Also advance enough time for the per-second bucket to refill (at 100 cps, 0.01s fills 1 token)
 		let after_penalty = now + (penalty_ms + 1000) * 1_000_000; // penalty + 1 second
-		assert!(matches!(state.check_at(peer, &no_peek(), after_penalty), Decision::Allow));
+		assert!(matches!(state.check_at(peer, &no_peek(), after_penalty), Decision::Allow(_)));
 		state.release(peer);
 	}
 
@@ -925,6 +1023,146 @@ mod tests {
 		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Block(BlockReason::RateLimited)));
 		// Still rate limited, but NOT PenaltyBoxed — penalty box is off
 		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Block(BlockReason::RateLimited)));
+	}
+
+	// ── Fix 1: u64 overflow with absurd penalty duration ──────────────────────
+
+	#[test]
+	fn penalty_box_absurd_duration_still_engages() {
+		// A "ban forever" duration near u64::MAX would overflow now + penalty_ms * 1_000_000
+		// without saturating arithmetic, wrapping to a past deadline and silently never
+		// engaging the box. saturating_add/saturating_mul must clamp to u64::MAX instead.
+		let now: u64 = 1_000_000_000; // 1 s into process life
+		let absurd_ms: u64 = u64::MAX / 1_000_000 + 1; // multiplying by 1_000_000 overflows
+		let state = ProtectionState::new(ProtectionConfig {
+			rate_limit_cps: Some(100.0),
+			rate_limit_burst: Some(1.0),
+			penalty_box_duration_ms: absurd_ms,
+			..Default::default()
+		});
+		let peer = ip("7.0.0.1");
+
+		// Consume token → rate limited → penalty entered with saturated deadline
+		state.check_at(peer, &no_peek(), now); // Allow
+		state.release(peer);
+		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Block(BlockReason::RateLimited)));
+
+		// Verify deadline is u64::MAX (saturated), not a wrapped past value
+		let state_entry = state.ip_table.get(&peer).unwrap();
+		let deadline = state_entry.penalty_deadline_ns.load(Ordering::Relaxed);
+		drop(state_entry);
+		assert_eq!(deadline, u64::MAX, "absurd duration must saturate to u64::MAX, not wrap");
+
+		// Box must now engage (now < u64::MAX)
+		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Block(BlockReason::PenaltyBoxed)));
+		// And at a much later time still far below u64::MAX, still blocked
+		assert!(matches!(
+			state.check_at(peer, &no_peek(), now + 86_400_000_000_000),
+			Decision::Block(BlockReason::PenaltyBoxed)
+		));
+	}
+
+	// ── Fix 4: blockedIps() respects config after hot-swap disables penaltyBox ─
+
+	#[test]
+	fn blocked_ips_penalty_boxed_gated_on_config() {
+		let now = now_ns();
+		let state = ProtectionState::new(ProtectionConfig {
+			rate_limit_cps: Some(100.0),
+			rate_limit_burst: Some(0.5), // always blocked
+			penalty_box_duration_ms: 600_000,
+			..Default::default()
+		});
+		let peer = ip("8.0.0.1");
+
+		// Enter the penalty box
+		state.check_at(peer, &no_peek(), now);
+
+		// Confirm it's reported
+		let (_, _, pb) = state.blocked_ips();
+		assert!(pb.contains(&peer), "IP must appear in penaltyBoxed while box is enabled");
+
+		// Hot-swap: disable penalty box
+		state.config.store(Arc::new(
+			ProtectionConfig {
+				rate_limit_cps: Some(100.0),
+				rate_limit_burst: Some(0.5),
+				penalty_box_duration_ms: 0, // disabled
+				..Default::default()
+			}
+			.precompute(),
+		));
+
+		// IP still has a non-zero deadline on its IpState (stale), but config says disabled
+		let (_, _, pb_after) = state.blocked_ips();
+		assert!(
+			pb_after.is_empty(),
+			"penaltyBoxed must be empty after hot-swap disables penaltyBox config; got: {pb_after:?}"
+		);
+	}
+
+	// ── Fix 5: blockedIps() rate-limited uses lazy projection ──────────────────
+
+	#[test]
+	fn blocked_ips_rate_limited_excludes_recovered_ips() {
+		let now = now_ns();
+		let state = ProtectionState::new(ProtectionConfig {
+			rate_limit_cps: Some(1000.0), // fast refill: 1000 tokens/s
+			rate_limit_burst: Some(1.0),  // burst_fp=1000
+			..Default::default()
+		});
+		let peer = ip("8.0.0.2");
+
+		// Exhaust bucket
+		state.check_at(peer, &no_peek(), now); // Allow — consumes last token
+		state.release(peer);
+		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Block(BlockReason::RateLimited)));
+
+		// At now+0 the stored token value is 0 (below ONE_TOKEN=1000) — stale check would
+		// report the IP as still limited. Lazy projection must exclude it at t=now+2ms
+		// (2ms @ 1000cps = 2000 fp refill, capped at burst_fp=1000 → fully recovered).
+		let recovered = now + 2_000_000; // 2 ms later
+		let (rl, _, _) = state.blocked_ips_at(recovered);
+		assert!(!rl.contains(&peer), "recovered IP must not appear in rateLimited; got: {rl:?}");
+	}
+
+	// ── Fix 6: evict vs active-counter race (Arc-held decrement) ──────────────
+
+	#[test]
+	fn active_guard_arc_release_survives_eviction() {
+		// Simulate the race: check() returns Allow(Arc<IpState>), then evict() removes the
+		// entry from the map, then the held Arc releases the active counter.
+		// With the pre-fix implementation, release() would re-look-up by IP and decrement
+		// a fresh (zero-active) entry. With the fix, the held Arc is decremented directly.
+		let state = ProtectionState::new(ProtectionConfig {
+			max_concurrent_per_ip: 10,
+			..Default::default()
+		});
+		let peer = ip("9.0.0.1");
+		let now = now_ns();
+
+		// Admit the connection, holding the Arc<IpState>
+		let held_arc = match state.check_at(peer, &no_peek(), now) {
+			Decision::Allow(s) => s,
+			other => panic!("expected Allow, got {other:?}"),
+		};
+		assert_eq!(held_arc.active.load(Ordering::Relaxed), 1, "active must be 1 after check");
+
+		// Forcibly evict the entry (simulating the race: evict runs after check but before release)
+		state.ip_table.remove(&peer);
+		assert!(state.ip_table.get(&peer).is_none(), "entry must be gone from map");
+
+		// Release through the held Arc — must decrement the SAME IpState, not a re-inserted one
+		held_arc.release();
+		assert_eq!(held_arc.active.load(Ordering::Relaxed), 0, "active on held Arc must be 0 after release");
+
+		// A new check should get a fresh entry with active=0, not a poisoned one
+		let d2 = state.check_at(peer, &no_peek(), now);
+		assert!(matches!(d2, Decision::Allow(_)), "fresh entry after evict must allow");
+		if let Decision::Allow(s2) = d2 {
+			assert_eq!(s2.active.load(Ordering::Relaxed), 1, "fresh entry active must be 1");
+			s2.release();
+		}
 	}
 
 	// ── Eviction tests ─────────────────────────────────────────────────────────
@@ -1005,9 +1243,9 @@ mod tests {
 		let peer = ip("6.0.0.3");
 
 		// Exhaust sustained bucket (2 connections)
-		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow));
+		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow(_)));
 		state.release(peer);
-		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow));
+		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow(_)));
 		state.release(peer);
 		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Block(BlockReason::RateLimited)));
 
@@ -1039,7 +1277,10 @@ mod tests {
 		let now = now_ns();
 
 		// Allow and do NOT release — active counter remains 1
-		state.check_at(peer, &no_peek(), now); // Allow
+		let held = match state.check_at(peer, &no_peek(), now) {
+			Decision::Allow(s) => s,
+			other => panic!("expected Allow, got {other:?}"),
+		};
 
 		assert_eq!(state.ip_table.len(), 1);
 		// Even with a long future time, the active=1 guard keeps it
@@ -1047,6 +1288,6 @@ mod tests {
 		assert_eq!(state.ip_table.len(), 1, "entry with active connections must not be evicted");
 
 		// Clean up
-		state.release(peer);
+		held.release();
 	}
 }

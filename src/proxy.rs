@@ -439,6 +439,9 @@ impl SymphonyProxyWrap {
 
 		// Spawn a periodic IP state eviction task per listener that has protection.
 		// Eviction bounds ip_table memory growth under diverse-IP traffic / attack.
+		// evict() is O(N) DashMap::retain with shard locks and per-entry float math —
+		// running it directly inside select! would stall the accept path under diverse-IP
+		// flood. spawn_blocking moves it off the tokio worker thread pool.
 		for ls in &self.listener_states {
 			if let Some(prot) = ls.protection.clone() {
 				let mut evict_rx = tx.subscribe();
@@ -447,7 +450,12 @@ impl SymphonyProxyWrap {
 					loop {
 						tokio::select! {
 							_ = evict_rx.recv() => break,
-							_ = tokio::time::sleep(interval) => prot.evict(),
+							_ = tokio::time::sleep(interval) => {
+								let prot_clone = prot.clone();
+								// Fire-and-forget: an in-flight eviction completing during
+								// shutdown is harmless (it just holds a DashMap shard lock briefly).
+								let _ = tokio::task::spawn_blocking(move || prot_clone.evict()).await;
+							}
 						}
 					}
 				});
@@ -773,7 +781,7 @@ fn parse_protection_config(
 		})
 		.collect::<Result<Vec<_>>>()?;
 
-	Ok(cfg)
+	Ok(cfg.precompute())
 }
 
 fn listener_tls_spec(l: &JsListenerConfig) -> ListenerTlsSpec {
