@@ -272,7 +272,7 @@ impl SymphonyProxyWrap {
 			.iter()
 			.map(parse_route_spec)
 			.collect::<Result<Vec<_>>>()?;
-		let table = build_route_table(&specs, &default_listener_tls)
+		let table = build_route_table(&specs, &default_listener_tls, None)
 			.map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
 		// Set up threadsafe event emitter
@@ -415,7 +415,11 @@ impl SymphonyProxyWrap {
 				.iter()
 				.map(parse_route_spec)
 				.collect::<Result<Vec<_>>>()?;
-			let table = build_route_table(&specs, &self.default_listener_tls)
+			// Pass the currently-live table so a route whose cert transiently fails to
+			// rebuild (mid-rotation KeyMismatch) retains its last-good cert instead of
+			// dropping the SNI from the live table.
+			let current = self.route_table.0.load();
+			let table = build_route_table(&specs, &self.default_listener_tls, Some(&current))
 				.map_err(|e| napi::Error::from_reason(e.to_string()))?;
 			self.route_table.swap(table);
 		}

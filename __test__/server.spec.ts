@@ -34,6 +34,42 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
 	throw new Error('waitFor: timed out');
 }
 
+interface RunningServer {
+	child: ChildProcess;
+	getStderr: () => string;
+	markShutdown: () => void;
+}
+
+function spawnServer(configPath: string): RunningServer {
+	let stderr = '';
+	let shuttingDown = false;
+	const child = spawn(process.execPath, [SERVER_JS, '--config', configPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+	child.stderr?.on('data', (d) => (stderr += d.toString()));
+	child.on('exit', (code, sig) => {
+		if (!shuttingDown) stderr += `\n[child exited early code=${code} sig=${sig}]`;
+	});
+	return { child, getStderr: () => stderr, markShutdown: () => (shuttingDown = true) };
+}
+
+async function killServer(server: RunningServer): Promise<void> {
+	server.markShutdown();
+	if (server.child.exitCode === null) {
+		server.child.kill('SIGTERM');
+		await waitFor(() => server.child.exitCode !== null, 3000).catch(() => server.child.kill('SIGKILL'));
+	}
+}
+
+// A round-trip that resolves true only when the server presents a cert that verifies
+// against `caCert` for `servername` — used to detect which cert is live after a rotation.
+async function servesCert(port: number, servername: string, caCert: string): Promise<boolean> {
+	try {
+		await tlsRoundTrip({ port, servername, caCert, data: Buffer.from('ping'), rejectUnauthorized: true });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 describe('symphony-server (standalone process)', () => {
 	const cert = generateSelfSignedCert('localhost');
 	let dir: string;
@@ -166,5 +202,237 @@ describe('symphony-server (standalone process)', () => {
 			150
 		);
 		assert.deepEqual(res, payload, `server did not reload routes. stderr:\n${stderr}`);
+	});
+});
+
+describe('symphony-server (cert-file hot reload)', () => {
+	// Two independent certs for the same host: rotating from A to B on disk (without
+	// touching config.json) must make the server serve B.
+	const certA = generateSelfSignedCert('localhost');
+	const certB = generateSelfSignedCert('localhost');
+	let dir: string;
+	let configPath: string;
+	let statusPath: string;
+	let certFile: string;
+	let keyFile: string;
+	let proxyPort: number;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	let server: RunningServer;
+
+	before(async () => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-certrot-'));
+		configPath = path.join(dir, 'config.json');
+		statusPath = path.join(dir, 'status.json');
+		certFile = path.join(dir, 'fullchain.pem'); // both cert and key referenced by path
+		keyFile = path.join(dir, 'privkey.pem');
+		fs.writeFileSync(certFile, certA.cert);
+		fs.writeFileSync(keyFile, certA.key);
+
+		echo = await startEchoServer();
+		proxyPort = await getFreePort();
+
+		writeConfigAtomic(configPath, {
+			version: 1,
+			proxies: [
+				{
+					listeners: [{ host: '127.0.0.1', port: proxyPort }],
+					routes: [
+						{
+							sni: 'localhost',
+							upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+							terminateTls: true,
+							cert: { certChainFile: certFile, privateKeyFile: keyFile },
+						},
+					],
+				},
+			],
+		});
+
+		server = spawnServer(configPath);
+		await waitFor(() => fs.existsSync(statusPath));
+	});
+
+	after(async () => {
+		await killServer(server);
+		await echo.close().catch(() => {});
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it('serves the initial cert loaded from certChainFile', async () => {
+		await waitFor(() => servesCert(proxyPort, 'localhost', certA.cert));
+	});
+
+	it('hot-reloads a rotated cert file without a config.json change', async () => {
+		// Overwrite the cert+key files in place (key first, then chain) — no config write. A
+		// running symphony watches the referenced files, so it should pick up cert B. If a
+		// reconcile happens mid-write, the transient key/cert mismatch is a logged per-route
+		// skip that self-heals on the next event (Fix #2), so the rotation still converges.
+		fs.writeFileSync(keyFile, certB.key);
+		fs.writeFileSync(certFile, certB.cert);
+
+		await waitFor(() => servesCert(proxyPort, 'localhost', certB.cert), 8000, 150);
+		// And the old cert is no longer trusted-verifiable (fully rotated, not both live).
+		assert.equal(
+			await servesCert(proxyPort, 'localhost', certA.cert),
+			false,
+			`old cert still served after rotation. stderr:\n${server.getStderr()}`
+		);
+	});
+});
+
+describe('symphony-server (per-route cert isolation)', () => {
+	// A healthy tenant and a broken one (mismatched cert/key → rustls KeyMismatch) share a
+	// listener. The broken route must be dropped without taking the healthy co-tenant down.
+	const good = generateSelfSignedCert('good.local');
+	const certX = generateSelfSignedCert('bad.local');
+	const certY = generateSelfSignedCert('bad.local');
+	let dir: string;
+	let configPath: string;
+	let statusPath: string;
+	let proxyPort: number;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	let server: RunningServer;
+
+	before(async () => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-isolation-'));
+		configPath = path.join(dir, 'config.json');
+		statusPath = path.join(dir, 'status.json');
+		const goodCert = path.join(dir, 'good.crt');
+		const goodKey = path.join(dir, 'good.key');
+		const badCert = path.join(dir, 'bad.crt');
+		const badKey = path.join(dir, 'bad.key');
+		fs.writeFileSync(goodCert, good.cert);
+		fs.writeFileSync(goodKey, good.key);
+		fs.writeFileSync(badCert, certX.cert); // chain from X…
+		fs.writeFileSync(badKey, certY.key); // …paired with an unrelated key → KeyMismatch
+
+		echo = await startEchoServer();
+		proxyPort = await getFreePort();
+
+		writeConfigAtomic(configPath, {
+			version: 1,
+			proxies: [
+				{
+					listeners: [{ host: '127.0.0.1', port: proxyPort }],
+					routes: [
+						{
+							sni: 'good.local',
+							upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+							terminateTls: true,
+							cert: { certChainFile: goodCert, privateKeyFile: goodKey },
+						},
+						{
+							sni: 'bad.local',
+							upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+							terminateTls: true,
+							cert: { certChainFile: badCert, privateKeyFile: badKey },
+						},
+					],
+				},
+			],
+		});
+
+		server = spawnServer(configPath);
+		await waitFor(() => fs.existsSync(statusPath));
+	});
+
+	after(async () => {
+		await killServer(server);
+		await echo.close().catch(() => {});
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it('serves the healthy co-tenant despite a broken route on the same port', async () => {
+		const payload = Buffer.from('healthy-tenant');
+		const res = await tlsRoundTrip({
+			port: proxyPort,
+			servername: 'good.local',
+			caCert: good.cert,
+			data: payload,
+			rejectUnauthorized: true,
+		});
+		assert.deepEqual(res, payload);
+	});
+
+	it('drops only the broken route and logs the skip', async () => {
+		// The bad SNI has no route (KeyMismatch skipped it), so the handshake never completes.
+		await assert.rejects(
+			tlsRoundTrip({
+				port: proxyPort,
+				servername: 'bad.local',
+				caCert: certX.cert,
+				data: Buffer.from('x'),
+				rejectUnauthorized: true,
+			})
+		);
+		assert.match(server.getStderr(), /skipping route 'bad\.local'/);
+	});
+});
+
+describe('symphony-server (listener default-cert hot reload)', () => {
+	// A route that relies on the listener-level defaultCert (no per-route cert). The
+	// listener default is frozen at construction, so a rotation must force a proxy recreate
+	// (not a route-only hot-swap) — the resolved-listener signature makes that happen.
+	const certA = generateSelfSignedCert('localhost');
+	const certB = generateSelfSignedCert('localhost');
+	let dir: string;
+	let configPath: string;
+	let statusPath: string;
+	let certFile: string;
+	let keyFile: string;
+	let proxyPort: number;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	let server: RunningServer;
+
+	before(async () => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-listenercert-'));
+		configPath = path.join(dir, 'config.json');
+		statusPath = path.join(dir, 'status.json');
+		certFile = path.join(dir, 'fullchain.pem');
+		keyFile = path.join(dir, 'privkey.pem');
+		fs.writeFileSync(certFile, certA.cert);
+		fs.writeFileSync(keyFile, certA.key);
+
+		echo = await startEchoServer();
+		proxyPort = await getFreePort();
+
+		writeConfigAtomic(configPath, {
+			version: 1,
+			proxies: [
+				{
+					listeners: [
+						{ host: '127.0.0.1', port: proxyPort, defaultCert: { certChainFile: certFile, privateKeyFile: keyFile } },
+					],
+					routes: [
+						{
+							sni: 'localhost',
+							upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+							terminateTls: true, // no per-route cert → uses the listener defaultCert
+						},
+					],
+				},
+			],
+		});
+
+		server = spawnServer(configPath);
+		await waitFor(() => fs.existsSync(statusPath));
+	});
+
+	after(async () => {
+		await killServer(server);
+		await echo.close().catch(() => {});
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it('hot-reloads a rotated listener defaultCert file without a config.json change', async () => {
+		await waitFor(() => servesCert(proxyPort, 'localhost', certA.cert));
+		fs.writeFileSync(keyFile, certB.key);
+		fs.writeFileSync(certFile, certB.cert);
+		await waitFor(() => servesCert(proxyPort, 'localhost', certB.cert), 8000, 150);
+		assert.equal(
+			await servesCert(proxyPort, 'localhost', certA.cert),
+			false,
+			`old listener cert still served after rotation. stderr:\n${server.getStderr()}`
+		);
 	});
 });

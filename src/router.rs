@@ -168,6 +168,17 @@ impl RouteTable {
 
 		self.default.as_ref()
 	}
+
+	/// Look up the route stored under the key a spec's SNI would insert to (the exact SNI,
+	/// or the suffix of a `*.` wildcard) — not the resolve()-style match. Used to carry a
+	/// last-good route forward across a hot-swap when the new cert transiently fails to build.
+	fn get_for_spec_sni(&self, sni: &str) -> Option<&Route> {
+		if let Some(suffix) = sni.strip_prefix("*.") {
+			self.wildcard.iter().find(|(s, _)| s.as_ref() == suffix).map(|(_, r)| r)
+		} else {
+			self.exact.get(sni)
+		}
+	}
 }
 
 // ── Builder / config types ────────────────────────────────────────────────────
@@ -230,9 +241,15 @@ impl ListenerTlsSpec {
 }
 
 /// Build a RouteTable from a list of route specs and a listener-level fallback.
+///
+/// `previous` is the currently-live table on a hot-swap (None on initial construction). When
+/// a route's cert fails to build, its last-good route is carried forward from `previous` if
+/// present, so a transient rotation mismatch keeps serving the old (still-valid) cert instead
+/// of dropping the SNI.
 pub fn build_route_table(
 	specs: &[RouteSpec],
 	listener_tls: &ListenerTlsSpec,
+	previous: Option<&RouteTable>,
 ) -> crate::error::Result<RouteTable> {
 	let mut cache = TlsConfigCache::new();
 	let mut exact: HashMap<Arc<str>, Route> = HashMap::new();
@@ -240,7 +257,32 @@ pub fn build_route_table(
 	let mut monitored_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
 
 	for spec in specs {
-		let route = build_route(spec, listener_tls, &mut cache)?;
+		// Isolate per-route failures: a single route whose cert can't be built (e.g. a
+		// rotated key no longer matching an inlined chain → rustls KeyMismatch) must not
+		// abort the whole table and take every other tenant on the port down with it.
+		let route = match build_route(spec, listener_tls, &mut cache) {
+			Ok(route) => route,
+			// On a hot-swap, a cert and key rotate as two non-atomic files, so a transient
+			// mismatch mid-rotation is normal. Keep serving the previous good route for this
+			// SNI (its cert is still valid) rather than dropping it; it heals on the next
+			// reconcile. The cert watcher's write event will trigger that reconcile.
+			Err(e) => match previous.and_then(|p| p.get_for_spec_sni(&spec.sni)) {
+				Some(prev) => {
+					eprintln!(
+						"symphony: route '{}' failed to rebuild ({}); retaining last-good route",
+						spec.sni, e
+					);
+					prev.clone()
+				}
+				// No prior route (initial build, or a newly-added route): drop this SNI. The
+				// missing route simply resolves to nothing — strictly better than a host-wide
+				// abort that would take down every other tenant on the listener.
+				None => {
+					eprintln!("symphony: skipping route '{}': {}", spec.sni, e);
+					continue;
+				}
+			},
+		};
 
 		// Collect UdsBalancers that have pid/tid slots for the monitor task.
 		if let Destination::UdsSet(ref bal) = route.destination {
@@ -387,5 +429,162 @@ impl LiveRouteTable {
 
 	pub fn swap(&self, table: RouteTable) {
 		self.0.store(Arc::new(table));
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// A self-signed cert (CERT_A) and its matching key (KEY_A), plus an unrelated key
+	// (KEY_B). Pairing CERT_A with KEY_B reproduces the production rustls KeyMismatch a
+	// cert rotation causes (leaf pubkey ≠ private key).
+	const CERT_A: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIIDNDCCAhygAwIBAgIUM+1LAIojftQSkEIBoBR0AV87XfowDQYJKoZIhvcNAQEL
+BQAwGzEZMBcGA1UEAwwQZ29vZC5leGFtcGxlLmNvbTAeFw0yNjA3MDYxNTQ4MzBa
+Fw0zNjA3MDMxNTQ4MzBaMBsxGTAXBgNVBAMMEGdvb2QuZXhhbXBsZS5jb20wggEi
+MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCua7KJUHPYvO/PaqLDMrHGlEdd
+pxkFGMifO87nj9QRnIpHcz+nWrdvH57QpBRdojBC/j9L2/ybaRVGM52OO5fJm1DH
+4veD9axofkOGWBp1yPqDlxe0g/wlreWtAAMRVqGODw/OOvcDwnokWlLWfJ9lRKma
+GQ8Pmd9iza19gnuLTc7OggqXK3wgqNA3A/OrciTIBp+Dcf8GdUIHiXmyMC0UaA14
+2YzfVSnMd8Umhn41rHhMXk9Wedlp9FBeZHKLOW8i/vUOBdz0tm8sCK1xEqZIfIZg
+EMUdu/VeJ0rvsQ6RFgooU3rmxVmvsMaJwHHQYuOOO1y+h6tTakwQ+6FIMbY7AgMB
+AAGjcDBuMB0GA1UdDgQWBBQoUwNGmTQXq7HjxnbQQyojQYLFijAfBgNVHSMEGDAW
+gBQoUwNGmTQXq7HjxnbQQyojQYLFijAPBgNVHRMBAf8EBTADAQH/MBsGA1UdEQQU
+MBKCEGdvb2QuZXhhbXBsZS5jb20wDQYJKoZIhvcNAQELBQADggEBAKsI0WUT7Cx1
+D81qwxrSGKONVsyPDalenIMRKQlx3SS4hhijMnwDCR23DLEXQVRAadwzHURx6qkx
+nJW+C4Ete3KcEM8Y3pWUFV9OZCPoCh9LKj/wQdCkldSkT3vHKbovgefgxbEn0aSD
++FYsvd8jhGfyEs1JoU/58/rf2D/l6srNyn20ODTQ5AAMwh1IG8XjfhwpGm9gHwh2
+DFtLpgH9/vMh9LPjXRc3Mdc4Idqoi6pSlswPXxshjhQncVXy1/RhEzfEtrM7BuzZ
+ZlgCEToIkYUjQVGSygmQqFBbRC5EJAPb+Wpx8N5Y2+g/Q2qy2aPKXhIcOwFSrtbB
+43vjnvisyZ0=
+-----END CERTIFICATE-----
+";
+
+	const KEY_A: &[u8] = b"-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCua7KJUHPYvO/P
+aqLDMrHGlEddpxkFGMifO87nj9QRnIpHcz+nWrdvH57QpBRdojBC/j9L2/ybaRVG
+M52OO5fJm1DH4veD9axofkOGWBp1yPqDlxe0g/wlreWtAAMRVqGODw/OOvcDwnok
+WlLWfJ9lRKmaGQ8Pmd9iza19gnuLTc7OggqXK3wgqNA3A/OrciTIBp+Dcf8GdUIH
+iXmyMC0UaA142YzfVSnMd8Umhn41rHhMXk9Wedlp9FBeZHKLOW8i/vUOBdz0tm8s
+CK1xEqZIfIZgEMUdu/VeJ0rvsQ6RFgooU3rmxVmvsMaJwHHQYuOOO1y+h6tTakwQ
++6FIMbY7AgMBAAECggEAB3Mq1Hn2AaYEt7uamwFV3eEoIr7oC3NaUskIaFtfxgoh
+wPygatZKUln59LD53+9Kgmyw9zKgWZtspGuHvrMpI43goGrNrTNXqYPNxzXCJx/D
+d+q7pM2kKKy7kzQy0Oaosk0yKxL15co2YR9XaABWA3UwVG2lzHrmz9CM8CON1xy/
+IHisFG0ydUcM/RJf8xyU4YO74ko/XSRnLaXpjzro+uMJI6Wkhz7ny6Z5SP9xbjwS
+ZzzczOxjZlP11mpkEfapp1ircWLPp/IXcFXYTjrHgWXjO6W/LCYAJCZgf+eFuUrC
+OeZ4QbRodt9D+j4IHBWReuD6Ey0i46OKPrvLKCBRQQKBgQDxscnPQSEIhLVfglUB
+byILifk8nr1n8SWrInJ2yZKwoEOowuFgzIhQ1wSNvJI3X0K+2jtNTeuCQxzLFe11
+I0+NTUmpBde3WGcvXAs3KW4aKlLqM6QniP7P60/WeYMGbWqPz06MiyVHFbY/s2Z5
+/WOFt78H6hN1JcIl5S5rTdFLIQKBgQC4vo+ONGatoP7OmPW9ZEU0wuDxoWnsm538
+qxbxCrHZ2183W7wFImjIbQl9zOwOttsmeKgPUFcdA1CMx0UvL3hkbiR+awI0W16u
+E7tFo8zfTe0xVjsS+hMJJSO/2t5eZbydHHGNzArvuMMo9Ya3w+1J0b/O7WGZjv7o
+rcjfKkFR2wKBgHxlmEwu5lSfEUb2KtBRJcGwovI7dZsA9/VMBoPzHagA5LIAk8Wh
+n+uTr4lP7CXJxu26Htmb6EIkTraMM6qdoP1GMUpocm2wd3NduXwLu9qFvCVErRGY
+JiZXo8Dsy65MNJOODIyztV0P5LyGlpDlBQs21oC5Toh2BaZBfhHGfJlhAoGAAigP
+Suynqi0v7D9y1uQdvrDrqUZmEyH55SImIWgrjUx3PxEuD61IJdbH/pTuyHkv87IC
+3DLm4WrRfOMylotqT1nNyT/8hZnvb/7A994inRSuyR2lkOIkaL3rPekTIWz0l6zm
+Um5oTkYM2SSMjwaVdYAiSgsRUZaOuS6WIqy+mHMCgYAPnBR1Siot76IC1LvMtCKY
+jNlP4EkR2mcBb/5QVbGHWO3N+8k5I6HUPRXtzKYOYWHimi6O2oQvo2VXYQiyVBvt
+VoFdScNyywMI3pOWGUD+OixcgPt/EF9+XG77/jfrDAgHV8rGlin6OAysdi9NHynA
+UKlOCXtHXb1XskMBV7W29w==
+-----END PRIVATE KEY-----
+";
+
+	const KEY_B: &[u8] = b"-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCWxNE5Z315MdlX
+Za+MKSJrdcJlm5zHfsBZ642On9Cc+oMe+U5+91RMUhiNt524CNvQyDMTntiD9wn7
+zUaeQGZjP+wtUDcIG1S1EIXhoAWLWd+Jww/3WAYNxnauIW3QawlqH/aiJVxTgWB2
+K0WjqkLM8T1A23uBSoJUl87f0wnLVctxyqF+dZ7QwqYvNcywnmeRnoNb//eKEttF
+qhaxkxgdG72tpO65bAF2IGaQ3Sk0npmqD1TP5ZF1jGVr+uW+4TwAxazN7E+Cvyz3
+IXdkTz/yj81vUZXQxK22Z3lgpXosBrFcrEYiy0/YIIdaOrPC3z9WEiXxI2eIxwWt
+Nd7Kp4TFAgMBAAECggEAAeXeYGOeH71x5/i+ufv2k/W6ib7ovVYqI7ekY4w9ewxo
+RCaNR2njpMZPytDp6lwqMDmk8vVH8nlUpdfSsMFMyKkQVw2wc6isa08W8F0sVLG/
+76MF+24fPWMnMU/4auw+BRj76NShkeeKCFLJIKNPDfdndv6MUndWpqv2jbjBYc7g
+ug3IyQPIRhgbqYi79ErVnSAvOIxoimhDu7+xX6tQkZYFDTBXNA9G4K+KTblHxRSC
+Dg+7yRQVzUm784r204aTuGuZSNYe6mNlzvINe5sJWTDf2HE7JY+wHBnKN9rgC3zt
+orEOZCfJcfoBhRbVsjmYHsX7L4Yvp/5A2LWwvW0LoQKBgQDOFm4jsl28QnCt+w88
+X9hWGmEsdfdhy+rP300ciLy/L/2xGHMPbBiQQCuMBAatAvJVkET6ftfoMoXKxERv
+wGPnc4gWtfySEdeZkPjg754HqtWQPFr0eKP3yivHges+Z8mwk6fIauE3CBJBAA5X
+62zGh/PNY74Nlee+Edu9FgbXrQKBgQC7SJWjGI/h+UGZXK1k3WgTVwfcGfgceLV/
+wmQTffT+WTsFEiAQNKm51VKRjAk4vxW6JkSo4bHZPjR0ZuK4Pze+/IpSn2nEHBg7
+eg+hbCcmNkgJR7reidPbiPejtM6+mgugZiBkhKi/NWKF71GpZhiv7M6cWhSd2XSV
+0I6+X1xkeQKBgQDJl0FXo8NzQx6L4Vju+uZYm2dQoXhCbsEbY9g/QDY5Yo1rbXon
+rNp+SHcQeGO7W3WHYx9GVUuHs9wSE1jKY8yV+/o0FQKiM9fNPPVmup2/7EkJ1TA3
+kcb6vQWEG77shYPSOS1Xq8zwEvIgKRjewcjejuBameWvzmIpF7j1xpUc5QKBgQCI
+3Nllj+yN8g5rWdvpCxgkkgRPZ7b2b4wLqm5iBDlGqsTDxuQhk6q5AFjPvmt6ycHC
+AHdKh2zl2lyQ+CMVDDXb30fia1bqlrFqvZ+wko3lkeOAzKeWO1jUZTq7qsUvavm2
+JQvlCUEcQpIWWLbvuYmu/rpabkYEuMZHOVsnah7l2QKBgQCedSuSWUxLxmQQu2Ri
+lfpts6F0SwVIO43UeE+bBVJArbHFZKXOb3HJ8CV9sgpfhYZPU+NqCnfvaZRyI2us
+SSDk4Ki3CTdueA7HBr+zCHwXsxEYL1cElQvhbSiOeXEiJ4vbk0yfY0VC0WEn1yoc
+UlqL1DcgX6Szi9w/p7B4BZO9iA==
+-----END PRIVATE KEY-----
+";
+
+	fn tls_route(sni: &str, cert: &[u8], key: &[u8]) -> RouteSpec {
+		RouteSpec {
+			sni: sni.to_string(),
+			upstreams: Vec::new(),
+			terminate_tls: true,
+			cert_pem: Some(cert.to_vec()),
+			key_pem: Some(key.to_vec()),
+			mtls_ca_pem: None,
+			require_client_cert: false,
+			suspended: false,
+			suspend_timeout_ms: 100,
+			max_cps: None,
+			burst: None,
+			source_address_mode: SourceAddressMode::None,
+			http2: false,
+		}
+	}
+
+	// A single route with a mismatched cert/key must not abort the whole table: the
+	// healthy co-tenant on the same listener stays routable, the bad one is dropped.
+	#[test]
+	fn bad_route_is_skipped_not_fatal() {
+		let specs = vec![
+			tls_route("good.example.com", CERT_A, KEY_A),
+			tls_route("bad.example.com", CERT_A, KEY_B), // KeyMismatch
+		];
+
+		let table = build_route_table(&specs, &ListenerTlsSpec::empty(), None)
+			.expect("a single bad route must not fail the whole build");
+
+		assert!(
+			table.resolve(Some("good.example.com")).is_some(),
+			"the valid route must remain present"
+		);
+		assert!(
+			table.resolve(Some("bad.example.com")).is_none(),
+			"the unbuildable route must be absent (no default fallback)"
+		);
+	}
+
+	// On a hot-swap, a route whose cert transiently fails to rebuild (the normal cert+key
+	// non-atomic write window) must retain its last-good route from the live table rather
+	// than dropping the SNI.
+	#[test]
+	fn transient_failure_retains_last_good_on_hot_swap() {
+		// First build with a valid cert → the live table.
+		let good = vec![tls_route("tenant.example.com", CERT_A, KEY_A)];
+		let live = build_route_table(&good, &ListenerTlsSpec::empty(), None).expect("initial build");
+		assert!(live.resolve(Some("tenant.example.com")).is_some());
+
+		// Hot-swap where the same SNI now presents a mismatched pair (mid-rotation).
+		let mismatched = vec![tls_route("tenant.example.com", CERT_A, KEY_B)];
+		let swapped = build_route_table(&mismatched, &ListenerTlsSpec::empty(), Some(&live))
+			.expect("hot-swap must not fail");
+		assert!(
+			swapped.resolve(Some("tenant.example.com")).is_some(),
+			"the SNI must keep its last-good route across a transient rebuild failure"
+		);
+
+		// With no previous table (initial build), the same bad route is dropped.
+		let fresh = build_route_table(&mismatched, &ListenerTlsSpec::empty(), None).expect("build");
+		assert!(
+			fresh.resolve(Some("tenant.example.com")).is_none(),
+			"with no prior route there is nothing to retain — the SNI is dropped"
+		);
 	}
 }
