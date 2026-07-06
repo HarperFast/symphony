@@ -2,7 +2,7 @@ use crate::balancer::{UdsBalancer, UdsSlotSpec};
 use crate::tls::{CertSpec, MtlsSpec, TlsConfigCache};
 use arc_swap::ArcSwap;
 use rustls::ServerConfig;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -137,6 +137,9 @@ pub struct RouteTable {
 	/// All UdsBalancers that have at least one pid/tid-configured slot.
 	/// Used by the CPU monitor task spawned in `proxy.rs::start()`.
 	pub monitored_balancers: Vec<Arc<UdsBalancer>>,
+	/// SNIs whose cert failed to build in this table. Carried across a hot-swap so a
+	/// persistently-broken route is logged only on the good→bad transition, not every reconcile.
+	failing_snis: HashSet<Arc<str>>,
 }
 
 impl RouteTable {
@@ -255,6 +258,7 @@ pub fn build_route_table(
 	let mut exact: HashMap<Arc<str>, Route> = HashMap::new();
 	let mut wildcard: Vec<(Arc<str>, Route)> = Vec::new();
 	let mut monitored_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
+	let mut failing_snis: HashSet<Arc<str>> = HashSet::new();
 
 	for spec in specs {
 		// Isolate per-route failures: a single route whose cert can't be built (e.g. a
@@ -262,26 +266,40 @@ pub fn build_route_table(
 		// abort the whole table and take every other tenant on the port down with it.
 		let route = match build_route(spec, listener_tls, &mut cache) {
 			Ok(route) => route,
-			// On a hot-swap, a cert and key rotate as two non-atomic files, so a transient
-			// mismatch mid-rotation is normal. Keep serving the previous good route for this
-			// SNI (its cert is still valid) rather than dropping it; it heals on the next
-			// reconcile. The cert watcher's write event will trigger that reconcile.
-			Err(e) => match previous.and_then(|p| p.get_for_spec_sni(&spec.sni)) {
-				Some(prev) => {
-					eprintln!(
-						"symphony: route '{}' failed to rebuild ({}); retaining last-good route",
-						spec.sni, e
-					);
-					prev.clone()
+			Err(e) => {
+				// Log only on the good→bad transition: a persistently-broken cert would
+				// otherwise re-log on every reconcile, since each cert-file event rebuilds
+				// the whole table.
+				let newly_failing = previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
+				failing_snis.insert(Arc::from(spec.sni.as_str()));
+
+				match previous.and_then(|p| p.get_for_spec_sni(&spec.sni)) {
+					// On a hot-swap, a cert and key rotate as two non-atomic files, so a
+					// transient mismatch mid-rotation is normal. Carry the previous route
+					// forward *whole* (cert and upstreams) — intentional: its cert is still
+					// valid, and the route heals on the next reconcile when the pair is
+					// consistent. If the route's upstreams also changed in the same reconcile,
+					// they too persist until then; that's the accepted cost of last-good.
+					Some(prev) => {
+						if newly_failing {
+							eprintln!(
+								"symphony: route '{}' failed to rebuild ({}); retaining last-good route",
+								spec.sni, e
+							);
+						}
+						prev.clone()
+					}
+					// No prior route (initial build, or a newly-added route): drop this SNI. The
+					// missing route simply resolves to nothing — strictly better than a host-wide
+					// abort that would take down every other tenant on the listener.
+					None => {
+						if newly_failing {
+							eprintln!("symphony: skipping route '{}': {}", spec.sni, e);
+						}
+						continue;
+					}
 				}
-				// No prior route (initial build, or a newly-added route): drop this SNI. The
-				// missing route simply resolves to nothing — strictly better than a host-wide
-				// abort that would take down every other tenant on the listener.
-				None => {
-					eprintln!("symphony: skipping route '{}': {}", spec.sni, e);
-					continue;
-				}
-			},
+			}
 		};
 
 		// Collect UdsBalancers that have pid/tid slots for the monitor task.
@@ -300,7 +318,7 @@ pub fn build_route_table(
 		}
 	}
 
-	Ok(RouteTable { exact, wildcard, default: None, monitored_balancers })
+	Ok(RouteTable { exact, wildcard, default: None, monitored_balancers, failing_snis })
 }
 
 fn build_route(
@@ -578,6 +596,10 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		assert!(
 			swapped.resolve(Some("tenant.example.com")).is_some(),
 			"the SNI must keep its last-good route across a transient rebuild failure"
+		);
+		assert!(
+			swapped.failing_snis.contains("tenant.example.com"),
+			"the transiently-failing SNI must be tracked so it isn't re-logged every reconcile"
 		);
 
 		// With no previous table (initial build), the same bad route is dropped.
