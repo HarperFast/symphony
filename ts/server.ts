@@ -283,12 +283,21 @@ class ServerState {
 				// default_listener_tls), so updateConfig can't hot-swap it. Keying off resolved
 				// content means a listener-cert rotation on disk (same paths, new bytes) changes
 				// the signature and forces a recreate, which route-only hot-swap would miss.
-				// Protection is excluded: it is fully hot-swappable and must not force a recreate.
+				//
+				// Protection PRESENCE (hasProtection) is part of the signature: none→some and
+				// some→none transitions force a seamless recreate so the new listener is
+				// constructed with the correct Option<ProtectionState>. Protection CONTENTS are
+				// excluded so a contents-only change stays on the hot-swap path without recreating.
 				const listenerSig = JSON.stringify(
-					proxyConfig.listeners.map(({ protection: _p, ...rest }) => rest),
+					proxyConfig.listeners.map(({ protection, ...rest }) => ({
+						...rest,
+						hasProtection: protection != null,
+					})),
 				);
 				if (existing && existing.listenerSig === listenerSig) {
-					// Same listeners → hot-swap routes and protection.
+					// Same listeners (presence-unchanged) → hot-swap routes and protection contents.
+					// All listeners here either had protection from the start (Some) or never did
+					// (None, excluded by filter). none→some / some→none went through the recreate path.
 					existing.proxy.updateConfig({
 						routes: proxyConfig.routes,
 						protection: proxyConfig.listeners

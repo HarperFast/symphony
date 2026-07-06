@@ -439,7 +439,7 @@ proxy.updateConfig({
 
 The entire `ProtectionConfig` is replaced atomically (one pointer swap). Any field not included in the new config reverts to its default. Existing per-IP rate-limit token buckets are preserved across a swap; if burst decreases, tokens are capped at the new ceiling on the next refill — no underflow.
 
-**Caveat:** a listener started with no `protection` field cannot gain protection at runtime; only listeners configured with `protection` at start can be hot-updated.
+**Transitions (none→some, some→none):** when using `symphony-server`, adding or removing a `protection` block in the config file triggers a seamless proxy recreate via SO_REUSEPORT — no bind gap, existing connections unaffected. Only contents-only changes (same presence, different CIDR/rate/etc.) stay on the pure hot-swap path. When calling `updateConfig()` directly, a listener that was started without protection cannot gain it and returns an error; restart the listener to change protection presence.
 
 ---
 
@@ -474,7 +474,7 @@ proxy.updateConfig({
 
 **What can be hot-swapped:** routes (destinations, TLS certs, suspension state) and per-listener protection (CIDR allowlist/blocklist, JA3 blocklist, rate limits, concurrency caps, handshake timeout, requireSni).
 
-**What requires a restart:** bind address, port, idle timeout, worker threads. Protection can only be hot-updated on listeners that had `protection` configured at start.
+**What requires a restart:** bind address, port, idle timeout, worker threads. When calling `updateConfig()` directly, protection presence (None↔Some) cannot change at runtime — the listener must be restarted. The `symphony-server` bin handles this automatically via seamless recreate.
 
 ---
 
