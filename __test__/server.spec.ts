@@ -168,3 +168,66 @@ describe('symphony-server (standalone process)', () => {
 		assert.deepEqual(res, payload, `server did not reload routes. stderr:\n${stderr}`);
 	});
 });
+
+describe('symphony-server – status file ownership on shutdown', () => {
+	const cert = generateSelfSignedCert('localhost');
+	let dir: string;
+	let configPath: string;
+	let statusPath: string;
+	let keyFile: string;
+
+	before(() => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-status-test-'));
+		configPath = path.join(dir, 'config.json');
+		statusPath = path.join(dir, 'status.json');
+		keyFile = path.join(dir, 'privkey.pem');
+		fs.writeFileSync(keyFile, cert.key);
+	});
+
+	after(() => {
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	// Boots a fresh server on its own port and resolves once it has written status.json.
+	async function bootServer(): Promise<ChildProcess> {
+		const port = await getFreePort();
+		writeConfigAtomic(configPath, {
+			version: 1,
+			proxies: [
+				{
+					listeners: [{ host: '127.0.0.1', port }],
+					routes: [
+						{
+							sni: 'localhost',
+							upstreams: [{ kind: 'tcp', host: '127.0.0.1', port }],
+							terminateTls: true,
+							cert: { certChain: cert.cert, privateKeyFile: keyFile },
+						},
+					],
+				},
+			],
+		});
+		const child = spawn(process.execPath, [SERVER_JS, '--config', configPath], { stdio: 'ignore' });
+		await waitFor(() => fs.existsSync(statusPath));
+		return child;
+	}
+
+	it('removes its own status file on graceful shutdown', async () => {
+		const child = await bootServer();
+		child.kill('SIGTERM');
+		await waitFor(() => child.exitCode !== null, 3000);
+		assert.ok(!fs.existsSync(statusPath), 'a process must clean up the status file it owns');
+	});
+
+	it('leaves a status file owned by another pid intact', async () => {
+		// Simulate an overlapping upgrade: the incoming process has already rewritten status.json
+		// with its own pid before this outgoing one stops. The outgoing process must not delete it.
+		const child = await bootServer();
+		const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+		fs.writeFileSync(statusPath, JSON.stringify({ ...status, pid: (child.pid ?? 0) + 100000 }));
+
+		child.kill('SIGTERM');
+		await waitFor(() => child.exitCode !== null, 3000);
+		assert.ok(fs.existsSync(statusPath), 'a status file owned by another pid must survive shutdown');
+	});
+});

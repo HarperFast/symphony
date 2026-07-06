@@ -255,8 +255,17 @@ class ServerState {
 			await entry.proxy.stop().catch((err) => logErr(`stopping proxy [${key}]:`, err));
 		}
 		this.active.clear();
+		// Only remove the status file if it still describes *this* process. During an overlapping
+		// upgrade handoff the incoming process has already rewritten status.json with its own pid;
+		// deleting it then would strand a healthy new process with no status file, so its supervisor
+		// sees "not running" and spawns a redundant third instance. If the file is already gone or
+		// unreadable there is nothing to clean up. (A read→unlink race with the incoming process
+		// remains theoretically possible but is now a two-syscall window, versus the previous
+		// unconditional delete; the handoff writes the new status before the old process is signalled
+		// to stop, so by the time this runs the read already sees the new owner's pid.)
 		try {
-			unlinkSync(this.statusPath);
+			const owner = JSON.parse(readFileSync(this.statusPath, 'utf8')) as { pid?: number };
+			if (owner.pid === process.pid) unlinkSync(this.statusPath);
 		} catch {
 			// best effort
 		}
