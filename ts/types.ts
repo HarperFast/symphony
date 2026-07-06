@@ -205,12 +205,14 @@ export interface ListenerProtectionHotConfig {
  * Fields that can be updated live without restarting listeners.
  *
  * Hot-swappable: routes (destinations, TLS certs, suspension state) and
- * per-listener protection (CIDR lists, JA3 blocklist, rate limits, concurrency
+ * per-listener protection contents (CIDR lists, JA3 blocklist, rate limits, concurrency
  * caps, handshake timeout, requireSni).
  *
  * Requires restart: bind address, port, idle timeout, worker threads.
- * Protection can only be hot-swapped on listeners that had protection configured at start;
- * listeners started without protection are silently skipped.
+ * Protection presence (None↔Some) cannot change via updateConfig() — a listener must be
+ * restarted to gain or lose protection. updateConfig() returns an error for ports that have
+ * no protection or that match no listener. symphony-server handles none→some/some→none
+ * transitions automatically via seamless recreate.
  */
 export interface HotConfig {
 	routes?: RouteConfig[];

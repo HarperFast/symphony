@@ -126,8 +126,8 @@ pub struct JsListenerProtectionHotConfig {
 #[napi(object)]
 pub struct JsHotConfig {
 	pub routes: Option<Vec<JsRouteConfig>>,
-	/// Per-listener protection updates. Only applies to listeners that had protection
-	/// configured at start; listeners constructed without protection are skipped.
+	/// Per-listener protection updates. Each entry must reference a listener that was
+	/// started WITH protection; a mismatched port or a port without protection is an error.
 	pub protection: Option<Vec<JsListenerProtectionHotConfig>>,
 }
 
@@ -448,18 +448,44 @@ impl SymphonyProxyWrap {
 			self.route_table.swap(table);
 		}
 		if let Some(protection_updates) = hot.protection {
-			for update in protection_updates {
-				let cfg = parse_protection_config(&update.protection)?;
-				// Find the listener with matching port and swap its protection config.
-				// Listeners started without protection cannot gain it at runtime — skip silently.
-				if let Some(prot) = self
+			// Phase 1: validate all updates before any store (atomicity + early error).
+			// Collect all offending ports so the caller gets one actionable error.
+			let mut errors: Vec<String> = Vec::new();
+			for update in &protection_updates {
+				let matches: Vec<_> =
+					self.listener_states.iter().filter(|s| s.port == update.port).collect();
+				match matches.as_slice() {
+					[] => errors.push(format!("port {} matches no listener", update.port)),
+					[single] if single.protection.is_none() => errors.push(format!(
+						"port {} was started without protection; recreate to enable",
+						update.port
+					)),
+					[_single] => {} // valid — exactly one protection-enabled listener
+					_multiple => errors.push(format!(
+						"port {} matches multiple listeners; use per-listener restart-configure",
+						update.port
+					)),
+				}
+			}
+			if !errors.is_empty() {
+				return Err(napi::Error::from_reason(errors.join("; ")));
+			}
+
+			// Phase 2: parse all configs (fallible) — all-or-nothing before any store.
+			let parsed = protection_updates
+				.iter()
+				.map(|u| parse_protection_config(&u.protection))
+				.collect::<Result<Vec<_>>>()?;
+
+			// Phase 3: store all (infallible — validation above guarantees each port is valid).
+			for (update, cfg) in protection_updates.iter().zip(parsed) {
+				let prot = self
 					.listener_states
 					.iter()
 					.find(|s| s.port == update.port)
 					.and_then(|s| s.protection.as_ref())
-				{
-					prot.config.store(Arc::new(cfg));
-				}
+					.expect("validated above");
+				prot.config.store(Arc::new(cfg));
 			}
 		}
 		Ok(())
@@ -476,37 +502,33 @@ impl SymphonyProxyWrap {
 
 	#[napi]
 	pub fn blocked_ips(&self) -> JsBlockedIpsInfo {
-		let mut rate_limited: Vec<String> = Vec::new();
-		let mut concurrency_limited: Vec<String> = Vec::new();
-		let mut cidr_blocklist: Vec<String> = Vec::new();
+		use std::collections::HashSet as HSet;
+		let mut rate_limited_set: HSet<String> = HSet::new();
+		let mut concurrency_limited_set: HSet<String> = HSet::new();
+		let mut cidr_blocklist_set: HSet<String> = HSet::new();
 
 		for state in &self.listener_states {
 			if let Some(prot) = &state.protection {
 				let cfg = prot.config.load();
-				// Blocklist is now live-readable from the hot-swappable config snapshot
+				// Blocklist is live-readable from the hot-swappable config snapshot.
 				for net in &cfg.blocklist {
-					let s = net.to_string();
-					if !cidr_blocklist.contains(&s) {
-						cidr_blocklist.push(s);
-					}
+					cidr_blocklist_set.insert(net.to_string());
 				}
 				let (rl, cl) = prot.blocked_ips();
 				for ip in rl {
-					let s = ip.to_string();
-					if !rate_limited.contains(&s) {
-						rate_limited.push(s);
-					}
+					rate_limited_set.insert(ip.to_string());
 				}
 				for ip in cl {
-					let s = ip.to_string();
-					if !concurrency_limited.contains(&s) {
-						concurrency_limited.push(s);
-					}
+					concurrency_limited_set.insert(ip.to_string());
 				}
 			}
 		}
 
-		JsBlockedIpsInfo { rate_limited, concurrency_limited, cidr_blocklist }
+		JsBlockedIpsInfo {
+			rate_limited: rate_limited_set.into_iter().collect(),
+			concurrency_limited: concurrency_limited_set.into_iter().collect(),
+			cidr_blocklist: cidr_blocklist_set.into_iter().collect(),
+		}
 	}
 
 	#[napi]

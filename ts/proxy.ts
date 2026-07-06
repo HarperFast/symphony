@@ -217,7 +217,7 @@ export class SymphonyProxy extends EventEmitter {
 	/**
 	 * Atomically update routes and/or per-listener protection config.
 	 * In-flight connections are unaffected.
-	 * Protection updates only apply to listeners that had protection configured at start.
+	 * Throws if any protection entry references a port that has no protection or matches no listener.
 	 */
 	updateConfig(config: HotConfig): void {
 		this._inner.updateConfig({

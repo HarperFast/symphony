@@ -260,7 +260,6 @@ impl ProtectionState {
 	/// Returns (rate_limited_ips, concurrency_limited_ips) for the `blockedIps()` API.
 	pub fn blocked_ips(&self) -> (Vec<IpAddr>, Vec<IpAddr>) {
 		let cfg = self.config.load();
-		let burst_fp = cfg.burst_fp();
 		let max_concurrent = cfg.max_concurrent_per_ip;
 		let mut rate_limited = Vec::new();
 		let mut concurrency_limited = Vec::new();
@@ -274,8 +273,8 @@ impl ProtectionState {
 			}
 			if max_concurrent > 0 {
 				let active = state.active.load(Ordering::Relaxed);
-				// Track IPs that are AT the limit (>= max) — they'd be blocked
-				if active >= max_concurrent && burst_fp > 0 {
+				// Track IPs that are AT the limit (>= max) — they'd be blocked on next connect.
+				if active >= max_concurrent {
 					concurrency_limited.push(ip);
 				}
 			}
@@ -478,6 +477,27 @@ mod tests {
 
 		// Consume step: tokens ≈ 50000 fp → 50000 - 1000 = 49000 fp; no underflow
 		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+		state.release(peer);
+	}
+
+	#[test]
+	fn blocked_ips_reports_concurrency_limited_without_rate_limit() {
+		// Concurrency cap with NO rate limit — burst_fp is 0, but concurrency-limited IPs
+		// must still appear in blocked_ips(). The old `&& burst_fp > 0` guard was wrong.
+		let state = ProtectionState::new(ProtectionConfig {
+			max_concurrent_per_ip: 1,
+			..Default::default()
+		});
+		let peer = ip("5.0.0.1");
+
+		// First connection: allowed and active counter incremented (not released yet).
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+
+		// IP is now at the concurrency limit; blocked_ips() must report it.
+		let (rl, cl) = state.blocked_ips();
+		assert!(rl.is_empty(), "no rate limit configured — rateLimited must be empty");
+		assert!(cl.contains(&peer), "IP at concurrency limit must appear in concurrencyLimited");
+
 		state.release(peer);
 	}
 }
