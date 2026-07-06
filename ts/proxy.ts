@@ -113,6 +113,10 @@ function toJsProtectionConfig(p: ProtectionConfig) {
 		rateLimit: p.rateLimit
 			? { connectionsPerSecond: p.rateLimit.connectionsPerSecond, burst: p.rateLimit.burst }
 			: undefined,
+		sustained: p.sustained
+			? { connectionsPerMinute: p.sustained.connectionsPerMinute, burst: p.sustained.burst }
+			: undefined,
+		penaltyBox: p.penaltyBox ? { durationMs: p.penaltyBox.durationMs } : undefined,
 		maxConcurrentPerIp: p.maxConcurrentPerIp,
 		allowlist: p.allowlist,
 		blocklist: p.blocklist,

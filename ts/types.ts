@@ -133,8 +133,47 @@ export interface RateLimitConfig {
 	burst?: number;
 }
 
+/**
+ * Sustained (per-minute) token bucket — independent of the per-second `rateLimit` bucket.
+ * Both buckets are checked on admission; exhausting either one blocks the connection.
+ * Use this to limit total connection volume over longer windows while still allowing
+ * short bursts via `rateLimit`.
+ */
+export interface SustainedRateLimitConfig {
+	/** Maximum new connections per minute from a single IP. */
+	connectionsPerMinute: number;
+	/**
+	 * Token bucket burst size. Default: connectionsPerMinute.
+	 * Max: 4,294,967 connections (u32 fixed-point limit).
+	 */
+	burst?: number;
+}
+
+/**
+ * Penalty box: when an IP exhausts any rate limit, block it for a configurable duration.
+ * While penalized, all connections from that IP are rejected outright (no token consumed).
+ * If the IP continues to exceed its rate while boxed, the penalty is extended — reset to
+ * the full `durationMs` from the moment of continued excess. The penalty expires naturally
+ * once the IP stops attacking and the deadline passes.
+ */
+export interface PenaltyBoxConfig {
+	/** Duration in ms an IP is penalized after exhausting any rate limit. Default: 600000 (10 min). */
+	durationMs?: number;
+}
+
 export interface ProtectionConfig {
+	/** Per-second token bucket rate limit per source IP. */
 	rateLimit?: RateLimitConfig;
+	/**
+	 * Per-minute (sustained) token bucket — independent of rateLimit.
+	 * Checked in addition to rateLimit; exhausting either blocks the connection.
+	 */
+	sustained?: SustainedRateLimitConfig;
+	/**
+	 * Penalty box: block an IP for `durationMs` after any rate limit exhaustion.
+	 * Absent = disabled (current behavior: each blocked connection is independent).
+	 */
+	penaltyBox?: PenaltyBoxConfig;
 	/** Maximum simultaneous connections from a single IP. 0 = unlimited. */
 	maxConcurrentPerIp?: number;
 	/** CIDRs that bypass all protection checks (e.g. trusted internal ranges). */
@@ -235,12 +274,14 @@ export interface ProxyMetrics {
 }
 
 export interface BlockedIpsInfo {
-	/** IPs whose token buckets are currently depleted. */
+	/** IPs whose per-second or sustained token buckets are currently depleted. */
 	rateLimited: string[];
 	/** IPs currently at their maxConcurrentPerIp limit. */
 	concurrencyLimited: string[];
 	/** The configured static CIDR blocklist entries. */
 	cidrBlocklist: string[];
+	/** IPs currently in the penalty box (blocked for durationMs after rate-limit exhaustion). */
+	penaltyBoxed: string[];
 }
 
 // ── Suspended connection ──────────────────────────────────────────────────────
