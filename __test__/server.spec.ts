@@ -40,10 +40,12 @@ interface RunningServer {
 	markShutdown: () => void;
 }
 
-function spawnServer(configPath: string): RunningServer {
+function spawnServer(configPath: string, statusPath?: string): RunningServer {
 	let stderr = '';
 	let shuttingDown = false;
-	const child = spawn(process.execPath, [SERVER_JS, '--config', configPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+	const args = [SERVER_JS, '--config', configPath];
+	if (statusPath) args.push('--status', statusPath);
+	const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 	child.stderr?.on('data', (d) => (stderr += d.toString()));
 	child.on('exit', (code, sig) => {
 		if (!shuttingDown) stderr += `\n[child exited early code=${code} sig=${sig}]`;
@@ -522,5 +524,72 @@ describe('symphony-server (route cert-file read failure is isolated)', () => {
 			`co-tenant b.local was dropped when its cert file went missing. stderr:\n${server.getStderr()}`
 		);
 		assert.match(server.getStderr(), /route 'b\.local'/);
+	});
+});
+
+describe('symphony-server (status.json ownership guard)', () => {
+	// During a version upgrade the replacement starts first (SO_REUSEPORT overlap) and
+	// rewrites status.json with its own pid before the incumbent retires. stop() must only
+	// delete status.json if this process still owns it, or it clobbers the successor's file.
+	const cert = generateSelfSignedCert('localhost');
+	let dir: string;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+
+	before(async () => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-status-'));
+		echo = await startEchoServer();
+	});
+
+	after(async () => {
+		await echo.close().catch(() => {});
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	// Inline cert (no cert files) so overwriting the status file can't trip a cert watcher
+	// and cause a reconcile that rewrites status.json out from under the test.
+	async function boot(name: string): Promise<{ server: RunningServer; statusPath: string }> {
+		const configPath = path.join(dir, `${name}.json`);
+		const statusPath = path.join(dir, `${name}-status.json`);
+		const port = await getFreePort();
+		writeConfigAtomic(configPath, {
+			version: 1,
+			proxies: [
+				{
+					listeners: [{ host: '127.0.0.1', port }],
+					routes: [
+						{
+							sni: 'localhost',
+							upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+							terminateTls: true,
+							cert: { certChain: cert.cert, privateKey: cert.key },
+						},
+					],
+				},
+			],
+		});
+		const server = spawnServer(configPath, statusPath);
+		await waitFor(() => fs.existsSync(statusPath));
+		return { server, statusPath };
+	}
+
+	it('removes status.json on stop when this process owns it', async () => {
+		const { server, statusPath } = await boot('owned');
+		assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).pid, server.child.pid);
+		await killServer(server);
+		assert.equal(fs.existsSync(statusPath), false, 'owned status.json should be removed on stop');
+	});
+
+	it('leaves status.json alone on stop when another process owns it', async () => {
+		const { server, statusPath } = await boot('foreign');
+		// A successor process overwrites status.json with its own pid before this one retires.
+		const foreignPid = 2147483646;
+		writeConfigAtomic(statusPath, { pid: foreignPid, note: 'successor' });
+		await killServer(server);
+		assert.equal(fs.existsSync(statusPath), true, 'a status.json owned by another pid must survive stop');
+		assert.equal(
+			JSON.parse(fs.readFileSync(statusPath, 'utf8')).pid,
+			foreignPid,
+			'the successor-owned status.json must be left untouched'
+		);
 	});
 });

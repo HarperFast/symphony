@@ -374,10 +374,16 @@ class ServerState {
 			await entry.proxy.stop().catch((err) => logErr(`stopping proxy [${key}]:`, err));
 		}
 		this.active.clear();
+		// Only remove status.json if this process still owns it. During a version upgrade the
+		// replacement starts first (SO_REUSEPORT overlap) and rewrites status.json with its own
+		// pid before this incumbent is retired; an unconditional unlink here would delete the
+		// successor's file and make host-manager's health check read null → respawn a duplicate.
+		// Best-effort: a missing or garbage status file must not throw out of stop().
 		try {
-			unlinkSync(this.statusPath);
+			const current = JSON.parse(readFileSync(this.statusPath, 'utf8')) as { pid?: number };
+			if (current.pid === process.pid) unlinkSync(this.statusPath);
 		} catch {
-			// best effort
+			// status file missing, unreadable, or not ours — leave it alone
 		}
 	}
 }
