@@ -17,6 +17,8 @@ fn now_ns() -> u64 {
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
+/// Snapshot of all protection settings for a listener.
+/// Stored inside ArcSwap so every field is hot-swappable in one atomic pointer store.
 #[derive(Clone, Debug, Default)]
 pub struct ProtectionConfig {
 	/// Token bucket: max new connections/second per IP
@@ -31,6 +33,10 @@ pub struct ProtectionConfig {
 	pub tls_handshake_timeout_ms: u64,
 	/// Reject connections without SNI
 	pub require_sni: bool,
+	/// CIDRs that bypass all protection checks
+	pub allowlist: Vec<IpNetwork>,
+	/// CIDRs that are always blocked
+	pub blocklist: Vec<IpNetwork>,
 }
 
 impl ProtectionConfig {
@@ -113,23 +119,16 @@ pub enum Decision {
 // ── ProtectionState ───────────────────────────────────────────────────────────
 
 pub struct ProtectionState {
+	/// All protection settings in one ArcSwap snapshot — a single store() reaches all checks.
 	pub config: ArcSwap<ProtectionConfig>,
 	ip_table: DashMap<IpAddr, Arc<IpState>>,
-	allowlist: Vec<IpNetwork>,
-	blocklist: Vec<IpNetwork>,
 }
 
 impl ProtectionState {
-	pub fn new(
-		config: ProtectionConfig,
-		allowlist: Vec<IpNetwork>,
-		blocklist: Vec<IpNetwork>,
-	) -> Arc<Self> {
+	pub fn new(config: ProtectionConfig) -> Arc<Self> {
 		Arc::new(Self {
 			config: ArcSwap::new(Arc::new(config)),
 			ip_table: DashMap::new(),
-			allowlist,
-			blocklist,
 		})
 	}
 
@@ -139,14 +138,14 @@ impl ProtectionState {
 		let cfg = self.config.load();
 
 		// 1. Allowlist — skip all other checks; active counter is NOT incremented
-		for network in &self.allowlist {
+		for network in &cfg.allowlist {
 			if network.contains(peer_ip) {
 				return Decision::AllowBypassed;
 			}
 		}
 
 		// 2. Blocklist
-		for network in &self.blocklist {
+		for network in &cfg.blocklist {
 			if network.contains(peer_ip) {
 				return Decision::Block(BlockReason::CidrBlocked);
 			}
@@ -183,6 +182,8 @@ impl ProtectionState {
 					break;
 				}
 				let old_tokens = state.tokens.load(Ordering::Relaxed);
+				// Refill caps at burst_fp — handles burst decrease without underflow.
+				// If old tokens > new burst, the cap brings them down on next refill.
 				let new_tokens = old_tokens.saturating_add(refill).min(burst_fp);
 				// CAS: update tokens and last_refill atomically
 				if state
@@ -244,9 +245,10 @@ impl ProtectionState {
 	}
 
 	/// Returns (rate_limited_ips, concurrency_limited_ips) for the `blockedIps()` API.
-	pub fn blocked_ips(&self, max_concurrent: u32) -> (Vec<IpAddr>, Vec<IpAddr>) {
+	pub fn blocked_ips(&self) -> (Vec<IpAddr>, Vec<IpAddr>) {
 		let cfg = self.config.load();
 		let burst_fp = cfg.burst_fp();
+		let max_concurrent = cfg.max_concurrent_per_ip;
 		let mut rate_limited = Vec::new();
 		let mut concurrency_limited = Vec::new();
 
@@ -309,5 +311,160 @@ fn from_hex_digit(b: u8) -> Option<u8> {
 		b'a'..=b'f' => Some(b - b'a' + 10),
 		b'A'..=b'F' => Some(b - b'A' + 10),
 		_ => None,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::sni::PeekInfo;
+
+	fn ip(s: &str) -> IpAddr {
+		s.parse().unwrap()
+	}
+
+	fn no_peek() -> PeekInfo {
+		PeekInfo::default()
+	}
+
+	fn peek_with_ja3(hex: &str) -> PeekInfo {
+		PeekInfo { sni: None, ja3: hex.to_string() }
+	}
+
+	#[test]
+	fn cidr_block_hot_swap_adds_block() {
+		let state = ProtectionState::new(ProtectionConfig::default());
+		let peer = ip("10.0.0.1");
+
+		// Initially allowed
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+		state.release(peer);
+
+		// Swap in a blocklist containing the peer
+		state.config.store(Arc::new(ProtectionConfig {
+			blocklist: vec!["10.0.0.0/24".parse().unwrap()],
+			..Default::default()
+		}));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::CidrBlocked)));
+	}
+
+	#[test]
+	fn cidr_block_hot_swap_removes_block() {
+		let state = ProtectionState::new(ProtectionConfig {
+			blocklist: vec!["10.0.0.0/8".parse().unwrap()],
+			..Default::default()
+		});
+		let peer = ip("10.1.2.3");
+
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::CidrBlocked)));
+
+		// Remove the blocklist
+		state.config.store(Arc::new(ProtectionConfig::default()));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+		state.release(peer);
+	}
+
+	#[test]
+	fn allowlist_bypass_overrides_blocklist() {
+		let state = ProtectionState::new(ProtectionConfig {
+			blocklist: vec!["10.0.0.0/8".parse().unwrap()],
+			..Default::default()
+		});
+		let peer = ip("10.0.0.5");
+
+		// Initially blocked by CIDR
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::CidrBlocked)));
+
+		// Add an allowlist covering that IP — allowlist check runs before blocklist
+		state.config.store(Arc::new(ProtectionConfig {
+			allowlist: vec!["10.0.0.0/24".parse().unwrap()],
+			blocklist: vec!["10.0.0.0/8".parse().unwrap()],
+			..Default::default()
+		}));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::AllowBypassed));
+	}
+
+	#[test]
+	fn ja3_block_hot_swap() {
+		let state = ProtectionState::new(ProtectionConfig::default());
+		let peer = ip("1.2.3.4");
+		let hex = "e7d705a3286e19ea42f587b344ee6865";
+
+		assert!(matches!(state.check(peer, &peek_with_ja3(hex)), Decision::Allow));
+		state.release(peer);
+
+		// Swap in a JA3 blocklist
+		let mut new_cfg = ProtectionConfig::default();
+		new_cfg.ja3_blocklist.insert(hex_to_bytes16(hex).unwrap());
+		state.config.store(Arc::new(new_cfg));
+		assert!(matches!(state.check(peer, &peek_with_ja3(hex)), Decision::Block(BlockReason::Ja3Blocked)));
+	}
+
+	#[test]
+	fn rate_limit_hot_swap_enables_limiting() {
+		// Start with no rate limit — ip_table entry created with burst_fp=0 (tokens=0)
+		let state = ProtectionState::new(ProtectionConfig::default());
+		let peer = ip("2.0.0.1");
+
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+		state.release(peer);
+
+		// Enable rate limiting with burst < ONE_TOKEN (1000 fp), so the existing entry
+		// (tokens=0) will never accumulate enough to pass the consume step.
+		// burst_fp = (0.5 * 1000.0) as u32 = 500 < 1000 = ONE_TOKEN → always blocked.
+		state.config.store(Arc::new(ProtectionConfig {
+			rate_limit_cps: Some(10.0),
+			rate_limit_burst: Some(0.5),
+			..Default::default()
+		}));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::RateLimited)));
+	}
+
+	#[test]
+	fn rate_limit_hot_swap_loosens_limit() {
+		// Start with a very tight rate limit — burst_fp=1 so immediately rate-limited
+		let state = ProtectionState::new(ProtectionConfig {
+			rate_limit_cps: Some(1.0),
+			rate_limit_burst: Some(0.001), // burst_fp=1, ONE_TOKEN=1000 → always blocked
+			..Default::default()
+		});
+		let peer = ip("2.0.0.2");
+
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::RateLimited)));
+
+		// Remove rate limit entirely — now unrestricted
+		state.config.store(Arc::new(ProtectionConfig::default()));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+		state.release(peer);
+	}
+
+	#[test]
+	fn burst_decrease_no_underflow() {
+		// Start with a generous burst (100 tokens = 100000 fp)
+		let state = ProtectionState::new(ProtectionConfig {
+			rate_limit_cps: Some(100.0),
+			rate_limit_burst: Some(100.0),
+			..Default::default()
+		});
+		let peer = ip("3.0.0.1");
+
+		// Consume 50 tokens — each check decrements by 1000 fp; 50 × 1000 = 50000 fp consumed
+		for _ in 0..50 {
+			assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+			state.release(peer);
+		}
+		// tokens ≈ 50000 fp (remaining in bucket; negligible refill during fast loop)
+
+		// Reduce burst to 1 (burst_fp=1000). On next refill the bucket will be capped.
+		// Existing tokens (50000) remain until first refill; no underflow in consume step.
+		state.config.store(Arc::new(ProtectionConfig {
+			rate_limit_cps: Some(1.0),
+			rate_limit_burst: Some(1.0),
+			..Default::default()
+		}));
+
+		// Consume step: tokens ≈ 50000 fp → 50000 - 1000 = 49000 fp; no underflow
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow));
+		state.release(peer);
 	}
 }

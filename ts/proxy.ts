@@ -10,6 +10,7 @@ import type {
 	Upstream,
 	CertConfig,
 	MtlsConfig,
+	ProtectionConfig,
 	RouteConfig,
 	ProxyEvent,
 	SuspendedConnection,
@@ -92,6 +93,20 @@ function toJsRoute(r: RouteConfig): JsRouteConfig {
 	};
 }
 
+function toJsProtectionConfig(p: ProtectionConfig) {
+	return {
+		rateLimit: p.rateLimit
+			? { connectionsPerSecond: p.rateLimit.connectionsPerSecond, burst: p.rateLimit.burst }
+			: undefined,
+		maxConcurrentPerIp: p.maxConcurrentPerIp,
+		allowlist: p.allowlist,
+		blocklist: p.blocklist,
+		ja3Blocklist: p.ja3Blocklist,
+		tlsHandshakeTimeoutMs: p.tlsHandshakeTimeoutMs,
+		requireSni: p.requireSni,
+	};
+}
+
 function toJsListenerConfig(l: import('./types.js').ListenerConfig): JsListenerConfig {
 	return {
 		host: l.host,
@@ -101,22 +116,7 @@ function toJsListenerConfig(l: import('./types.js').ListenerConfig): JsListenerC
 		mtls: l.mtls ? toJsMtls(l.mtls) : undefined,
 		maxConnections: l.maxConnections,
 		idleTimeoutMs: l.idleTimeoutMs,
-		protection: l.protection
-			? {
-					rateLimit: l.protection.rateLimit
-						? {
-								connectionsPerSecond: l.protection.rateLimit.connectionsPerSecond,
-								burst: l.protection.rateLimit.burst,
-							}
-						: undefined,
-					maxConcurrentPerIp: l.protection.maxConcurrentPerIp,
-					allowlist: l.protection.allowlist,
-					blocklist: l.protection.blocklist,
-					ja3Blocklist: l.protection.ja3Blocklist,
-					tlsHandshakeTimeoutMs: l.protection.tlsHandshakeTimeoutMs,
-					requireSni: l.protection.requireSni,
-				}
-			: undefined,
+		protection: l.protection ? toJsProtectionConfig(l.protection) : undefined,
 	};
 }
 
@@ -193,12 +193,17 @@ export class SymphonyProxy extends EventEmitter {
 	}
 
 	/**
-	 * Atomically replace the route table and/or protection config.
+	 * Atomically update routes and/or per-listener protection config.
 	 * In-flight connections are unaffected.
+	 * Protection updates only apply to listeners that had protection configured at start.
 	 */
 	updateConfig(config: HotConfig): void {
 		this._inner.updateConfig({
 			routes: config.routes?.map(toJsRoute),
+			protection: config.protection?.map((p) => ({
+				port: p.port,
+				protection: toJsProtectionConfig(p.protection),
+			})),
 		});
 	}
 

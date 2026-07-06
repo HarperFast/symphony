@@ -283,10 +283,18 @@ class ServerState {
 				// default_listener_tls), so updateConfig can't hot-swap it. Keying off resolved
 				// content means a listener-cert rotation on disk (same paths, new bytes) changes
 				// the signature and forces a recreate, which route-only hot-swap would miss.
-				const listenerSig = JSON.stringify(proxyConfig.listeners);
+				// Protection is excluded: it is fully hot-swappable and must not force a recreate.
+				const listenerSig = JSON.stringify(
+					proxyConfig.listeners.map(({ protection: _p, ...rest }) => rest),
+				);
 				if (existing && existing.listenerSig === listenerSig) {
-					// Same listeners → hot-swap the route table only.
-					existing.proxy.updateConfig({ routes: proxyConfig.routes });
+					// Same listeners → hot-swap routes and protection.
+					existing.proxy.updateConfig({
+						routes: proxyConfig.routes,
+						protection: proxyConfig.listeners
+							.filter((l) => l.protection != null)
+							.map((l) => ({ port: l.port, protection: l.protection! })),
+					});
 				} else {
 					// New port-set, or listener settings changed → (re)create. SO_REUSEPORT lets the
 					// new listener bind before the old one is dropped, so there is no bind gap.

@@ -59,6 +59,9 @@ A single `stream.peek(&mut buf[..512])` reads the ClientHello without consuming 
 ### ArcSwap for RouteTable
 `ArcSwap<RouteTable>` gives us a pointer-swap on writes (single atomic store) and a single `load()` on reads — no lock contention on the hot path. With ≤100 routes, rebuilding the full table on `updateConfig` costs ~microseconds (Arc pointer clones only). A partial-update scheme would be more complex without meaningful benefit.
 
+### ArcSwap for ProtectionConfig (hot-swappable)
+`ProtectionState.config: ArcSwap<ProtectionConfig>` holds *all* protection settings as one swappable snapshot — CIDR allowlist/blocklist, JA3 blocklist, rate limit parameters, concurrency cap, handshake timeout, and requireSni are all inside `ProtectionConfig`. This means one atomic `store()` in `updateConfig` reaches all checks for a listener with zero hot-path cost. `check()` calls `config.load()` once per connection, which is a single lock-free pointer load. Callers identify listeners by port (`JsHotConfig.protection: [{ port, protection }]`). Listeners started without protection cannot gain it at runtime (the `Option<Arc<ProtectionState>>` in `ListenerState` stays `None` — no extra synchronization was added to the accept path).
+
 ### DashMap throughout
 `DashMap` provides lock-free concurrent access via internal sharding. Used for:
 - `protection.rs`: per-IP state (`ip_table: DashMap<IpAddr, Arc<IpState>>`)
