@@ -178,3 +178,62 @@ describe('SymphonyProxy – hot config updateConfig', () => {
 		assert.deepEqual(response, payload);
 	});
 });
+
+describe('SymphonyProxy – one poisoned route does not sink the listener', () => {
+	const good = generateSelfSignedCert('good.example.com');
+	const other = generateSelfSignedCert('bad.example.com');
+	let proxyPort: number;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	let proxy: SymphonyProxy;
+
+	before(async () => {
+		echo = await startEchoServer();
+		proxyPort = await getFreePort();
+
+		// The first route pairs one cert with a *different* key — the exact inconsistency a cert
+		// renewal produces when an inline chain is left pointing at a rotated key file. rustls
+		// rejects it with KeyMismatch. Building routes eagerly, symphony used to let that abort the
+		// whole proxy; now the bad route is skipped and its co-tenant on the same listener survives.
+		proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: proxyPort }],
+			routes: [
+				{
+					sni: 'bad.example.com',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+					terminateTls: true,
+					cert: { certChain: other.cert, privateKey: good.key }, // mismatched pair
+				},
+				{
+					sni: 'good.example.com',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+					terminateTls: true,
+					cert: { certChain: good.cert, privateKey: good.key },
+				},
+			],
+		});
+		await proxy.start();
+		await sleep(50);
+	});
+
+	after(async () => {
+		await proxy.stop();
+		await echo.close();
+	});
+
+	it('constructs despite the mismatched-cert route', () => {
+		// Reaching here at all means construction did not throw KeyMismatch.
+		assert.ok(proxy);
+	});
+
+	it('still serves the co-tenant route on the same listener', async () => {
+		const payload = Buffer.from('survivor');
+		const response = await tlsRoundTrip({
+			port: proxyPort,
+			servername: 'good.example.com',
+			caCert: good.cert,
+			data: payload,
+			rejectUnauthorized: true,
+		});
+		assert.deepEqual(response, payload);
+	});
+});

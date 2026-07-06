@@ -415,6 +415,13 @@ impl SymphonyProxyWrap {
 				.iter()
 				.map(parse_route_spec)
 				.collect::<Result<Vec<_>>>()?;
+			// build_route_table now skips (rather than rejects) an individual unbuildable route, so
+			// a hot reload also drops such a route from the swapped-in table instead of failing the
+			// whole reload and keeping the previous table wholesale. A route that was serving from a
+			// prior good build but whose new spec transiently fails to build (e.g. mid-rotation
+			// cert/key skew) is therefore evicted until the next reload with a buildable spec. That
+			// is the intended tradeoff: one tenant's bad spec must not block every other tenant's
+			// legitimate updates.
 			let table = build_route_table(&specs, &self.default_listener_tls)
 				.map_err(|e| napi::Error::from_reason(e.to_string()))?;
 			self.route_table.swap(table);

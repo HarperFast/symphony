@@ -240,7 +240,18 @@ pub fn build_route_table(
 	let mut monitored_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
 
 	for spec in specs {
-		let route = build_route(spec, listener_tls, &mut cache)?;
+		// A single unbuildable route (mismatched cert/key → rustls KeyMismatch, unparseable PEM,
+		// a bad upstream) must not take down the whole listener. Routes are built eagerly, so
+		// before this one poisoned SNI aborted the entire reconcile and every co-tenant sharing the
+		// port went dark — the cert/key-consistency analogue of the missing-file outage in issue
+		// #120. Skip the offending route, log it, and keep serving the rest.
+		let route = match build_route(spec, listener_tls, &mut cache) {
+			Ok(route) => route,
+			Err(e) => {
+				eprintln!("symphony: route '{}' skipped — failed to build: {e}", spec.sni);
+				continue;
+			}
+		};
 
 		// Collect UdsBalancers that have pid/tid slots for the monitor task.
 		if let Destination::UdsSet(ref bal) = route.destination {
