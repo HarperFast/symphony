@@ -62,8 +62,20 @@ export interface JsRateLimitConfig {
   connectionsPerSecond: number
   burst?: number
 }
+export interface JsSustainedRateLimitConfig {
+  connectionsPerMinute: number
+  burst?: number
+}
+export interface JsPenaltyBoxConfig {
+  /** Duration in ms an IP remains blocked after exhausting a rate limit. Default: 600000. */
+  durationMs?: number
+}
 export interface JsProtectionConfig {
   rateLimit?: JsRateLimitConfig
+  /** Sustained (per-minute) token bucket — independent of the per-second bucket. */
+  sustained?: JsSustainedRateLimitConfig
+  /** Penalty box: block an IP for a configurable duration after any rate limit exhaustion. */
+  penaltyBox?: JsPenaltyBoxConfig
   maxConcurrentPerIp?: number
   allowlist?: Array<string>
   blocklist?: Array<string>
@@ -115,6 +127,8 @@ export interface JsBlockedIpsInfo {
   rateLimited: Array<string>
   concurrencyLimited: Array<string>
   cidrBlocklist: Array<string>
+  /** IPs currently in the penalty box (blocked for a configured duration after rate-limit exhaustion). */
+  penaltyBoxed: Array<string>
 }
 export interface JsResolveRoute {
   upstream: JsUpstream

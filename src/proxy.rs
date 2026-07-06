@@ -82,8 +82,24 @@ pub struct JsRateLimitConfig {
 }
 
 #[napi(object)]
+pub struct JsSustainedRateLimitConfig {
+	pub connections_per_minute: f64,
+	pub burst: Option<f64>,
+}
+
+#[napi(object)]
+pub struct JsPenaltyBoxConfig {
+	/// Duration in ms an IP remains blocked after exhausting a rate limit. Default: 600000.
+	pub duration_ms: Option<f64>,
+}
+
+#[napi(object)]
 pub struct JsProtectionConfig {
 	pub rate_limit: Option<JsRateLimitConfig>,
+	/// Sustained (per-minute) token bucket — independent of the per-second bucket.
+	pub sustained: Option<JsSustainedRateLimitConfig>,
+	/// Penalty box: block an IP for a configurable duration after any rate limit exhaustion.
+	pub penalty_box: Option<JsPenaltyBoxConfig>,
 	pub max_concurrent_per_ip: Option<u32>,
 	pub allowlist: Option<Vec<String>>,
 	pub blocklist: Option<Vec<String>>,
@@ -143,6 +159,8 @@ pub struct JsBlockedIpsInfo {
 	pub rate_limited: Vec<String>,
 	pub concurrency_limited: Vec<String>,
 	pub cidr_blocklist: Vec<String>,
+	/// IPs currently in the penalty box (blocked for a configured duration after rate-limit exhaustion).
+	pub penalty_boxed: Vec<String>,
 }
 
 #[napi(object)]
@@ -419,6 +437,23 @@ impl SymphonyProxyWrap {
 			}
 		});
 
+		// Spawn a periodic IP state eviction task per listener that has protection.
+		// Eviction bounds ip_table memory growth under diverse-IP traffic / attack.
+		for ls in &self.listener_states {
+			if let Some(prot) = ls.protection.clone() {
+				let mut evict_rx = tx.subscribe();
+				self.rt_handle.spawn(async move {
+					let interval = Duration::from_secs(60);
+					loop {
+						tokio::select! {
+							_ = evict_rx.recv() => break,
+							_ = tokio::time::sleep(interval) => prot.evict(),
+						}
+					}
+				});
+			}
+		}
+
 		Ok(())
 	}
 
@@ -506,6 +541,7 @@ impl SymphonyProxyWrap {
 		let mut rate_limited_set: HSet<String> = HSet::new();
 		let mut concurrency_limited_set: HSet<String> = HSet::new();
 		let mut cidr_blocklist_set: HSet<String> = HSet::new();
+		let mut penalty_boxed_set: HSet<String> = HSet::new();
 
 		for state in &self.listener_states {
 			if let Some(prot) = &state.protection {
@@ -514,12 +550,15 @@ impl SymphonyProxyWrap {
 				for net in &cfg.blocklist {
 					cidr_blocklist_set.insert(net.to_string());
 				}
-				let (rl, cl) = prot.blocked_ips();
+				let (rl, cl, pb) = prot.blocked_ips();
 				for ip in rl {
 					rate_limited_set.insert(ip.to_string());
 				}
 				for ip in cl {
 					concurrency_limited_set.insert(ip.to_string());
+				}
+				for ip in pb {
+					penalty_boxed_set.insert(ip.to_string());
 				}
 			}
 		}
@@ -528,6 +567,7 @@ impl SymphonyProxyWrap {
 			rate_limited: rate_limited_set.into_iter().collect(),
 			concurrency_limited: concurrency_limited_set.into_iter().collect(),
 			cidr_blocklist: cidr_blocklist_set.into_iter().collect(),
+			penalty_boxed: penalty_boxed_set.into_iter().collect(),
 		}
 	}
 
@@ -683,6 +723,13 @@ fn parse_protection_config(
 	if let Some(rl) = &prot.rate_limit {
 		cfg.rate_limit_cps = Some(rl.connections_per_second);
 		cfg.rate_limit_burst = rl.burst;
+	}
+	if let Some(s) = &prot.sustained {
+		cfg.sustained_cpm = Some(s.connections_per_minute);
+		cfg.sustained_burst = s.burst;
+	}
+	if let Some(pb) = &prot.penalty_box {
+		cfg.penalty_box_duration_ms = pb.duration_ms.unwrap_or(600_000.0) as u64;
 	}
 	cfg.max_concurrent_per_ip = prot.max_concurrent_per_ip.unwrap_or(0);
 
