@@ -56,6 +56,11 @@ export interface JsProtectionConfig {
   allowlist?: Array<string>
   blocklist?: Array<string>
   ja3Blocklist?: Array<string>
+  /**
+   * JA4 fingerprints to block. Each value is the full 36-char JA4 string
+   * (t<ver><sni><cc><ec><alpn>_<12hex>_<12hex>); case-insensitive match.
+   */
+  ja4Blocklist?: Array<string>
   tlsHandshakeTimeoutMs?: number
   requireSni?: boolean
 }

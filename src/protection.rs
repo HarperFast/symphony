@@ -27,6 +27,9 @@ pub struct ProtectionConfig {
 	pub max_concurrent_per_ip: u32,
 	/// JA3 fingerprints to block (raw 16-byte MD5)
 	pub ja3_blocklist: HashSet<[u8; 16]>,
+	/// JA4 fingerprints to block. Values are stored lowercase; comparison is case-insensitive.
+	/// JA4 strings are 36-char lowercase ASCII: t<ver><sni><cc><ec><alpn>_<12hex>_<12hex>.
+	pub ja4_blocklist: HashSet<Box<str>>,
 	/// Max ms for TLS handshake (0 = use default 10000)
 	pub tls_handshake_timeout_ms: u64,
 	/// Reject connections without SNI
@@ -84,6 +87,7 @@ impl IpState {
 pub enum BlockReason {
 	CidrBlocked,
 	Ja3Blocked,
+	Ja4Blocked,
 	NoSni,
 	RateLimited,
 	TooManyConnections,
@@ -94,6 +98,7 @@ impl BlockReason {
 		match self {
 			Self::CidrBlocked => "cidr_blocked",
 			Self::Ja3Blocked => "ja3_blocked",
+			Self::Ja4Blocked => "ja4_blocked",
 			Self::NoSni => "no_sni",
 			Self::RateLimited => "rate_limited",
 			Self::TooManyConnections => "too_many_connections",
@@ -158,6 +163,13 @@ impl ProtectionState {
 				if cfg.ja3_blocklist.contains(&bytes) {
 					return Decision::Block(BlockReason::Ja3Blocked);
 				}
+			}
+		}
+
+		// 3b. JA4 blocklist
+		if !cfg.ja4_blocklist.is_empty() && !peek_info.ja4.is_empty() {
+			if cfg.ja4_blocklist.contains(peek_info.ja4.as_str()) {
+				return Decision::Block(BlockReason::Ja4Blocked);
 			}
 		}
 

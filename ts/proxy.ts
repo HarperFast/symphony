@@ -113,6 +113,7 @@ function toJsListenerConfig(l: import('./types.js').ListenerConfig): JsListenerC
 					allowlist: l.protection.allowlist,
 					blocklist: l.protection.blocklist,
 					ja3Blocklist: l.protection.ja3Blocklist,
+					ja4Blocklist: l.protection.ja4Blocklist,
 					tlsHandshakeTimeoutMs: l.protection.tlsHandshakeTimeoutMs,
 					requireSni: l.protection.requireSni,
 				}
@@ -121,7 +122,7 @@ function toJsListenerConfig(l: import('./types.js').ListenerConfig): JsListenerC
 }
 
 export interface SymphonyProxyEvents {
-	blocked: [event: { ip: string; reason: string; listener: string }];
+	blocked: [event: { ip: string; reason: string; listener: string; ja3: string; ja4: string }];
 	suspended: [conn: SuspendedConnection];
 	error: [err: Error, ctx?: { listener?: string }];
 	ready: [];
@@ -161,7 +162,13 @@ export class SymphonyProxy extends EventEmitter {
 			const event = raw as ProxyEvent;
 			switch (event.type) {
 				case 'blocked':
-					this.emit('blocked', { ip: event.ip, reason: event.reason, listener: event.listener });
+					this.emit('blocked', {
+						ip: event.ip,
+						reason: event.reason,
+						listener: event.listener,
+						ja3: event.ja3,
+						ja4: event.ja4,
+					});
 					break;
 				case 'suspended':
 					this.emit('suspended', {

@@ -113,6 +113,12 @@ export interface ProtectionConfig {
 	blocklist?: string[];
 	/** JA3 MD5 fingerprint hex strings to block (32 hex chars each). */
 	ja3Blocklist?: string[];
+	/**
+	 * JA4 TLS fingerprints to block. Each entry is the full 36-char JA4 string
+	 * (t<ver><sni><cc><ec><alpn>_<12hex>_<12hex>); matching is case-insensitive.
+	 * Only core JA4 (TLS client fingerprinting, BSD-licensed) is implemented.
+	 */
+	ja4Blocklist?: string[];
 	/** Reject connections whose TLS handshake exceeds this many ms. Default: 10000. */
 	tlsHandshakeTimeoutMs?: number;
 	/** Reject connections that present no SNI. Default: false. */
@@ -215,6 +221,10 @@ export interface BlockedEvent {
 	ip: string;
 	reason: string;
 	listener: string;
+	/** JA3 fingerprint (32-char hex) if the ClientHello was parsed; empty string otherwise. */
+	ja3: string;
+	/** JA4 fingerprint if the ClientHello was parsed; empty string otherwise. */
+	ja4: string;
 }
 
 export interface SuspendedEvent extends SuspendedConnection {
