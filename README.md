@@ -484,6 +484,8 @@ const info = proxy.blockedIps();
 
 Penalty state is stored on per-IP runtime state and survives a configuration hot-swap. `penaltyBox` can be added or removed via `updateConfig` without restarting.
 
+**Hot-swap note on active deadlines:** changing `durationMs` via `updateConfig` affects new penalty stamps immediately, but IPs already in the box retain their current deadline until it expires or is re-stamped by a continued rate-limit hit. There is no retroactive recalculation of existing deadlines.
+
 ### JA3 blocking
 
 JA3 fingerprints the TLS ClientHello by hashing a canonical string of the version, cipher suites, extensions, elliptic curves, and EC point formats using MD5. That MD5 is by specification, not a security claim — it allows lists of known-bad fingerprints to be compared cheaply. Collect JA3 fingerprints from your logs (available in the `blocked` event `ja3` field) and add known-bad clients:
