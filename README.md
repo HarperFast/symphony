@@ -136,7 +136,9 @@ Both fields accept PEM-encoded strings or `Buffer`. The cert chain may include i
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `rateLimit` | `{ connectionsPerSecond, burst? }` | — | Token bucket per source IP |
+| `rateLimit` | `{ connectionsPerSecond, burst? }` | — | Per-second token bucket per source IP |
+| `sustained` | `{ connectionsPerMinute, burst? }` | — | Per-minute token bucket per source IP (independent of `rateLimit`) |
+| `penaltyBox` | `{ durationMs? }` | — | Block an IP for `durationMs` after any rate limit exhaustion |
 | `maxConcurrentPerIp` | `number` | `0` (unlimited) | Max simultaneous connections per source IP |
 | `allowlist` | `string[]` | `[]` | CIDRs that bypass all checks |
 | `blocklist` | `string[]` | `[]` | CIDRs that are always blocked |
@@ -400,12 +402,47 @@ Bun.serve({
 ```typescript
 protection: {
   rateLimit: { connectionsPerSecond: 50, burst: 100 },
+  sustained: { connectionsPerMinute: 300, burst: 300 },
+  penaltyBox: { durationMs: 600_000 }, // 10 minutes
   maxConcurrentPerIp: 200,
   allowlist: ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'],
   requireSni: true,
   tlsHandshakeTimeoutMs: 5000,
 }
 ```
+
+### Sustained rate limits
+
+Use `sustained` to enforce a per-minute cap that is independent of the per-second `rateLimit` bucket. Both buckets are checked on every connection; exhausting either one blocks the connection. This lets you allow short bursts while still capping total volume over longer windows:
+
+```typescript
+protection: {
+  rateLimit: { connectionsPerSecond: 50, burst: 200 }, // allow short bursts
+  sustained: { connectionsPerMinute: 600, burst: 600 }, // but cap at 10/s long-term
+}
+```
+
+### Penalty box
+
+When `penaltyBox` is configured, exhausting any rate limit places the source IP in a penalty box for `durationMs` (default 10 minutes). While penalized, all connections from that IP are rejected outright without touching the token buckets — protecting the proxy from re-assembling per-connection state under a sustained attack.
+
+**Extension semantics:** while an IP is boxed, symphony still debits its token buckets on each connection attempt (to measure whether the attack is continuing). If a bucket is exhausted (the IP is still sending at the excess rate), the penalty deadline is reset to `now + durationMs` — effectively extending the penalty by a full `durationMs` from the moment of continued excess. If the IP stops attacking, the buckets refill and debits succeed; the deadline is not extended, so the IP is readmitted once the original deadline expires.
+
+```typescript
+protection: {
+  rateLimit: { connectionsPerSecond: 50, burst: 100 },
+  penaltyBox: { durationMs: 600_000 }, // 10 minutes (default)
+}
+```
+
+Blocked events from penalized IPs have `reason: 'penalty_boxed'`. They appear under `penaltyBoxed` in `blockedIps()`:
+
+```typescript
+const info = proxy.blockedIps();
+// info.penaltyBoxed — IPs currently in the penalty box
+```
+
+Penalty state is stored on per-IP runtime state and survives a configuration hot-swap. `penaltyBox` can be added or removed via `updateConfig` without restarting.
 
 ### JA3 blocking
 
@@ -452,9 +489,10 @@ const m = proxy.metrics();
 // m.pendingSuspended — connections currently held waiting for resolveConnection()
 
 const blocked = proxy.blockedIps();
-// blocked.rateLimited — IPs with depleted token buckets
+// blocked.rateLimited — IPs with a depleted per-second or sustained token bucket
 // blocked.concurrencyLimited — IPs at their maxConcurrentPerIp limit
 // blocked.cidrBlocklist — the configured static CIDR blocklist
+// blocked.penaltyBoxed — IPs currently in the penalty box
 
 setInterval(() => {
   console.log('active:', proxy.metrics().activeConnections);
@@ -472,7 +510,7 @@ proxy.updateConfig({
 });
 ```
 
-**What can be hot-swapped:** routes (destinations, TLS certs, suspension state) and per-listener protection (CIDR allowlist/blocklist, JA3 blocklist, rate limits, concurrency caps, handshake timeout, requireSni).
+**What can be hot-swapped:** routes (destinations, TLS certs, suspension state) and per-listener protection (CIDR allowlist/blocklist, JA3 blocklist, rate limits, sustained rate limits, penalty box, concurrency caps, handshake timeout, requireSni).
 
 **What requires a restart:** bind address, port, idle timeout, worker threads. When calling `updateConfig()` directly, protection presence (None↔Some) cannot change at runtime — the listener must be restarted. The `symphony-server` bin handles this automatically via seamless recreate.
 
