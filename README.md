@@ -420,6 +420,8 @@ ja3Blocklist: [
 
 **Limitation:** Chrome and other modern browsers randomize the order of ClientHello extensions on each connection, so a single browser can produce many different JA3 hashes. This makes per-browser JA3 blocking unreliable. Use `ja4Blocklist` where extension-order randomization is a concern.
 
+**Upgrade note:** earlier versions filtered only one of the 16 GREASE values when computing JA3, so hashes for clients that send other GREASE values (e.g. Chrome) were nonstandard and unstable. JA3 values collected from earlier symphony versions may no longer match and should be re-collected.
+
 ### JA4 blocking
 
 JA4 is the randomization-resistant successor to JA3. It sorts the cipher and extension lists before hashing, so it produces a stable fingerprint regardless of ClientHello field ordering. Fingerprints are 36-char lowercase ASCII strings in the form `t<ver><sni><cc><ec><alpn>_<sha256/12>_<sha256/12>`.

@@ -32,7 +32,7 @@ fn parse_client_hello(buf: &[u8]) -> PeekInfo {
 	};
 	let sni = extract_sni(hello.extensions);
 	let ja3 = compute_ja3(hello.legacy_version, hello.cipher_suites, hello.extensions);
-	let ja4 = compute_ja4(hello.legacy_version, hello.cipher_suites, hello.extensions, &sni);
+	let ja4 = compute_ja4(hello.legacy_version, hello.cipher_suites, hello.extensions);
 	PeekInfo { sni, ja3, ja4 }
 }
 
@@ -291,12 +291,7 @@ fn compute_ja3(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> 
 // Spec: https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
 // Format: t<ver><sni><cc><ec><alpn>_<ciphers-sha256/12>_<exts-sha256/12>
 
-fn compute_ja4(
-	legacy_version: u16,
-	cipher_suites: &[u8],
-	extensions: &[u8],
-	sni: &Option<String>,
-) -> String {
+fn compute_ja4(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> String {
 	// Parse extensions in a single pass.
 	let mut ext_ids: Vec<u16> = Vec::new(); // all non-GREASE ext types
 	let mut supported_versions: Vec<u16> = Vec::new();
@@ -374,8 +369,9 @@ fn compute_ja4(
 		_ => "00",
 	};
 
-	// SNI indicator.
-	let sni_char = if sni.is_some() { 'd' } else { 'i' };
+	// SNI indicator: keyed on the SNI extension being present, per spec — not on whether
+	// symphony's own hostname validation accepted its value.
+	let sni_char = if ext_ids.contains(&0x0000) { 'd' } else { 'i' };
 
 	// Cipher count: GREASE excluded, capped at 99.
 	let cipher_count = cipher_suites
@@ -636,6 +632,17 @@ mod tests {
 		let info_i = parse_client_hello(&without_sni);
 		assert_eq!(&info_d.ja4[3..4], "d", "SNI present should give 'd': {}", info_d.ja4);
 		assert_eq!(&info_i.ja4[3..4], "i", "SNI absent should give 'i': {}", info_i.ja4);
+	}
+
+	#[test]
+	fn test_ja4_sni_indicator_present_but_rejected_hostname() {
+		// The indicator is keyed on extension PRESENCE per spec: an SNI whose value fails
+		// symphony's hostname validation (here an IPv6 literal, contains ':') still gives 'd'
+		// even though extract_sni returns None.
+		let hello = make_client_hello(0x0303, &[0x1301], &[make_sni_ext(b"::1")]);
+		let info = parse_client_hello(&hello);
+		assert_eq!(info.sni, None, "invalid hostname should be rejected");
+		assert_eq!(&info.ja4[3..4], "d", "SNI extension present should give 'd': {}", info.ja4);
 	}
 
 	#[test]
