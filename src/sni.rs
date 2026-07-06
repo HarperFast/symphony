@@ -557,7 +557,7 @@ mod tests {
 	fn test_is_grease() {
 		// All 16 GREASE values (RFC 8701): 0x?A?A where both bytes equal and nibble=0xA
 		for n in 0u16..=0xF {
-			let v = ((n << 4 | 0xA) as u16) << 8 | (n << 4 | 0xA) as u16;
+			let v = (n << 4 | 0xA) << 8 | (n << 4 | 0xA);
 			assert!(is_grease(v), "expected is_grease(0x{v:04X})");
 		}
 		// Non-GREASE: bytes differ
