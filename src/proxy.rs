@@ -117,8 +117,18 @@ pub struct JsProxyConfig {
 }
 
 #[napi(object)]
+pub struct JsListenerProtectionHotConfig {
+	/// Port of the listener to update. Must match a listener configured at start.
+	pub port: u16,
+	pub protection: JsProtectionConfig,
+}
+
+#[napi(object)]
 pub struct JsHotConfig {
 	pub routes: Option<Vec<JsRouteConfig>>,
+	/// Per-listener protection updates. Only applies to listeners that had protection
+	/// configured at start; listeners constructed without protection are skipped.
+	pub protection: Option<Vec<JsListenerProtectionHotConfig>>,
 }
 
 #[napi(object)]
@@ -165,9 +175,9 @@ struct InternalListener {
 /// Per-listener runtime state.
 struct ListenerState {
 	addr: String,
+	port: u16,
 	metrics: Arc<ListenerMetrics>,
 	protection: Option<Arc<ProtectionState>>,
-	protection_blocklist: Vec<String>,
 }
 
 // ── SymphonyProxy napi class ──────────────────────────────────────────────────
@@ -263,19 +273,18 @@ impl SymphonyProxyWrap {
 				mode,
 			});
 
-			let (protection, protection_blocklist) = if let Some(prot_cfg) = &l.protection {
-				let (cfg, allowlist, blocklist, bl_strings) = parse_protection_config(prot_cfg)?;
-				let state = ProtectionState::new(cfg, allowlist, blocklist);
-				(Some(state), bl_strings)
+			let protection = if let Some(prot_cfg) = &l.protection {
+				let cfg = parse_protection_config(prot_cfg)?;
+				Some(ProtectionState::new(cfg))
 			} else {
-				(None, Vec::new())
+				None
 			};
 
 			listener_states.push(ListenerState {
 				addr: addr_str,
+				port: l.port,
 				metrics: Arc::new(ListenerMetrics::default()),
 				protection,
-				protection_blocklist,
 			});
 		}
 
@@ -438,6 +447,21 @@ impl SymphonyProxyWrap {
 				.map_err(|e| napi::Error::from_reason(e.to_string()))?;
 			self.route_table.swap(table);
 		}
+		if let Some(protection_updates) = hot.protection {
+			for update in protection_updates {
+				let cfg = parse_protection_config(&update.protection)?;
+				// Find the listener with matching port and swap its protection config.
+				// Listeners started without protection cannot gain it at runtime — skip silently.
+				if let Some(prot) = self
+					.listener_states
+					.iter()
+					.find(|s| s.port == update.port)
+					.and_then(|s| s.protection.as_ref())
+				{
+					prot.config.store(Arc::new(cfg));
+				}
+			}
+		}
 		Ok(())
 	}
 
@@ -457,15 +481,16 @@ impl SymphonyProxyWrap {
 		let mut cidr_blocklist: Vec<String> = Vec::new();
 
 		for state in &self.listener_states {
-			for bl in &state.protection_blocklist {
-				if !cidr_blocklist.contains(bl) {
-					cidr_blocklist.push(bl.clone());
-				}
-			}
 			if let Some(prot) = &state.protection {
 				let cfg = prot.config.load();
-				let max = cfg.max_concurrent_per_ip;
-				let (rl, cl) = prot.blocked_ips(max);
+				// Blocklist is now live-readable from the hot-swappable config snapshot
+				for net in &cfg.blocklist {
+					let s = net.to_string();
+					if !cidr_blocklist.contains(&s) {
+						cidr_blocklist.push(s);
+					}
+				}
+				let (rl, cl) = prot.blocked_ips();
 				for ip in rl {
 					let s = ip.to_string();
 					if !rate_limited.contains(&s) {
@@ -628,15 +653,9 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 	})
 }
 
-/// Parsed protection config plus the derived allowlist, blocklist, and raw blocklist strings.
-type ParsedProtectionConfig = (
-	crate::protection::ProtectionConfig,
-	Vec<IpNetwork>,
-	Vec<IpNetwork>,
-	Vec<String>,
-);
-
-fn parse_protection_config(prot: &JsProtectionConfig) -> Result<ParsedProtectionConfig> {
+fn parse_protection_config(
+	prot: &JsProtectionConfig,
+) -> Result<crate::protection::ProtectionConfig> {
 	let mut cfg = crate::protection::ProtectionConfig::default();
 
 	if let Some(rl) = &prot.rate_limit {
@@ -663,7 +682,7 @@ fn parse_protection_config(prot: &JsProtectionConfig) -> Result<ParsedProtection
 	cfg.tls_handshake_timeout_ms = prot.tls_handshake_timeout_ms.unwrap_or(0.0) as u64;
 	cfg.require_sni = prot.require_sni.unwrap_or(false);
 
-	let allowlist: Vec<IpNetwork> = prot
+	cfg.allowlist = prot
 		.allowlist
 		.as_deref()
 		.unwrap_or(&[])
@@ -674,9 +693,10 @@ fn parse_protection_config(prot: &JsProtectionConfig) -> Result<ParsedProtection
 		})
 		.collect::<Result<Vec<_>>>()?;
 
-	let blocklist_strings: Vec<String> = prot.blocklist.as_deref().unwrap_or(&[]).to_vec();
-
-	let blocklist: Vec<IpNetwork> = blocklist_strings
+	cfg.blocklist = prot
+		.blocklist
+		.as_deref()
+		.unwrap_or(&[])
 		.iter()
 		.map(|s| {
 			s.parse::<IpNetwork>()
@@ -684,7 +704,7 @@ fn parse_protection_config(prot: &JsProtectionConfig) -> Result<ParsedProtection
 		})
 		.collect::<Result<Vec<_>>>()?;
 
-	Ok((cfg, allowlist, blocklist, blocklist_strings))
+	Ok(cfg)
 }
 
 fn listener_tls_spec(l: &JsListenerConfig) -> ListenerTlsSpec {

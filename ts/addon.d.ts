@@ -93,8 +93,18 @@ export interface JsProxyConfig {
   workerThreads?: number
   readBufferSize?: number
 }
+export interface JsListenerProtectionHotConfig {
+  /** Port of the listener to update. Must match a listener configured at start. */
+  port: number
+  protection: JsProtectionConfig
+}
 export interface JsHotConfig {
   routes?: Array<JsRouteConfig>
+  /**
+   * Per-listener protection updates. Only applies to listeners that had protection
+   * configured at start; listeners constructed without protection are skipped.
+   */
+  protection?: Array<JsListenerProtectionHotConfig>
 }
 export interface JsProxyMetrics {
   activeConnections: number

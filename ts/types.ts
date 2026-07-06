@@ -194,9 +194,31 @@ export interface ProxyConfig {
 
 // ── Hot-swap config ───────────────────────────────────────────────────────────
 
-/** Fields that can be updated live without restarting listeners. */
+/** Protection update for a single listener in a hot-config call. */
+export interface ListenerProtectionHotConfig {
+	/** Port number of the listener to update. Must match a listener configured at start. */
+	port: number;
+	protection: ProtectionConfig;
+}
+
+/**
+ * Fields that can be updated live without restarting listeners.
+ *
+ * Hot-swappable: routes (destinations, TLS certs, suspension state) and
+ * per-listener protection (CIDR lists, JA3 blocklist, rate limits, concurrency
+ * caps, handshake timeout, requireSni).
+ *
+ * Requires restart: bind address, port, idle timeout, worker threads.
+ * Protection can only be hot-swapped on listeners that had protection configured at start;
+ * listeners started without protection are silently skipped.
+ */
 export interface HotConfig {
 	routes?: RouteConfig[];
+	/**
+	 * Per-listener protection updates. Each entry identifies a listener by port and
+	 * replaces its entire protection config atomically. Absent = leave unchanged.
+	 */
+	protection?: ListenerProtectionHotConfig[];
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────

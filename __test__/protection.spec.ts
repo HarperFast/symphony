@@ -1,5 +1,5 @@
 /**
- * Tests for the protection layer: rate limiting, blockedIps(), JA4 blocking.
+ * Tests for the protection layer: rate limiting, blockedIps(), JA4 blocking, and hot-swap via updateConfig().
  */
 
 import assert from 'node:assert/strict';
@@ -238,5 +238,120 @@ describe('Protection – JA4 blocklist', () => {
 		await testProxy.stop();
 
 		assert.equal(blockedReason, 'ja4_blocked', `Expected ja4_blocked, got: ${blockedReason}`);
+	});
+});
+
+describe('Protection – updateConfig hot-swap', () => {
+	let proxyPort: number;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	let proxy: SymphonyProxy;
+
+	before(async () => {
+		echo = await startEchoServer();
+		proxyPort = await getFreePort();
+
+		// Start with no CIDR blocklist — connections from 127.0.0.1 are allowed
+		proxy = new SymphonyProxy({
+			listeners: [
+				{
+					host: '127.0.0.1',
+					port: proxyPort,
+					protection: {
+						blocklist: [], // initially empty
+					},
+				},
+			],
+			routes: [
+				{
+					sni: 'localhost',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+					terminateTls: false,
+				},
+			],
+		});
+		await proxy.start();
+		await sleep(50);
+	});
+
+	after(async () => {
+		await proxy.stop();
+		await echo.close();
+	});
+
+	it('connection succeeds before blocklist is pushed', async () => {
+		// Raw TCP connect should succeed (no blocklist)
+		const connected = await new Promise<boolean>((resolve) => {
+			const s = net.createConnection({ port: proxyPort, host: '127.0.0.1' }, () => {
+				s.destroy();
+				resolve(true);
+			});
+			s.on('error', () => resolve(false));
+			setTimeout(() => resolve(false), 2000);
+		});
+		assert.ok(connected, 'Expected connection to succeed before blocklist update');
+	});
+
+	it('blockedIps() reflects new blocklist after updateConfig — no restart', async () => {
+		// Push a blocklist covering 127.0.0.1 via updateConfig (no restart)
+		proxy.updateConfig({
+			protection: [
+				{
+					port: proxyPort,
+					protection: { blocklist: ['127.0.0.1/32'] },
+				},
+			],
+		});
+		await sleep(20);
+
+		const info = proxy.blockedIps();
+		assert.ok(
+			info.cidrBlocklist.includes('127.0.0.1/32'),
+			`Expected 127.0.0.1/32 in cidrBlocklist after hot-swap, got: ${JSON.stringify(info.cidrBlocklist)}`,
+		);
+	});
+
+	it('new connections from blocklisted IP are blocked after updateConfig', async () => {
+		// Listen for the proxy's 'blocked' event — emitted when protection blocks a connection.
+		// sni::peek() blocks until the client sends data or closes; s.end() (client FIN) unblocks it.
+		const blockedEventFired = new Promise<boolean>((resolve) => {
+			const handler = (event: { ip: string }) => {
+				if (event.ip === '127.0.0.1') {
+					proxy.off('blocked', handler);
+					resolve(true);
+				}
+			};
+			proxy.on('blocked', handler);
+			setTimeout(() => {
+				proxy.off('blocked', handler);
+				resolve(false);
+			}, 1000);
+		});
+
+		// Connect and immediately half-close so sni::peek() returns EOF and the protection check runs.
+		await new Promise<void>((resolve) => {
+			const s = net.createConnection({ port: proxyPort, host: '127.0.0.1' }, () => s.end());
+			s.on('close', () => resolve());
+			s.on('error', () => resolve());
+		});
+
+		assert.ok(
+			await blockedEventFired,
+			'Expected "blocked" event for 127.0.0.1 after blocklist hot-swap',
+		);
+	});
+
+	it('removes blocklist via another updateConfig — connections allowed again', async () => {
+		proxy.updateConfig({
+			protection: [
+				{
+					port: proxyPort,
+					protection: { blocklist: [] },
+				},
+			],
+		});
+		await sleep(20);
+
+		const info = proxy.blockedIps();
+		assert.equal(info.cidrBlocklist.length, 0, 'Expected cidrBlocklist to be empty after removal');
 	});
 });
