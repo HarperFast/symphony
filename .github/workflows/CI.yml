@@ -7,6 +7,26 @@ on:
   pull_request:
 
 jobs:
+  cargo-test:
+    name: Cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-test-
+
+      - name: Run cargo test
+        run: cargo test
+
   build-linux:
     name: Build – ${{ matrix.target }}
     runs-on: ubuntu-latest
