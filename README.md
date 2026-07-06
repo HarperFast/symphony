@@ -17,7 +17,7 @@ symphony sits in front of your services and:
 - **Limits** routes with per-route token-bucket rate caps to prevent any one route from starving others
 - **Protects** connections with per-IP token-bucket rate limiting, concurrency limits, CIDR allowlist/blocklist, JA3 fingerprint blocking, TLS handshake timeout, and SNI-required enforcement
 - **Suspends** routes — hold incoming connections and fire an event; your code decides whether to proxy or reject each one
-- **Hot-swaps** routes and protection config without restarting or dropping existing connections
+- **Hot-swaps** routes and per-listener protection config (CIDR lists, JA3 blocklist, rate limits, concurrency caps, handshake timeout, requireSni) without restarting or dropping existing connections
 - Scales to **~1 million concurrent connections** via `SO_REUSEPORT`, tokio's multi-thread runtime, and lock-free data structures
 
 ---
@@ -479,7 +479,27 @@ Matching is case-insensitive. JA4 fingerprints are always emitted as lowercase.
 
 ### Hot-swapping protection config
 
-Protection config is per-listener and not currently hot-swappable via `updateConfig` (listeners would need to restart). To update protection, restart with a new config. Route changes do not require listener restarts.
+Protection config is per-listener and fully hot-swappable via `updateConfig`. Push a new config atomically to each listener by port — no restart needed, in-flight connections are unaffected:
+
+```typescript
+// Block a new CIDR range without restarting
+proxy.updateConfig({
+  protection: [
+    {
+      port: 443,
+      protection: {
+        blocklist: ['198.51.100.0/24'],  // added under attack
+        rateLimit: { connectionsPerSecond: 50, burst: 100 },
+        requireSni: true,
+      },
+    },
+  ],
+});
+```
+
+The entire `ProtectionConfig` is replaced atomically (one pointer swap). Any field not included in the new config reverts to its default. Existing per-IP rate-limit token buckets are preserved across a swap; if burst decreases, tokens are capped at the new ceiling on the next refill — no underflow.
+
+**Caveat:** a listener started with no `protection` field cannot gain protection at runtime; only listeners configured with `protection` at start can be hot-updated.
 
 ---
 
@@ -523,9 +543,9 @@ proxy.updateConfig({
 });
 ```
 
-**What can be hot-swapped:** routes (destinations, TLS certs, suspension state).
+**What can be hot-swapped:** routes (destinations, TLS certs, suspension state) and per-listener protection (CIDR allowlist/blocklist, JA3 blocklist, rate limits, concurrency caps, handshake timeout, requireSni).
 
-**What requires a restart:** listeners (bind address, port, protection config, idle timeout).
+**What requires a restart:** bind address, port, idle timeout, worker threads. Protection can only be hot-updated on listeners that had `protection` configured at start.
 
 ---
 
