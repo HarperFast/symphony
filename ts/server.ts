@@ -90,18 +90,39 @@ function resolveMtls(m: FileMtlsConfig, baseDir: string): MtlsConfig {
 	return { clientCaCert, requireClientCert: m.requireClientCert };
 }
 
-// Resolve a file-backed proxy spec into the in-memory ProxyConfig the napi layer accepts.
+// A cert the Rust layer is guaranteed to reject at build time (empty PEM → "no
+// certificates"). Substituted for a route whose cert/key file can't be read, so the failure
+// is isolated inside build_route_table (which carries the route's last-good forward on a
+// hot-swap, or drops just that SNI on an initial build) instead of throwing out of
+// toProxyConfig and aborting the update for every route on the port-set.
+const UNRESOLVABLE_CERT: CertConfig = { certChain: '', privateKey: Buffer.alloc(0) };
+
+// Resolve one route's cert/mTLS from disk, isolating a file-read failure (e.g. ENOENT while a
+// cert rotates) to this route rather than letting it abort the whole port-set's reconcile.
+function resolveRoute(r: FileRouteConfig, baseDir: string): RouteConfig {
+	try {
+		return {
+			...r,
+			cert: r.cert ? resolveCert(r.cert, baseDir) : undefined,
+			mtls: r.mtls ? resolveMtls(r.mtls, baseDir) : undefined,
+		};
+	} catch (err) {
+		logErr(`failed to resolve cert material for route '${r.sni}' — isolating route:`, (err as Error).message);
+		return { ...r, cert: UNRESOLVABLE_CERT, mtls: undefined };
+	}
+}
+
+// Resolve a file-backed proxy spec into the in-memory ProxyConfig the napi layer accepts. A
+// listener-level cert failure is intentionally *not* isolated here — it throws, so the
+// per-proxy guard in doReconcile leaves the existing proxy running rather than recreating it
+// against an unbuildable default cert.
 function toProxyConfig(spec: FileProxyConfig, baseDir: string): ProxyConfig {
 	const listeners: ListenerConfig[] = spec.listeners.map((l) => ({
 		...l,
 		defaultCert: l.defaultCert ? resolveCert(l.defaultCert, baseDir) : undefined,
 		mtls: l.mtls ? resolveMtls(l.mtls, baseDir) : undefined,
 	}));
-	const routes: RouteConfig[] = spec.routes.map((r) => ({
-		...r,
-		cert: r.cert ? resolveCert(r.cert, baseDir) : undefined,
-		mtls: r.mtls ? resolveMtls(r.mtls, baseDir) : undefined,
-	}));
+	const routes: RouteConfig[] = spec.routes.map((r) => resolveRoute(r, baseDir));
 	return { listeners, routes, workerThreads: spec.workerThreads, readBufferSize: spec.readBufferSize };
 }
 

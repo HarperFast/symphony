@@ -436,3 +436,91 @@ describe('symphony-server (listener default-cert hot reload)', () => {
 		);
 	});
 });
+
+describe('symphony-server (route cert-file read failure is isolated)', () => {
+	// Two by-file routes on one port. If one route's cert file goes missing (ENOENT mid-
+	// rotation), it must not block the OTHER route's rotation on the same port-set — the
+	// unreadable route keeps its last-good cert while the healthy route's rotation applies.
+	const a1 = generateSelfSignedCert('a.local');
+	const a2 = generateSelfSignedCert('a.local');
+	const b = generateSelfSignedCert('b.local');
+	let dir: string;
+	let configPath: string;
+	let statusPath: string;
+	let aCertFile: string;
+	let aKeyFile: string;
+	let bCertFile: string;
+	let bKeyFile: string;
+	let proxyPort: number;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	let server: RunningServer;
+
+	before(async () => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-routefail-'));
+		configPath = path.join(dir, 'config.json');
+		statusPath = path.join(dir, 'status.json');
+		aCertFile = path.join(dir, 'a.crt');
+		aKeyFile = path.join(dir, 'a.key');
+		bCertFile = path.join(dir, 'b.crt');
+		bKeyFile = path.join(dir, 'b.key');
+		fs.writeFileSync(aCertFile, a1.cert);
+		fs.writeFileSync(aKeyFile, a1.key);
+		fs.writeFileSync(bCertFile, b.cert);
+		fs.writeFileSync(bKeyFile, b.key);
+
+		echo = await startEchoServer();
+		proxyPort = await getFreePort();
+
+		writeConfigAtomic(configPath, {
+			version: 1,
+			proxies: [
+				{
+					listeners: [{ host: '127.0.0.1', port: proxyPort }],
+					routes: [
+						{
+							sni: 'a.local',
+							upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+							terminateTls: true,
+							cert: { certChainFile: aCertFile, privateKeyFile: aKeyFile },
+						},
+						{
+							sni: 'b.local',
+							upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+							terminateTls: true,
+							cert: { certChainFile: bCertFile, privateKeyFile: bKeyFile },
+						},
+					],
+				},
+			],
+		});
+
+		server = spawnServer(configPath);
+		await waitFor(() => fs.existsSync(statusPath));
+	});
+
+	after(async () => {
+		await killServer(server);
+		await echo.close().catch(() => {});
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it('rotates the healthy route while a co-tenant cert file is missing, retaining its last-good', async () => {
+		await waitFor(() => servesCert(proxyPort, 'a.local', a1.cert));
+		await waitFor(() => servesCert(proxyPort, 'b.local', b.cert));
+
+		// b.local's cert file disappears (mid-rotation ENOENT); a.local rotates at the same time.
+		fs.rmSync(bCertFile);
+		fs.writeFileSync(aKeyFile, a2.key);
+		fs.writeFileSync(aCertFile, a2.cert);
+
+		// a.local's rotation must apply despite b.local's unreadable file…
+		await waitFor(() => servesCert(proxyPort, 'a.local', a2.cert), 8000, 150);
+		// …and b.local keeps serving its last-good cert (route isolated + carried forward).
+		assert.equal(
+			await servesCert(proxyPort, 'b.local', b.cert),
+			true,
+			`co-tenant b.local was dropped when its cert file went missing. stderr:\n${server.getStderr()}`
+		);
+		assert.match(server.getStderr(), /route 'b\.local'/);
+	});
+});
