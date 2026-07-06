@@ -444,6 +444,8 @@ const info = proxy.blockedIps();
 
 Penalty state is stored on per-IP runtime state and survives a configuration hot-swap. `penaltyBox` can be added or removed via `updateConfig` without restarting.
 
+**Hot-swap note on active deadlines:** changing `durationMs` via `updateConfig` affects new penalty stamps immediately, but IPs already in the box retain their current deadline until it expires or is re-stamped by a continued rate-limit hit. There is no retroactive recalculation of existing deadlines.
+
 ### JA3 blocking
 
 Collect JA3 fingerprints from your logs (the `ja3` field is available in future log integrations) and add known-bad clients:

@@ -75,8 +75,11 @@ The rate limit uses a fixed-point token count (×1000) in an `AtomicU32` with CA
 
 Each IP now has **two independent token buckets** on `IpState`: a per-second bucket (`tokens`, `last_refill_ns`) and a sustained per-minute bucket (`sustained_tokens`, `sustained_last_refill_ns`). Both use the same ×1000 fixed-point and CAS idiom. Both are checked on admission; exhausting either blocks the connection. Max sustained burst: 4,294,967 connections (u32::MAX / 1000) — far above any realistic value.
 
+### Monotonic clock for all timing
+`now_ns()` returns a monotonic offset from a process-wide `Instant` anchor (`static START: OnceLock<Instant>`), NOT wall-clock nanoseconds. All penalty deadlines and bucket timestamps use this value. Trade-off: values cannot be interpreted as unix timestamps; they are only ever compared internally. Benefit: forward NTP steps cannot release a penalty-boxed IP early and backward steps cannot freeze bucket refills.
+
 ### Penalty box via AtomicU64 deadline
-When `penaltyBox.durationMs > 0`, exhausting any rate limit sets `IpState.penalty_deadline_ns = now_ns() + duration_ns`. While `now < deadline`, connections are blocked as `PenaltyBoxed`. Each blocked attempt while boxed also debits the token buckets (lazy refill + consume); if a bucket exhausts, the deadline is reset to `now + duration_ns` (extension). The IP is readmitted once the deadline passes without further extension. Penalty state lives on `IpState` and survives config hot-swaps.
+When `penaltyBox.durationMs > 0`, exhausting any rate limit sets `IpState.penalty_deadline_ns = now_ns() + duration_ns`. While `now < deadline`, connections are blocked as `PenaltyBoxed`. Each blocked attempt while boxed also debits the token buckets (lazy refill + consume); if a bucket exhausts, the deadline is reset to `now + duration_ns` (extension). The IP is readmitted once the deadline passes without further extension. Penalty state lives on `IpState` and survives config hot-swaps. A `durationMs` hot-swap affects new stamps only; existing deadlines run out on the old duration.
 
 ### IP state eviction (spawned in start())
 `ProtectionState::evict()` is spawned as a periodic background task (60 s interval) per listener with protection, in `start()` via the `shutdown_tx` broadcast pattern. Eviction uses **lazy bucket projection** — it computes what the token level *would* be if refilled by the current time (`now - last_refill_ns`), rather than relying on the stored token value (which is only updated on access). An entry is retained if:
