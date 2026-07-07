@@ -477,7 +477,10 @@ impl SymphonyProxyWrap {
 
 	#[napi]
 	pub fn update_config(&self, hot: JsHotConfig) -> Result<()> {
-		if let Some(routes) = hot.routes {
+		// Build new route table if provided — hold it, do NOT swap yet.
+		// All validation must pass before either section is applied: a combined update
+		// with valid routes + invalid protection must leave both in their old state.
+		let new_route_table = if let Some(routes) = hot.routes {
 			let specs: Vec<RouteSpec> = routes
 				.iter()
 				.map(parse_route_spec)
@@ -488,10 +491,14 @@ impl SymphonyProxyWrap {
 			let current = self.route_table.0.load();
 			let table = build_route_table(&specs, &self.default_listener_tls, Some(&current))
 				.map_err(|e| napi::Error::from_reason(e.to_string()))?;
-			self.route_table.swap(table);
-		}
-		if let Some(protection_updates) = hot.protection {
-			// Phase 1: validate all updates before any store (atomicity + early error).
+			Some(table)
+		} else {
+			None
+		};
+
+		// Validate + parse protection updates if provided — all-or-nothing before any store.
+		let validated_protection = if let Some(protection_updates) = hot.protection {
+			// Phase 1: validate all updates (atomicity + early error).
 			// Collect all offending ports so the caller gets one actionable error.
 			let mut errors: Vec<String> = Vec::new();
 			for update in &protection_updates {
@@ -514,12 +521,22 @@ impl SymphonyProxyWrap {
 				return Err(napi::Error::from_reason(errors.join("; ")));
 			}
 
-			// Phase 2: parse all configs (fallible) — all-or-nothing before any store.
+			// Phase 2: parse all configs (fallible).
 			let parsed = protection_updates
 				.iter()
 				.map(|u| parse_protection_config(&u.protection))
 				.collect::<Result<Vec<_>>>()?;
 
+			Some((protection_updates, parsed))
+		} else {
+			None
+		};
+
+		// All validation passed — apply atomically (routes then protection, neither applied on any error above).
+		if let Some(table) = new_route_table {
+			self.route_table.swap(table);
+		}
+		if let Some((protection_updates, parsed)) = validated_protection {
 			// Phase 3: store all (infallible — validation above guarantees each port is valid).
 			for (update, cfg) in protection_updates.iter().zip(parsed) {
 				let prot = self
@@ -729,10 +746,36 @@ fn parse_protection_config(
 	let mut cfg = crate::protection::ProtectionConfig::default();
 
 	if let Some(rl) = &prot.rate_limit {
+		if !rl.connections_per_second.is_finite() || rl.connections_per_second <= 0.0 {
+			return Err(napi::Error::from_reason(format!(
+				"rateLimit.connectionsPerSecond must be a finite positive number, got {}",
+				rl.connections_per_second
+			)));
+		}
+		if let Some(burst) = rl.burst {
+			if !burst.is_finite() || burst < 0.0 {
+				return Err(napi::Error::from_reason(format!(
+					"rateLimit.burst must be a finite non-negative number, got {burst}"
+				)));
+			}
+		}
 		cfg.rate_limit_cps = Some(rl.connections_per_second);
 		cfg.rate_limit_burst = rl.burst;
 	}
 	if let Some(s) = &prot.sustained {
+		if !s.connections_per_minute.is_finite() || s.connections_per_minute <= 0.0 {
+			return Err(napi::Error::from_reason(format!(
+				"sustained.connectionsPerMinute must be a finite positive number, got {}",
+				s.connections_per_minute
+			)));
+		}
+		if let Some(burst) = s.burst {
+			if !burst.is_finite() || burst < 0.0 {
+				return Err(napi::Error::from_reason(format!(
+					"sustained.burst must be a finite non-negative number, got {burst}"
+				)));
+			}
+		}
 		cfg.sustained_cpm = Some(s.connections_per_minute);
 		cfg.sustained_burst = s.burst;
 	}
@@ -857,5 +900,113 @@ fn from_hex_digit(b: u8) -> Option<u8> {
 		b'a'..=b'f' => Some(b - b'a' + 10),
 		b'A'..=b'F' => Some(b - b'A' + 10),
 		_ => None,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn no_rate_limit_prot() -> JsProtectionConfig {
+		JsProtectionConfig {
+			rate_limit: None,
+			sustained: None,
+			penalty_box: None,
+			max_concurrent_per_ip: None,
+			allowlist: None,
+			blocklist: None,
+			ja3_blocklist: None,
+			tls_handshake_timeout_ms: None,
+			require_sni: None,
+		}
+	}
+
+	#[test]
+	fn reject_nan_cps() {
+		let prot = JsProtectionConfig {
+			rate_limit: Some(JsRateLimitConfig { connections_per_second: f64::NAN, burst: None }),
+			..no_rate_limit_prot()
+		};
+		assert!(parse_protection_config(&prot).is_err(), "NaN cps must error");
+	}
+
+	#[test]
+	fn reject_negative_cps() {
+		let prot = JsProtectionConfig {
+			rate_limit: Some(JsRateLimitConfig { connections_per_second: -1.0, burst: None }),
+			..no_rate_limit_prot()
+		};
+		assert!(parse_protection_config(&prot).is_err(), "negative cps must error");
+	}
+
+	#[test]
+	fn reject_zero_cps() {
+		let prot = JsProtectionConfig {
+			rate_limit: Some(JsRateLimitConfig { connections_per_second: 0.0, burst: None }),
+			..no_rate_limit_prot()
+		};
+		assert!(parse_protection_config(&prot).is_err(), "zero cps must error");
+	}
+
+	#[test]
+	fn reject_nan_burst() {
+		let prot = JsProtectionConfig {
+			rate_limit: Some(JsRateLimitConfig {
+				connections_per_second: 10.0,
+				burst: Some(f64::NAN),
+			}),
+			..no_rate_limit_prot()
+		};
+		assert!(parse_protection_config(&prot).is_err(), "NaN burst must error");
+	}
+
+	#[test]
+	fn reject_negative_burst() {
+		let prot = JsProtectionConfig {
+			rate_limit: Some(JsRateLimitConfig {
+				connections_per_second: 10.0,
+				burst: Some(-1.0),
+			}),
+			..no_rate_limit_prot()
+		};
+		assert!(parse_protection_config(&prot).is_err(), "negative burst must error");
+	}
+
+	#[test]
+	fn reject_nan_cpm() {
+		let prot = JsProtectionConfig {
+			sustained: Some(JsSustainedRateLimitConfig {
+				connections_per_minute: f64::NAN,
+				burst: None,
+			}),
+			..no_rate_limit_prot()
+		};
+		assert!(parse_protection_config(&prot).is_err(), "NaN cpm must error");
+	}
+
+	#[test]
+	fn reject_negative_cpm() {
+		let prot = JsProtectionConfig {
+			sustained: Some(JsSustainedRateLimitConfig {
+				connections_per_minute: -1.0,
+				burst: None,
+			}),
+			..no_rate_limit_prot()
+		};
+		assert!(parse_protection_config(&prot).is_err(), "negative cpm must error");
+	}
+
+	#[test]
+	fn accept_absent_burst() {
+		// burst: None (absent) must not error — only present-but-invalid burst is rejected
+		let prot = JsProtectionConfig {
+			rate_limit: Some(JsRateLimitConfig { connections_per_second: 10.0, burst: None }),
+			sustained: Some(JsSustainedRateLimitConfig {
+				connections_per_minute: 100.0,
+				burst: None,
+			}),
+			..no_rate_limit_prot()
+		};
+		assert!(parse_protection_config(&prot).is_ok(), "absent burst must be accepted");
 	}
 }
