@@ -8,14 +8,72 @@ use crate::router::{
 };
 use crate::suspended::{build_resolved_route, ResolveSpec, ResolveUpstream, SuspendedRegistry};
 use ipnetwork::IpNetwork;
+use maxminddb::Mmap;
+use maxminddb::Reader;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunction;
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::runtime::{Handle as RtHandle, Runtime};
 use tokio::sync::broadcast;
+
+// ── Process-wide MMDB reader cache ───────────────────────────────────────────
+//
+// Key: canonical path. Value: (mtime_nanos, file_size, reader).
+// N listeners referencing the same file share one mmap; a file rotation (mtime/size
+// change) is detected on the next hot-swap and triggers a fresh open.
+//
+// Design: hot-swap failure (bad path) is NOT propagated — the caller retains the
+// previous reader and logs a warning. Initial-construction failure IS propagated (hard
+// error: operator typo'd the path). This follows the "last-good" philosophy in router.rs.
+type MmdbCacheMap = HashMap<PathBuf, (u64, u64, Arc<Reader<Mmap>>)>;
+static MMDB_CACHE: OnceLock<Mutex<MmdbCacheMap>> = OnceLock::new();
+
+fn mmdb_cache() -> &'static Mutex<MmdbCacheMap> {
+	MMDB_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Load (or return cached) a MaxMind ASN database reader.
+/// Returns `Err` when the file can't be opened (propagate on initial build; absorb on hot-swap).
+///
+/// # Safety
+/// The caller must ensure the file is not truncated while mapped. Use atomic rotation
+/// (write-then-rename) rather than in-place overwrite; host-manager satisfies this.
+fn load_asn_reader(path: &str) -> Result<Arc<Reader<Mmap>>> {
+	let canonical = std::fs::canonicalize(path)
+		.map_err(|e| napi::Error::from_reason(format!("cannot resolve ASN DB path '{path}': {e}")))?;
+	let meta = std::fs::metadata(&canonical)
+		.map_err(|e| napi::Error::from_reason(format!("cannot stat ASN DB '{path}': {e}")))?;
+	let mtime = meta
+		.modified()
+		.map(|t| {
+			t.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_nanos() as u64
+		})
+		.unwrap_or(0);
+	let size = meta.len();
+
+	let mut cache = mmdb_cache().lock().unwrap();
+	if let Some((cached_mtime, cached_size, reader)) = cache.get(&canonical) {
+		if *cached_mtime == mtime && *cached_size == size {
+			return Ok(Arc::clone(reader));
+		}
+	}
+
+	// SAFETY: the file is not truncated while mapped — caller uses atomic rotation.
+	let reader = unsafe {
+		Reader::open_mmap(&canonical)
+			.map_err(|e| napi::Error::from_reason(format!("cannot open ASN DB '{path}': {e}")))?
+	};
+	let reader = Arc::new(reader);
+	cache.insert(canonical, (mtime, size, Arc::clone(&reader)));
+	Ok(reader)
+}
 
 // ── JS-facing config types (in / out of NAPI boundary only) ──────────────────
 
@@ -95,6 +153,12 @@ pub struct JsProtectionConfig {
 	pub allowlist: Option<Vec<String>>,
 	pub blocklist: Option<Vec<String>>,
 	pub ja3_blocklist: Option<Vec<String>>,
+	/// Autonomous System Numbers (ASNs) to block. Requires asnDatabasePath.
+	pub asn_blocklist: Option<Vec<f64>>,
+	/// Path to a MaxMind-format ASN MMDB (GeoLite2-ASN or GeoIP2-ASN).
+	/// Symphony ships no data; the operator must supply the file under their own MaxMind license.
+	/// Hot-swappable: an in-place DB refresh triggers a reload via the file watcher.
+	pub asn_database_path: Option<String>,
 	pub tls_handshake_timeout_ms: Option<f64>,
 	pub require_sni: Option<bool>,
 }
@@ -279,7 +343,8 @@ impl SymphonyProxyWrap {
 			});
 
 			let protection = if let Some(prot_cfg) = &l.protection {
-				let cfg = parse_protection_config(prot_cfg)?;
+				// Initial build: no previous reader → a bad DB path is a hard error.
+				let cfg = parse_protection_config(prot_cfg, None)?;
 				Some(ProtectionState::new(cfg))
 			} else {
 				None
@@ -506,10 +571,19 @@ impl SymphonyProxyWrap {
 				return Err(napi::Error::from_reason(errors.join("; ")));
 			}
 
-			// Phase 2: parse all configs (fallible).
+			// Phase 2: parse all configs (fallible) — pass prev_reader so a DB-load failure on
+			// hot-swap retains the last-good MMDB reader rather than aborting the whole update.
 			let parsed = protection_updates
 				.iter()
-				.map(|u| parse_protection_config(&u.protection))
+				.map(|u| {
+					let prev_reader = self
+						.listener_states
+						.iter()
+						.find(|s| s.port == u.port)
+						.and_then(|s| s.protection.as_ref())
+						.and_then(|p| p.config.load().asn_reader.clone());
+					parse_protection_config(&u.protection, prev_reader)
+				})
 				.collect::<Result<Vec<_>>>()?;
 
 			Some((protection_updates, parsed))
@@ -698,8 +772,14 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 	})
 }
 
+/// Parse a JS protection config into a Rust ProtectionConfig.
+///
+/// `prev_reader` is the current MMDB reader for this listener (if any) — used on hot-swap
+/// when the new DB path fails to load. Pass `None` on initial construction so a bad path
+/// is a hard error rather than a silent fallback.
 fn parse_protection_config(
 	prot: &JsProtectionConfig,
+	prev_reader: Option<Arc<Reader<Mmap>>>,
 ) -> Result<crate::protection::ProtectionConfig> {
 	let mut cfg = crate::protection::ProtectionConfig::default();
 
@@ -749,6 +829,32 @@ fn parse_protection_config(
 			}
 		}
 	}
+
+	// ASN blocklist: f64 vec from JS (JS has no u32 type in napi objects) → HashSet<u32>.
+	if let Some(asns) = &prot.asn_blocklist {
+		for &asn in asns {
+			cfg.asn_blocklist.insert(asn as u32);
+		}
+	}
+
+	// ASN database: load or return cached reader. On initial construction, a failure is
+	// propagated as a hard error (operator typo). On hot-swap (prev_reader is Some), a
+	// failure falls back to the previous reader so the rest of the new config still applies.
+	cfg.asn_reader = if let Some(path) = &prot.asn_database_path {
+		match load_asn_reader(path) {
+			Ok(reader) => Some(reader),
+			Err(e) if prev_reader.is_some() => {
+				tracing::warn!(
+					"ASN DB load failed on hot-swap (keeping previous reader): {e}; \
+					path = {path}"
+				);
+				prev_reader
+			}
+			Err(e) => return Err(e),
+		}
+	} else {
+		None
+	};
 
 	cfg.tls_handshake_timeout_ms = prot.tls_handshake_timeout_ms.unwrap_or(0.0) as u64;
 	cfg.require_sni = prot.require_sni.unwrap_or(false);

@@ -68,6 +68,14 @@ export interface JsProtectionConfig {
   allowlist?: Array<string>
   blocklist?: Array<string>
   ja3Blocklist?: Array<string>
+  /** Autonomous System Numbers (ASNs) to block. Requires asnDatabasePath. */
+  asnBlocklist?: Array<number>
+  /**
+   * Path to a MaxMind-format ASN MMDB (GeoLite2-ASN or GeoIP2-ASN).
+   * Symphony ships no data; the operator must supply the file under their own MaxMind license.
+   * Hot-swappable: an in-place DB refresh triggers a reload via the file watcher.
+   */
+  asnDatabasePath?: string
   tlsHandshakeTimeoutMs?: number
   requireSni?: boolean
 }

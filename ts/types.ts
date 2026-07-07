@@ -152,6 +152,22 @@ export interface ProtectionConfig {
 	blocklist?: string[];
 	/** JA3 MD5 fingerprint hex strings to block (32 hex chars each). */
 	ja3Blocklist?: string[];
+	/**
+	 * Autonomous System Numbers (AS numbers) to block.
+	 * Connections from any IP whose ASN is in this list are rejected.
+	 * Requires `asnDatabasePath`. Has no effect when the list is empty or no DB is loaded.
+	 */
+	asnBlocklist?: number[];
+	/**
+	 * Path to a MaxMind-format ASN MMDB file (GeoLite2-ASN or GeoIP2-ASN).
+	 * Symphony ships no data; the operator must supply this file under their own MaxMind license.
+	 * (GeoLite2-ASN is available free at https://dev.maxmind.com/geoip/geolite2-free-geolocation-data)
+	 *
+	 * Hot-reload: symphony watches this file alongside cert files. An in-place DB refresh
+	 * (what host-manager does) is detected and applied automatically without a config write.
+	 * On a failed reload the previous reader is retained (last-good semantics).
+	 */
+	asnDatabasePath?: string;
 	/** Reject connections whose TLS handshake exceeds this many ms. Default: 10000. */
 	tlsHandshakeTimeoutMs?: number;
 	/** Reject connections that present no SNI. Default: false. */

@@ -67,7 +67,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 				ctx.global_metrics.inc_blocked();
 				emit(&ctx.js_emit, JsEvent::Blocked {
 					ip: peer_ip.to_string(),
-					reason: reason.as_str().to_string(),
+					reason: reason.to_reason_string(),
 					listener: ctx.listener_addr.clone(),
 				});
 				return;

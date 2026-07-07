@@ -121,6 +121,17 @@ function toProxyConfig(spec: FileProxyConfig, baseDir: string): ProxyConfig {
 		...l,
 		defaultCert: l.defaultCert ? resolveCert(l.defaultCert, baseDir) : undefined,
 		mtls: l.mtls ? resolveMtls(l.mtls, baseDir) : undefined,
+		// Resolve asnDatabasePath relative to the config file's directory so relative
+		// paths work the same as certChainFile/privateKeyFile. The Rust load_asn_reader()
+		// then calls canonicalize() on the absolute path it receives here.
+		protection: l.protection
+			? {
+					...l.protection,
+					asnDatabasePath: l.protection.asnDatabasePath
+						? resolvePath(l.protection.asnDatabasePath, baseDir)
+						: undefined,
+				}
+			: undefined,
 	}));
 	const routes: RouteConfig[] = spec.routes.map((r) => resolveRoute(r, baseDir));
 	return { listeners, routes, workerThreads: spec.workerThreads, readBufferSize: spec.readBufferSize };
@@ -215,6 +226,9 @@ class ServerState {
 				add(l.defaultCert?.certChainFile);
 				add(l.defaultCert?.privateKeyFile);
 				add(l.mtls?.clientCaCertFile);
+				// Watch ASN DB alongside cert files so an in-place refresh triggers a
+				// hot-reload without a config.json write (host-manager rotates in-place).
+				if (l.protection?.asnDatabasePath) add(l.protection.asnDatabasePath);
 			}
 			for (const r of proxy.routes ?? []) {
 				add(r.cert?.certChainFile);

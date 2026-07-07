@@ -4,9 +4,13 @@
 
 import assert from 'node:assert/strict';
 import * as net from 'node:net';
+import * as path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { SymphonyProxy } from '../ts/proxy.js';
 import { generateSelfSignedCert, getFreePort, startEchoServer, sleep } from './util.js';
+
+// __dirname is dist-test/__test__/ when compiled; fixture lives in source __test__/fixtures/
+const TEST_ASN_MMDB = path.resolve(__dirname, '../../__test__/fixtures/test-asn.mmdb');
 
 /** Attempt a raw TCP connection without reading/writing, then close it. */
 async function openAndClose(port: number): Promise<void> {
@@ -488,5 +492,123 @@ describe('Protection – updateConfig hot-swap', () => {
 
 		const info = proxy.blockedIps();
 		assert.equal(info.cidrBlocklist.length, 0, 'Expected cidrBlocklist to be empty after removal');
+	});
+});
+
+// ── ASN blocking tests ────────────────────────────────────────────────────────
+//
+// The test fixture maps:
+//   127.0.0.0/8   → AS64512  (loopback — all test connections originate here)
+//   192.0.2.0/24  → AS64513  (TEST-NET-1, never reachable in practice)
+
+describe('Protection – ASN blocklist', () => {
+	let proxyPort: number;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	let proxy: SymphonyProxy;
+
+	before(async () => {
+		echo = await startEchoServer();
+		proxyPort = await getFreePort();
+
+		// Block AS64512 — all loopback connections will be rejected.
+		proxy = new SymphonyProxy({
+			listeners: [
+				{
+					host: '127.0.0.1',
+					port: proxyPort,
+					protection: {
+						asnBlocklist: [64512],
+						asnDatabasePath: TEST_ASN_MMDB,
+					},
+				},
+			],
+			routes: [
+				{
+					sni: 'localhost',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+					terminateTls: false,
+				},
+			],
+		});
+		await proxy.start();
+		await sleep(50);
+	});
+
+	after(async () => {
+		await proxy.stop();
+		await echo.close();
+	});
+
+	it('emits blocked event with asn_blocked:AS64512 reason for loopback connections', async () => {
+		const blockedReason = await new Promise<string | null>((resolve) => {
+			const handler = (ev: { ip: string; reason: string }) => {
+				proxy.off('blocked', handler);
+				resolve(ev.reason);
+			};
+			proxy.on('blocked', handler);
+			setTimeout(() => {
+				proxy.off('blocked', handler);
+				resolve(null);
+			}, 2000);
+
+			// Connect and half-close so peek() returns and protection check runs.
+			const s = net.createConnection({ port: proxyPort, host: '127.0.0.1' }, () => s.end());
+			s.on('error', () => {});
+		});
+
+		assert.equal(
+			blockedReason,
+			'asn_blocked:AS64512',
+			`Expected reason "asn_blocked:AS64512", got: ${blockedReason}`,
+		);
+	});
+
+	it('does not block when asnBlocklist does not contain the connection ASN', async () => {
+		// Hot-swap to AS64513 blocklist; loopback (AS64512) should now be allowed.
+		proxy.updateConfig({
+			protection: [
+				{
+					port: proxyPort,
+					protection: {
+						asnBlocklist: [64513],
+						asnDatabasePath: TEST_ASN_MMDB,
+					},
+				},
+			],
+		});
+		await sleep(20);
+
+		const connected = await new Promise<boolean>((resolve) => {
+			const s = net.createConnection({ port: proxyPort, host: '127.0.0.1' }, () => {
+				s.destroy();
+				resolve(true);
+			});
+			s.on('error', () => resolve(false));
+			setTimeout(() => resolve(false), 2000);
+		});
+		assert.ok(connected, 'Expected connection to succeed when ASN is not in blocklist');
+	});
+
+	it('allows connections after hot-swapping asnBlocklist to empty', async () => {
+		// Remove the blocklist entirely — no ASN filtering.
+		proxy.updateConfig({
+			protection: [
+				{
+					port: proxyPort,
+					protection: { asnBlocklist: [] },
+				},
+			],
+		});
+		await sleep(20);
+
+		const connected = await new Promise<boolean>((resolve) => {
+			const s = net.createConnection({ port: proxyPort, host: '127.0.0.1' }, () => {
+				s.destroy();
+				resolve(true);
+			});
+			s.on('error', () => resolve(false));
+			setTimeout(() => resolve(false), 2000);
+		});
+		assert.ok(connected, 'Expected connection after ASN blocklist removed');
 	});
 });

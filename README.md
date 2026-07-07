@@ -15,9 +15,9 @@ symphony sits in front of your services and:
 - **Proxies TCP** — either terminating TLS (decrypt + forward plaintext) or passing raw TLS bytes through
 - **Balances over Unix Domain Sockets** (UDS) using least-connections weighted by thread CPU utilisation, with optional IP session affinity
 - **Limits** routes with per-route token-bucket rate caps to prevent any one route from starving others
-- **Protects** connections with per-IP token-bucket rate limiting, concurrency limits, CIDR allowlist/blocklist, JA3 fingerprint blocking, TLS handshake timeout, and SNI-required enforcement
+- **Protects** connections with per-IP token-bucket rate limiting, concurrency limits, CIDR allowlist/blocklist, JA3 fingerprint blocking, ASN blocking (operator-supplied MaxMind MMDB), TLS handshake timeout, and SNI-required enforcement
 - **Suspends** routes — hold incoming connections and fire an event; your code decides whether to proxy or reject each one
-- **Hot-swaps** routes and per-listener protection config (CIDR lists, JA3 blocklist, rate limits, concurrency caps, handshake timeout, requireSni) without restarting or dropping existing connections
+- **Hot-swaps** routes and per-listener protection config (CIDR lists, JA3/ASN blocklists, rate limits, concurrency caps, handshake timeout, requireSni) without restarting or dropping existing connections
 - Scales to **~1 million concurrent connections** via `SO_REUSEPORT`, tokio's multi-thread runtime, and lock-free data structures
 
 ---
@@ -143,6 +143,8 @@ Both fields accept PEM-encoded strings or `Buffer`. The cert chain may include i
 | `allowlist` | `string[]` | `[]` | CIDRs that bypass all checks |
 | `blocklist` | `string[]` | `[]` | CIDRs that are always blocked |
 | `ja3Blocklist` | `string[]` | `[]` | JA3 MD5 hex fingerprints to block (32 chars each) |
+| `asnBlocklist` | `number[]` | `[]` | Autonomous System Numbers to block. Requires `asnDatabasePath`. |
+| `asnDatabasePath` | `string` | — | Path to a MaxMind-format ASN MMDB (GeoLite2-ASN or GeoIP2-ASN). symphony ships no data; the operator must supply this file. See [ASN blocking](#asn-blocking). |
 | `tlsHandshakeTimeoutMs` | `number` | `10000` | Abort slow TLS handshakes |
 | `requireSni` | `boolean` | `false` | Reject connections without an SNI extension |
 
@@ -455,6 +457,34 @@ ja3Blocklist: [
   'e7d705a3286e19ea42f587b344ee6865', // example known-bad scanner
 ]
 ```
+
+### ASN blocking
+
+Block entire Autonomous Systems (hosting providers, VPN networks, TOR exit nodes, etc.) by AS number. symphony looks up each connection's source IP in a MaxMind-format MMDB and rejects it if the AS number is in `asnBlocklist`.
+
+**Symphony ships no geolocation data.** You must supply the MMDB yourself:
+
+- **GeoLite2-ASN** — free, requires a MaxMind account: <https://dev.maxmind.com/geoip/geolite2-free-geolocation-data>
+- **GeoIP2-ASN** — commercial, higher accuracy
+
+```typescript
+protection: {
+  asnBlocklist: [
+    7922,   // Comcast
+    15169,  // Google
+    16509,  // Amazon AWS
+  ],
+  asnDatabasePath: '/etc/maxmind/GeoLite2-ASN.mmdb',
+}
+```
+
+The `blocked` event includes `reason: 'asn_blocked:AS{number}'` when ASN blocking fires.
+
+**Hot-reload:** symphony watches `asnDatabasePath` alongside cert files. When the file changes on disk (e.g. a weekly MaxMind update performed by host-manager via atomic rename), symphony detects the change and reloads the DB automatically — no config change or restart needed. If the new file can't be read, the previous reader is retained (last-good semantics) and a warning is logged.
+
+**Performance:** the MMDB trie walk is ~sub-microsecond per connection. Multiple listeners referencing the same path share one memory-mapped reader (process-wide cache keyed by canonical path + mtime + size). Admission-path reads are lock-free.
+
+**Check ordering:** ASN is evaluated after the allowlist bypass and CIDR/JA3 blocklists (cheaper checks first), and before `requireSni`. An IP on the allowlist always bypasses ASN checking.
 
 ### Hot-swapping protection config
 

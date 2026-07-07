@@ -1,7 +1,10 @@
 use crate::sni::PeekInfo;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use ip_network_table::IpNetworkTable;
 use ipnetwork::IpNetwork;
+use maxminddb::Mmap;
+use maxminddb::Reader;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -20,11 +23,37 @@ fn now_ns() -> u64 {
 		.as_nanos() as u64
 }
 
+// ── Helper: convert ipnetwork::IpNetwork to ip_network::IpNetwork for trie ──
+
+fn to_ip_net(net: &IpNetwork) -> ip_network::IpNetwork {
+	match net {
+		IpNetwork::V4(n) => ip_network::Ipv4Network::new(n.network(), n.prefix())
+			.expect("valid ipnetwork always converts to ip_network")
+			.into(),
+		IpNetwork::V6(n) => ip_network::Ipv6Network::new(n.network(), n.prefix())
+			.expect("valid ipnetwork always converts to ip_network")
+			.into(),
+	}
+}
+
+// Build an IpNetworkTable<()> from a slice of IpNetwork entries.
+fn build_trie(nets: &[IpNetwork]) -> IpNetworkTable<()> {
+	let mut trie = IpNetworkTable::new();
+	for net in nets {
+		trie.insert(to_ip_net(net), ());
+	}
+	trie
+}
+
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 /// Snapshot of all protection settings for a listener.
 /// Stored inside ArcSwap so every field is hot-swappable in one atomic pointer store.
-#[derive(Clone, Debug, Default)]
+///
+/// Note: Clone and Debug are intentionally not derived.
+/// - IpNetworkTable does not implement Clone or Debug.
+/// - ProtectionConfig is always owned by Arc<> — no clone is needed.
+#[derive(Default)]
 pub struct ProtectionConfig {
 	/// Per-second token bucket: max new connections/second per IP.
 	pub rate_limit_cps: Option<f64>,
@@ -45,13 +74,19 @@ pub struct ProtectionConfig {
 	pub max_concurrent_per_ip: u32,
 	/// JA3 fingerprints to block (raw 16-byte MD5).
 	pub ja3_blocklist: HashSet<[u8; 16]>,
+	/// Autonomous System Numbers to block. Lookup skipped when empty.
+	pub asn_blocklist: HashSet<u32>,
+	/// Open MaxMind-format ASN database for per-connection ASN lookup.
+	/// Shared across listeners that reference the same file via the proxy-level MMDB cache.
+	/// None = ASN blocking disabled (skip the trie walk entirely).
+	pub asn_reader: Option<Arc<Reader<Mmap>>>,
 	/// Max ms for TLS handshake (0 = use default 10000).
 	pub tls_handshake_timeout_ms: u64,
 	/// Reject connections without SNI.
 	pub require_sni: bool,
-	/// CIDRs that bypass all protection checks.
+	/// CIDRs that bypass all protection checks (stored for blockedIps() reporting).
 	pub allowlist: Vec<IpNetwork>,
-	/// CIDRs that are always blocked.
+	/// CIDRs that are always blocked (stored for blockedIps() reporting).
 	pub blocklist: Vec<IpNetwork>,
 
 	// Precomputed derived constants — populated by ProtectionConfig::precompute().
@@ -64,6 +99,10 @@ pub struct ProtectionConfig {
 	pub sustained_tokens_per_ns: f64,
 	/// Sustained burst ceiling in fixed-point (×1000). 0 = no limit.
 	pub sustained_burst_fp: u32,
+	/// LPM trie for allowlist: O(prefix bits) lookup, replaces O(n) Vec scan.
+	pub(crate) allowlist_trie: IpNetworkTable<()>,
+	/// LPM trie for blocklist: O(prefix bits) lookup, replaces O(n) Vec scan.
+	pub(crate) blocklist_trie: IpNetworkTable<()>,
 }
 
 impl ProtectionConfig {
@@ -76,6 +115,13 @@ impl ProtectionConfig {
 			(self.sustained_burst.or(self.sustained_cpm).unwrap_or(0.0) * 1000.0) as u32;
 		// 1 minute = 60_000_000_000 ns
 		self.sustained_tokens_per_ns = self.sustained_cpm.map_or(0.0, |cpm| cpm / 60_000_000_000.0);
+
+		// Build LPM tries from the CIDR lists.
+		// Allowlist precedence: allowlist is checked before blocklist in check(),
+		// so a /24 allowlist inside a /8 blocklist allows the narrower range.
+		// This is identical semantics to the former O(n) linear scan, just O(prefix bits).
+		self.allowlist_trie = build_trie(&self.allowlist);
+		self.blocklist_trie = build_trie(&self.blocklist);
 		self
 	}
 
@@ -176,6 +222,9 @@ fn refill_and_consume(
 pub enum BlockReason {
 	CidrBlocked,
 	Ja3Blocked,
+	/// Blocked because the peer IP belongs to a blocked autonomous system.
+	/// The u32 is the AS number returned by the MMDB lookup.
+	AsnBlocked(u32),
 	NoSni,
 	RateLimited,
 	TooManyConnections,
@@ -188,10 +237,20 @@ impl BlockReason {
 		match self {
 			Self::CidrBlocked => "cidr_blocked",
 			Self::Ja3Blocked => "ja3_blocked",
+			Self::AsnBlocked(_) => "asn_blocked",
 			Self::NoSni => "no_sni",
 			Self::RateLimited => "rate_limited",
 			Self::TooManyConnections => "too_many_connections",
 			Self::PenaltyBoxed => "penalty_boxed",
+		}
+	}
+
+	/// Full reason string: for AsnBlocked includes the AS number so the blocked event
+	/// carries structured information without needing a new event field.
+	pub fn to_reason_string(&self) -> String {
+		match self {
+			Self::AsnBlocked(asn) => format!("asn_blocked:AS{asn}"),
+			other => other.as_str().to_string(),
 		}
 	}
 }
@@ -234,20 +293,19 @@ impl ProtectionState {
 		let cfg = self.config.load();
 
 		// 1. Allowlist — skip all other checks; active counter is NOT incremented.
-		for network in &cfg.allowlist {
-			if network.contains(peer_ip) {
-				return Decision::AllowBypassed;
-			}
+		//    Uses an LPM trie: O(prefix bits) vs the former O(n) linear scan.
+		//    Precedence rule: allowlist is always checked before blocklist, so a narrower
+		//    allowlist prefix (/24) inside a wider blocklist (/8) will still allow the IP.
+		if cfg.allowlist_trie.longest_match(peer_ip).is_some() {
+			return Decision::AllowBypassed;
 		}
 
-		// 2. Blocklist
-		for network in &cfg.blocklist {
-			if network.contains(peer_ip) {
-				return Decision::Block(BlockReason::CidrBlocked);
-			}
+		// 2. CIDR blocklist — LPM trie, O(prefix bits).
+		if cfg.blocklist_trie.longest_match(peer_ip).is_some() {
+			return Decision::Block(BlockReason::CidrBlocked);
 		}
 
-		// 3. JA3 blocklist
+		// 3. JA3 blocklist — O(1) HashSet lookup.
 		if !cfg.ja3_blocklist.is_empty() && peek_info.ja3.len() == 32 {
 			if let Some(bytes) = hex_to_bytes16(&peek_info.ja3) {
 				if cfg.ja3_blocklist.contains(&bytes) {
@@ -256,15 +314,35 @@ impl ProtectionState {
 			}
 		}
 
-		// 4. Require SNI
+		// 4. ASN blocklist — mmdb trie walk (~sub-µs) + O(1) HashSet.
+		//    Positioned after the cheaper JA3 HashSet but before requireSni, since an mmdb
+		//    trie walk costs more than a HashSet but less than a full TLS handshake.
+		//    Skipped entirely when asnBlocklist is empty or no DB is loaded.
+		if !cfg.asn_blocklist.is_empty() {
+			if let Some(reader) = &cfg.asn_reader {
+				// lookup() takes &self — no locking, safe to call concurrently.
+				if let Ok(result) = reader.lookup(peer_ip) {
+					// decode_path extracts just the ASN number without deserializing the full record.
+					if let Ok(Some(asn)) = result
+						.decode_path::<u32>(&[maxminddb::PathElement::Key("autonomous_system_number")])
+					{
+						if cfg.asn_blocklist.contains(&asn) {
+							return Decision::Block(BlockReason::AsnBlocked(asn));
+						}
+					}
+				}
+			}
+		}
+
+		// 5. Require SNI
 		if cfg.require_sni && peek_info.sni.is_none() {
 			return Decision::Block(BlockReason::NoSni);
 		}
 
-		// 5–8: IP-state checks — access IpState once
+		// 6–9: IP-state checks — access IpState once
 		let state = self.get_or_create_state(peer_ip, cfg.burst_fp, cfg.sustained_burst_fp);
 
-		// 5. Penalty box — if the IP is currently penalized, debit buckets to detect continued
+		// 6. Penalty box — if the IP is currently penalized, debit buckets to detect continued
 		//    excess and extend the deadline if found, then block outright.
 		let penalty_ms = cfg.penalty_box_duration_ms;
 		if penalty_ms > 0 {
@@ -280,7 +358,8 @@ impl ProtectionState {
 						now,
 						cfg.tokens_per_ns,
 						cfg.burst_fp,
-					) {
+					)
+				{
 					exceeded = true;
 				}
 				if cfg.sustained_tokens_per_ns > 0.0
@@ -290,7 +369,8 @@ impl ProtectionState {
 						now,
 						cfg.sustained_tokens_per_ns,
 						cfg.sustained_burst_fp,
-					) {
+					)
+				{
 					exceeded = true;
 				}
 				if exceeded {
@@ -305,7 +385,7 @@ impl ProtectionState {
 			}
 		}
 
-		// 6. Per-second rate limit
+		// 7. Per-second rate limit
 		if cfg.tokens_per_ns > 0.0
 			&& !refill_and_consume(&state.tokens, &state.last_refill_ns, now, cfg.tokens_per_ns, cfg.burst_fp)
 		{
@@ -318,7 +398,7 @@ impl ProtectionState {
 			return Decision::Block(BlockReason::RateLimited);
 		}
 
-		// 7. Sustained rate limit (per-minute)
+		// 8. Sustained rate limit (per-minute)
 		if cfg.sustained_tokens_per_ns > 0.0
 			&& !refill_and_consume(
 				&state.sustained_tokens,
@@ -337,7 +417,7 @@ impl ProtectionState {
 			return Decision::Block(BlockReason::RateLimited);
 		}
 
-		// 8. Concurrency limit — atomic test-and-increment to avoid TOCTOU
+		// 9. Concurrency limit — atomic test-and-increment to avoid TOCTOU
 		if cfg.max_concurrent_per_ip > 0 {
 			let max = cfg.max_concurrent_per_ip;
 			let result = state.active.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -583,6 +663,315 @@ mod tests {
 	fn peek_with_ja3(hex: &str) -> PeekInfo {
 		PeekInfo { sni: None, ja3: hex.to_string() }
 	}
+
+	// ── Trie-based CIDR tests ──────────────────────────────────────────────────
+
+	#[test]
+	fn trie_cidr_block_hot_swap_adds_block() {
+		let state = ProtectionState::new(ProtectionConfig::default());
+		let peer = ip("10.0.0.1");
+
+		// Initially allowed
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
+		state.release(peer);
+
+		// Swap in a blocklist containing the peer
+		state.config.store(Arc::new(
+			ProtectionConfig {
+				blocklist: vec!["10.0.0.0/24".parse().unwrap()],
+				..Default::default()
+			}
+			.precompute(),
+		));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::CidrBlocked)));
+	}
+
+	#[test]
+	fn trie_cidr_block_hot_swap_removes_block() {
+		let state = ProtectionState::new(ProtectionConfig {
+			blocklist: vec!["10.0.0.0/8".parse().unwrap()],
+			..Default::default()
+		});
+		let peer = ip("10.1.2.3");
+
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::CidrBlocked)));
+
+		// Remove the blocklist
+		state.config.store(Arc::new(ProtectionConfig::default().precompute()));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
+		state.release(peer);
+	}
+
+	#[test]
+	fn trie_allowlist_bypass_overrides_blocklist() {
+		let state = ProtectionState::new(ProtectionConfig {
+			blocklist: vec!["10.0.0.0/8".parse().unwrap()],
+			..Default::default()
+		});
+		let peer = ip("10.0.0.5");
+
+		// Initially blocked by CIDR
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::CidrBlocked)));
+
+		// A /24 allowlist inside a /8 blocklist: allowlist is checked first, so the IP
+		// is allowed even though the blocklist's /8 would otherwise match.
+		state.config.store(Arc::new(
+			ProtectionConfig {
+				allowlist: vec!["10.0.0.0/24".parse().unwrap()],
+				blocklist: vec!["10.0.0.0/8".parse().unwrap()],
+				..Default::default()
+			}
+			.precompute(),
+		));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::AllowBypassed));
+	}
+
+	#[test]
+	fn trie_longest_prefix_match_in_blocklist() {
+		// Both /8 and /24 in blocklist: the more specific /24 is still a block (only one list).
+		// This test verifies that any match in the blocklist (LPM or not) → block.
+		let state = ProtectionState::new(ProtectionConfig {
+			blocklist: vec!["10.0.0.0/8".parse().unwrap(), "10.0.1.0/24".parse().unwrap()],
+			..Default::default()
+		});
+
+		// Both should be blocked
+		assert!(matches!(state.check(ip("10.0.0.5"), &no_peek()), Decision::Block(BlockReason::CidrBlocked)));
+		assert!(matches!(state.check(ip("10.0.1.5"), &no_peek()), Decision::Block(BlockReason::CidrBlocked)));
+		// Outside the /8 — not blocked
+		state.config.store(Arc::new(
+			ProtectionConfig {
+				blocklist: vec!["10.0.1.0/24".parse().unwrap()],
+				..Default::default()
+			}
+			.precompute(),
+		));
+		assert!(matches!(state.check(ip("10.0.0.5"), &no_peek()), Decision::Allow(_)));
+		state.release(ip("10.0.0.5"));
+		assert!(matches!(state.check(ip("10.0.1.5"), &no_peek()), Decision::Block(BlockReason::CidrBlocked)));
+	}
+
+	#[test]
+	fn trie_narrow_allowlist_inside_wide_blocklist() {
+		// /8 blocklist with /24 allowlist inside: the IP in /24 is bypassed (allowlist wins
+		// because allowlist is checked before blocklist, not because of LPM within one list).
+		let state = ProtectionState::new(ProtectionConfig {
+			allowlist: vec!["10.0.1.0/24".parse().unwrap()],
+			blocklist: vec!["10.0.0.0/8".parse().unwrap()],
+			..Default::default()
+		});
+
+		// In the /24 → allowlist wins (checked first)
+		assert!(matches!(state.check(ip("10.0.1.5"), &no_peek()), Decision::AllowBypassed));
+		// In the /8 but not /24 → blocklist wins
+		assert!(matches!(state.check(ip("10.0.2.5"), &no_peek()), Decision::Block(BlockReason::CidrBlocked)));
+	}
+
+	// ── ASN blocking tests ─────────────────────────────────────────────────────
+
+	/// Build a minimal in-memory ASN MMDB for unit tests.
+	/// Maps 127.0.0.0/8 → AS64512 and 192.0.2.0/24 → AS64513.
+	/// License: generated programmatically using maxminddb-writer (MIT/Apache-2.0).
+	#[cfg(test)]
+	pub(crate) fn build_test_asn_mmdb() -> Vec<u8> {
+		use maxminddb_writer::{
+			metadata::IpVersion,
+			paths::IpAddrWithMask,
+			Database,
+		};
+		use serde::Serialize;
+
+		#[derive(Serialize)]
+		struct AsnRecord {
+			autonomous_system_number: u32,
+			autonomous_system_organization: String,
+		}
+
+		let mut db = Database::default();
+		// Set only public fields (node_count and record_size are managed by the writer).
+		db.metadata.ip_version = IpVersion::V4;
+		db.metadata.database_type = "GeoLite2-ASN".to_string();
+		db.metadata.languages = vec!["en".to_string()];
+		db.metadata.binary_format_major_version = 2;
+		db.metadata.binary_format_minor_version = 0;
+		db.metadata.build_epoch = 0;
+		db.metadata.description =
+			std::collections::HashMap::from([("en".to_string(), "Test ASN DB".to_string())]);
+
+		let ref127 = db
+			.insert_value(AsnRecord {
+				autonomous_system_number: 64512,
+				autonomous_system_organization: "Test-AS-A".to_string(),
+			})
+			.unwrap();
+		let ref192 = db
+			.insert_value(AsnRecord {
+				autonomous_system_number: 64513,
+				autonomous_system_organization: "Test-AS-B".to_string(),
+			})
+			.unwrap();
+
+		db.insert_node("127.0.0.0/8".parse::<IpAddrWithMask>().unwrap(), ref127);
+		db.insert_node("192.0.2.0/24".parse::<IpAddrWithMask>().unwrap(), ref192);
+
+		let mut out = Vec::new();
+		db.write_to(&mut out).unwrap();
+		out
+	}
+
+	#[cfg(test)]
+	fn make_test_reader() -> Arc<Reader<maxminddb::Mmap>> {
+		use std::io::Write;
+		let bytes = build_test_asn_mmdb();
+		// Write to a temp file and mmap it.
+		// SAFETY: temp file is not modified while mapped within this test.
+		let mut f = tempfile::NamedTempFile::new().unwrap();
+		f.write_all(&bytes).unwrap();
+		f.flush().unwrap();
+		let path = f.into_temp_path();
+		let reader = unsafe { Reader::open_mmap(&path).unwrap() };
+		Arc::new(reader)
+	}
+
+	#[test]
+	fn asn_block_matches_known_asn() {
+		let reader = make_test_reader();
+		let state = ProtectionState::new(ProtectionConfig {
+			asn_blocklist: HashSet::from([64512]),
+			asn_reader: Some(reader),
+			..Default::default()
+		});
+
+		// 127.0.0.1 is in 127.0.0.0/8 → AS64512 → blocked
+		let peer = ip("127.0.0.1");
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::AsnBlocked(64512))));
+	}
+
+	#[test]
+	fn asn_block_non_matching_asn_passes() {
+		let reader = make_test_reader();
+		let state = ProtectionState::new(ProtectionConfig {
+			asn_blocklist: HashSet::from([64513]), // only block AS64513
+			asn_reader: Some(reader),
+			..Default::default()
+		});
+
+		// 127.0.0.1 → AS64512 → NOT in blocklist → allowed
+		let peer = ip("127.0.0.1");
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
+		state.release(peer);
+	}
+
+	#[test]
+	fn asn_block_empty_blocklist_skips_lookup() {
+		let reader = make_test_reader();
+		let state = ProtectionState::new(ProtectionConfig {
+			asn_blocklist: HashSet::new(), // empty → skip lookup
+			asn_reader: Some(reader),
+			..Default::default()
+		});
+
+		let peer = ip("127.0.0.1");
+		// Empty blocklist → lookup skipped entirely → allowed
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
+		state.release(peer);
+	}
+
+	#[test]
+	fn asn_block_no_reader_skips_check() {
+		let state = ProtectionState::new(ProtectionConfig {
+			asn_blocklist: HashSet::from([64512]),
+			asn_reader: None, // no DB → skip check
+			..Default::default()
+		});
+
+		let peer = ip("127.0.0.1");
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
+		state.release(peer);
+	}
+
+	#[test]
+	fn asn_block_allowlist_bypasses_asn_check() {
+		let reader = make_test_reader();
+		let state = ProtectionState::new(ProtectionConfig {
+			allowlist: vec!["127.0.0.0/8".parse().unwrap()],
+			asn_blocklist: HashSet::from([64512]),
+			asn_reader: Some(reader),
+			..Default::default()
+		});
+
+		// Allowlist check runs before ASN check → bypassed
+		let peer = ip("127.0.0.1");
+		assert!(matches!(state.check(peer, &no_peek()), Decision::AllowBypassed));
+	}
+
+	#[test]
+	fn asn_block_hot_swap_changes_asn_list() {
+		let reader = make_test_reader();
+		let state = ProtectionState::new(ProtectionConfig {
+			asn_blocklist: HashSet::from([64512]),
+			asn_reader: Some(Arc::clone(&reader)),
+			..Default::default()
+		});
+
+		// Initially blocked
+		let peer = ip("127.0.0.1");
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::AsnBlocked(64512))));
+
+		// Hot-swap: remove AS64512 from blocklist
+		state.config.store(Arc::new(
+			ProtectionConfig {
+				asn_blocklist: HashSet::new(),
+				asn_reader: Some(reader),
+				..Default::default()
+			}
+			.precompute(),
+		));
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
+		state.release(peer);
+	}
+
+	#[test]
+	fn asn_block_hot_swap_bad_path_retains_last_good() {
+		// Simulate: hot-swap with a non-existent DB path → proxy.rs keeps the previous reader.
+		// This test verifies the ProtectionConfig can be constructed with asn_reader=None
+		// (representing a failed DB load that fell back to None on hot-swap), and that
+		// check() then skips ASN blocking (rather than panicking or blocking all traffic).
+		// The "keep previous reader" logic lives in parse_protection_config (proxy.rs),
+		// which tests it separately. Here we test the None-reader graceful skip.
+		let reader = make_test_reader();
+		let state = ProtectionState::new(ProtectionConfig {
+			asn_blocklist: HashSet::from([64512]),
+			asn_reader: Some(reader),
+			..Default::default()
+		});
+
+		let peer = ip("127.0.0.1");
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Block(BlockReason::AsnBlocked(64512))));
+
+		// Simulate failed hot-swap: new config has asn_reader=None (no DB loaded)
+		// but still has the blocklist → ASN check skipped (graceful degradation).
+		state.config.store(Arc::new(
+			ProtectionConfig {
+				asn_blocklist: HashSet::from([64512]),
+				asn_reader: None,
+				..Default::default()
+			}
+			.precompute(),
+		));
+		// No panic, no block — lookup is skipped when reader is None
+		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
+		state.release(peer);
+	}
+
+	#[test]
+	fn asn_block_reason_string_includes_asn() {
+		let r = BlockReason::AsnBlocked(12345);
+		assert_eq!(r.to_reason_string(), "asn_blocked:AS12345");
+		assert_eq!(r.as_str(), "asn_blocked");
+	}
+
+	// ── Original tests preserved below ────────────────────────────────────────
 
 	#[test]
 	fn cidr_block_hot_swap_adds_block() {

@@ -106,6 +106,8 @@ function toJsProtectionConfig(p: ProtectionConfig) {
 		allowlist: p.allowlist,
 		blocklist: p.blocklist,
 		ja3Blocklist: p.ja3Blocklist,
+		asnBlocklist: p.asnBlocklist,
+		asnDatabasePath: p.asnDatabasePath,
 		tlsHandshakeTimeoutMs: p.tlsHandshakeTimeoutMs,
 		requireSni: p.requireSni,
 	};
