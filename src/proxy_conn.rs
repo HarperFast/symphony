@@ -51,7 +51,10 @@ pub struct ConnContext {
 }
 
 pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnContext>) {
-	let peer_ip = peer_addr.ip();
+	// Normalize IPv4-mapped IPv6 (::ffff:a.b.c.d) to plain IPv4. On dual-stack `::`
+	// listeners, IPv4 clients arrive with a V6 peer address; without canonicalization
+	// they bypass V4 CIDR blocklists, fail V4-only MMDB lookups, and split per-IP state.
+	let peer_ip = peer_addr.ip().to_canonical();
 
 	// ── 1. Peek: extract SNI + JA3 ───────────────────────────────────────────
 	let peek_info = sni::peek(&stream).await;

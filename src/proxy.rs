@@ -8,7 +8,6 @@ use crate::router::{
 };
 use crate::suspended::{build_resolved_route, ResolveSpec, ResolveUpstream, SuspendedRegistry};
 use ipnetwork::IpNetwork;
-use maxminddb::Mmap;
 use maxminddb::Reader;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunction;
@@ -16,62 +15,49 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::{Handle as RtHandle, Runtime};
 use tokio::sync::broadcast;
 
-// ── Process-wide MMDB reader cache ───────────────────────────────────────────
+// ── Per-parse MMDB reader cache type ─────────────────────────────────────────
 //
-// Key: canonical path. Value: (mtime_nanos, file_size, reader).
-// N listeners referencing the same file share one mmap; a file rotation (mtime/size
-// change) is detected on the next hot-swap and triggers a fresh open.
+// Passed into parse_protection_config so that N listeners sharing the same path
+// within a single updateConfig call share one Arc<Reader<Vec<u8>>>.  A fresh map is
+// created for each updateConfig/new() call, so every config parse re-reads the file.
+// This makes the file-watcher event the single source of freshness: when the watcher
+// detects an MMDB update and triggers reconcile → updateConfig, the new bytes are read
+// immediately.  There is no mtime/size keying and no stale-reader risk.
 //
-// Design: hot-swap failure (bad path) is NOT propagated — the caller retains the
-// previous reader and logs a warning. Initial-construction failure IS propagated (hard
-// error: operator typo'd the path). This follows the "last-good" philosophy in router.rs.
-type MmdbCacheMap = HashMap<PathBuf, (u64, u64, Arc<Reader<Mmap>>)>;
-static MMDB_CACHE: OnceLock<Mutex<MmdbCacheMap>> = OnceLock::new();
+// Hot-swap failure (bad path, wrong schema) is NOT propagated — the caller retains the
+// previous reader and logs a warning (last-good semantics, same as router.rs).
+// Initial-construction failure IS propagated as a hard error.
+type PerParseCache = HashMap<PathBuf, Arc<Reader<Vec<u8>>>>;
 
-fn mmdb_cache() -> &'static Mutex<MmdbCacheMap> {
-	MMDB_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Load (or return cached) a MaxMind ASN database reader.
-/// Returns `Err` when the file can't be opened (propagate on initial build; absorb on hot-swap).
-///
-/// # Safety
-/// The caller must ensure the file is not truncated while mapped. Use atomic rotation
-/// (write-then-rename) rather than in-place overwrite; host-manager satisfies this.
-fn load_asn_reader(path: &str) -> Result<Arc<Reader<Mmap>>> {
+/// Load a MaxMind ASN database reader into owned memory.
+/// Safe from in-place DB rewrites: the data is fully copied at load time.
+/// Deduplicates within a single config-parse pass via `per_parse_cache`.
+fn load_asn_reader(path: &str, per_parse_cache: &mut PerParseCache) -> Result<Arc<Reader<Vec<u8>>>> {
 	let canonical = std::fs::canonicalize(path)
 		.map_err(|e| napi::Error::from_reason(format!("cannot resolve ASN DB path '{path}': {e}")))?;
-	let meta = std::fs::metadata(&canonical)
-		.map_err(|e| napi::Error::from_reason(format!("cannot stat ASN DB '{path}': {e}")))?;
-	let mtime = meta
-		.modified()
-		.map(|t| {
-			t.duration_since(std::time::UNIX_EPOCH)
-				.unwrap_or_default()
-				.as_nanos() as u64
-		})
-		.unwrap_or(0);
-	let size = meta.len();
 
-	let mut cache = mmdb_cache().lock().unwrap();
-	if let Some((cached_mtime, cached_size, reader)) = cache.get(&canonical) {
-		if *cached_mtime == mtime && *cached_size == size {
-			return Ok(Arc::clone(reader));
-		}
+	if let Some(reader) = per_parse_cache.get(&canonical) {
+		return Ok(Arc::clone(reader));
 	}
 
-	// SAFETY: the file is not truncated while mapped — caller uses atomic rotation.
-	let reader = unsafe {
-		Reader::open_mmap(&canonical)
-			.map_err(|e| napi::Error::from_reason(format!("cannot open ASN DB '{path}': {e}")))?
-	};
+	let reader = Reader::open_readfile(&canonical)
+		.map_err(|e| napi::Error::from_reason(format!("cannot open ASN DB '{path}': {e}")))?;
+
+	// Validate schema: GeoLite2-ASN and GeoIP2-ASN both contain "ASN" in database_type.
+	if !reader.metadata().database_type.contains("ASN") {
+		return Err(napi::Error::from_reason(format!(
+			"ASN DB '{path}' has unsupported database_type '{}'; expected GeoLite2-ASN or GeoIP2-ASN",
+			reader.metadata().database_type
+		)));
+	}
+
 	let reader = Arc::new(reader);
-	cache.insert(canonical, (mtime, size, Arc::clone(&reader)));
+	per_parse_cache.insert(canonical, Arc::clone(&reader));
 	Ok(reader)
 }
 
@@ -318,6 +304,8 @@ impl SymphonyProxyWrap {
 
 		let mut internal_listeners = Vec::new();
 		let mut listener_states = Vec::new();
+		// Per-parse cache: N listeners sharing the same MMDB path share one reader.
+		let mut per_parse_cache: PerParseCache = HashMap::new();
 
 		for l in &config.listeners {
 			let host = l.host.as_deref().unwrap_or("0.0.0.0");
@@ -344,7 +332,7 @@ impl SymphonyProxyWrap {
 
 			let protection = if let Some(prot_cfg) = &l.protection {
 				// Initial build: no previous reader → a bad DB path is a hard error.
-				let cfg = parse_protection_config(prot_cfg, None)?;
+				let cfg = parse_protection_config(prot_cfg, None, &mut per_parse_cache)?;
 				Some(ProtectionState::new(cfg))
 			} else {
 				None
@@ -573,18 +561,18 @@ impl SymphonyProxyWrap {
 
 			// Phase 2: parse all configs (fallible) — pass prev_reader so a DB-load failure on
 			// hot-swap retains the last-good MMDB reader rather than aborting the whole update.
-			let parsed = protection_updates
-				.iter()
-				.map(|u| {
-					let prev_reader = self
-						.listener_states
-						.iter()
-						.find(|s| s.port == u.port)
-						.and_then(|s| s.protection.as_ref())
-						.and_then(|p| p.config.load().asn_reader.clone());
-					parse_protection_config(&u.protection, prev_reader)
-				})
-				.collect::<Result<Vec<_>>>()?;
+			// Per-parse cache deduplicates readers across listeners in this call.
+			let mut per_parse_cache: PerParseCache = HashMap::new();
+			let mut parsed: Vec<crate::protection::ProtectionConfig> = Vec::new();
+			for u in &protection_updates {
+				let prev_reader = self
+					.listener_states
+					.iter()
+					.find(|s| s.port == u.port)
+					.and_then(|s| s.protection.as_ref())
+					.and_then(|p| p.config.load().asn_reader.clone());
+				parsed.push(parse_protection_config(&u.protection, prev_reader, &mut per_parse_cache)?);
+			}
 
 			Some((protection_updates, parsed))
 		} else {
@@ -774,12 +762,16 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 
 /// Parse a JS protection config into a Rust ProtectionConfig.
 ///
-/// `prev_reader` is the current MMDB reader for this listener (if any) — used on hot-swap
-/// when the new DB path fails to load. Pass `None` on initial construction so a bad path
-/// is a hard error rather than a silent fallback.
+/// `prev_reader`: the current MMDB reader for this listener — retained on hot-swap when
+/// the new DB path fails to load (last-good semantics). Pass `None` on initial construction
+/// so a bad path is a hard error.
+///
+/// `per_parse_cache`: deduplicates readers within a single config-parse pass so N listeners
+/// referencing the same MMDB path share one Arc.
 fn parse_protection_config(
 	prot: &JsProtectionConfig,
-	prev_reader: Option<Arc<Reader<Mmap>>>,
+	prev_reader: Option<Arc<Reader<Vec<u8>>>>,
+	per_parse_cache: &mut PerParseCache,
 ) -> Result<crate::protection::ProtectionConfig> {
 	let mut cfg = crate::protection::ProtectionConfig::default();
 
@@ -837,16 +829,22 @@ fn parse_protection_config(
 		}
 	}
 
-	// ASN database: load or return cached reader. On initial construction, a failure is
-	// propagated as a hard error (operator typo). On hot-swap (prev_reader is Some), a
-	// failure falls back to the previous reader so the rest of the new config still applies.
+	// Validation: asnBlocklist without asnDatabasePath is a config error.
+	if !cfg.asn_blocklist.is_empty() && prot.asn_database_path.is_none() {
+		return Err(napi::Error::from_reason(
+			"asnBlocklist requires asnDatabasePath to be set".to_string(),
+		));
+	}
+
+	// ASN database: load into owned memory (safe from in-place rewrites).
+	// On initial construction, failure is a hard error (operator typo'd the path).
+	// On hot-swap (prev_reader is Some), failure retains the previous reader (last-good).
 	cfg.asn_reader = if let Some(path) = &prot.asn_database_path {
-		match load_asn_reader(path) {
+		match load_asn_reader(path, per_parse_cache) {
 			Ok(reader) => Some(reader),
 			Err(e) if prev_reader.is_some() => {
-				tracing::warn!(
-					"ASN DB load failed on hot-swap (keeping previous reader): {e}; \
-					path = {path}"
+				eprintln!(
+					"symphony: ASN DB load failed on hot-swap (keeping previous reader): {e}; path = {path}"
 				);
 				prev_reader
 			}
@@ -961,6 +959,8 @@ mod tests {
 			allowlist: None,
 			blocklist: None,
 			ja3_blocklist: None,
+			asn_blocklist: None,
+			asn_database_path: None,
 			tls_handshake_timeout_ms: None,
 			require_sni: None,
 		}
@@ -972,7 +972,7 @@ mod tests {
 			rate_limit: Some(JsRateLimitConfig { connections_per_second: f64::NAN, burst: None }),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_err(), "NaN cps must error");
+		assert!(parse_protection_config(&prot, None, &mut HashMap::new()).is_err(), "NaN cps must error");
 	}
 
 	#[test]
@@ -981,7 +981,7 @@ mod tests {
 			rate_limit: Some(JsRateLimitConfig { connections_per_second: -1.0, burst: None }),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_err(), "negative cps must error");
+		assert!(parse_protection_config(&prot, None, &mut HashMap::new()).is_err(), "negative cps must error");
 	}
 
 	#[test]
@@ -990,7 +990,7 @@ mod tests {
 			rate_limit: Some(JsRateLimitConfig { connections_per_second: 0.0, burst: None }),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_err(), "zero cps must error");
+		assert!(parse_protection_config(&prot, None, &mut HashMap::new()).is_err(), "zero cps must error");
 	}
 
 	#[test]
@@ -1002,7 +1002,7 @@ mod tests {
 			}),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_err(), "NaN burst must error");
+		assert!(parse_protection_config(&prot, None, &mut HashMap::new()).is_err(), "NaN burst must error");
 	}
 
 	#[test]
@@ -1014,7 +1014,7 @@ mod tests {
 			}),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_err(), "negative burst must error");
+		assert!(parse_protection_config(&prot, None, &mut HashMap::new()).is_err(), "negative burst must error");
 	}
 
 	#[test]
@@ -1026,7 +1026,7 @@ mod tests {
 			}),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_err(), "NaN cpm must error");
+		assert!(parse_protection_config(&prot, None, &mut HashMap::new()).is_err(), "NaN cpm must error");
 	}
 
 	#[test]
@@ -1038,7 +1038,7 @@ mod tests {
 			}),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_err(), "negative cpm must error");
+		assert!(parse_protection_config(&prot, None, &mut HashMap::new()).is_err(), "negative cpm must error");
 	}
 
 	#[test]
@@ -1052,6 +1052,6 @@ mod tests {
 			}),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_ok(), "absent burst must be accepted");
+		assert!(parse_protection_config(&prot, None, &mut HashMap::new()).is_ok(), "absent burst must be accepted");
 	}
 }

@@ -3,13 +3,16 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use ip_network_table::IpNetworkTable;
 use ipnetwork::IpNetwork;
-use maxminddb::Mmap;
 use maxminddb::Reader;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+// Rate-limit ASN lookup error logging: log first occurrence and every 1000th.
+// Allocation-free on the non-error path (counter load never allocates).
+static ASN_ERR_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // Process-wide monotonic anchor. All timing uses monotonic offsets from process start.
 // Trade-off vs wall-clock: deadlines and bucket timestamps cannot be compared to unix time,
@@ -77,9 +80,9 @@ pub struct ProtectionConfig {
 	/// Autonomous System Numbers to block. Lookup skipped when empty.
 	pub asn_blocklist: HashSet<u32>,
 	/// Open MaxMind-format ASN database for per-connection ASN lookup.
-	/// Shared across listeners that reference the same file via the proxy-level MMDB cache.
+	/// Loaded into owned memory at config-parse time; safe from in-place DB rewrites.
 	/// None = ASN blocking disabled (skip the trie walk entirely).
-	pub asn_reader: Option<Arc<Reader<Mmap>>>,
+	pub asn_reader: Option<Arc<Reader<Vec<u8>>>>,
 	/// Max ms for TLS handshake (0 = use default 10000).
 	pub tls_handshake_timeout_ms: u64,
 	/// Reject connections without SNI.
@@ -318,16 +321,38 @@ impl ProtectionState {
 		//    Positioned after the cheaper JA3 HashSet but before requireSni, since an mmdb
 		//    trie walk costs more than a HashSet but less than a full TLS handshake.
 		//    Skipped entirely when asnBlocklist is empty or no DB is loaded.
+		//    Fail-open: errors are observable (rate-limited eprintln) but never block traffic.
 		if !cfg.asn_blocklist.is_empty() {
 			if let Some(reader) = &cfg.asn_reader {
 				// lookup() takes &self — no locking, safe to call concurrently.
-				if let Ok(result) = reader.lookup(peer_ip) {
-					// decode_path extracts just the ASN number without deserializing the full record.
-					if let Ok(Some(asn)) = result
-						.decode_path::<u32>(&[maxminddb::PathElement::Key("autonomous_system_number")])
-					{
-						if cfg.asn_blocklist.contains(&asn) {
-							return Decision::Block(BlockReason::AsnBlocked(asn));
+				match reader.lookup(peer_ip) {
+					Err(_) => {
+						let n = ASN_ERR_COUNT.fetch_add(1, Ordering::Relaxed);
+						if n == 0 || n.is_multiple_of(1000) {
+							eprintln!(
+								"symphony: ASN DB lookup failed for {peer_ip} (fail-open; total errors: {})",
+								n + 1
+							);
+						}
+					}
+					Ok(result) => {
+						// decode_path extracts just the ASN without deserializing the full record.
+						match result.decode_path::<u32>(&[maxminddb::PathElement::Key("autonomous_system_number")]) {
+							Err(_) => {
+								let n = ASN_ERR_COUNT.fetch_add(1, Ordering::Relaxed);
+								if n == 0 || n.is_multiple_of(1000) {
+									eprintln!(
+										"symphony: ASN DB decode failed for {peer_ip} (fail-open; total errors: {})",
+										n + 1
+									);
+								}
+							}
+							Ok(None) => {} // IP not in MMDB — fail open, no log
+							Ok(Some(asn)) => {
+								if cfg.asn_blocklist.contains(&asn) {
+									return Decision::Block(BlockReason::AsnBlocked(asn));
+								}
+							}
 						}
 					}
 				}
@@ -820,17 +845,9 @@ mod tests {
 	}
 
 	#[cfg(test)]
-	fn make_test_reader() -> Arc<Reader<maxminddb::Mmap>> {
-		use std::io::Write;
+	fn make_test_reader() -> Arc<Reader<Vec<u8>>> {
 		let bytes = build_test_asn_mmdb();
-		// Write to a temp file and mmap it.
-		// SAFETY: temp file is not modified while mapped within this test.
-		let mut f = tempfile::NamedTempFile::new().unwrap();
-		f.write_all(&bytes).unwrap();
-		f.flush().unwrap();
-		let path = f.into_temp_path();
-		let reader = unsafe { Reader::open_mmap(&path).unwrap() };
-		Arc::new(reader)
+		Arc::new(Reader::from_source(bytes).unwrap())
 	}
 
 	#[test]
@@ -969,6 +986,71 @@ mod tests {
 		let r = BlockReason::AsnBlocked(12345);
 		assert_eq!(r.to_reason_string(), "asn_blocked:AS12345");
 		assert_eq!(r.as_str(), "asn_blocked");
+	}
+
+	// ── Fix 1: IPv4-mapped IPv6 canonicalization ───────────────────────────────
+	//
+	// On dual-stack `::` listeners, IPv4 clients arrive as ::ffff:a.b.c.d.
+	// proxy_conn.rs calls to_canonical() before invoking check(), so the protection
+	// checks always see a plain V4 address. These tests demonstrate the before/after
+	// behavior — they call check() directly with the raw and canonical forms.
+
+	#[test]
+	fn fix1_v4_mapped_bypasses_cidr_blocklist_without_canonicalization() {
+		// Demonstrates the bug: ::ffff:127.0.0.1 does NOT match 127.0.0.0/8 blocklist.
+		let state = ProtectionState::new(
+			ProtectionConfig {
+				blocklist: vec!["127.0.0.0/8".parse().unwrap()],
+				..Default::default()
+			}
+			.precompute(),
+		);
+		let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+		// Without canonicalization: V6 address does not match V4 prefix → allowed (bug).
+		assert!(
+			matches!(state.check(mapped, &no_peek()), Decision::Allow(_)),
+			"IPv4-mapped form bypasses V4 blocklist without to_canonical() — this is the bug"
+		);
+		state.release(mapped);
+	}
+
+	#[test]
+	fn fix1_v4_mapped_cidr_block_after_canonicalization() {
+		// Fix: proxy_conn.rs calls to_canonical() before check(), so the plain V4 form reaches here.
+		let state = ProtectionState::new(
+			ProtectionConfig {
+				blocklist: vec!["127.0.0.0/8".parse().unwrap()],
+				..Default::default()
+			}
+			.precompute(),
+		);
+		let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+		let canonical = mapped.to_canonical();
+		assert_eq!(canonical, IpAddr::from([127, 0, 0, 1]), "to_canonical() must yield plain V4");
+		assert!(
+			matches!(state.check(canonical, &no_peek()), Decision::Block(BlockReason::CidrBlocked)),
+			"Canonical V4 form must be blocked by V4 CIDR blocklist"
+		);
+	}
+
+	#[test]
+	fn fix1_v4_mapped_asn_block_after_canonicalization() {
+		// Same for MMDB: the test DB is V4-only, so ::ffff: form fails lookup (fail-open);
+		// the canonical V4 form hits AS64512 and is blocked.
+		let reader = make_test_reader();
+		let state = ProtectionState::new(ProtectionConfig {
+			asn_blocklist: HashSet::from([64512]),
+			asn_reader: Some(reader),
+			..Default::default()
+		});
+		let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+		let canonical = mapped.to_canonical();
+
+		// Canonical form hits AS64512 → blocked.
+		assert!(
+			matches!(state.check(canonical, &no_peek()), Decision::Block(BlockReason::AsnBlocked(64512))),
+			"Canonical V4 form must trigger ASN block"
+		);
 	}
 
 	// ── Original tests preserved below ────────────────────────────────────────

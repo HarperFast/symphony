@@ -480,9 +480,13 @@ protection: {
 
 The `blocked` event includes `reason: 'asn_blocked:AS{number}'` when ASN blocking fires.
 
-**Hot-reload:** symphony watches `asnDatabasePath` alongside cert files. When the file changes on disk (e.g. a weekly MaxMind update performed by host-manager via atomic rename), symphony detects the change and reloads the DB automatically — no config change or restart needed. If the new file can't be read, the previous reader is retained (last-good semantics) and a warning is logged.
+**`asnBlocklist` requires `asnDatabasePath`** — setting one without the other is a hard error at construction time.
 
-**Performance:** the MMDB trie walk is ~sub-microsecond per connection. Multiple listeners referencing the same path share one memory-mapped reader (process-wide cache keyed by canonical path + mtime + size). Admission-path reads are lock-free.
+**DB validation:** at load time, symphony checks that the MMDB `database_type` contains "ASN" (both GeoLite2-ASN and GeoIP2-ASN satisfy this). A wrong-schema DB (e.g. a City DB) is rejected with a descriptive error. On a hot-swap, a load failure retains the previous reader (last-good semantics) and logs a warning.
+
+**Hot-reload:** symphony watches `asnDatabasePath` alongside cert files. When the file changes on disk, symphony reads it into owned memory on the next reconcile — no config change or restart needed. Both atomic rename (what host-manager does) and in-place rewrites are safe because the data is fully copied at load time.
+
+**Performance:** the MMDB trie walk is ~sub-microsecond per connection. Multiple listeners referencing the same path within a single config parse share one reader. Admission-path reads are lock-free.
 
 **Check ordering:** ASN is evaluated after the allowlist bypass and CIDR/JA3 blocklists (cheaper checks first), and before `requireSni`. An IP on the allowlist always bypasses ASN checking.
 

@@ -612,3 +612,51 @@ describe('Protection – ASN blocklist', () => {
 		assert.ok(connected, 'Expected connection after ASN blocklist removed');
 	});
 });
+
+// ── Config validation tests ───────────────────────────────────────────────────
+
+describe('Protection – config validation', () => {
+	it('throws when asnBlocklist is non-empty but asnDatabasePath is absent', () => {
+		assert.throws(
+			() =>
+				new SymphonyProxy({
+					listeners: [
+						{
+							host: '127.0.0.1',
+							port: 19876,
+							protection: {
+								asnBlocklist: [64512],
+								// asnDatabasePath intentionally omitted
+							},
+						},
+					],
+					routes: [],
+				}),
+			/asnBlocklist requires asnDatabasePath/,
+			'Should throw a descriptive error when asnBlocklist is set without asnDatabasePath',
+		);
+	});
+
+	it('throws when asnDatabasePath points to a non-ASN MMDB (wrong database_type)', () => {
+		// Use the test fixture which has database_type "GeoLite2-ASN" — this should pass.
+		// A non-existent path must also throw a descriptive error.
+		assert.throws(
+			() =>
+				new SymphonyProxy({
+					listeners: [
+						{
+							host: '127.0.0.1',
+							port: 19877,
+							protection: {
+								asnBlocklist: [64512],
+								asnDatabasePath: '/nonexistent/path/to/db.mmdb',
+							},
+						},
+					],
+					routes: [],
+				}),
+			/cannot resolve ASN DB path|cannot open ASN DB/,
+			'Should throw when path does not exist',
+		);
+	});
+});
