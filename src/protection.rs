@@ -307,9 +307,9 @@ impl ProtectionState {
 					exceeded = true;
 				}
 				if exceeded {
-					// Reset the full penalty from now (extension).
-					// saturating_add/mul guard against absurdly large configured durations.
-					state.penalty_deadline_ns.store(
+					// Extend deadline monotonically — fetch_max prevents inter-thread now_ns
+					// skew from regressing a deadline set by a concurrent writer.
+					state.penalty_deadline_ns.fetch_max(
 						now.saturating_add(penalty_ms.saturating_mul(1_000_000)),
 						Ordering::Relaxed,
 					);
@@ -323,7 +323,7 @@ impl ProtectionState {
 			&& !refill_and_consume(&state.tokens, &state.last_refill_ns, now, cfg.tokens_per_ns, cfg.burst_fp)
 		{
 			if penalty_ms > 0 {
-				state.penalty_deadline_ns.store(
+				state.penalty_deadline_ns.fetch_max(
 					now.saturating_add(penalty_ms.saturating_mul(1_000_000)),
 					Ordering::Relaxed,
 				);
@@ -342,7 +342,7 @@ impl ProtectionState {
 			)
 		{
 			if penalty_ms > 0 {
-				state.penalty_deadline_ns.store(
+				state.penalty_deadline_ns.fetch_max(
 					now.saturating_add(penalty_ms.saturating_mul(1_000_000)),
 					Ordering::Relaxed,
 				);
@@ -509,9 +509,11 @@ impl ProtectionState {
 		let cfg = self.config.load();
 
 		self.ip_table.retain(|_, state| {
-			// Keep: in the penalty box
+			// Keep: in the penalty box — but only when penaltyBox is currently enabled.
+			// A stale deadline left from a prior enabled window must not pin the entry
+			// after penaltyBox is disabled; otherwise re-enabling resurrects old deadlines.
 			let deadline = state.penalty_deadline_ns.load(Ordering::Relaxed);
-			if deadline > 0 && now < deadline {
+			if cfg.penalty_box_duration_ms > 0 && deadline > 0 && now < deadline {
 				return true;
 			}
 
@@ -1289,5 +1291,70 @@ mod tests {
 
 		// Clean up
 		held.release();
+	}
+
+	// ── Fix 2: stale penalty deadline eviction after penaltyBox disable/re-enable ─
+
+	#[test]
+	fn evict_clears_stale_penalty_after_penaltybox_disabled() {
+		// Box an IP, then hot-swap penaltyBox off, evict with fully-refilled buckets,
+		// re-enable — re-enabled penaltyBox must not resurrect the pre-disable deadline.
+		let now = now_ns();
+		let penalty_ms: u64 = 60_000; // 60 s
+		let state = ProtectionState::new(ProtectionConfig {
+			rate_limit_cps: Some(100.0),
+			rate_limit_burst: Some(1.0), // burst_fp=1000 = ONE_TOKEN
+			penalty_box_duration_ms: penalty_ms,
+			..Default::default()
+		});
+		let peer = ip("6.0.0.5");
+
+		// Consume the only token → rate limited → penalty box entered with deadline = now + 60s
+		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Allow(_)));
+		state.release(peer);
+		assert!(matches!(state.check_at(peer, &no_peek(), now), Decision::Block(BlockReason::RateLimited)));
+
+		// Verify entry is present and IP is in penalty box
+		assert!(state.ip_table.contains_key(&peer));
+		let (_, _, pb) = state.blocked_ips_at(now + 1_000_000);
+		assert!(pb.contains(&peer), "IP must be in penalty box before disable");
+
+		// Hot-swap: disable penalty box
+		state.config.store(Arc::new(
+			ProtectionConfig {
+				rate_limit_cps: Some(100.0),
+				rate_limit_burst: Some(1.0),
+				penalty_box_duration_ms: 0, // disabled
+				..Default::default()
+			}
+			.precompute(),
+		));
+
+		// Evict at a time far enough in the future that the per-second bucket is fully
+		// refilled (100 cps × 120s >>> burst_fp=1000). With penaltyBox disabled, the
+		// stale deadline must NOT prevent eviction.
+		let far_future = now + 120_000_000_000; // 2 min
+		state.evict_at(far_future);
+		assert!(
+			!state.ip_table.contains_key(&peer),
+			"entry must be evicted when penaltyBox disabled and buckets fully refilled"
+		);
+
+		// Re-enable penalty box — the pre-disable deadline is gone (entry evicted).
+		state.config.store(Arc::new(
+			ProtectionConfig {
+				rate_limit_cps: Some(100.0),
+				rate_limit_burst: Some(1.0),
+				penalty_box_duration_ms: penalty_ms,
+				..Default::default()
+			}
+			.precompute(),
+		));
+
+		// IP must be admitted fresh — no stale deadline blocks it
+		assert!(
+			matches!(state.check_at(peer, &no_peek(), far_future), Decision::Allow(_)),
+			"IP must be admitted fresh after re-enable; stale deadline must not resurrect"
+		);
 	}
 }

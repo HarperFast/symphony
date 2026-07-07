@@ -261,3 +261,92 @@ describe('SymphonyProxy – hot config updateConfig', () => {
 		assert.deepEqual(response, payload);
 	});
 });
+
+describe('SymphonyProxy – updateConfig atomicity (routes + protection)', () => {
+	// Regression for: combined update with valid routes + invalid protection must leave
+	// BOTH in the old state. Previously routes were swapped before protection validation ran,
+	// causing partial application on error.
+	const certA = generateSelfSignedCert('atomicity-a.test');
+	let proxyPort: number;
+	let echoA: Awaited<ReturnType<typeof startEchoServer>>;
+	let proxy: SymphonyProxy;
+
+	before(async () => {
+		echoA = await startEchoServer();
+		proxyPort = await getFreePort();
+
+		proxy = new SymphonyProxy({
+			listeners: [
+				{
+					host: '127.0.0.1',
+					port: proxyPort,
+					protection: { blocklist: [] },
+				},
+			],
+			routes: [
+				{
+					sni: 'atomicity-a.test',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echoA.port }],
+					terminateTls: true,
+					cert: { certChain: certA.cert, privateKey: certA.key },
+				},
+			],
+		});
+		await proxy.start();
+		await sleep(50);
+	});
+
+	after(async () => {
+		await proxy.stop();
+		await echoA.close();
+	});
+
+	it('failed combined update (valid routes + invalid protection) leaves old routes serving', async () => {
+		// Confirm the initial route serves.
+		const before = await tlsRoundTrip({
+			port: proxyPort,
+			servername: 'atomicity-a.test',
+			caCert: certA.cert,
+			data: Buffer.from('before-atomic-test'),
+			rejectUnauthorized: false,
+		});
+		assert.deepEqual(before, Buffer.from('before-atomic-test'), 'initial route must serve');
+
+		// Combined update: routes would remove atomicity-a.test, protection references a non-existent port.
+		// The call must throw and leave both routes AND protection unchanged.
+		assert.throws(
+			() =>
+				proxy.updateConfig({
+					routes: [
+						{
+							sni: 'atomicity-b.test', // replaces atomicity-a.test
+							upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echoA.port }],
+							terminateTls: false,
+						},
+					],
+					protection: [
+						{
+							port: 9999, // valid u16, but no such listener → error
+							protection: {},
+						},
+					],
+				}),
+			/port 9999 matches no listener/,
+			'updateConfig must throw when protection references a non-existent port',
+		);
+
+		// Old route must still resolve — not replaced by atomicity-b.test.
+		const after = await tlsRoundTrip({
+			port: proxyPort,
+			servername: 'atomicity-a.test',
+			caCert: certA.cert,
+			data: Buffer.from('after-atomic-fail'),
+			rejectUnauthorized: false,
+		});
+		assert.deepEqual(
+			after,
+			Buffer.from('after-atomic-fail'),
+			'old route must still serve after failed combined update',
+		);
+	});
+});
