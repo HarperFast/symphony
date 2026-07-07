@@ -28,7 +28,7 @@ pub async fn spawn_listeners(
 
 	for _ in 0..workers {
 		let socket = make_reuseport_socket(addr)?;
-		let listener = TcpListener::from_std(socket.into())?;
+		let listener = TcpListener::from_std(socket)?;
 		let ctx2 = ctx.clone();
 		let max_conn = max_connections;
 		let srx = shutdown_rx.resubscribe();

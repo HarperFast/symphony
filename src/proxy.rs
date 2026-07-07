@@ -628,14 +628,15 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 	})
 }
 
-fn parse_protection_config(
-	prot: &JsProtectionConfig,
-) -> Result<(
+/// Parsed protection config plus the derived allowlist, blocklist, and raw blocklist strings.
+type ParsedProtectionConfig = (
 	crate::protection::ProtectionConfig,
 	Vec<IpNetwork>,
 	Vec<IpNetwork>,
 	Vec<String>,
-)> {
+);
+
+fn parse_protection_config(prot: &JsProtectionConfig) -> Result<ParsedProtectionConfig> {
 	let mut cfg = crate::protection::ProtectionConfig::default();
 
 	if let Some(rl) = &prot.rate_limit {
@@ -673,13 +674,7 @@ fn parse_protection_config(
 		})
 		.collect::<Result<Vec<_>>>()?;
 
-	let blocklist_strings: Vec<String> = prot
-		.blocklist
-		.as_deref()
-		.unwrap_or(&[])
-		.iter()
-		.cloned()
-		.collect();
+	let blocklist_strings: Vec<String> = prot.blocklist.as_deref().unwrap_or(&[]).to_vec();
 
 	let blocklist: Vec<IpNetwork> = blocklist_strings
 		.iter()

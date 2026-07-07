@@ -1,12 +1,12 @@
-/// HTTP/1.1 header parsing and response rewriting utilities for the UDS proxy loop.
-///
-/// Harper's UDS sockets send `Connection: close` per response even for HTTP/1.1
-/// clients.  The TLS-terminating proxy loop in proxy_conn.rs uses these helpers
-/// to:
-///   1. Frame individual request / response messages (find \r\n\r\n).
-///   2. Rewrite `Connection: close` → `Connection: keep-alive` in upstream
-///      responses so downstream TLS connections are reused.
-///   3. Copy body bytes for Content-Length or read-until-close semantics.
+//! HTTP/1.1 header parsing and response rewriting utilities for the UDS proxy loop.
+//!
+//! Harper's UDS sockets send `Connection: close` per response even for HTTP/1.1
+//! clients.  The TLS-terminating proxy loop in proxy_conn.rs uses these helpers
+//! to:
+//!   1. Frame individual request / response messages (find \r\n\r\n).
+//!   2. Rewrite `Connection: close` → `Connection: keep-alive` in upstream
+//!      responses so downstream TLS connections are reused.
+//!   3. Copy body bytes for Content-Length or read-until-close semantics.
 
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
