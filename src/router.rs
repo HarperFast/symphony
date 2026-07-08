@@ -116,6 +116,9 @@ pub enum Destination {
 #[derive(Clone)]
 pub struct Route {
 	pub destination: Destination,
+	/// Destination for connections that negotiated `h2` in ALPN, when the route
+	/// has h2-marked upstreams. None = all protocols share `destination`.
+	pub destination_h2: Option<Destination>,
 	/// None = TLS passthrough (no termination)
 	pub tls_config: Option<Arc<ServerConfig>>,
 	pub terminate_tls: bool,
@@ -198,6 +201,9 @@ pub enum UpstreamSpec {
 		tids: Vec<Option<u32>>,
 		ip_affinity: bool,
 		affinity_ttl_ms: u64,
+		/// Application protocol this socket speaks ("h2" for a cleartext HTTP/2
+		/// upstream, e.g. Harper's `-h2.sock` mirror). None = HTTP/1.x (historical).
+		protocol: Option<String>,
 	},
 }
 
@@ -303,9 +309,11 @@ pub fn build_route_table(
 		};
 
 		// Collect UdsBalancers that have pid/tid slots for the monitor task.
-		if let Destination::UdsSet(ref bal) = route.destination {
-			if bal.has_monitored_slots() {
-				monitored_balancers.push(bal.clone());
+		for dest in std::iter::once(&route.destination).chain(route.destination_h2.iter()) {
+			if let Destination::UdsSet(ref bal) = dest {
+				if bal.has_monitored_slots() {
+					monitored_balancers.push(bal.clone());
+				}
 			}
 		}
 
@@ -370,7 +378,29 @@ fn build_route(
 		None
 	};
 
-	let destination = build_destination(spec)?;
+	let (destination, destination_h2) = build_destinations(spec)?;
+
+	if destination_h2.is_some() {
+		// Header injection cannot apply to h2 frames; PROXY protocol rides before the
+		// preface and works for both protocols. Enforce it rather than corrupt streams.
+		if spec.source_address_mode == SourceAddressMode::XForwardedFor {
+			return Err(crate::error::SymphonyError::Config(format!(
+				"route '{}': sourceAddressHeader 'xForwardedFor' cannot be combined with h2 upstreams (header injection would corrupt HTTP/2 frames); use 'proxyProtocol' or 'none'",
+				spec.sni
+			)));
+		}
+		if !spec.http2 {
+			eprintln!(
+				"symphony: route '{}': has h2 upstreams but http2=false — clients will never negotiate h2, so those upstreams are unreachable",
+				spec.sni
+			);
+		}
+	} else if spec.http2 && spec.terminate_tls {
+		eprintln!(
+			"symphony: route '{}': http2=true with no h2-marked upstream — h2-negotiated connections are forwarded to the default upstream, which must itself speak HTTP/2",
+			spec.sni
+		);
+	}
 
 	let rate_limiter = spec
 		.max_cps
@@ -378,6 +408,7 @@ fn build_route(
 
 	Ok(Route {
 		destination,
+		destination_h2,
 		tls_config,
 		terminate_tls: spec.terminate_tls,
 		suspended: spec.suspended,
@@ -387,14 +418,38 @@ fn build_route(
 	})
 }
 
-fn build_destination(spec: &RouteSpec) -> crate::error::Result<Destination> {
+/// Build the route's destinations: the default (h1) destination plus, when any
+/// upstream is marked `protocol: "h2"`, a separate destination for connections
+/// that negotiated h2 in ALPN.
+fn build_destinations(spec: &RouteSpec) -> crate::error::Result<(Destination, Option<Destination>)> {
 	// Suspended routes or routes with no upstreams use a placeholder TCP dest
 	// that is replaced by resolveConnection() before any data flows.
 	if spec.suspended || spec.upstreams.is_empty() {
-		return Ok(Destination::Tcp("127.0.0.1:1".parse().unwrap()));
+		return Ok((Destination::Tcp("127.0.0.1:1".parse().unwrap()), None));
 	}
 
-	match &spec.upstreams[0] {
+	let is_h2 = |u: &UpstreamSpec| matches!(u, UpstreamSpec::Uds { protocol: Some(p), .. } if p == "h2");
+	let h1_specs: Vec<&UpstreamSpec> = spec.upstreams.iter().filter(|u| !is_h2(u)).collect();
+	let h2_specs: Vec<&UpstreamSpec> = spec.upstreams.iter().filter(|u| is_h2(u)).collect();
+
+	if h1_specs.is_empty() {
+		return Err(crate::error::SymphonyError::Config(format!(
+			"route '{}': all upstreams are marked protocol 'h2' — at least one default (http/1.x) upstream is required for clients that do not negotiate h2",
+			spec.sni
+		)));
+	}
+
+	let destination = build_destination_for(&h1_specs)?;
+	let destination_h2 = if h2_specs.is_empty() {
+		None
+	} else {
+		Some(build_destination_for(&h2_specs)?)
+	};
+	Ok((destination, destination_h2))
+}
+
+fn build_destination_for(upstreams: &[&UpstreamSpec]) -> crate::error::Result<Destination> {
+	match upstreams[0] {
 		UpstreamSpec::Tcp { host, port } => {
 			let addr: SocketAddr =
 				format!("{host}:{port}").parse().map_err(crate::error::SymphonyError::AddrParse)?;
@@ -406,13 +461,14 @@ fn build_destination(spec: &RouteSpec) -> crate::error::Result<Destination> {
 			let mut ip_affinity = false;
 			let mut affinity_ttl_ms = 300_000u64;
 
-			for u in &spec.upstreams {
+			for u in upstreams {
 				if let UpstreamSpec::Uds {
 					paths,
 					pids,
 					tids,
 					ip_affinity: aff,
 					affinity_ttl_ms: ttl,
+					..
 				} = u
 				{
 					for (i, path) in paths.iter().enumerate() {
@@ -426,7 +482,6 @@ fn build_destination(spec: &RouteSpec) -> crate::error::Result<Destination> {
 					affinity_ttl_ms = *ttl;
 				}
 			}
-
 			Ok(Destination::UdsSet(Arc::new(UdsBalancer::new(
 				slots,
 				ip_affinity,

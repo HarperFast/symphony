@@ -23,6 +23,18 @@ export interface UdsUpstream {
 	pid?: number;
 	/** Linux thread ID (TID) of the worker serving this socket. Must be set together with `pid`. */
 	tid?: number;
+	/**
+	 * Application protocol this socket speaks. `'h2'` marks a cleartext HTTP/2
+	 * upstream (e.g. Harper's `<worker>-<port>-h2.sock` mirror, whose UDS metadata
+	 * yaml carries `protocol: h2`): when the route also sets `http2: true`,
+	 * connections that negotiate `h2` in ALPN are forwarded here, while all other
+	 * connections use the route's unmarked (HTTP/1.x) upstreams. A route with any
+	 * `'h2'` upstream must keep at least one unmarked upstream, and cannot use
+	 * `sourceAddressHeader: 'xForwardedFor'` (header injection would corrupt h2
+	 * frames — use `'proxyProtocol'`, which rides before the h2 preface, or `'none'`).
+	 * Default: HTTP/1.x.
+	 */
+	protocol?: 'h2' | 'http/1.1';
 }
 
 export type Upstream = TcpUpstream | UdsUpstream;

@@ -137,6 +137,8 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 
 		EffectiveRoute {
 			destination: resolved.destination,
+			// resolveConnection() supplies a single destination; no h2 split.
+			destination_h2: None,
 			tls_config: resolved.tls_config,
 			terminate_tls: resolved.terminate_tls,
 			source_address_mode: resolved.source_address_mode,
@@ -144,6 +146,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	} else {
 		EffectiveRoute {
 			destination: route.destination.clone(),
+			destination_h2: route.destination_h2.clone(),
 			tls_config: route.tls_config.clone(),
 			terminate_tls: route.terminate_tls,
 			source_address_mode: route.source_address_mode,
@@ -162,7 +165,15 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		if let Some(tls_cfg) = effective_route.tls_config {
 			let acceptor = TlsAcceptor::from(tls_cfg);
 			match timeout(hs_timeout, acceptor.accept(stream)).await {
-				Ok(Ok(tls_stream)) => proxy_via_tls(tls_stream, &effective_route.destination, peer_addr, source_mode, &ctx).await,
+				Ok(Ok(tls_stream)) => {
+					// Route by negotiated protocol: h2 connections go to the route's
+					// h2-marked upstreams (e.g. Harper's `-h2.sock` mirror) when present.
+					let destination = match &effective_route.destination_h2 {
+						Some(dest) if tls_stream.get_ref().1.alpn_protocol() == Some(b"h2") => dest,
+						_ => &effective_route.destination,
+					};
+					proxy_via_tls(tls_stream, destination, peer_addr, source_mode, &ctx).await
+				}
 				Ok(Err(e)) => {
 					tracing::debug!("TLS handshake error from {peer_ip}: {e}");
 					ctx.listener_metrics.inc_error();
@@ -279,6 +290,8 @@ where
 
 struct EffectiveRoute {
 	destination: Destination,
+	/// Destination for ALPN-h2 connections, when the route has h2-marked upstreams.
+	destination_h2: Option<Destination>,
 	tls_config: Option<Arc<rustls::ServerConfig>>,
 	terminate_tls: bool,
 	source_address_mode: SourceAddressMode,

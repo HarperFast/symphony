@@ -1,6 +1,13 @@
 import { EventEmitter } from 'node:events';
 import * as path from 'node:path';
-import type { SymphonyProxyWrap, JsUpstream, JsCertConfig, JsMtlsConfig, JsRouteConfig, JsListenerConfig } from './addon';
+import type {
+	SymphonyProxyWrap,
+	JsUpstream,
+	JsCertConfig,
+	JsMtlsConfig,
+	JsRouteConfig,
+	JsListenerConfig,
+} from './addon';
 import type {
 	ProxyConfig,
 	HotConfig,
@@ -60,6 +67,9 @@ function toJsUpstream(u: Upstream): JsUpstream {
 		path: u.path,
 		ipAffinity: u.ipAffinity,
 		ipAffinityTtlMs: u.ipAffinityTtlMs,
+		pid: u.pid,
+		tid: u.tid,
+		protocol: u.protocol,
 	};
 }
 
@@ -89,6 +99,7 @@ function toJsRoute(r: RouteConfig): JsRouteConfig {
 		maxConnectionsPerSecond: r.maxConnectionsPerSecond,
 		burst: r.burst,
 		sourceAddressHeader: r.sourceAddressHeader,
+		http2: r.http2,
 	};
 }
 

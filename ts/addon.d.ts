@@ -14,6 +14,11 @@ export interface JsUpstream {
   pid?: number
   /** Linux thread ID of the worker thread (UDS upstreams only). */
   tid?: number
+  /**
+   * Application protocol the upstream speaks: "h2" for cleartext HTTP/2
+   * (UDS upstreams only). Omitted = HTTP/1.x.
+   */
+  protocol?: string
 }
 export interface JsCertConfig {
   certChain: string | Buffer
