@@ -380,12 +380,23 @@ fn build_route(
 
 	let (destination, destination_h2) = build_destinations(spec)?;
 
+	// Header injection cannot apply to h2 frames; PROXY protocol rides before the
+	// preface and works for both protocols. Any route that can carry h2 to an
+	// upstream (a split h2 destination, OR http2 ALPN advertised so an h2 client's
+	// preface flows to the default upstream) must not use XFF — enforce it rather
+	// than splice a header into the middle of the connection preface.
+	if (destination_h2.is_some() || (spec.http2 && spec.terminate_tls))
+		&& spec.source_address_mode == SourceAddressMode::XForwardedFor
+	{
+		return Err(crate::error::SymphonyError::Config(format!(
+			"route '{}': sourceAddressHeader 'xForwardedFor' cannot be combined with HTTP/2 (header injection would corrupt h2 frames); use 'proxyProtocol' or 'none'",
+			spec.sni
+		)));
+	}
 	if destination_h2.is_some() {
-		// Header injection cannot apply to h2 frames; PROXY protocol rides before the
-		// preface and works for both protocols. Enforce it rather than corrupt streams.
-		if spec.source_address_mode == SourceAddressMode::XForwardedFor {
+		if !spec.terminate_tls {
 			return Err(crate::error::SymphonyError::Config(format!(
-				"route '{}': sourceAddressHeader 'xForwardedFor' cannot be combined with h2 upstreams (header injection would corrupt HTTP/2 frames); use 'proxyProtocol' or 'none'",
+				"route '{}': h2-marked upstreams require terminateTls=true — in passthrough mode symphony never sees the negotiated ALPN, so it cannot dispatch by protocol",
 				spec.sni
 			)));
 		}

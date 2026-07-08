@@ -17,14 +17,24 @@ import { after, before, describe, it } from 'node:test';
 import { SymphonyProxy } from '../ts/proxy.js';
 import { generateSelfSignedCert, getFreePort, sleep } from './util.js';
 
-/** UDS server that records the first data chunk of every connection and echoes a tag back. */
-function startRecordingUds(tag: string): Promise<{ path: string; firstChunks: Buffer[]; close: () => Promise<void> }> {
+/**
+ * UDS server that records everything each connection sends and echoes a tag back.
+ * Accumulates across 'data' events: symphony writes the PROXY header and the pumped
+ * client bytes as separate writes, so whether they coalesce into one recv is a
+ * kernel-timing race — assertions must run against the concatenation, not chunk 0.
+ */
+function startRecordingUds(tag: string): Promise<{ path: string; received: Buffer[]; close: () => Promise<void> }> {
 	const sockPath = path.join(os.tmpdir(), `sym-h2d-${tag}-${process.pid}-${Math.random().toString(36).slice(2)}.sock`);
-	const firstChunks: Buffer[] = [];
+	const received: Buffer[] = [];
 	const server = net.createServer((socket) => {
-		socket.once('data', (chunk) => {
-			firstChunks.push(chunk);
-			socket.write(`tag:${tag}`);
+		const index = received.push(Buffer.alloc(0)) - 1;
+		let replied = false;
+		socket.on('data', (chunk) => {
+			received[index] = Buffer.concat([received[index], chunk]);
+			if (!replied) {
+				replied = true;
+				socket.write(`tag:${tag}`);
+			}
 		});
 		socket.on('error', () => {});
 	});
@@ -32,7 +42,7 @@ function startRecordingUds(tag: string): Promise<{ path: string; firstChunks: Bu
 		server.listen(sockPath, () =>
 			resolve({
 				path: sockPath,
-				firstChunks,
+				received,
 				close: () =>
 					new Promise((r) => {
 						server.close(() => {
@@ -117,6 +127,12 @@ describe('SymphonyProxy – ALPN h2 upstream dispatch', () => {
 		await h2Up.close();
 	});
 
+	/** Poll until `cond` holds (the pumped client bytes can land after the reply). */
+	async function waitFor(cond: () => boolean): Promise<void> {
+		for (let i = 0; i < 100 && !cond(); i++) await sleep(10);
+		assert.ok(cond(), 'condition not reached within 1s');
+	}
+
 	it('sends an ALPN-h2 connection to the h2-marked upstream, with PROXY v1 first', async () => {
 		const { alpn, reply } = await alpnRoundTrip({
 			port: proxyPort,
@@ -126,10 +142,11 @@ describe('SymphonyProxy – ALPN h2 upstream dispatch', () => {
 		});
 		assert.equal(alpn, 'h2');
 		assert.equal(reply, 'tag:h2');
-		assert.equal(h2Up.firstChunks.length, 1);
-		const first = h2Up.firstChunks[0].toString('latin1');
-		assert.match(first, /^PROXY TCP4 127\.0\.0\.1 /);
-		assert.ok(first.includes('PRI * HTTP/2.0'), 'h2 preface should follow the PROXY header');
+		assert.equal(h2Up.received.length, 1);
+		await waitFor(() => h2Up.received[0].includes('PRI * HTTP/2.0'));
+		const bytes = h2Up.received[0].toString('latin1');
+		assert.match(bytes, /^PROXY TCP4 127\.0\.0\.1 /);
+		assert.ok(bytes.indexOf('PRI * HTTP/2.0') > bytes.indexOf('\r\n'), 'h2 preface should follow the PROXY header');
 	});
 
 	it('sends an http/1.1 connection to the unmarked upstream', async () => {
@@ -141,8 +158,9 @@ describe('SymphonyProxy – ALPN h2 upstream dispatch', () => {
 		});
 		assert.equal(alpn, 'http/1.1');
 		assert.equal(reply, 'tag:h1');
-		assert.equal(h1Up.firstChunks.length, 1);
-		assert.match(h1Up.firstChunks[0].toString('latin1'), /^PROXY TCP4 /);
+		assert.equal(h1Up.received.length, 1);
+		await waitFor(() => h1Up.received[0].length > 0);
+		assert.match(h1Up.received[0].toString('latin1'), /^PROXY TCP4 /);
 	});
 });
 
@@ -199,6 +217,60 @@ describe('SymphonyProxy – h2 upstream config validation', () => {
 		await assert.rejects(
 			alpnRoundTrip({ port: proxyPort, servername: 'localhost', alpn: ['h2', 'http/1.1'], data: 'x' }),
 			/timeout|ECONNRESET|EPROTO|socket hang up|closed/i
+		);
+		await proxy.stop();
+		await up.close();
+	});
+
+	it('rejects xForwardedFor with http2=true even without a split h2 upstream (route dropped)', async () => {
+		// An h2 client's preface would flow to the default upstream with an XFF
+		// header spliced into it — must be rejected, not just warned.
+		const up = await startRecordingUds('xff2');
+		const proxyPort = await getFreePort();
+		const proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: proxyPort }],
+			routes: [
+				{
+					sni: 'localhost',
+					upstreams: [{ kind: 'uds', path: up.path }],
+					terminateTls: true,
+					http2: true,
+					sourceAddressHeader: 'xForwardedFor',
+					cert: { certChain: cert.cert, privateKey: cert.key },
+				},
+			],
+		});
+		await proxy.start();
+		await sleep(50);
+		await assert.rejects(
+			alpnRoundTrip({ port: proxyPort, servername: 'localhost', alpn: ['http/1.1'], data: 'x' }),
+			/timeout|ECONNRESET|EPROTO|socket hang up|closed/i
+		);
+		await proxy.stop();
+		await up.close();
+	});
+
+	it('rejects h2-marked upstreams on a passthrough route (route dropped)', async () => {
+		const up = await startRecordingUds('pass');
+		const proxyPort = await getFreePort();
+		const proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: proxyPort }],
+			routes: [
+				{
+					sni: 'localhost',
+					upstreams: [
+						{ kind: 'uds', path: up.path },
+						{ kind: 'uds', path: up.path, protocol: 'h2' },
+					],
+					terminateTls: false,
+				},
+			],
+		});
+		await proxy.start();
+		await sleep(50);
+		await assert.rejects(
+			alpnRoundTrip({ port: proxyPort, servername: 'localhost', alpn: ['http/1.1'], data: 'x' }),
+			/timeout|ECONNRESET|EPROTO|socket hang up|closed|record|handshake/i
 		);
 		await proxy.stop();
 		await up.close();
