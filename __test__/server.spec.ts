@@ -19,6 +19,10 @@ import { generateSelfSignedCert, getFreePort, startEchoServer, tlsRoundTrip, sle
 // server.js sits next to this compiled spec's sibling ts/ dir: dist-test/ts/server.js
 const SERVER_JS = path.join(__dirname, '..', 'ts', 'server.js');
 
+// status.json reports the package version; read it from the same source of truth
+// the server does rather than hardcoding, so a version bump doesn't break the test.
+const PKG_VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')).version;
+
 function writeConfigAtomic(configPath: string, config: unknown): void {
 	const tmp = `${configPath}.tmp`;
 	fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
@@ -139,7 +143,7 @@ describe('symphony-server (standalone process)', () => {
 	it('writes a status file with pid and version', () => {
 		const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
 		assert.equal(status.pid, child.pid);
-		assert.equal(status.version, '0.4.0');
+		assert.equal(status.version, PKG_VERSION);
 		assert.ok(status.ports.includes(proxyPort), `ports ${status.ports} should include ${proxyPort}`);
 	});
 

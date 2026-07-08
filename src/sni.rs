@@ -187,7 +187,8 @@ fn extract_sni(extensions: &[u8]) -> Option<String> {
 fn is_grease(v: u16) -> bool {
 	let lo = (v & 0x00FF) as u8;
 	let hi = ((v >> 8) & 0xFF) as u8;
-	lo == 0x0A && hi == lo
+	// GREASE values are 0x0A0A, 0x1A1A, ... 0xFAFA: both bytes equal, low nibble 0xA.
+	hi == lo && (lo & 0x0F) == 0x0A
 }
 
 fn md5_hex(data: &[u8]) -> String {
