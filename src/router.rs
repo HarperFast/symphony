@@ -460,7 +460,10 @@ fn build_destinations(spec: &RouteSpec) -> crate::error::Result<(Destination, Op
 }
 
 fn build_destination_for(upstreams: &[&UpstreamSpec]) -> crate::error::Result<Destination> {
-	match upstreams[0] {
+	let first = upstreams
+		.first()
+		.ok_or_else(|| crate::error::SymphonyError::Config("route has no upstreams".to_string()))?;
+	match first {
 		UpstreamSpec::Tcp { host, port } => {
 			let addr: SocketAddr =
 				format!("{host}:{port}").parse().map_err(crate::error::SymphonyError::AddrParse)?;

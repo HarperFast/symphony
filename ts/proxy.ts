@@ -60,7 +60,10 @@ function loadAddon(): { SymphonyProxyWrap: typeof SymphonyProxyWrap } {
 // Convert public Upstream → JsUpstream (the flat struct the Rust side expects)
 function toJsUpstream(u: Upstream): JsUpstream {
 	if (u.kind === 'tcp') {
-		return { kind: 'tcp', host: u.host, port: u.port };
+		// Forward `protocol` even though TcpUpstream doesn't declare it, so an untyped
+		// config (e.g. symphony-server JSON) setting it gets the napi-layer rejection
+		// instead of a silent strip.
+		return { kind: 'tcp', host: u.host, port: u.port, protocol: (u as { protocol?: string }).protocol };
 	}
 	return {
 		kind: 'uds',
