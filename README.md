@@ -423,6 +423,17 @@ Protection config is per-listener and not currently hot-swappable via `updateCon
 
 ---
 
+## Security & compliance
+
+For deployment hardening and security-questionnaire guidance — private key file
+handling and rotation, protecting the (hot-reloaded) config file with restrictive
+permissions and file-integrity monitoring, why an MD5 dependency appears (JA3
+fingerprinting, not a cryptographic use), the current TLS parameters and FIPS/PCI
+attestation roadmap, and the shared-responsibility split for DDoS — see
+[SECURITY.md](./SECURITY.md).
+
+---
+
 ## Metrics & monitoring
 
 ```typescript
