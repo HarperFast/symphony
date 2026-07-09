@@ -297,7 +297,6 @@ fn compute_ja4(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> 
 	let mut supported_versions: Vec<u16> = Vec::new();
 	let mut alpn_first: Option<Vec<u8>> = None;
 	let mut sig_algs: Vec<u16> = Vec::new();
-	let mut has_sig_algs = false;
 
 	let mut p = Parser::new(extensions);
 	while p.remaining() >= 4 {
@@ -346,7 +345,6 @@ fn compute_ja4(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> 
 			}
 			0x000D => {
 				// signature_algorithms: list_len(2) + [alg(2)]*
-				has_sig_algs = true;
 				if ext_data.len() >= 2 {
 					let list_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
 					let algs = &ext_data[2..];
@@ -383,17 +381,26 @@ fn compute_ja4(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> 
 	// Extension count: all non-GREASE extensions including SNI (0) and ALPN (16), capped at 99.
 	let ext_count = ext_ids.len().min(99);
 
-	// ALPN first and last character of the first protocol value.
-	// Non-alphanumeric characters are replaced with '9'; result is lowercase.
+	// ALPN first and last character of the first protocol value, lowercased.
+	// Per JA4 spec: if either the first or last byte is non-alphanumeric, use the
+	// first and last characters of the hex representation of the whole ALPN instead.
 	let alpn_chars: String = match &alpn_first {
 		None => "00".to_string(),
 		Some(proto) if proto.is_empty() => "00".to_string(),
 		Some(proto) => {
-			let to_alnum = |b: u8| -> char {
-				let c = b as char;
-				if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '9' }
-			};
-			format!("{}{}", to_alnum(proto[0]), to_alnum(proto[proto.len() - 1]))
+			let first = proto[0];
+			let last = proto[proto.len() - 1];
+			if first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric() {
+				format!(
+					"{}{}",
+					(first as char).to_ascii_lowercase(),
+					(last as char).to_ascii_lowercase()
+				)
+			} else {
+				let hex = bytes_to_hex(proto);
+				let hb = hex.as_bytes();
+				format!("{}{}", hb[0] as char, hb[hb.len() - 1] as char)
+			}
 		}
 	};
 
@@ -424,7 +431,10 @@ fn compute_ja4(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> 
 	ext_for_hash.sort_unstable();
 	let ext_str = ext_for_hash.iter().map(|v| format!("{v:04x}")).collect::<Vec<_>>().join(",");
 
-	let hash_input = if has_sig_algs {
+	// Per JA4 spec: with no signature algorithms the string ends without a trailing
+	// underscore. Gate on the parsed list, not extension presence — a present-but-empty
+	// or truncated sig_algs extension must not append a bare '_'.
+	let hash_input = if !sig_algs.is_empty() {
 		let sig_str = sig_algs.iter().map(|v| format!("{v:04x}")).collect::<Vec<_>>().join(",");
 		format!("{ext_str}_{sig_str}")
 	} else {
@@ -691,6 +701,27 @@ mod tests {
 		assert_eq!(&info_h2.ja4[8..10], "h2", "h2 ALPN: {}", info_h2.ja4);
 		assert_eq!(&info_http11.ja4[8..10], "h1", "http/1.1 ALPN: {}", info_http11.ja4);
 		assert_eq!(&info_no.ja4[8..10], "00", "no ALPN: {}", info_no.ja4);
+	}
+
+	#[test]
+	fn test_ja4_alpn_nonalnum_uses_hex() {
+		// Per JA4 spec: if the first or last byte of the first ALPN is non-alphanumeric,
+		// use the first and last chars of the hex of the whole value. 0x02 0x68 ("\x02h")
+		// → hex "0268" → first='0', last='8'.
+		let ch = make_client_hello(0x0303, &[0x1301], &[make_alpn_ext(&[&[0x02, 0x68]])]);
+		let info = parse_client_hello(&ch);
+		assert_eq!(&info.ja4[8..10], "08", "non-alnum ALPN should use hex: {}", info.ja4);
+	}
+
+	#[test]
+	fn test_ja4_empty_sig_algs_no_trailing_underscore() {
+		// A present-but-empty signature_algorithms extension must not append a bare '_'
+		// to the JA4_c hash input. Only ext 0x000D present → ext list "000d", no underscore.
+		let ch = make_client_hello(0x0303, &[0x1301], &[make_sig_algs_ext(&[])]);
+		let info = parse_client_hello(&ch);
+		let part_c = &info.ja4[info.ja4.len() - 12..];
+		assert_eq!(part_c, sha256_hex12(b"000d"), "no trailing underscore: {}", info.ja4);
+		assert_ne!(part_c, sha256_hex12(b"000d_"), "must not hash a trailing '_': {}", info.ja4);
 	}
 
 	#[test]
