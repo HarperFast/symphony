@@ -43,7 +43,8 @@ makes them. Recommended baseline:
 
 **Rotation.** `symphony-server` watches the cert/key files referenced by its config and
 hot-reloads an in-place or renamed rotation live — no config write, no restart, no
-dropped connections (see the cert-rotation notes in `CLAUDE.md`). To rotate a key:
+dropped connections (see the config/cert file watcher in `ts/server.ts` and the
+per-route cert-failure isolation in `router.rs::build_route_table`). To rotate a key:
 replace the key and matching chain on disk (atomic rename preferred so a reader never
 sees a half-written pair), and Symphony picks them up on the next debounced reconcile.
 During the window between a new chain and its new key, the previous cert continues to
@@ -100,10 +101,12 @@ different ClientHellos share a fingerprint, which is already possible by other m
 is exactly why JA3 is treated as a coarse signal, not an authorization primitive.
 
 Because of that coarseness (Chrome and other Chromium browsers randomize ClientHello
-extension order, so one client emits many JA3 hashes), Symphony also computes **JA4**,
-the randomization-resistant successor, which uses a **truncated SHA-256** — again as an
-identity label, not a security primitive. Both fingerprints feed optional blocklists
-(`ja3Blocklist` / `ja4Blocklist`); neither is a trust boundary.
+extension order, so one client emits many JA3 hashes), **JA4** — the
+randomization-resistant successor, which uses a **truncated SHA-256** — is planned as a
+future identity label, not a security primitive. Today, JA3 is the only fingerprint
+Symphony computes, and it feeds a single optional blocklist (`ja3Blocklist`); a
+`ja4Blocklist` would follow once JA4 support ships. Neither is, nor is intended to be, a
+trust boundary.
 
 **Questionnaire answer:** *Symphony links an MD5 implementation solely because the JA3
 TLS-fingerprint standard is defined over MD5. MD5 is used as a non-cryptographic
@@ -163,8 +166,9 @@ it as one.
 - **In scope: connection-level controls.** Once connections reach it, Symphony provides
   per-IP connection rate limiting and burst caps, per-IP concurrency limits, CIDR
   allow/blocklists, TLS-handshake timeouts (to shed slow-handshake abuse), `requireSni`
-  enforcement, and JA3/JA4 fingerprint blocking. These blunt application-adjacent and
-  connection-exhaustion abuse and keep one noisy source from starving others — they are
+  enforcement, and JA3 fingerprint blocking (JA4 planned). These blunt
+  application-adjacent and connection-exhaustion abuse and keep one noisy source from
+  starving others — they are
   **not** a substitute for upstream volumetric protection.
 
 **Questionnaire answer:** *Volumetric (L3/L4) DDoS protection is a shared responsibility:
