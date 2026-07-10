@@ -89,6 +89,7 @@ function toJsRoute(r: RouteConfig): JsRouteConfig {
 		maxConnectionsPerSecond: r.maxConnectionsPerSecond,
 		burst: r.burst,
 		sourceAddressHeader: r.sourceAddressHeader,
+		http2: r.http2,
 	};
 }
 

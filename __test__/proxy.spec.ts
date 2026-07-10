@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import { SymphonyProxy } from '../ts/proxy.js';
-import { generateSelfSignedCert, getFreePort, startEchoServer, tlsRoundTrip, sleep } from './util.js';
+import { generateSelfSignedCert, getFreePort, startEchoServer, tlsRoundTrip, tlsAlpn, sleep } from './util.js';
 
 describe('SymphonyProxy – TLS termination', () => {
 	const cert = generateSelfSignedCert('localhost');
@@ -56,6 +56,89 @@ describe('SymphonyProxy – TLS termination', () => {
 		await sleep(50);
 		const m = proxy.metrics();
 		assert.equal(m.activeConnections, 0);
+	});
+});
+
+describe('SymphonyProxy – http2 ALPN', () => {
+	// Regression: toJsRoute() used to drop `http2`, so `http2: true` never reached
+	// Rust and no route ever advertised h2 in ALPN.
+	const cert = generateSelfSignedCert('localhost');
+	let proxyPort: number;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	let proxy: SymphonyProxy;
+
+	before(async () => {
+		echo = await startEchoServer();
+		proxyPort = await getFreePort();
+
+		proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: proxyPort }],
+			routes: [
+				{
+					sni: 'h2.localhost',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+					terminateTls: true,
+					http2: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+				},
+				{
+					sni: 'h1.localhost',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+				},
+			],
+		});
+		await proxy.start();
+		await sleep(50);
+	});
+
+	after(async () => {
+		await proxy.stop();
+		await echo.close();
+	});
+
+	it('advertises h2 in ALPN when http2: true', async () => {
+		const negotiated = await tlsAlpn({
+			port: proxyPort,
+			servername: 'h2.localhost',
+			caCert: cert.cert,
+			alpnProtocols: ['h2', 'http/1.1'],
+		});
+		assert.equal(negotiated, 'h2');
+	});
+
+	it('does not advertise h2 when http2 is unset (default)', async () => {
+		const negotiated = await tlsAlpn({
+			port: proxyPort,
+			servername: 'h1.localhost',
+			caCert: cert.cert,
+			alpnProtocols: ['h2', 'http/1.1'],
+		});
+		assert.equal(negotiated, '');
+	});
+
+	it('picks up http2 through updateConfig', async () => {
+		proxy.updateConfig({
+			routes: [
+				{
+					sni: 'h1.localhost',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+					terminateTls: true,
+					http2: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+				},
+			],
+		});
+		await sleep(20);
+
+		const negotiated = await tlsAlpn({
+			port: proxyPort,
+			servername: 'h1.localhost',
+			caCert: cert.cert,
+			alpnProtocols: ['h2', 'http/1.1'],
+		});
+		assert.equal(negotiated, 'h2');
 	});
 });
 

@@ -224,6 +224,33 @@ export function tlsRoundTrip(opts: {
 	});
 }
 
+/**
+ * Open a TLS connection offering the given ALPN protocols and return the
+ * protocol the server negotiated (empty string if none). Used to verify that a
+ * route's `http2` flag reaches the Rust side and drives ALPN advertisement.
+ */
+export function tlsAlpn(opts: {
+	port: number;
+	host?: string;
+	servername: string;
+	caCert?: string;
+	alpnProtocols: string[];
+	rejectUnauthorized?: boolean;
+}): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const { port, host = '127.0.0.1', servername, caCert, alpnProtocols, rejectUnauthorized = false } = opts;
+		const socket = tls.connect(
+			{ port, host, servername, ca: caCert, ALPNProtocols: alpnProtocols, rejectUnauthorized },
+			() => {
+				resolve(socket.alpnProtocol || '');
+				socket.end();
+			},
+		);
+		socket.on('error', reject);
+		setTimeout(() => reject(new Error('tlsAlpn timeout')), 5000);
+	});
+}
+
 /** Send data through a raw TCP connection and return the echoed response. */
 export function tcpRoundTrip(opts: { port: number; host?: string; data: Buffer | string }): Promise<Buffer> {
 	return new Promise((resolve, reject) => {
