@@ -1,6 +1,13 @@
 import { EventEmitter } from 'node:events';
 import * as path from 'node:path';
-import type { SymphonyProxyWrap, JsUpstream, JsCertConfig, JsMtlsConfig, JsRouteConfig, JsListenerConfig } from './addon';
+import type {
+	SymphonyProxyWrap,
+	JsUpstream,
+	JsCertConfig,
+	JsMtlsConfig,
+	JsRouteConfig,
+	JsListenerConfig,
+} from './addon';
 import type {
 	ProxyConfig,
 	HotConfig,
@@ -53,13 +60,19 @@ function loadAddon(): { SymphonyProxyWrap: typeof SymphonyProxyWrap } {
 // Convert public Upstream → JsUpstream (the flat struct the Rust side expects)
 function toJsUpstream(u: Upstream): JsUpstream {
 	if (u.kind === 'tcp') {
-		return { kind: 'tcp', host: u.host, port: u.port };
+		// Forward `protocol` even though TcpUpstream doesn't declare it, so an untyped
+		// config (e.g. symphony-server JSON) setting it gets the napi-layer rejection
+		// instead of a silent strip.
+		return { kind: 'tcp', host: u.host, port: u.port, protocol: (u as { protocol?: string }).protocol };
 	}
 	return {
 		kind: 'uds',
 		path: u.path,
 		ipAffinity: u.ipAffinity,
 		ipAffinityTtlMs: u.ipAffinityTtlMs,
+		pid: u.pid,
+		tid: u.tid,
+		protocol: u.protocol,
 	};
 }
 
@@ -89,6 +102,7 @@ function toJsRoute(r: RouteConfig): JsRouteConfig {
 		maxConnectionsPerSecond: r.maxConnectionsPerSecond,
 		burst: r.burst,
 		sourceAddressHeader: r.sourceAddressHeader,
+		http2: r.http2,
 	};
 }
 

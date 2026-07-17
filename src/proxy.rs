@@ -31,6 +31,9 @@ pub struct JsUpstream {
 	pub pid: Option<u32>,
 	/// Linux thread ID of the worker thread (UDS upstreams only).
 	pub tid: Option<u32>,
+	/// Application protocol the upstream speaks: "h2" for cleartext HTTP/2
+	/// (UDS upstreams only). Omitted = HTTP/1.x.
+	pub protocol: Option<String>,
 }
 
 #[napi(object)]
@@ -537,6 +540,11 @@ fn parse_upstream_spec(u: &JsUpstream, sni: &str) -> Result<UpstreamSpec> {
 			let port = u
 				.port
 				.ok_or_else(|| napi::Error::from_reason(format!("tcp upstream for '{sni}' missing port")))?;
+			if u.protocol.is_some() {
+				return Err(napi::Error::from_reason(format!(
+					"tcp upstream for '{sni}': 'protocol' is only supported on uds upstreams"
+				)));
+			}
 			Ok(UpstreamSpec::Tcp { host, port })
 		}
 		"uds" => {
@@ -544,12 +552,20 @@ fn parse_upstream_spec(u: &JsUpstream, sni: &str) -> Result<UpstreamSpec> {
 				.path
 				.clone()
 				.ok_or_else(|| napi::Error::from_reason(format!("uds upstream for '{sni}' missing path")))?;
+			if let Some(p) = &u.protocol {
+				if p != "h2" && p != "http/1.1" {
+					return Err(napi::Error::from_reason(format!(
+						"uds upstream for '{sni}': unknown protocol '{p}' (expected 'h2' or 'http/1.1')"
+					)));
+				}
+			}
 			Ok(UpstreamSpec::Uds {
 				paths: vec![path],
 				pids: vec![u.pid],
 				tids: vec![u.tid],
 				ip_affinity: u.ip_affinity.unwrap_or(false),
 				affinity_ttl_ms: u.ip_affinity_ttl_ms.unwrap_or(300_000.0) as u64,
+				protocol: u.protocol.clone().filter(|p| p == "h2"),
 			})
 		}
 		other => Err(napi::Error::from_reason(format!(
