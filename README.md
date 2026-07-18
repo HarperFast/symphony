@@ -409,6 +409,8 @@ The **carrier depends on `sourceAddressHeader`**:
 - With `'proxyProtocolV2'`, the fingerprint rides a PROXY v2 **TLV** — type `0xE0` for JA3, `0xE1` for JA4 (in HAProxy's `0xE0–0xEF` private range). This works even in passthrough (`terminateTls: false`), since the header prefixes the raw TLS bytes.
 - Otherwise, symphony injects an **`X-JA3` / `X-JA4` HTTP header**. This requires a plaintext HTTP/1 upstream (`terminateTls: true` and not `http2`); it is skipped for passthrough or HTTP/2 upstreams (use `'proxyProtocolV2'` there). Any client-supplied `X-JA3`/`X-JA4` is stripped so the injected value is authoritative and can't be spoofed.
 
+A config that requests `forwardFingerprint` with no viable carrier — passthrough (`terminateTls: false`) without `sourceAddressHeader: 'proxyProtocolV2'`, where there's neither an HTTP request to inject a header into nor a v2 TLV — logs a startup warning rather than silently dropping the signal.
+
 ```typescript
 // TLV carrier — works for any upstream that speaks PROXY v2, including passthrough
 {
