@@ -166,6 +166,7 @@ Tests live in `__test__/` and use Node's built-in `node:test` runner.
 - **`proxy.spec.ts`** — TLS termination, wildcard SNI routing, `updateConfig` hot-swap
 - **`protection.spec.ts`** — rate limit token bucket exhaustion, CIDR blocklist in `blockedIps()`
 - **`suspended.spec.ts`** — hold → resolve → proxy, hold → null → close, hold → timeout → drop
+- **`mtls.spec.ts`** — mTLS termination + PROXY v2 TLV forwarding of the client cert chain (0xE2, SSL TLV 0x20); skips without openssl
 
 Build and run:
 ```bash

@@ -352,7 +352,7 @@ Use `sourceAddressHeader` on a route to control how the real client IP is commun
 | Value | Behaviour |
 |---|---|
 | `'proxyProtocol'` | Sends a PROXY protocol v1 (text) header (`PROXY TCP4 <src-ip> <dst-ip> <src-port> 0\r\n`) before any application data. Default for UDS upstreams. |
-| `'proxyProtocolV2'` | Sends a PROXY protocol v2 (binary) header before any application data. v2 adds a TLV section — the carrier for `forwardFingerprint` below. Keep it opt-in: the consumer must speak v2 (nginx/HAProxy do; Harper core's own UDS reader currently parses v1 only). |
+| `'proxyProtocolV2'` | Sends a PROXY protocol v2 (binary) header before any application data. v2 adds a TLV section — the carrier for `forwardFingerprint` below and for [mTLS client cert forwarding](#forwarding-mtls-client-certificates). Keep it opt-in: the consumer must speak v2 (nginx/HAProxy do; Harper core's UDS reader parses v1 only before Harper 5.2). |
 | `'xForwardedFor'` | Reads the first chunk of the HTTP request, inserts an `X-Forwarded-For` header after the request line, then copies the rest verbatim. No per-request parsing overhead for keep-alive connections. Default for TCP upstreams (disabled). |
 | `'none'` | Does not forward source address information. Default for TCP upstreams. |
 
@@ -432,6 +432,39 @@ The **carrier depends on `sourceAddressHeader`**:
   forwardFingerprint: 'ja3', // upstream reads X-JA3 alongside X-Forwarded-For
 }
 ```
+
+### Forwarding mTLS client certificates
+
+When symphony terminates TLS on a route with `mtls` configured, the verified client
+certificate would normally be invisible to the upstream. With
+`sourceAddressHeader: 'proxyProtocolV2'` and `terminateTls: true`, the v2 TLV section
+carries the connection's TLS facts, once per connection, before any application data:
+
+| TLV | Type | Content |
+|---|---|---|
+| ALPN | `0x01` | Negotiated ALPN protocol (e.g. `h2`) |
+| Authority | `0x02` | SNI hostname from the ClientHello |
+| SSL | `0x20` | `client` bit field (`0x01` = TLS, `0x02` = client cert presented on this connection), `verify` (u32 BE, `0` only for a verified cert), and sub-TLVs `0x21` (TLS version) and `0x23` (cipher suite) |
+| Client cert chain | `0xE2` (custom range, after JA3 `0xE0` / JA4 `0xE1`) | One TLV per certificate, DER-encoded, leaf first |
+
+```typescript
+{
+  sni: 'api.example.com',
+  upstreams: [{ kind: 'uds', path: '/run/app/worker.sock' }],
+  terminateTls: true,
+  cert: { certChain, privateKey },
+  mtls: { clientCaCert, requireClientCert: true },
+  sourceAddressHeader: 'proxyProtocolV2',
+}
+```
+
+A certificate chain is only forwarded when the `mtls` verifier accepted it — rustls
+aborts the handshake otherwise — so an upstream receiving a `0xE2` TLV over a trusted
+(e.g. UDS) link can treat it as a verified client identity. A pathological chain that
+cannot fit the v2 header's 16-bit length budget is omitted with a warning (the SSL TLV
+still signals that a verified cert was presented). On passthrough routes
+(`terminateTls: false`) the TLS facts are unavailable; the header carries the source
+address, SNI authority, and any configured fingerprint TLV.
 
 ---
 

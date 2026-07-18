@@ -97,6 +97,19 @@ const PROXY_V2_SIGNATURE: [u8; 12] =
 pub const PP2_TYPE_JA3: u8 = 0xE0;
 /// PP2 TLV type carrying the JA4 fingerprint.
 pub const PP2_TYPE_JA4: u8 = 0xE1;
+/// PP2 TLV type carrying the mTLS client certificate chain: one TLV per certificate,
+/// DER-encoded, leaf first (also in the 0xE0–0xEF custom range).
+pub const PP2_TYPE_CLIENT_CERT: u8 = 0xE2;
+
+// Standard PP2 TLV types (spec §2.2.x)
+pub const PP2_TYPE_ALPN: u8 = 0x01;
+pub const PP2_TYPE_AUTHORITY: u8 = 0x02;
+pub const PP2_TYPE_SSL: u8 = 0x20;
+pub const PP2_SUBTYPE_SSL_VERSION: u8 = 0x21;
+pub const PP2_SUBTYPE_SSL_CIPHER: u8 = 0x23;
+// PP2_TYPE_SSL `client` bit field
+pub const PP2_CLIENT_SSL: u8 = 0x01;
+pub const PP2_CLIENT_CERT_CONN: u8 = 0x02;
 
 /// Normalized address bytes for a PROXY v2 address block, IPv4-mapped IPv6 unwrapped to v4
 /// so the emitted family matches the v1 path's behaviour.
@@ -117,7 +130,7 @@ fn normalize_v2_addr(ip: IpAddr) -> V2Addr {
 
 /// Write a PROXY protocol v2 (binary) header so the backend can recover the real client
 /// address, plus any `tlvs` (type, value) appended to the TLV section — used to carry the
-/// client TLS fingerprint downstream. TLVs with an empty value are skipped.
+/// client TLS fingerprint and mTLS facts downstream. TLVs with an empty value are skipped.
 ///
 /// `local_addr` is the address the client connected to (the destination). When absent, or of a
 /// different family than the source, a family-matched placeholder is used; the source address —
@@ -126,7 +139,7 @@ pub async fn write_proxy_v2_header<W: tokio::io::AsyncWrite + Unpin>(
 	stream: &mut W,
 	peer_addr: SocketAddr,
 	local_addr: Option<SocketAddr>,
-	tlvs: &[(u8, &str)],
+	tlvs: &[(u8, &[u8])],
 ) -> std::io::Result<()> {
 	let src = normalize_v2_addr(peer_addr.ip());
 	let dst = local_addr.map(|a| normalize_v2_addr(a.ip()));
@@ -169,11 +182,10 @@ pub async fn write_proxy_v2_header<W: tokio::io::AsyncWrite + Unpin>(
 
 	// TLV section, appended after the address block.
 	let mut tlv_block = Vec::new();
-	for (ty, value) in tlvs {
-		if value.is_empty() {
+	for (ty, bytes) in tlvs {
+		if bytes.is_empty() {
 			continue;
 		}
-		let bytes = value.as_bytes();
 		// TLV and header length fields are u16; refuse to silently truncate an oversized value.
 		let tlv_len: u16 = bytes.len().try_into().map_err(|_| {
 			std::io::Error::new(std::io::ErrorKind::InvalidInput, "PROXY v2 TLV value exceeds 65535 bytes")
@@ -215,7 +227,7 @@ mod tests {
 		let peer: SocketAddr = "192.168.1.5:51000".parse().unwrap();
 		let local: SocketAddr = "10.0.0.1:443".parse().unwrap();
 		let mut out: Vec<u8> = Vec::new();
-		write_proxy_v2_header(&mut out, peer, Some(local), &[(PP2_TYPE_JA3, JA3)])
+		write_proxy_v2_header(&mut out, peer, Some(local), &[(PP2_TYPE_JA3, JA3.as_bytes())])
 			.await
 			.unwrap();
 
@@ -244,7 +256,7 @@ mod tests {
 		let peer: SocketAddr = "203.0.113.9:1234".parse().unwrap();
 		let mut out: Vec<u8> = Vec::new();
 		// Empty fingerprint value (unparsed ClientHello) and no local_addr.
-		write_proxy_v2_header(&mut out, peer, None, &[(PP2_TYPE_JA3, "")])
+		write_proxy_v2_header(&mut out, peer, None, &[(PP2_TYPE_JA3, b"")])
 			.await
 			.unwrap();
 
