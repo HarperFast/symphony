@@ -167,10 +167,11 @@ impl ProtectionState {
 		}
 
 		// 3b. JA4 blocklist
-		if !cfg.ja4_blocklist.is_empty() && !peek_info.ja4.is_empty() {
-			if cfg.ja4_blocklist.contains(peek_info.ja4.as_str()) {
-				return Decision::Block(BlockReason::Ja4Blocked);
-			}
+		if !cfg.ja4_blocklist.is_empty()
+			&& !peek_info.ja4.is_empty()
+			&& cfg.ja4_blocklist.contains(peek_info.ja4.as_str())
+		{
+			return Decision::Block(BlockReason::Ja4Blocked);
 		}
 
 		// 4. Require SNI

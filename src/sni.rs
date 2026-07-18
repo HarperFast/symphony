@@ -337,7 +337,7 @@ fn compute_ja4(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> 
 					let list = &ext_data[2..2 + list_len.min(ext_data.len().saturating_sub(2))];
 					if !list.is_empty() {
 						let proto_len = list[0] as usize;
-						if proto_len > 0 && 1 + proto_len <= list.len() {
+						if proto_len > 0 && proto_len < list.len() {
 							alpn_first = Some(list[1..1 + proto_len].to_vec());
 						}
 					}
