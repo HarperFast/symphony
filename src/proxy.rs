@@ -916,6 +916,7 @@ mod tests {
 			allowlist: None,
 			blocklist: None,
 			ja3_blocklist: None,
+			ja4_blocklist: None,
 			tls_handshake_timeout_ms: None,
 			require_sni: None,
 		}
