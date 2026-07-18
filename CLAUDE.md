@@ -18,7 +18,7 @@ The server also **watches the cert/key files referenced by the config** (grouped
 
 ```
 TCP accept (SO_REUSEPORT per worker thread)
-  └─ sni.rs       peek() — 1 syscall, 512-byte stack buf → PeekInfo { sni, ja3, ja4 }
+  └─ sni.rs       peek() — MSG_PEEK ClientHello (reassembled when fragmented) → PeekInfo { sni, ja3, ja4, complete }
   └─ protection.rs check() → Block (emit 'blocked', drop) | Allow
   └─ router.rs    RouteTable.resolve(sni) → Route
   └─ [suspended.rs  register, emit 'suspended', await oneshot]
@@ -53,8 +53,10 @@ TCP accept (SO_REUSEPORT per worker thread)
 
 ## Key design decisions
 
-### MSG_PEEK for SNI/JA3
-A single `stream.peek(&mut buf[..512])` reads the ClientHello without consuming any bytes. Cost: 1 syscall, 512-byte stack buffer, zero heap allocation. This gives us both the SNI (for routing) and the JA3 fingerprint (for protection) before the TLS handshake begins. The alternative — a custom TLS acceptor that extracts SNI internally — would require modifying rustls internals.
+### MSG_PEEK for SNI/JA3/JA4
+`stream.peek()` reads the ClientHello without consuming any bytes, giving SNI (routing) and the JA3/JA4 fingerprints (protection) before the TLS handshake begins. The alternative — a custom TLS acceptor that extracts SNI internally — would require modifying rustls internals.
+
+Because a single peek returns only whatever bytes are currently buffered, `peek()` **reassembles**: it reads the declared ClientHello length from the record+handshake headers and re-peeks (into a growing buffer, bounded by `MAX_CLIENT_HELLO` and `REASSEMBLY_TIMEOUT`) until the whole hello is present, setting `PeekInfo::complete`. This closes a blocklist-bypass: without it, a client fragments the ClientHello so symphony computes a different/empty fingerprint while rustls later accepts the full handshake. `protection.rs` fails closed on `!complete` when a JA3/JA4 blocklist is configured (`BlockReason::IncompleteHandshake`).
 
 ### Source-address & fingerprint forwarding (`upstream.rs` + `proxy_conn.rs`)
 Per route, `sourceAddressHeader` picks how the client IP reaches the upstream: PROXY v1 (text),

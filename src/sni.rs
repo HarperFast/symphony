@@ -1,7 +1,23 @@
+use std::time::Duration;
 use tokio::net::TcpStream;
 
+/// Largest ClientHello we will buffer while reassembling before giving up. A normal
+/// ClientHello is well under this; the cap bounds memory against a client that declares a
+/// huge handshake length and dribbles bytes.
+const MAX_CLIENT_HELLO: usize = 16 * 1024;
+/// Initial peek buffer — covers the common single-segment ClientHello without a second syscall.
+const INITIAL_PEEK: usize = 4096;
+/// How long to wait for the full declared ClientHello before parsing what we have and
+/// marking the result incomplete. Short: a client that hasn't sent its ClientHello promptly
+/// is either slow or probing.
+const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Poll interval between peeks while waiting for more of a partial ClientHello. MSG_PEEK
+/// doesn't consume, so socket readiness stays asserted — we can't await "more than what's
+/// buffered"; a small sleep keeps a stalled client from spinning a core until the timeout.
+const PEEK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Information extracted from a TLS ClientHello via MSG_PEEK.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PeekInfo {
 	/// SNI hostname, if present in the ClientHello.
 	pub sni: Option<String>,
@@ -12,17 +28,86 @@ pub struct PeekInfo {
 	/// FoxIO proprietary license). Format: t<ver><sni><cc><ec><alpn>_<sha256/12>_<sha256/12>.
 	/// Empty string if the ClientHello could not be parsed.
 	pub ja4: String,
+	/// True when the full declared ClientHello was buffered before fingerprinting. When
+	/// false, the fingerprints are computed from a truncated hello and must not be trusted
+	/// for enforcement — a client can fragment the ClientHello to force a different/empty
+	/// fingerprint here while rustls later reads the complete handshake (blocklist bypass).
+	pub complete: bool,
 }
 
-/// Peek at the first 4096 bytes of the stream and parse the TLS ClientHello.
-/// Does NOT consume any bytes from the stream.
+impl Default for PeekInfo {
+	fn default() -> Self {
+		// An unreadable/absent ClientHello is not a complete one.
+		PeekInfo { sni: None, ja3: String::new(), ja4: String::new(), complete: false }
+	}
+}
+
+/// The total ClientHello size declared by the leading TLS record + handshake headers
+/// (`5` record header + `4` handshake header + 3-byte handshake length), or `None` if
+/// fewer than 9 bytes are buffered or the record isn't a handshake.
+fn declared_client_hello_len(buf: &[u8]) -> Option<usize> {
+	if buf.len() < 9 || buf[0] != 0x16 {
+		return None; // not a TLS handshake record
+	}
+	let handshake_len = ((buf[6] as usize) << 16) | ((buf[7] as usize) << 8) | (buf[8] as usize);
+	Some(5 + 4 + handshake_len)
+}
+
+/// Peek at the stream and parse the TLS ClientHello, reassembling until the full declared
+/// hello is buffered (bounded by `MAX_CLIENT_HELLO` and `REASSEMBLY_TIMEOUT`). Does NOT
+/// consume any bytes. `PeekInfo::complete` reports whether the whole hello was captured.
 pub async fn peek(stream: &TcpStream) -> PeekInfo {
-	let mut buf = [0u8; 4096];
-	let n = match stream.peek(&mut buf).await {
-		Ok(n) => n,
-		Err(_) => return PeekInfo::default(),
-	};
-	parse_client_hello(&buf[..n])
+	peek_with_timeout(stream, REASSEMBLY_TIMEOUT).await
+}
+
+async fn peek_with_timeout(stream: &TcpStream, timeout: Duration) -> PeekInfo {
+	match tokio::time::timeout(timeout, peek_reassemble(stream)).await {
+		Ok(Some((buf, complete))) => {
+			let mut info = parse_client_hello(&buf);
+			// A parse from a truncated buffer is never trustworthy for enforcement, even if
+			// it happened to yield a fingerprint.
+			info.complete = complete;
+			info
+		}
+		// Timed out mid-reassembly, or the peek errored: parse whatever last arrived, if any.
+		Ok(None) => PeekInfo::default(),
+		Err(_) => PeekInfo::default(),
+	}
+}
+
+/// Peek repeatedly until the full declared ClientHello is buffered or the size cap is hit.
+/// Returns `(buffer, complete)`, or `None` if the stream errored before any bytes.
+async fn peek_reassemble(stream: &TcpStream) -> Option<(Vec<u8>, bool)> {
+	let mut buf = vec![0u8; INITIAL_PEEK];
+	loop {
+		let n = match stream.peek(&mut buf).await {
+			Ok(0) => return None, // peer closed before sending a ClientHello
+			Ok(n) => n,
+			Err(_) => return None,
+		};
+		if let Some(declared) = declared_client_hello_len(&buf[..n]) {
+			if declared > MAX_CLIENT_HELLO {
+				// Declared hello exceeds our cap — parse what we have, marked incomplete.
+				return Some((buf[..n].to_vec(), false));
+			}
+			if n >= declared {
+				return Some((buf[..declared].to_vec(), true));
+			}
+			// Need more bytes: grow the buffer to fit the declared size and re-peek (MSG_PEEK
+			// always returns from offset 0, so a larger buffer captures more of the same hello).
+			if buf.len() < declared {
+				buf.resize(declared, 0);
+			}
+		} else if n >= MAX_CLIENT_HELLO {
+			return Some((buf[..n].to_vec(), false));
+		} else if buf.len() < MAX_CLIENT_HELLO {
+			// Not enough bytes yet to even read the declared length — grow and retry.
+			buf.resize((buf.len() * 2).min(MAX_CLIENT_HELLO), 0);
+		}
+		// Wait before re-peeking. The outer timeout bounds the total wait; this just paces
+		// the poll so a stalled partial hello can't spin a core.
+		tokio::time::sleep(PEEK_POLL_INTERVAL).await;
+	}
 }
 
 fn parse_client_hello(buf: &[u8]) -> PeekInfo {
@@ -33,7 +118,9 @@ fn parse_client_hello(buf: &[u8]) -> PeekInfo {
 	let sni = extract_sni(hello.extensions);
 	let ja3 = compute_ja3(hello.legacy_version, hello.cipher_suites, hello.extensions);
 	let ja4 = compute_ja4(hello.legacy_version, hello.cipher_suites, hello.extensions);
-	PeekInfo { sni, ja3, ja4 }
+	// `complete` is set by the caller (`peek`) from the reassembly result — a direct parse
+	// here makes no claim about whether the buffer held the whole hello.
+	PeekInfo { sni, ja3, ja4, complete: false }
 }
 
 // ── TLS record / ClientHello structures ──────────────────────────────────────
@@ -209,6 +296,21 @@ fn sha256_hex12(data: &[u8]) -> String {
 	bytes_to_hex(&hash[..6]) // 6 bytes = 12 hex chars
 }
 
+/// Write `values` as comma-separated 4-hex (`%04x`) tokens into a single pre-allocated
+/// String. `compute_ja4` runs on the peek hot path (every connection), so this avoids the
+/// per-token `format!` + `Vec<String>` + `join` churn of the naive `.map().collect().join()`.
+fn join_hex4(values: &[u16]) -> String {
+	use std::fmt::Write;
+	let mut out = String::with_capacity(values.len() * 5); // 4 hex + 1 comma
+	for (i, &v) in values.iter().enumerate() {
+		if i > 0 {
+			out.push(',');
+		}
+		let _ = write!(out, "{v:04x}");
+	}
+	out
+}
+
 fn compute_ja3(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> String {
 	// Collect cipher suite values, skipping GREASE
 	let ciphers: Vec<u16> = cipher_suites
@@ -349,7 +451,13 @@ fn compute_ja4(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> 
 					let list_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
 					let algs = &ext_data[2..];
 					for chunk in algs[..list_len.min(algs.len())].chunks_exact(2) {
-						sig_algs.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+						let v = u16::from_be_bytes([chunk[0], chunk[1]]);
+						// Per JA4 spec, GREASE values are ignored wherever they appear —
+						// including signature algorithms — else the fingerprint won't match
+						// standard JA4 tooling.
+						if !is_grease(v) {
+							sig_algs.push(v);
+						}
 					}
 				}
 			}
@@ -417,8 +525,7 @@ fn compute_ja4(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> 
 	let part_b = if ciphers.is_empty() {
 		"000000000000".to_string()
 	} else {
-		let cipher_str = ciphers.iter().map(|v| format!("{v:04x}")).collect::<Vec<_>>().join(",");
-		sha256_hex12(cipher_str.as_bytes())
+		sha256_hex12(join_hex4(&ciphers).as_bytes())
 	};
 
 	// Part C: SHA-256/12 of (sorted ext IDs, GREASE/SNI/ALPN excluded) optionally
@@ -429,14 +536,13 @@ fn compute_ja4(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> 
 		.copied()
 		.collect();
 	ext_for_hash.sort_unstable();
-	let ext_str = ext_for_hash.iter().map(|v| format!("{v:04x}")).collect::<Vec<_>>().join(",");
+	let ext_str = join_hex4(&ext_for_hash);
 
 	// Per JA4 spec: with no signature algorithms the string ends without a trailing
 	// underscore. Gate on the parsed list, not extension presence — a present-but-empty
 	// or truncated sig_algs extension must not append a bare '_'.
 	let hash_input = if !sig_algs.is_empty() {
-		let sig_str = sig_algs.iter().map(|v| format!("{v:04x}")).collect::<Vec<_>>().join(",");
-		format!("{ext_str}_{sig_str}")
+		format!("{ext_str}_{}", join_hex4(&sig_algs))
 	} else {
 		ext_str
 	};
@@ -722,6 +828,108 @@ mod tests {
 		let part_c = &info.ja4[info.ja4.len() - 12..];
 		assert_eq!(part_c, sha256_hex12(b"000d"), "no trailing underscore: {}", info.ja4);
 		assert_ne!(part_c, sha256_hex12(b"000d_"), "must not hash a trailing '_': {}", info.ja4);
+	}
+
+	#[test]
+	fn test_ja4_grease_signature_algorithm_ignored() {
+		// A GREASE signature algorithm must be excluded from JA4_c, else the fingerprint
+		// diverges from standard JA4 tooling (RFC 8701: ignore GREASE wherever it appears).
+		let real = make_client_hello(0x0303, &[0x1301], &[make_sig_algs_ext(&[0x0403, 0x0804])]);
+		let with_grease =
+			make_client_hello(0x0303, &[0x1301], &[make_sig_algs_ext(&[0x0403, 0x0A0A, 0x0804])]);
+		assert_eq!(
+			parse_client_hello(&real).ja4,
+			parse_client_hello(&with_grease).ja4,
+			"GREASE sig alg must not change JA4"
+		);
+	}
+
+	#[test]
+	fn test_join_hex4() {
+		assert_eq!(join_hex4(&[]), "");
+		assert_eq!(join_hex4(&[0x1301]), "1301");
+		assert_eq!(join_hex4(&[0x0403, 0x0804, 0x0001]), "0403,0804,0001");
+	}
+
+	#[test]
+	fn test_declared_client_hello_len() {
+		// record header (5) + handshake header (4) + declared handshake length.
+		let ch = make_client_hello(0x0303, &[0x1301], &[]);
+		let hs_len = ((ch[6] as usize) << 16) | ((ch[7] as usize) << 8) | (ch[8] as usize);
+		assert_eq!(declared_client_hello_len(&ch), Some(5 + 4 + hs_len));
+		assert_eq!(declared_client_hello_len(&ch), Some(ch.len()));
+		// Fewer than 9 bytes, or a non-handshake record type, yields None.
+		assert_eq!(declared_client_hello_len(&ch[..8]), None);
+		assert_eq!(declared_client_hello_len(&[0x17, 0x03, 0x03, 0, 0, 0, 0, 0, 5]), None);
+	}
+
+	// ── peek reassembly (fragmented ClientHello) ──────────────────────────────
+
+	// Drive `peek()` against one end of a real connected TCP pair, with `client_writes`
+	// driving the other end (a closure that owns the client socket).
+	async fn peek_with_client<F, Fut>(timeout: Duration, hello_writer: F) -> PeekInfo
+	where
+		F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+		Fut: std::future::Future<Output = ()> + Send,
+	{
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		let client = tokio::spawn(async move {
+			let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+			hello_writer(sock).await;
+		});
+		let (server, _) = listener.accept().await.unwrap();
+		let info = peek_with_timeout(&server, timeout).await;
+		client.abort(); // the writer may still be stalling; we have our result
+		let _ = client.await;
+		info
+	}
+
+	#[tokio::test]
+	async fn peek_reassembles_fragmented_client_hello() {
+		// A large ClientHello sent in two segments with a gap must still be fully parsed and
+		// marked complete — this is the blocklist-bypass case.
+		let mut exts = vec![make_sni_ext(b"example.com")];
+		exts.push(make_sig_algs_ext(&[0x0403, 0x0804, 0x0805, 0x0806, 0x0401]));
+		// Pad past the initial peek buffer so reassembly must fetch a second time.
+		exts.push(make_extension(0xABCD, &vec![0u8; 5000]));
+		let hello = make_client_hello(0x0303, &[0x1301, 0x1302, 0x1303], &exts);
+		assert!(hello.len() > INITIAL_PEEK, "test hello must exceed one peek buffer");
+		let split = 200;
+
+		let info = peek_with_client(Duration::from_secs(5), move |mut sock| async move {
+			use tokio::io::AsyncWriteExt;
+			sock.write_all(&hello[..split]).await.unwrap();
+			tokio::time::sleep(Duration::from_millis(30)).await;
+			sock.write_all(&hello[split..]).await.unwrap();
+			// Keep the socket open so peek's MSG_PEEK still sees the buffered bytes.
+			tokio::time::sleep(Duration::from_secs(2)).await;
+		})
+		.await;
+
+		assert!(info.complete, "fragmented hello should reassemble to complete");
+		assert_eq!(info.sni.as_deref(), Some("example.com"));
+		assert_eq!(info.ja4.len(), 36);
+	}
+
+	#[tokio::test]
+	async fn peek_marks_incomplete_when_client_stalls_mid_hello() {
+		// A client that sends only part of a declared ClientHello and stalls must yield
+		// complete=false (so the caller can fail closed under fingerprint enforcement),
+		// without blocking past the reassembly timeout.
+		let hello = make_client_hello(0x0303, &[0x1301], &[make_extension(0xABCD, &vec![0u8; 3000])]);
+		let partial = hello[..100].to_vec();
+
+		// Short injected timeout so the test doesn't wait out the production 5s.
+		let info = peek_with_client(Duration::from_millis(200), move |mut sock| async move {
+			use tokio::io::AsyncWriteExt;
+			sock.write_all(&partial).await.unwrap();
+			// Stall past the (injected) reassembly timeout without sending the rest.
+			tokio::time::sleep(Duration::from_secs(30)).await;
+		})
+		.await;
+
+		assert!(!info.complete, "a stalled partial hello must be marked incomplete");
 	}
 
 	#[test]

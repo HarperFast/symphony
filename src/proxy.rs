@@ -786,14 +786,26 @@ fn parse_protection_config(
 
 	if let Some(ja3s) = &prot.ja3_blocklist {
 		for hex in ja3s {
-			if let Some(bytes) = hex_to_bytes16(hex) {
-				cfg.ja3_blocklist.insert(bytes);
-			}
+			// A JA3 is an MD5 digest — exactly 32 hex chars. Reject typos rather than
+			// silently installing an entry that can never match.
+			let bytes = hex_to_bytes16(hex).ok_or_else(|| {
+				napi::Error::from_reason(format!(
+					"invalid ja3Blocklist entry '{hex}': expected 32 hex characters"
+				))
+			})?;
+			cfg.ja3_blocklist.insert(bytes);
 		}
 	}
 
 	if let Some(ja4s) = &prot.ja4_blocklist {
 		for s in ja4s {
+			// Validate the documented JA4 structure so a malformed entry fails at config
+			// time instead of silently never matching.
+			if !is_valid_ja4(s) {
+				return Err(napi::Error::from_reason(format!(
+					"invalid ja4Blocklist entry '{s}': expected JA4 format t<ver><sni><cc><ec><alpn>_<12 hex>_<12 hex> (36 chars)"
+				)));
+			}
 			// Normalize to lowercase for case-insensitive matching.
 			cfg.ja4_blocklist.insert(s.to_lowercase().into_boxed_str());
 		}
@@ -879,6 +891,31 @@ fn num_cpus() -> u32 {
 	std::thread::available_parallelism()
 		.map(|n| n.get() as u32)
 		.unwrap_or(4)
+}
+
+/// Validate a JA4 core-TLS fingerprint string: `t<ver2><sni1><cc2><ec2><alpn2>_<12hex>_<12hex>`
+/// (36 chars), matching what `sni::compute_ja4` emits and standard JA4 tooling. Case-insensitive
+/// on the hash halves.
+fn is_valid_ja4(s: &str) -> bool {
+	let b = s.as_bytes();
+	if b.len() != 36 || b[10] != b'_' || b[23] != b'_' {
+		return false;
+	}
+	let a = &b[..10];
+	// protocol (t=TCP, q=QUIC, d=DTLS), tls version (2 digits), sni presence (d=domain/i=ip),
+	// cipher count (2 digits), extension count (2 digits), alpn first/last (2 alphanumeric).
+	matches!(a[0], b't' | b'q' | b'd')
+		&& a[1].is_ascii_digit()
+		&& a[2].is_ascii_digit()
+		&& matches!(a[3], b'd' | b'i')
+		&& a[4].is_ascii_digit()
+		&& a[5].is_ascii_digit()
+		&& a[6].is_ascii_digit()
+		&& a[7].is_ascii_digit()
+		&& a[8].is_ascii_alphanumeric()
+		&& a[9].is_ascii_alphanumeric()
+		&& b[11..23].iter().all(u8::is_ascii_hexdigit)
+		&& b[24..36].iter().all(u8::is_ascii_hexdigit)
 }
 
 fn hex_to_bytes16(hex: &str) -> Option<[u8; 16]> {
@@ -1009,5 +1046,23 @@ mod tests {
 			..no_rate_limit_prot()
 		};
 		assert!(parse_protection_config(&prot).is_ok(), "absent burst must be accepted");
+	}
+
+	#[test]
+	fn valid_ja4_accepts_well_formed() {
+		assert!(is_valid_ja4("t13d1516h2_8daaf6152771_02713d6af862"));
+		assert!(is_valid_ja4("q13i070500_1234567890ab_abcdef012345")); // QUIC, no-SNI variant
+	}
+
+	#[test]
+	fn valid_ja4_rejects_malformed() {
+		assert!(!is_valid_ja4(""), "empty");
+		assert!(!is_valid_ja4("t13d1516h2_8daaf6152771"), "missing part C");
+		assert!(!is_valid_ja4("t13d1516h2_8daaf6152771_02713d6af86"), "part C too short");
+		assert!(!is_valid_ja4("t13d1516h2_8daaf6152771_02713d6af862x"), "too long");
+		assert!(!is_valid_ja4("t13d1516h2-8daaf6152771-02713d6af862"), "wrong separators");
+		assert!(!is_valid_ja4("t13d1516h2_8daaf615277g_02713d6af862"), "non-hex in part B");
+		assert!(!is_valid_ja4("x13d1516h2_8daaf6152771_02713d6af862"), "bad protocol char");
+		assert!(!is_valid_ja4("t1xd1516h2_8daaf6152771_02713d6af862"), "non-digit version");
 	}
 }

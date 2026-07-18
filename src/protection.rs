@@ -180,6 +180,9 @@ pub enum BlockReason {
 	CidrBlocked,
 	Ja3Blocked,
 	Ja4Blocked,
+	/// A fingerprint blocklist is configured but the ClientHello could not be fully
+	/// reassembled, so the fingerprint can't be trusted — fail closed.
+	IncompleteHandshake,
 	NoSni,
 	RateLimited,
 	TooManyConnections,
@@ -193,6 +196,7 @@ impl BlockReason {
 			Self::CidrBlocked => "cidr_blocked",
 			Self::Ja3Blocked => "ja3_blocked",
 			Self::Ja4Blocked => "ja4_blocked",
+			Self::IncompleteHandshake => "incomplete_handshake",
 			Self::NoSni => "no_sni",
 			Self::RateLimited => "rate_limited",
 			Self::TooManyConnections => "too_many_connections",
@@ -252,7 +256,16 @@ impl ProtectionState {
 			}
 		}
 
-		// 3. JA3 blocklist
+		// 3. Fingerprint enforcement. When a JA3/JA4 blocklist is configured, a ClientHello
+		// we couldn't fully reassemble must fail closed: otherwise a client fragments the
+		// hello so we compute a different/empty fingerprint here while rustls accepts the
+		// complete handshake — bypassing the blocklist.
+		let fingerprint_enforced = !cfg.ja3_blocklist.is_empty() || !cfg.ja4_blocklist.is_empty();
+		if fingerprint_enforced && !peek_info.complete {
+			return Decision::Block(BlockReason::IncompleteHandshake);
+		}
+
+		// 3a. JA3 blocklist
 		if !cfg.ja3_blocklist.is_empty() && peek_info.ja3.len() == 32 {
 			if let Some(bytes) = hex_to_bytes16(&peek_info.ja3) {
 				if cfg.ja3_blocklist.contains(&bytes) {
@@ -1356,5 +1369,44 @@ mod tests {
 			matches!(state.check_at(peer, &no_peek(), far_future), Decision::Allow(_)),
 			"IP must be admitted fresh after re-enable; stale deadline must not resurrect"
 		);
+	}
+
+	// ── Fragmented-hello fail-closed tests ──────────────────────────────────────
+
+	fn peek(ja4: &str, complete: bool) -> PeekInfo {
+		PeekInfo { sni: Some("x".into()), ja3: String::new(), ja4: ja4.into(), complete }
+	}
+
+	fn state_with_ja4_blocklist() -> Arc<ProtectionState> {
+		let mut cfg = ProtectionConfig::default();
+		cfg.ja4_blocklist.insert("t13d1516h2_8daaf6152771_02713d6af862".into());
+		ProtectionState::new(cfg)
+	}
+
+	#[test]
+	fn incomplete_hello_fails_closed_under_fingerprint_enforcement() {
+		let state = state_with_ja4_blocklist();
+		let ip = "1.2.3.4".parse().unwrap();
+		// A truncated ClientHello whose (untrusted) fingerprint happens not to match the
+		// blocklist must still be blocked — otherwise fragmentation bypasses enforcement.
+		let decision = state.check(ip, &peek("t13d0000zz_000000000000_000000000000", false));
+		assert!(matches!(decision, Decision::Block(BlockReason::IncompleteHandshake)));
+	}
+
+	#[test]
+	fn complete_hello_not_on_blocklist_is_allowed() {
+		let state = state_with_ja4_blocklist();
+		let ip = "1.2.3.5".parse().unwrap();
+		let decision = state.check(ip, &peek("t13d1516h2_ffffffffffff_ffffffffffff", true));
+		assert!(matches!(decision, Decision::Allow(_)));
+	}
+
+	#[test]
+	fn incomplete_hello_allowed_without_fingerprint_enforcement() {
+		// No blocklist configured: reassembly is best-effort only, incomplete is fine.
+		let state = ProtectionState::new(ProtectionConfig::default());
+		let ip = "1.2.3.6".parse().unwrap();
+		let decision = state.check(ip, &peek("", false));
+		assert!(matches!(decision, Decision::Allow(_)));
 	}
 }
