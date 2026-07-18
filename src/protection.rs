@@ -594,7 +594,7 @@ mod tests {
 	}
 
 	fn peek_with_ja3(hex: &str) -> PeekInfo {
-		PeekInfo { sni: None, ja3: hex.to_string() }
+		PeekInfo { ja3: hex.to_string(), ..Default::default() }
 	}
 
 	#[test]
