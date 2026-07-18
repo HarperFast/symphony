@@ -21,6 +21,10 @@ pub enum JsEvent {
 		ip: String,
 		reason: String,
 		listener: String,
+		/// JA3 fingerprint (32-char hex) if parsed; empty string otherwise.
+		ja3: String,
+		/// JA4 fingerprint if parsed; empty string otherwise.
+		ja4: String,
 	},
 	Suspended {
 		id: String,
@@ -68,6 +72,8 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 					ip: peer_ip.to_string(),
 					reason: reason.as_str().to_string(),
 					listener: ctx.listener_addr.clone(),
+					ja3: peek_info.ja3.clone(),
+					ja4: peek_info.ja4.clone(),
 				});
 				return;
 			}

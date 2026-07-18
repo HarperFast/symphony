@@ -141,6 +141,7 @@ Both fields accept PEM-encoded strings or `Buffer`. The cert chain may include i
 | `allowlist` | `string[]` | `[]` | CIDRs that bypass all checks |
 | `blocklist` | `string[]` | `[]` | CIDRs that are always blocked |
 | `ja3Blocklist` | `string[]` | `[]` | JA3 MD5 hex fingerprints to block (32 chars each) |
+| `ja4Blocklist` | `string[]` | `[]` | JA4 TLS fingerprints to block (36-char strings; see [JA4 blocking](#ja4-blocking)) |
 | `tlsHandshakeTimeoutMs` | `number` | `10000` | Abort slow TLS handshakes |
 | `requireSni` | `boolean` | `false` | Reject connections without an SNI extension |
 
@@ -409,13 +410,33 @@ protection: {
 
 ### JA3 blocking
 
-Collect JA3 fingerprints from your logs (the `ja3` field is available in future log integrations) and add known-bad clients:
+JA3 fingerprints the TLS ClientHello by hashing a canonical string of the version, cipher suites, extensions, elliptic curves, and EC point formats using MD5. That MD5 is by specification, not a security claim — it allows lists of known-bad fingerprints to be compared cheaply. Collect JA3 fingerprints from your logs (available in the `blocked` event `ja3` field) and add known-bad clients:
 
 ```typescript
 ja3Blocklist: [
   'e7d705a3286e19ea42f587b344ee6865', // example known-bad scanner
 ]
 ```
+
+**Limitation:** Chrome and other modern browsers randomize the order of ClientHello extensions on each connection, so a single browser can produce many different JA3 hashes. This makes per-browser JA3 blocking unreliable. Use `ja4Blocklist` where extension-order randomization is a concern.
+
+**Upgrade note:** earlier versions filtered only one of the 16 GREASE values when computing JA3, so hashes for clients that send other GREASE values (e.g. Chrome) were nonstandard and unstable. JA3 values collected from earlier symphony versions may no longer match and should be re-collected.
+
+### JA4 blocking
+
+JA4 is the randomization-resistant successor to JA3. It sorts the cipher and extension lists before hashing, so it produces a stable fingerprint regardless of ClientHello field ordering. Fingerprints are 36-char lowercase ASCII strings in the form `t<ver><sni><cc><ec><alpn>_<sha256/12>_<sha256/12>`.
+
+Collect JA4 values from the `blocked` event `ja4` field and configure them:
+
+```typescript
+ja4Blocklist: [
+  't13d1516h2_8daaf6152771_b186095e22b6', // example Chrome fingerprint
+]
+```
+
+Matching is case-insensitive. JA4 fingerprints are always emitted as lowercase.
+
+**License scope:** Symphony implements **core JA4** (TLS client fingerprinting) only. Core JA4 is BSD-licensed. The JA4+ suite of variants (JA4S, JA4H, JA4SSH, etc.) carries a separate FoxIO proprietary license and is **not implemented** here.
 
 ### Hot-swapping protection config
 

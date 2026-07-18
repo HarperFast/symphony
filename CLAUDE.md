@@ -18,7 +18,7 @@ The server also **watches the cert/key files referenced by the config** (grouped
 
 ```
 TCP accept (SO_REUSEPORT per worker thread)
-  └─ sni.rs       peek() — 1 syscall, 512-byte stack buf → PeekInfo { sni, ja3 }
+  └─ sni.rs       peek() — 1 syscall, 512-byte stack buf → PeekInfo { sni, ja3, ja4 }
   └─ protection.rs check() → Block (emit 'blocked', drop) | Allow
   └─ router.rs    RouteTable.resolve(sni) → Route
   └─ [suspended.rs  register, emit 'suspended', await oneshot]

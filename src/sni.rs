@@ -8,6 +8,10 @@ pub struct PeekInfo {
 	/// JA3 fingerprint as a 32-char lowercase hex string.
 	/// Empty string if the ClientHello could not be parsed.
 	pub ja3: String,
+	/// JA4 fingerprint (core TLS only — BSD-licensed; JA4+ variants not implemented,
+	/// FoxIO proprietary license). Format: t<ver><sni><cc><ec><alpn>_<sha256/12>_<sha256/12>.
+	/// Empty string if the ClientHello could not be parsed.
+	pub ja4: String,
 }
 
 /// Peek at the first 4096 bytes of the stream and parse the TLS ClientHello.
@@ -26,9 +30,10 @@ fn parse_client_hello(buf: &[u8]) -> PeekInfo {
 	let Some(hello) = p.parse_client_hello() else {
 		return PeekInfo::default();
 	};
-	let sni = extract_sni(&hello.extensions);
-	let ja3 = compute_ja3(hello.legacy_version, &hello.cipher_suites, &hello.extensions);
-	PeekInfo { sni, ja3 }
+	let sni = extract_sni(hello.extensions);
+	let ja3 = compute_ja3(hello.legacy_version, hello.cipher_suites, hello.extensions);
+	let ja4 = compute_ja4(hello.legacy_version, hello.cipher_suites, hello.extensions);
+	PeekInfo { sni, ja3, ja4 }
 }
 
 // ── TLS record / ClientHello structures ──────────────────────────────────────
@@ -182,8 +187,9 @@ fn extract_sni(extensions: &[u8]) -> Option<String> {
 
 // ── JA3 computation ───────────────────────────────────────────────────────────
 
-/// Returns true if a u16 value is a GREASE value.
-/// GREASE values follow the pattern 0x?A?A (RFC 8701).
+/// Returns true if a u16 value is a GREASE value (RFC 8701).
+/// GREASE values are 0x?A?A: both bytes are equal and the low nibble is 0xA.
+/// That gives 16 values: 0x0A0A, 0x1A1A, 0x2A2A, ..., 0xFAFA.
 fn is_grease(v: u16) -> bool {
 	let lo = (v & 0x00FF) as u8;
 	let hi = ((v >> 8) & 0xFF) as u8;
@@ -195,6 +201,12 @@ fn md5_hex(data: &[u8]) -> String {
 	use md5::{Digest, Md5};
 	let hash = Md5::digest(data);
 	bytes_to_hex(&hash)
+}
+
+fn sha256_hex12(data: &[u8]) -> String {
+	use sha2::{Digest, Sha256};
+	let hash = Sha256::digest(data);
+	bytes_to_hex(&hash[..6]) // 6 bytes = 12 hex chars
 }
 
 fn compute_ja3(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> String {
@@ -269,6 +281,175 @@ fn compute_ja3(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> 
 	md5_hex(ja3_str.as_bytes())
 }
 
+// ── JA4 computation ───────────────────────────────────────────────────────────
+//
+// JA4 is a BSD-licensed TLS client fingerprint (core TLS only).
+// JA4S, JA4H, JA4SSH, and all other JA4+ variants are NOT implemented here —
+// those variants carry a FoxIO proprietary license that is incompatible with
+// commercial distribution.
+//
+// Spec: https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
+// Format: t<ver><sni><cc><ec><alpn>_<ciphers-sha256/12>_<exts-sha256/12>
+
+fn compute_ja4(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> String {
+	// Parse extensions in a single pass.
+	let mut ext_ids: Vec<u16> = Vec::new(); // all non-GREASE ext types
+	let mut supported_versions: Vec<u16> = Vec::new();
+	let mut alpn_first: Option<Vec<u8>> = None;
+	let mut sig_algs: Vec<u16> = Vec::new();
+
+	let mut p = Parser::new(extensions);
+	while p.remaining() >= 4 {
+		let ext_type = match p.read_u16() {
+			Some(v) => v,
+			None => break,
+		};
+		let ext_len = match p.read_u16() {
+			Some(v) => v as usize,
+			None => break,
+		};
+		let ext_data = match p.read_bytes(ext_len) {
+			Some(v) => v,
+			None => break,
+		};
+
+		if is_grease(ext_type) {
+			continue;
+		}
+		ext_ids.push(ext_type);
+
+		match ext_type {
+			0x002B => {
+				// supported_versions: list_len(1) + [version(2)]*
+				if let Some((&list_len, rest)) = ext_data.split_first() {
+					for chunk in rest[..(list_len as usize).min(rest.len())].chunks_exact(2) {
+						let v = u16::from_be_bytes([chunk[0], chunk[1]]);
+						if !is_grease(v) {
+							supported_versions.push(v);
+						}
+					}
+				}
+			}
+			0x0010 => {
+				// ALPN: protocol_name_list_len(2) + [proto_len(1) + proto]*
+				if ext_data.len() >= 2 {
+					let list_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
+					let list = &ext_data[2..2 + list_len.min(ext_data.len().saturating_sub(2))];
+					if !list.is_empty() {
+						let proto_len = list[0] as usize;
+						if proto_len > 0 && 1 + proto_len <= list.len() {
+							alpn_first = Some(list[1..1 + proto_len].to_vec());
+						}
+					}
+				}
+			}
+			0x000D => {
+				// signature_algorithms: list_len(2) + [alg(2)]*
+				if ext_data.len() >= 2 {
+					let list_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
+					let algs = &ext_data[2..];
+					for chunk in algs[..list_len.min(algs.len())].chunks_exact(2) {
+						sig_algs.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+					}
+				}
+			}
+			_ => {}
+		}
+	}
+
+	// TLS version: max of supported_versions if present, else legacy_version.
+	let tls_version = supported_versions.iter().copied().max().unwrap_or(legacy_version);
+	let ver_str = match tls_version {
+		0x0304 => "13",
+		0x0303 => "12",
+		0x0302 => "11",
+		0x0301 => "10",
+		_ => "00",
+	};
+
+	// SNI indicator: keyed on the SNI extension being present, per spec — not on whether
+	// symphony's own hostname validation accepted its value.
+	let sni_char = if ext_ids.contains(&0x0000) { 'd' } else { 'i' };
+
+	// Cipher count: GREASE excluded, capped at 99.
+	let cipher_count = cipher_suites
+		.chunks_exact(2)
+		.filter(|c| !is_grease(u16::from_be_bytes([c[0], c[1]])))
+		.count()
+		.min(99);
+
+	// Extension count: all non-GREASE extensions including SNI (0) and ALPN (16), capped at 99.
+	let ext_count = ext_ids.len().min(99);
+
+	// ALPN first and last character of the first protocol value, lowercased.
+	// Per JA4 spec: if either the first or last byte is non-alphanumeric, use the
+	// first and last characters of the hex representation of the whole ALPN instead.
+	let alpn_chars: String = match &alpn_first {
+		None => "00".to_string(),
+		Some(proto) if proto.is_empty() => "00".to_string(),
+		Some(proto) => {
+			let first = proto[0];
+			let last = proto[proto.len() - 1];
+			if first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric() {
+				format!(
+					"{}{}",
+					(first as char).to_ascii_lowercase(),
+					(last as char).to_ascii_lowercase()
+				)
+			} else {
+				let hex = bytes_to_hex(proto);
+				let hb = hex.as_bytes();
+				format!("{}{}", hb[0] as char, hb[hb.len() - 1] as char)
+			}
+		}
+	};
+
+	// Part A: 10 chars — t<ver><sni><cc><ec><alpn>
+	let part_a = format!("t{ver_str}{sni_char}{cipher_count:02}{ext_count:02}{alpn_chars}");
+
+	// Part B: SHA-256/12 of sorted 4-hex cipher list (GREASE excluded).
+	let mut ciphers: Vec<u16> = cipher_suites
+		.chunks_exact(2)
+		.map(|c| u16::from_be_bytes([c[0], c[1]]))
+		.filter(|&v| !is_grease(v))
+		.collect();
+	ciphers.sort_unstable();
+	let part_b = if ciphers.is_empty() {
+		"000000000000".to_string()
+	} else {
+		let cipher_str = ciphers.iter().map(|v| format!("{v:04x}")).collect::<Vec<_>>().join(",");
+		sha256_hex12(cipher_str.as_bytes())
+	};
+
+	// Part C: SHA-256/12 of (sorted ext IDs, GREASE/SNI/ALPN excluded) optionally
+	// followed by '_' + unsorted signature algorithms from ext 13.
+	let mut ext_for_hash: Vec<u16> = ext_ids
+		.iter()
+		.filter(|&&t| t != 0x0000 && t != 0x0010) // remove SNI and ALPN
+		.copied()
+		.collect();
+	ext_for_hash.sort_unstable();
+	let ext_str = ext_for_hash.iter().map(|v| format!("{v:04x}")).collect::<Vec<_>>().join(",");
+
+	// Per JA4 spec: with no signature algorithms the string ends without a trailing
+	// underscore. Gate on the parsed list, not extension presence — a present-but-empty
+	// or truncated sig_algs extension must not append a bare '_'.
+	let hash_input = if !sig_algs.is_empty() {
+		let sig_str = sig_algs.iter().map(|v| format!("{v:04x}")).collect::<Vec<_>>().join(",");
+		format!("{ext_str}_{sig_str}")
+	} else {
+		ext_str
+	};
+
+	let part_c = if hash_input.is_empty() {
+		"000000000000".to_string()
+	} else {
+		sha256_hex12(hash_input.as_bytes())
+	};
+
+	format!("{part_a}_{part_b}_{part_c}")
+}
+
 fn join_u16(vals: &[u16]) -> String {
 	vals.iter()
 		.map(|v| v.to_string())
@@ -297,13 +478,107 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 mod tests {
 	use super::*;
 
+	// ── helpers for building synthetic ClientHellos ───────────────────────────
+
+	fn make_extension(ext_type: u16, data: &[u8]) -> Vec<u8> {
+		let mut v = Vec::new();
+		v.extend_from_slice(&ext_type.to_be_bytes());
+		v.extend_from_slice(&(data.len() as u16).to_be_bytes());
+		v.extend_from_slice(data);
+		v
+	}
+
+	fn make_sni_ext(hostname: &[u8]) -> Vec<u8> {
+		// SNI: list_len(2) + [name_type(1) + name_len(2) + name]*
+		let mut entry = vec![0x00u8]; // name_type = host_name
+		entry.extend_from_slice(&(hostname.len() as u16).to_be_bytes());
+		entry.extend_from_slice(hostname);
+		let mut data = (entry.len() as u16).to_be_bytes().to_vec();
+		data.extend_from_slice(&entry);
+		make_extension(0x0000, &data)
+	}
+
+	fn make_supported_versions_ext(versions: &[u16]) -> Vec<u8> {
+		// supported_versions: list_len(1) + [version(2)]*
+		let mut data = vec![(versions.len() * 2) as u8];
+		for &v in versions {
+			data.extend_from_slice(&v.to_be_bytes());
+		}
+		make_extension(0x002B, &data)
+	}
+
+	fn make_alpn_ext(protos: &[&[u8]]) -> Vec<u8> {
+		// ALPN: list_len(2) + [proto_len(1) + proto]*
+		let mut list = Vec::new();
+		for proto in protos {
+			list.push(proto.len() as u8);
+			list.extend_from_slice(proto);
+		}
+		let mut data = (list.len() as u16).to_be_bytes().to_vec();
+		data.extend_from_slice(&list);
+		make_extension(0x0010, &data)
+	}
+
+	fn make_sig_algs_ext(algs: &[u16]) -> Vec<u8> {
+		// signature_algorithms: list_len(2) + [alg(2)]*
+		let mut data = ((algs.len() * 2) as u16).to_be_bytes().to_vec();
+		for &alg in algs {
+			data.extend_from_slice(&alg.to_be_bytes());
+		}
+		make_extension(0x000D, &data)
+	}
+
+	fn make_client_hello(
+		legacy_version: u16,
+		ciphers: &[u16],
+		exts: &[Vec<u8>],
+	) -> Vec<u8> {
+		let mut body = Vec::new();
+		body.extend_from_slice(&legacy_version.to_be_bytes());
+		body.extend_from_slice(&[0u8; 32]); // random
+		body.push(0x00); // session_id length = 0
+		let cs_len = (ciphers.len() * 2) as u16;
+		body.extend_from_slice(&cs_len.to_be_bytes());
+		for &c in ciphers {
+			body.extend_from_slice(&c.to_be_bytes());
+		}
+		body.push(0x01); // compression methods length
+		body.push(0x00); // null compression
+		let ext_bytes: Vec<u8> = exts.iter().flat_map(|e| e.clone()).collect();
+		body.extend_from_slice(&(ext_bytes.len() as u16).to_be_bytes());
+		body.extend_from_slice(&ext_bytes);
+
+		let hs_len = body.len() as u32;
+		let mut hs = vec![0x01u8]; // ClientHello msg_type
+		hs.push(((hs_len >> 16) & 0xFF) as u8);
+		hs.push(((hs_len >> 8) & 0xFF) as u8);
+		hs.push((hs_len & 0xFF) as u8);
+		hs.extend_from_slice(&body);
+
+		let mut record = vec![0x16u8, 0x03, 0x01];
+		record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+		record.extend_from_slice(&hs);
+		record
+	}
+
+	// ── is_grease ────────────────────────────────────────────────────────────
+
 	#[test]
 	fn test_is_grease() {
-		assert!(is_grease(0x0A0A));
-		assert!(is_grease(0x1A1A));
-		assert!(is_grease(0xFAFA));
-		assert!(!is_grease(0x002F));
-		assert!(!is_grease(0x0A0B));
+		// All 16 GREASE values (RFC 8701): 0x?A?A where both bytes equal and nibble=0xA
+		for n in 0u16..=0xF {
+			let v = (n << 4 | 0xA) << 8 | (n << 4 | 0xA);
+			assert!(is_grease(v), "expected is_grease(0x{v:04X})");
+		}
+		// Non-GREASE: bytes differ
+		assert!(!is_grease(0x0A1A), "0x0A1A: bytes differ");
+		assert!(!is_grease(0x1A0A), "0x1A0A: bytes differ");
+		// Non-GREASE: low nibble not 0xA
+		assert!(!is_grease(0x0B0B), "0x0B0B: nibble 0xB");
+		assert!(!is_grease(0x0000), "0x0000");
+		assert!(!is_grease(0xFFFF), "0xFFFF");
+		assert!(!is_grease(0x002F), "real cipher");
+		assert!(!is_grease(0x0A0B), "0x0A0B: bytes differ");
 	}
 
 	#[test]
@@ -311,6 +586,218 @@ mod tests {
 		let bytes = [0xDE, 0xAD, 0xBE, 0xEF];
 		assert_eq!(bytes_to_hex(&bytes), "deadbeef");
 	}
+
+	// ── JA4 structural tests ─────────────────────────────────────────────────
+
+	#[test]
+	fn test_ja4_format() {
+		// Basic format: 3 parts separated by '_', lengths 10/12/12.
+		let hello = make_client_hello(
+			0x0303,
+			&[0x1301],
+			&[make_sni_ext(b"example.com")],
+		);
+		let info = parse_client_hello(&hello);
+		assert!(!info.ja4.is_empty(), "JA4 should not be empty");
+		let parts: Vec<&str> = info.ja4.split('_').collect();
+		assert_eq!(parts.len(), 3, "JA4 must have 3 '_'-separated parts: {}", info.ja4);
+		assert_eq!(parts[0].len(), 10, "Part A must be 10 chars: {}", info.ja4);
+		assert_eq!(parts[1].len(), 12, "Part B must be 12 hex chars: {}", info.ja4);
+		assert_eq!(parts[2].len(), 12, "Part C must be 12 hex chars: {}", info.ja4);
+	}
+
+	#[test]
+	fn test_ja4_version_from_supported_versions() {
+		// supported_versions = [0x0304] overrides legacy_version 0x0303 → "13"
+		let hello = make_client_hello(
+			0x0303,
+			&[0x1301],
+			&[
+				make_sni_ext(b"test"),
+				make_supported_versions_ext(&[0x0304]),
+			],
+		);
+		let info = parse_client_hello(&hello);
+		assert!(info.ja4.starts_with("t13"), "should use supported_versions: {}", info.ja4);
+	}
+
+	#[test]
+	fn test_ja4_version_fallback() {
+		// No supported_versions → fall back to legacy_version 0x0303 → "12"
+		let hello = make_client_hello(
+			0x0303,
+			&[0x1301],
+			&[make_sni_ext(b"test")],
+		);
+		let info = parse_client_hello(&hello);
+		assert!(info.ja4.starts_with("t12"), "should fall back to legacy version: {}", info.ja4);
+	}
+
+	#[test]
+	fn test_ja4_sni_indicator() {
+		// SNI present → 'd'; absent → 'i' (4th char of JA4).
+		let with_sni = make_client_hello(0x0303, &[0x1301], &[make_sni_ext(b"test")]);
+		let without_sni = make_client_hello(0x0303, &[0x1301], &[]);
+		let info_d = parse_client_hello(&with_sni);
+		let info_i = parse_client_hello(&without_sni);
+		assert_eq!(&info_d.ja4[3..4], "d", "SNI present should give 'd': {}", info_d.ja4);
+		assert_eq!(&info_i.ja4[3..4], "i", "SNI absent should give 'i': {}", info_i.ja4);
+	}
+
+	#[test]
+	fn test_ja4_sni_indicator_present_but_rejected_hostname() {
+		// The indicator is keyed on extension PRESENCE per spec: an SNI whose value fails
+		// symphony's hostname validation (here an IPv6 literal, contains ':') still gives 'd'
+		// even though extract_sni returns None.
+		let hello = make_client_hello(0x0303, &[0x1301], &[make_sni_ext(b"::1")]);
+		let info = parse_client_hello(&hello);
+		assert_eq!(info.sni, None, "invalid hostname should be rejected");
+		assert_eq!(&info.ja4[3..4], "d", "SNI extension present should give 'd': {}", info.ja4);
+	}
+
+	#[test]
+	fn test_ja4_cipher_count() {
+		// 3 ciphers (including 1 GREASE) → cc=02.
+		let hello = make_client_hello(
+			0x0303,
+			&[0x0A0A /* GREASE */, 0x1301, 0x1302],
+			&[make_sni_ext(b"test")],
+		);
+		let info = parse_client_hello(&hello);
+		assert_eq!(&info.ja4[4..6], "02", "cipher count should be 02 (GREASE excluded): {}", info.ja4);
+	}
+
+	#[test]
+	fn test_ja4_extension_count_includes_sni_and_alpn() {
+		// Spec: extension count includes SNI (0) and ALPN (16) even though they're excluded from the hash.
+		// SNI + ALPN + supported_versions + sig_algs = 4 extensions counted.
+		let hello = make_client_hello(
+			0x0303,
+			&[0x1301, 0x1302],
+			&[
+				make_sni_ext(b"test"),
+				make_alpn_ext(&[b"h2"]),
+				make_supported_versions_ext(&[0x0304]),
+				make_sig_algs_ext(&[0x0403, 0x0807]),
+			],
+		);
+		let info = parse_client_hello(&hello);
+		assert_eq!(&info.ja4[6..8], "04", "extension count should be 04 (incl SNI+ALPN): {}", info.ja4);
+	}
+
+	#[test]
+	fn test_ja4_alpn_chars() {
+		// "h2" → first='h', last='2' → "h2"
+		// "http/1.1" → first='h', last='1' → "h1"
+		// no ALPN → "00"
+		let with_h2 = make_client_hello(0x0303, &[0x1301], &[make_alpn_ext(&[b"h2"])]);
+		let with_http11 = make_client_hello(0x0303, &[0x1301], &[make_alpn_ext(&[b"http/1.1"])]);
+		let no_alpn = make_client_hello(0x0303, &[0x1301], &[]);
+
+		let info_h2 = parse_client_hello(&with_h2);
+		let info_http11 = parse_client_hello(&with_http11);
+		let info_no = parse_client_hello(&no_alpn);
+
+		assert_eq!(&info_h2.ja4[8..10], "h2", "h2 ALPN: {}", info_h2.ja4);
+		assert_eq!(&info_http11.ja4[8..10], "h1", "http/1.1 ALPN: {}", info_http11.ja4);
+		assert_eq!(&info_no.ja4[8..10], "00", "no ALPN: {}", info_no.ja4);
+	}
+
+	#[test]
+	fn test_ja4_alpn_nonalnum_uses_hex() {
+		// Per JA4 spec: if the first or last byte of the first ALPN is non-alphanumeric,
+		// use the first and last chars of the hex of the whole value. 0x02 0x68 ("\x02h")
+		// → hex "0268" → first='0', last='8'.
+		let ch = make_client_hello(0x0303, &[0x1301], &[make_alpn_ext(&[&[0x02, 0x68]])]);
+		let info = parse_client_hello(&ch);
+		assert_eq!(&info.ja4[8..10], "08", "non-alnum ALPN should use hex: {}", info.ja4);
+	}
+
+	#[test]
+	fn test_ja4_empty_sig_algs_no_trailing_underscore() {
+		// A present-but-empty signature_algorithms extension must not append a bare '_'
+		// to the JA4_c hash input. Only ext 0x000D present → ext list "000d", no underscore.
+		let ch = make_client_hello(0x0303, &[0x1301], &[make_sig_algs_ext(&[])]);
+		let info = parse_client_hello(&ch);
+		let part_c = &info.ja4[info.ja4.len() - 12..];
+		assert_eq!(part_c, sha256_hex12(b"000d"), "no trailing underscore: {}", info.ja4);
+		assert_ne!(part_c, sha256_hex12(b"000d_"), "must not hash a trailing '_': {}", info.ja4);
+	}
+
+	#[test]
+	fn test_ja4_known_vector() {
+		// Synthetic vector: verify Part A exactly and that Parts B/C are consistent
+		// with the expected hash inputs.
+		// Inputs:
+		//   legacy_version = 0x0303 (TLS 1.2)
+		//   supported_versions = [0x0304] → TLS 1.3 → "13"
+		//   ciphers = [0x1301, 0x1302] → sorted → "1301,1302"
+		//   extensions (non-GREASE, 4 total incl SNI+ALPN):
+		//     SNI("test"), ALPN("h2"), supported_versions, sig_algs
+		//     → for hash: sorted without SNI/ALPN → 000d,002b
+		//     → sigalgs (unsorted) → 0403,0807
+		//   hash input for Part C: "000d,002b_0403,0807"
+		let hello = make_client_hello(
+			0x0303,
+			&[0x1301, 0x1302],
+			&[
+				make_sni_ext(b"test"),
+				make_alpn_ext(&[b"h2"]),
+				make_supported_versions_ext(&[0x0304]),
+				make_sig_algs_ext(&[0x0403, 0x0807]),
+			],
+		);
+		let info = parse_client_hello(&hello);
+
+		assert!(info.ja4.starts_with("t13d0204h2_"), "Part A: {}", info.ja4);
+
+		// Independently compute expected Part B and C using sha256_hex12.
+		let expected_b = sha256_hex12(b"1301,1302");
+		let expected_c = sha256_hex12(b"000d,002b_0403,0807");
+		let expected = format!("t13d0204h2_{expected_b}_{expected_c}");
+		assert_eq!(info.ja4, expected, "JA4 mismatch");
+	}
+
+	#[test]
+	fn test_ja4_grease_excluded_from_ext_hash() {
+		// Adding a GREASE extension should not change Part A counts or Part C hash.
+		let without_grease = make_client_hello(
+			0x0303,
+			&[0x1301],
+			&[make_supported_versions_ext(&[0x0303])],
+		);
+		let with_grease = make_client_hello(
+			0x0303,
+			&[0x1301],
+			&[
+				make_extension(0x2A2A, &[0x00]), // GREASE extension
+				make_supported_versions_ext(&[0x0303]),
+			],
+		);
+		let info_without = parse_client_hello(&without_grease);
+		let info_with = parse_client_hello(&with_grease);
+		// Both should have ext_count=01 (only supported_versions, no GREASE counted)
+		assert_eq!(&info_without.ja4[6..8], "01", "without GREASE: {}", info_without.ja4);
+		assert_eq!(&info_with.ja4[6..8], "01", "with GREASE: {}", info_with.ja4);
+		// Part C should be identical
+		let parts_without: Vec<&str> = info_without.ja4.split('_').collect();
+		let parts_with: Vec<&str> = info_with.ja4.split('_').collect();
+		assert_eq!(parts_without[2], parts_with[2], "GREASE ext should not affect Part C");
+	}
+
+	#[test]
+	fn test_ja4_sni_excluded_from_ext_hash() {
+		// Changing SNI value should not change Part C (SNI ext excluded from hash).
+		let hello_a = make_client_hello(0x0303, &[0x1301], &[make_sni_ext(b"a.example.com")]);
+		let hello_b = make_client_hello(0x0303, &[0x1301], &[make_sni_ext(b"b.example.com")]);
+		let info_a = parse_client_hello(&hello_a);
+		let info_b = parse_client_hello(&hello_b);
+		let parts_a: Vec<&str> = info_a.ja4.split('_').collect();
+		let parts_b: Vec<&str> = info_b.ja4.split('_').collect();
+		assert_eq!(parts_a[2], parts_b[2], "Different SNI values should produce same Part C");
+	}
+
+	// ── SNI parsing (existing test) ──────────────────────────────────────────
 
 	/// Feed a minimal synthetic ClientHello and verify SNI extraction.
 	#[test]
@@ -370,5 +857,7 @@ mod tests {
 		assert_eq!(info.sni.as_deref(), Some("example.com"));
 		assert!(!info.ja3.is_empty());
 		assert_eq!(info.ja3.len(), 32);
+		assert!(!info.ja4.is_empty());
+		assert_eq!(info.ja4.len(), 36, "JA4 should be 36 chars (10+1+12+1+12): {}", info.ja4);
 	}
 }

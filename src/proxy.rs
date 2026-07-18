@@ -82,6 +82,9 @@ pub struct JsProtectionConfig {
 	pub allowlist: Option<Vec<String>>,
 	pub blocklist: Option<Vec<String>>,
 	pub ja3_blocklist: Option<Vec<String>>,
+	/// JA4 fingerprints to block. Each value is the full 36-char JA4 string
+	/// (t<ver><sni><cc><ec><alpn>_<12hex>_<12hex>); case-insensitive match.
+	pub ja4_blocklist: Option<Vec<String>>,
 	pub tls_handshake_timeout_ms: Option<f64>,
 	pub require_sni: Option<bool>,
 }
@@ -285,11 +288,13 @@ impl SymphonyProxyWrap {
 				let env = ctx.env;
 				let mut obj = env.create_object()?;
 				match event {
-					JsEvent::Blocked { ip, reason, listener } => {
+					JsEvent::Blocked { ip, reason, listener, ja3, ja4 } => {
 						obj.set("type", "blocked")?;
 						obj.set("ip", ip)?;
 						obj.set("reason", reason)?;
 						obj.set("listener", listener)?;
+						obj.set("ja3", ja3)?;
+						obj.set("ja4", ja4)?;
 					}
 					JsEvent::Suspended { id, sni, peer_ip, peer_port, listener } => {
 						obj.set("type", "suspended")?;
@@ -623,6 +628,13 @@ fn parse_protection_config(
 			if let Some(bytes) = hex_to_bytes16(hex) {
 				cfg.ja3_blocklist.insert(bytes);
 			}
+		}
+	}
+
+	if let Some(ja4s) = &prot.ja4_blocklist {
+		for s in ja4s {
+			// Normalize to lowercase for case-insensitive matching.
+			cfg.ja4_blocklist.insert(s.to_lowercase().into_boxed_str());
 		}
 	}
 
