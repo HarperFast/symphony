@@ -103,7 +103,7 @@ describe('PROXY protocol v2 + fingerprint forwarding', () => {
 		await capture.close();
 	});
 
-	it('emits a v2 header with no TLV when forwardFingerprint is off', async () => {
+	it('emits no fingerprint TLV when forwardFingerprint is off (TLS-facts TLVs still present)', async () => {
 		const capture = await startCaptureServer();
 		const proxyPort = await getFreePort();
 		const proxy = new SymphonyProxy({
@@ -123,7 +123,13 @@ describe('PROXY protocol v2 + fingerprint forwarding', () => {
 
 		const socket = await tlsSend(proxyPort, 'localhost', cert.cert, HTTP_REQUEST);
 		const parsed = parseProxyV2(await capture.received);
-		assert.equal(parsed.tlvs.size, 0, 'no TLVs without forwardFingerprint');
+		// No fingerprint (0xE0/0xE1) or client cert (0xE2) TLVs — but terminated PP2
+		// connections always carry the TLS-facts TLVs (authority 0x02, SSL 0x20, ALPN 0x01).
+		assert.ok(!parsed.tlvs.has(0xe0), 'no JA3 TLV without forwardFingerprint');
+		assert.ok(!parsed.tlvs.has(0xe1), 'no JA4 TLV without forwardFingerprint');
+		assert.ok(!parsed.tlvs.has(0xe2), 'no client cert TLV without a client cert');
+		assert.equal(parsed.tlvs.get(0x02)?.toString(), 'localhost', 'SNI authority TLV');
+		assert.ok(parsed.tlvs.has(0x20), 'SSL TLV present on terminated connections');
 		assert.equal(parsed.rest.toString('ascii'), HTTP_REQUEST);
 
 		socket.destroy();

@@ -134,6 +134,82 @@ function generateCertViaOpenssl(
 	return { cert, key };
 }
 
+// ── CA-signed client certificate generation (for mTLS tests) ──────────────────
+
+export interface ClientCa {
+	caCert: string;
+	clientCert: string;
+	clientKey: string;
+}
+
+/**
+ * Generate a CA and a client certificate signed by it, for mTLS tests.
+ * Returns null when openssl is unavailable (callers should skip).
+ */
+export function generateClientCa(caCn = 'Symphony Test CA', clientCn = 'test-client'): ClientCa | null {
+	const { spawnSync } = require('node:child_process');
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-mtls-'));
+	try {
+		const caKeyFile = path.join(dir, 'ca.key');
+		const caCertFile = path.join(dir, 'ca.pem');
+		const clientKeyFile = path.join(dir, 'client.key');
+		const csrFile = path.join(dir, 'client.csr');
+		const clientCertFile = path.join(dir, 'client.pem');
+		const extFile = path.join(dir, 'ext.cnf');
+
+		const caKey = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+		fs.writeFileSync(caKeyFile, caKey.privateKey.export({ type: 'pkcs8', format: 'pem' }) as string);
+		const clientKeyObj = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+		const clientKey = clientKeyObj.privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
+		fs.writeFileSync(clientKeyFile, clientKey);
+
+		// Explicit CA basicConstraints: OpenSSL 3 adds it by default for `req -x509`,
+		// LibreSSL (macOS system openssl) does not.
+		const ca = spawnSync(
+			'openssl',
+			[
+				'req', '-new', '-x509', '-key', caKeyFile, '-out', caCertFile, '-days', '1',
+				'-subj', `/CN=${caCn}`,
+				'-addext', 'basicConstraints=critical,CA:TRUE',
+				'-addext', 'keyUsage=keyCertSign,cRLSign',
+			],
+			{ encoding: 'utf8' },
+		);
+		if (ca.status !== 0) return null;
+
+		const csr = spawnSync(
+			'openssl',
+			['req', '-new', '-key', clientKeyFile, '-out', csrFile, '-subj', `/CN=${clientCn}`],
+			{ encoding: 'utf8' },
+		);
+		if (csr.status !== 0) return null;
+
+		fs.writeFileSync(
+			extFile,
+			'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n',
+		);
+		const signed = spawnSync(
+			'openssl',
+			[
+				'x509', '-req', '-in', csrFile, '-CA', caCertFile, '-CAkey', caKeyFile,
+				'-CAcreateserial', '-days', '1', '-out', clientCertFile, '-extfile', extFile,
+			],
+			{ encoding: 'utf8' },
+		);
+		if (signed.status !== 0) return null;
+
+		return {
+			caCert: fs.readFileSync(caCertFile, 'utf8'),
+			clientCert: fs.readFileSync(clientCertFile, 'utf8'),
+			clientKey,
+		};
+	} catch {
+		return null;
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+}
+
 // ── Free port helper ───────────────────────────────────────────────────────────
 
 /** Obtain a free TCP port on localhost. */
@@ -239,11 +315,15 @@ export function tlsRoundTrip(opts: {
 	caCert?: string;
 	data: Buffer | string;
 	rejectUnauthorized?: boolean;
+	/** Client certificate (PEM) presented to the server for mTLS. */
+	clientCert?: string;
+	/** Client private key (PEM), required with clientCert. */
+	clientKey?: string;
 }): Promise<Buffer> {
 	return new Promise((resolve, reject) => {
-		const { port, host = '127.0.0.1', servername, caCert, data, rejectUnauthorized = false } = opts;
+		const { port, host = '127.0.0.1', servername, caCert, data, rejectUnauthorized = false, clientCert, clientKey } = opts;
 		const socket = tls.connect(
-			{ port, host, servername, ca: caCert, rejectUnauthorized },
+			{ port, host, servername, ca: caCert, rejectUnauthorized, cert: clientCert, key: clientKey },
 			() => {
 				socket.write(data);
 			},

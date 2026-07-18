@@ -176,6 +176,8 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		fingerprint: effective_route.forward_fingerprint,
 		ja3: &peek_info.ja3,
 		ja4: &peek_info.ja4,
+		sni: sni_str,
+		tls: None,
 		peer_addr,
 		local_addr,
 	};
@@ -229,6 +231,12 @@ async fn proxy_via_tls(
 	sf: SourceForwarding<'_>,
 	ctx: &ConnContext,
 ) -> std::io::Result<()> {
+	// TLS facts (incl. the verified mTLS client cert chain) forwarded via PROXY v2
+	// TLVs; only collected on routes that can carry them.
+	let tls_forward = matches!(sf.mode, SourceAddressMode::ProxyProtocolV2)
+		.then(|| collect_tls_forward(client.get_ref().1));
+	let sf = SourceForwarding { tls: tls_forward.as_ref(), ..sf };
+
 	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
 		.await
 		.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
@@ -307,8 +315,63 @@ struct SourceForwarding<'a> {
 	fingerprint: ForwardFingerprint,
 	ja3: &'a str,
 	ja4: &'a str,
+	/// SNI from the ClientHello, forwarded as PP2_TYPE_AUTHORITY.
+	sni: Option<&'a str>,
+	/// TLS facts from termination (set by proxy_via_tls on PROXY v2 routes).
+	tls: Option<&'a TlsForward>,
 	peer_addr: SocketAddr,
 	local_addr: Option<SocketAddr>,
+}
+
+/// TLS facts captured after termination, forwarded via PROXY v2 TLVs.
+struct TlsForward {
+	version: Option<&'static str>,
+	cipher: Option<String>,
+	alpn: Option<Vec<u8>>,
+	/// Client certificate chain (DER, leaf first). Non-empty only when the client
+	/// presented a certificate and the route's verifier accepted it — rustls aborts
+	/// the handshake otherwise, so presence implies verification.
+	client_cert_chain: Vec<Vec<u8>>,
+}
+
+/// PP2_TYPE_SSL value: client(1) verify(4 BE) sub-TLVs (version, cipher).
+/// Per spec, verify is zero only when the client presented a certificate AND it
+/// was successfully verified — rustls only completes the handshake when the
+/// configured verifier accepted the cert, so cert presence implies verified.
+fn build_ssl_tlv(tls: &TlsForward) -> Vec<u8> {
+	let has_cert = !tls.client_cert_chain.is_empty();
+	let mut ssl: Vec<u8> = Vec::with_capacity(32);
+	ssl.push(upstream::PP2_CLIENT_SSL | if has_cert { upstream::PP2_CLIENT_CERT_CONN } else { 0 });
+	ssl.extend_from_slice(&if has_cert { 0u32 } else { 1u32 }.to_be_bytes());
+	if let Some(version) = tls.version {
+		push_sub_tlv(&mut ssl, upstream::PP2_SUBTYPE_SSL_VERSION, version.as_bytes());
+	}
+	if let Some(cipher) = &tls.cipher {
+		push_sub_tlv(&mut ssl, upstream::PP2_SUBTYPE_SSL_CIPHER, cipher.as_bytes());
+	}
+	ssl
+}
+
+fn push_sub_tlv(buf: &mut Vec<u8>, ty: u8, value: &[u8]) {
+	buf.push(ty);
+	buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+	buf.extend_from_slice(value);
+}
+
+fn collect_tls_forward(conn: &rustls::ServerConnection) -> TlsForward {
+	TlsForward {
+		version: match conn.protocol_version() {
+			Some(rustls::ProtocolVersion::TLSv1_3) => Some("TLSv1.3"),
+			Some(rustls::ProtocolVersion::TLSv1_2) => Some("TLSv1.2"),
+			_ => None,
+		},
+		cipher: conn.negotiated_cipher_suite().map(|s| format!("{:?}", s.suite())),
+		alpn: conn.alpn_protocol().map(|p| p.to_vec()),
+		client_cert_chain: conn
+			.peer_certificates()
+			.map(|certs| certs.iter().map(|c| c.as_ref().to_vec()).collect())
+			.unwrap_or_default(),
+	}
 }
 
 impl SourceForwarding<'_> {
@@ -342,11 +405,39 @@ where
 		SourceAddressMode::ProxyProtocol => upstream::write_proxy_v1_header(upstream, sf.peer_addr).await,
 		SourceAddressMode::ProxyProtocolV2 => {
 			let value = sf.fingerprint_value();
-			let mut tlvs: Vec<(u8, &str)> = Vec::new();
+			let mut tlvs: Vec<(u8, &[u8])> = Vec::new();
 			match sf.fingerprint {
-				ForwardFingerprint::Ja3 => tlvs.push((upstream::PP2_TYPE_JA3, value)),
-				ForwardFingerprint::Ja4 => tlvs.push((upstream::PP2_TYPE_JA4, value)),
+				ForwardFingerprint::Ja3 => tlvs.push((upstream::PP2_TYPE_JA3, value.as_bytes())),
+				ForwardFingerprint::Ja4 => tlvs.push((upstream::PP2_TYPE_JA4, value.as_bytes())),
 				ForwardFingerprint::None => {}
+			}
+			if let Some(sni) = sf.sni {
+				tlvs.push((upstream::PP2_TYPE_AUTHORITY, sni.as_bytes()));
+			}
+			// Built outside the branch so the borrow in `tlvs` outlives the write call.
+			let ssl_tlv;
+			if let Some(tls) = sf.tls {
+				if let Some(alpn) = &tls.alpn {
+					tlvs.push((upstream::PP2_TYPE_ALPN, alpn));
+				}
+				ssl_tlv = build_ssl_tlv(tls);
+				tlvs.push((upstream::PP2_TYPE_SSL, &ssl_tlv));
+				// The v2 header length field is u16: a pathological chain that can't fit
+				// is dropped (the SSL TLV still signals a verified cert was presented)
+				// rather than failing the connection.
+				let chain_len: usize = tls.client_cert_chain.iter().map(|c| 3 + c.len()).sum();
+				let tlv_len: usize = tlvs.iter().map(|(_, v)| 3 + v.len()).sum();
+				if tlv_len + chain_len + 36 <= u16::MAX as usize
+					&& tls.client_cert_chain.iter().all(|c| c.len() <= u16::MAX as usize)
+				{
+					for cert in &tls.client_cert_chain {
+						tlvs.push((upstream::PP2_TYPE_CLIENT_CERT, cert));
+					}
+				} else if chain_len > 0 {
+					tracing::warn!(
+						"client cert chain too large for PROXY v2 header ({chain_len} bytes); omitting chain TLVs"
+					);
+				}
 			}
 			upstream::write_proxy_v2_header(upstream, sf.peer_addr, sf.local_addr, &tlvs).await
 		}

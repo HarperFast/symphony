@@ -92,9 +92,13 @@ export interface RouteConfig {
 	 * - `'proxyProtocol'` — Send a PROXY protocol v1 (text) header before application data.
 	 *   Default for UDS upstreams.
 	 * - `'proxyProtocolV2'` — Send a PROXY protocol v2 (binary) header before application
-	 *   data. v2 carries a TLV section, which is the carrier for `forwardFingerprint`.
-	 *   Keep opt-in: consumers must speak v2 (HAProxy/nginx do; Harper core's UDS reader
-	 *   currently parses v1 only).
+	 *   data. v2 carries a TLV section: the carrier for `forwardFingerprint`, and — when
+	 *   `terminateTls: true` — the connection's TLS facts: ALPN (0x01), SNI authority
+	 *   (0x02), an SSL TLV (0x20, version/cipher sub-TLVs and a client-cert-present bit),
+	 *   and, when the client presented a certificate the `mtls` verifier accepted, the
+	 *   full client certificate chain as one DER TLV per certificate (custom type 0xE2,
+	 *   leaf first). Keep opt-in: consumers must speak v2 (HAProxy/nginx do; Harper
+	 *   core's UDS reader parses v1 only before Harper 5.2).
 	 * - `'xForwardedFor'` — Parse the beginning of the HTTP request and insert an
 	 *   `X-Forwarded-For` header. Use this for backends (e.g. Bun) that do not
 	 *   support the PROXY protocol.
