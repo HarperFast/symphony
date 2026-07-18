@@ -605,3 +605,46 @@ describe('Protection – updateConfig hot-swap', () => {
 		assert.equal(info.cidrBlocklist.length, 0, 'Expected cidrBlocklist to be empty after removal');
 	});
 });
+
+describe('Protection – fingerprint blocklist validation', () => {
+	const cert = generateSelfSignedCert('localhost');
+
+	function build(protection: any): SymphonyProxy {
+		return new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: 0, protection }],
+			routes: [
+				{
+					sni: 'localhost',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: 1 }],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+				},
+			],
+		});
+	}
+
+	it('rejects a malformed ja4Blocklist entry at construction', () => {
+		assert.throws(() => build({ ja4Blocklist: ['not-a-ja4'] }), /invalid ja4Blocklist entry/);
+		// Wrong length / bad separators / non-hex hash are all rejected.
+		assert.throws(() => build({ ja4Blocklist: ['t13d1516h2_8daaf6152771'] }), /invalid ja4Blocklist/);
+		assert.throws(
+			() => build({ ja4Blocklist: ['t13d1516h2_8daaf615277g_02713d6af862'] }),
+			/invalid ja4Blocklist/
+		);
+	});
+
+	it('accepts a well-formed ja4Blocklist entry', () => {
+		const proxy = build({ ja4Blocklist: ['t13d1516h2_8daaf6152771_02713d6af862'] });
+		assert.ok(proxy);
+	});
+
+	it('rejects a malformed ja3Blocklist entry at construction', () => {
+		assert.throws(() => build({ ja3Blocklist: ['deadbeef'] }), /invalid ja3Blocklist entry/);
+		assert.throws(() => build({ ja3Blocklist: ['z'.repeat(32)] }), /invalid ja3Blocklist entry/);
+	});
+
+	it('accepts a well-formed ja3Blocklist entry', () => {
+		const proxy = build({ ja3Blocklist: ['0123456789abcdef0123456789abcdef'] });
+		assert.ok(proxy);
+	});
+});

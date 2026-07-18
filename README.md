@@ -547,7 +547,16 @@ ja4Blocklist: [
 ]
 ```
 
-Matching is case-insensitive. JA4 fingerprints are always emitted as lowercase.
+Matching is case-insensitive. JA4 fingerprints are always emitted as lowercase. A blocklist
+entry that isn't a structurally valid JA4 (or JA3) string is rejected at construction rather
+than silently installed as an entry that could never match.
+
+**Fail-closed reassembly:** when a `ja3Blocklist` or `ja4Blocklist` is configured, symphony
+reassembles the full ClientHello (bounded by size and a short timeout) before fingerprinting.
+A connection whose ClientHello can't be fully reassembled — e.g. a client that fragments it to
+expose SNI while withholding later extensions — is **blocked** (`blocked` reason
+`incomplete_handshake`) rather than allowed on a partial/empty fingerprint. Without enforcement
+configured, fingerprinting stays best-effort and an incomplete hello is not blocked.
 
 **License scope:** Symphony implements **core JA4** (TLS client fingerprinting) only. Core JA4 is BSD-licensed. The JA4+ suite of variants (JA4S, JA4H, JA4SSH, etc.) carries a separate FoxIO proprietary license and is **not implemented** here.
 
