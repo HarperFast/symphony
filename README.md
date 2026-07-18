@@ -97,7 +97,8 @@ console.log('proxy listening on :443');
 | `maxConnectionsPerSecond` | `number` | — | Route-wide new-connection rate cap (token bucket). Connections are silently dropped when exhausted. |
 | `burst` | `number` | `maxConnectionsPerSecond` | Token bucket burst ceiling for the route rate limit |
 | `http2` | `boolean` | `false` | Advertise `h2` in ALPN so clients negotiate HTTP/2. Raw H2 frames flow through to the upstream unchanged. Requires `terminateTls: true`. |
-| `sourceAddressHeader` | `'proxyProtocol' \| 'xForwardedFor' \| 'none'` | `'proxyProtocol'` for UDS, `'none'` for TCP | How the real client IP is forwarded to the upstream. See [Source address forwarding](#source-address-forwarding). |
+| `sourceAddressHeader` | `'proxyProtocol' \| 'proxyProtocolV2' \| 'xForwardedFor' \| 'none'` | `'proxyProtocol'` for UDS, `'none'` for TCP | How the real client IP is forwarded to the upstream. See [Source address forwarding](#source-address-forwarding). |
+| `forwardFingerprint` | `'ja3' \| 'ja4' \| 'none'` | `'none'` | Forward the client TLS fingerprint downstream. See [Forwarding the fingerprint](#forwarding-the-fingerprint-downstream). |
 
 ### `Upstream`
 
@@ -344,11 +345,12 @@ Connections that exceed the limit are silently dropped (TCP RST). This is a glob
 
 ## Source address forwarding
 
-Use `sourceAddressHeader` on a route to control how the real client IP is communicated to the upstream. This only applies when `terminateTls: true` (TLS is terminated by the proxy).
+Use `sourceAddressHeader` on a route to control how the real client IP is communicated to the upstream. The PROXY protocol carriers work whether or not TLS is terminated (they prefix the connection); `'xForwardedFor'` requires `terminateTls: true` and a plaintext HTTP/1 upstream, since it rewrites the HTTP request.
 
 | Value | Behaviour |
 |---|---|
-| `'proxyProtocol'` | Sends a PROXY protocol v1 header (`PROXY TCP4 <src-ip> <dst-ip> <src-port> 0\r\n`) before any application data. Default for UDS upstreams. |
+| `'proxyProtocol'` | Sends a PROXY protocol v1 (text) header (`PROXY TCP4 <src-ip> <dst-ip> <src-port> 0\r\n`) before any application data. Default for UDS upstreams. |
+| `'proxyProtocolV2'` | Sends a PROXY protocol v2 (binary) header before any application data. v2 adds a TLV section — the carrier for `forwardFingerprint` below. Keep it opt-in: the consumer must speak v2 (nginx/HAProxy do; Harper core's own UDS reader currently parses v1 only). |
 | `'xForwardedFor'` | Reads the first chunk of the HTTP request, inserts an `X-Forwarded-For` header after the request line, then copies the rest verbatim. No per-request parsing overhead for keep-alive connections. Default for TCP upstreams (disabled). |
 | `'none'` | Does not forward source address information. Default for TCP upstreams. |
 
@@ -390,6 +392,43 @@ Bun.serve({
     // ...
   },
 });
+```
+
+### Forwarding the fingerprint downstream
+
+symphony computes the client's JA3/JA4 fingerprint from the ClientHello (the same value used for `ja3Blocklist`/`ja4Blocklist`). Set `forwardFingerprint` to also hand it to the upstream, so a backend behind symphony can make its own bot/abuse decisions on it.
+
+| `forwardFingerprint` | Value forwarded |
+|---|---|
+| `'ja3'` | The JA3 MD5 hex (32 chars) |
+| `'ja4'` | The JA4 fingerprint |
+| `'none'` (default) | Nothing forwarded |
+
+The **carrier depends on `sourceAddressHeader`**:
+
+- With `'proxyProtocolV2'`, the fingerprint rides a PROXY v2 **TLV** — type `0xE0` for JA3, `0xE1` for JA4 (in HAProxy's `0xE0–0xEF` private range). This works even in passthrough (`terminateTls: false`), since the header prefixes the raw TLS bytes.
+- Otherwise, symphony injects an **`X-JA3` / `X-JA4` HTTP header**. This requires a plaintext HTTP/1 upstream (`terminateTls: true` and not `http2`); it is skipped for passthrough or HTTP/2 upstreams (use `'proxyProtocolV2'` there). Any client-supplied `X-JA3`/`X-JA4` is stripped so the injected value is authoritative and can't be spoofed.
+
+```typescript
+// TLV carrier — works for any upstream that speaks PROXY v2, including passthrough
+{
+  sni: 'app.example.com',
+  upstreams: [{ kind: 'tcp', host: '10.0.0.5', port: 8080 }],
+  terminateTls: true,
+  cert: { certChain, privateKey },
+  sourceAddressHeader: 'proxyProtocolV2',
+  forwardFingerprint: 'ja4',
+}
+
+// HTTP-header carrier — for HTTP/1 backends that read request headers
+{
+  sni: 'app.example.com',
+  upstreams: [{ kind: 'uds', path: '/run/app/worker.sock' }],
+  terminateTls: true,
+  cert: { certChain, privateKey },
+  sourceAddressHeader: 'xForwardedFor',
+  forwardFingerprint: 'ja3', // upstream reads X-JA3 alongside X-Forwarded-For
+}
 ```
 
 ---

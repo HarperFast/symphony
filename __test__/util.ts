@@ -172,6 +172,45 @@ export function startEchoServer(): Promise<EchoServer> {
 	});
 }
 
+export interface CaptureServer {
+	port: number;
+	/** Resolves with all bytes received on the first connection (debounced 150ms after the last chunk). */
+	received: Promise<Buffer>;
+	close(): Promise<void>;
+}
+
+/**
+ * Start a plain TCP server that captures the raw bytes an upstream would receive — used to
+ * inspect the PROXY protocol header / injected HTTP headers symphony prepends. Does not echo.
+ */
+export function startCaptureServer(): Promise<CaptureServer> {
+	return new Promise((resolve, reject) => {
+		let resolveReceived!: (b: Buffer) => void;
+		const received = new Promise<Buffer>((res) => {
+			resolveReceived = res;
+		});
+		const chunks: Buffer[] = [];
+		let timer: NodeJS.Timeout | undefined;
+		const server = net.createServer((socket) => {
+			socket.on('data', (c: Buffer) => {
+				chunks.push(c);
+				if (timer) clearTimeout(timer);
+				timer = setTimeout(() => resolveReceived(Buffer.concat(chunks)), 150);
+			});
+		});
+		server.listen(0, '127.0.0.1', () => {
+			const { port } = server.address() as net.AddressInfo;
+			resolve({
+				port,
+				received,
+				close: () =>
+					new Promise((res, rej) => server.close((e) => (e ? rej(e) : res()))),
+			});
+		});
+		server.on('error', reject);
+	});
+}
+
 /** Start a TLS echo server (for terminate-TLS tests). */
 export function startTlsEchoServer(certPem: string, keyPem: string): Promise<EchoServer> {
 	return new Promise((resolve, reject) => {

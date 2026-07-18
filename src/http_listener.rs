@@ -121,7 +121,7 @@ async fn handle_http(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<Conn
 
 	// Read just the request line + headers. Capped by HEADER_READ_TIMEOUT so a
 	// stalled client can't hold a worker hostage.
-	let (headers, excess) = match timeout(HEADER_READ_TIMEOUT, read_http_headers(&mut stream)).await {
+	let (headers, _excess) = match timeout(HEADER_READ_TIMEOUT, read_http_headers(&mut stream)).await {
 		Ok(Ok(pair)) => pair,
 		Ok(Err(e)) => {
 			tracing::debug!("http :80 header read error from {}: {e}", peer_addr.ip());
