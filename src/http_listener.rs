@@ -1,17 +1,17 @@
-/// Plaintext HTTP/1.1 listener for ACME HTTP-01 challenges and HTTP→HTTPS redirects.
-///
-/// Behaviour, per connection:
-///   * Read the request headers.
-///   * If the request target begins with `/.well-known/acme-challenge/`, look up
-///     the route table by the `Host` header value (using the same wildcard rules
-///     as SNI matching) and proxy the raw HTTP bytes to that route's first
-///     upstream.  This lets the `letsencrypt-cert-generator-fabric` Harper
-///     component answer the challenge on its existing HTTP port.
-///   * Anything else returns `301 Moved Permanently` with
-///     `Location: https://<host><request-target>`.
-///
-/// This is intended to replace the standalone nginx :80 on Fabric hosts so
-/// symphony alone can bind to both ports.
+//! Plaintext HTTP/1.1 listener for ACME HTTP-01 challenges and HTTP→HTTPS redirects.
+//!
+//! Behaviour, per connection:
+//!   * Read the request headers.
+//!   * If the request target begins with `/.well-known/acme-challenge/`, look up
+//!     the route table by the `Host` header value (using the same wildcard rules
+//!     as SNI matching) and proxy the raw HTTP bytes to that route's first
+//!     upstream.  This lets the `letsencrypt-cert-generator-fabric` Harper
+//!     component answer the challenge on its existing HTTP port.
+//!   * Anything else returns `301 Moved Permanently` with
+//!     `Location: https://<host><request-target>`.
+//!
+//! This is intended to replace the standalone nginx :80 on Fabric hosts so
+//! symphony alone can bind to both ports.
 
 use crate::http_proxy::{
 	host_header, read_http_headers, request_target, strip_body_framing, with_connection_close,
@@ -55,7 +55,7 @@ pub async fn spawn_http_listeners(
 
 	for _ in 0..workers {
 		let socket = make_reuseport_socket(addr)?;
-		let listener = TcpListener::from_std(socket.into())?;
+		let listener = TcpListener::from_std(socket)?;
 		let ctx2 = ctx.clone();
 		let max_conn = max_connections;
 		let srx = shutdown_rx.resubscribe();
@@ -197,7 +197,7 @@ async fn proxy_acme(
 	let upstream =
 		upstream::connect(&route.destination, Some(peer_addr.ip()), UPSTREAM_CONNECT_TIMEOUT)
 			.await
-			.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+			.map_err(|e| std::io::Error::other(e.to_string()))?;
 
 	// ACME HTTP-01 challenges are GET requests with no body.  Strip any
 	// Content-Length / Transfer-Encoding headers so a client that lies about a

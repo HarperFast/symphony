@@ -231,7 +231,7 @@ async fn proxy_via_tls(
 ) -> std::io::Result<()> {
 	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
 		.await
-		.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+		.map_err(|e| std::io::Error::other(e.to_string()))?;
 
 	// HTTP-header injection is only valid for a plaintext HTTP/1 upstream. An h2-negotiated
 	// upstream receives binary frames, so text header insertion would corrupt them.
@@ -253,7 +253,7 @@ async fn proxy_raw(
 ) -> std::io::Result<()> {
 	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
 		.await
-		.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+		.map_err(|e| std::io::Error::other(e.to_string()))?;
 
 	// Passthrough forwards raw TLS bytes — never a plaintext HTTP/1 stream, so header injection
 	// is disabled (only PROXY protocol carriers apply here).

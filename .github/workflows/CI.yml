@@ -27,6 +27,25 @@ jobs:
       - name: Run cargo test
         run: cargo test
 
+  lint:
+    name: Clippy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: lint-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: lint-cargo-
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets
+
   build-linux:
     name: Build – ${{ matrix.target }}
     runs-on: ubuntu-latest
@@ -74,9 +93,9 @@ jobs:
           run: |
             set -e
             rustup update stable
+            rustup target add ${{ matrix.target }}
             npm ci --ignore-scripts
             if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-              rustup target add aarch64-unknown-linux-musl
               export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
               export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
             fi
