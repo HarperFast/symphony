@@ -4,7 +4,8 @@ use crate::metrics::{GlobalMetrics, ListenerMetrics};
 use crate::protection::ProtectionState;
 use crate::proxy_conn::{ConnContext, JsEvent};
 use crate::router::{
-	build_route_table, ListenerTlsSpec, LiveRouteTable, RouteSpec, SourceAddressMode, UpstreamSpec,
+	build_route_table, ForwardFingerprint, ListenerTlsSpec, LiveRouteTable, RouteSpec,
+	SourceAddressMode, UpstreamSpec,
 };
 use crate::suspended::{build_resolved_route, ResolveSpec, ResolveUpstream, SuspendedRegistry};
 use ipnetwork::IpNetwork;
@@ -63,8 +64,13 @@ pub struct JsRouteConfig {
 	/// Token bucket burst ceiling (defaults to `maxConnectionsPerSecond`).
 	pub burst: Option<f64>,
 	/// How the real client IP is forwarded to the upstream.
-	/// "proxyProtocol" (default for UDS), "xForwardedFor", or "none" (default for TCP).
+	/// "proxyProtocol" (v1, default for UDS), "proxyProtocolV2", "xForwardedFor", or
+	/// "none" (default for TCP).
 	pub source_address_header: Option<String>,
+	/// Which client TLS fingerprint to forward downstream: "ja3", "ja4", or "none"
+	/// (default). Carried as a PROXY v2 TLV under "proxyProtocolV2", otherwise as an
+	/// injected X-JA3/X-JA4 HTTP header.
+	pub forward_fingerprint: Option<String>,
 	/// Advertise h2 in ALPN so clients can negotiate HTTP/2. Default: false.
 	pub http2: Option<bool>,
 }
@@ -136,6 +142,7 @@ pub struct JsResolveRoute {
 	pub cert: Option<JsCertConfig>,
 	pub mtls: Option<JsMtlsConfig>,
 	pub source_address_header: Option<String>,
+	pub forward_fingerprint: Option<String>,
 	pub http2: Option<bool>,
 }
 
@@ -510,8 +517,9 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 
 	let has_uds = upstreams.iter().any(|u| matches!(u, UpstreamSpec::Uds { .. }));
 	let source_address_mode = parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
+	let forward_fingerprint = parse_forward_fingerprint(r.forward_fingerprint.as_deref())?;
 
-	let result = Ok(RouteSpec {
+	let spec = RouteSpec {
 		sni: r.sni.clone(),
 		upstreams,
 		terminate_tls: r.terminate_tls,
@@ -524,15 +532,26 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 		max_cps: r.max_connections_per_second,
 		burst: r.burst,
 		source_address_mode,
+		forward_fingerprint,
 		http2: r.http2.unwrap_or(false),
-	});
+	};
 
-	if let Ok(ref spec) = result {
-		if spec.http2 && !spec.terminate_tls {
-			eprintln!("symphony: route '{}': http2=true has no effect when terminateTls=false (passthrough mode)", spec.sni);
-		}
+	if spec.http2 && !spec.terminate_tls {
+		eprintln!("symphony: route '{}': http2=true has no effect when terminateTls=false (passthrough mode)", spec.sni);
 	}
-	result
+	// An injected X-JA3/X-JA4 header needs a plaintext HTTP/1 upstream (terminated, not h2); the
+	// runtime skips it otherwise. The PROXY v2 TLV carrier works everywhere (it prefixes the raw
+	// bytes), so steer non-HTTP/1 routes to it.
+	if forward_fingerprint != ForwardFingerprint::None
+		&& source_address_mode != SourceAddressMode::ProxyProtocolV2
+		&& (!spec.terminate_tls || spec.http2)
+	{
+		eprintln!(
+			"symphony: route '{}': forwardFingerprint via HTTP header has no effect on a non-HTTP/1 upstream (terminateTls=false or http2=true); use sourceAddressHeader='proxyProtocolV2'",
+			spec.sni
+		);
+	}
+	Ok(spec)
 }
 
 fn parse_upstream_spec(u: &JsUpstream, sni: &str) -> Result<UpstreamSpec> {
@@ -594,6 +613,7 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 
 	let has_uds = matches!(&upstream, ResolveUpstream::Uds { .. });
 	let source_address_mode = parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
+	let forward_fingerprint = parse_forward_fingerprint(r.forward_fingerprint.as_deref())?;
 
 	Ok(ResolveSpec {
 		upstream,
@@ -603,6 +623,7 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 		mtls_ca_pem: r.mtls.as_ref().map(|m| pem_bytes(&m.client_ca_cert)),
 		require_client_cert: r.mtls.as_ref().and_then(|m| m.require_client_cert).unwrap_or(false),
 		source_address_mode,
+		forward_fingerprint,
 		http2: r.http2.unwrap_or(false),
 	})
 }
@@ -693,10 +714,11 @@ fn parse_source_address_mode(
 ) -> Result<SourceAddressMode> {
 	match value {
 		Some("proxyProtocol") => Ok(SourceAddressMode::ProxyProtocol),
+		Some("proxyProtocolV2") => Ok(SourceAddressMode::ProxyProtocolV2),
 		Some("xForwardedFor") => Ok(SourceAddressMode::XForwardedFor),
 		Some("none") => Ok(SourceAddressMode::None),
 		Some(other) => Err(napi::Error::from_reason(format!(
-			"unknown sourceAddressHeader value '{other}'; expected 'proxyProtocol', 'xForwardedFor', or 'none'"
+			"unknown sourceAddressHeader value '{other}'; expected 'proxyProtocol', 'proxyProtocolV2', 'xForwardedFor', or 'none'"
 		))),
 		// Default: proxyProtocol for UDS upstreams, none for TCP
 		None => Ok(if has_uds_upstreams {
@@ -704,6 +726,17 @@ fn parse_source_address_mode(
 		} else {
 			SourceAddressMode::None
 		}),
+	}
+}
+
+fn parse_forward_fingerprint(value: Option<&str>) -> Result<ForwardFingerprint> {
+	match value {
+		None | Some("none") => Ok(ForwardFingerprint::None),
+		Some("ja3") => Ok(ForwardFingerprint::Ja3),
+		Some("ja4") => Ok(ForwardFingerprint::Ja4),
+		Some(other) => Err(napi::Error::from_reason(format!(
+			"unknown forwardFingerprint value '{other}'; expected 'ja3', 'ja4', or 'none'"
+		))),
 	}
 }
 

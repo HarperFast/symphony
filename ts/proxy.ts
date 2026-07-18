@@ -102,6 +102,7 @@ function toJsRoute(r: RouteConfig): JsRouteConfig {
 		maxConnectionsPerSecond: r.maxConnectionsPerSecond,
 		burst: r.burst,
 		sourceAddressHeader: r.sourceAddressHeader,
+		forwardFingerprint: r.forwardFingerprint,
 		http2: r.http2,
 	};
 }
@@ -256,6 +257,8 @@ export class SymphonyProxy extends EventEmitter {
 			cert: route.cert ? toJsCert(route.cert) : undefined,
 			mtls: route.mtls ? toJsMtls(route.mtls) : undefined,
 			sourceAddressHeader: route.sourceAddressHeader,
+			forwardFingerprint: route.forwardFingerprint,
+			http2: route.http2,
 		});
 	}
 }

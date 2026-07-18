@@ -45,9 +45,16 @@ export interface JsRouteConfig {
   burst?: number
   /**
    * How the real client IP is forwarded to the upstream.
-   * "proxyProtocol" (default for UDS), "xForwardedFor", or "none" (default for TCP).
+   * "proxyProtocol" (v1, default for UDS), "proxyProtocolV2", "xForwardedFor", or
+   * "none" (default for TCP).
    */
   sourceAddressHeader?: string
+  /**
+   * Which client TLS fingerprint to forward downstream: "ja3", "ja4", or "none"
+   * (default). Carried as a PROXY v2 TLV under "proxyProtocolV2", otherwise as an
+   * injected X-JA3/X-JA4 HTTP header.
+   */
+  forwardFingerprint?: string
   /** Advertise h2 in ALPN so clients can negotiate HTTP/2. Default: false. */
   http2?: boolean
 }
@@ -105,6 +112,7 @@ export interface JsResolveRoute {
   cert?: JsCertConfig
   mtls?: JsMtlsConfig
   sourceAddressHeader?: string
+  forwardFingerprint?: string
   http2?: boolean
 }
 export declare class SymphonyProxyWrap {

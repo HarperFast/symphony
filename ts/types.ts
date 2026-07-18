@@ -89,14 +89,32 @@ export interface RouteConfig {
 	/**
 	 * How the real client IP is forwarded to the upstream.
 	 *
-	 * - `'proxyProtocol'` — Send a PROXY protocol v1 header before application data.
+	 * - `'proxyProtocol'` — Send a PROXY protocol v1 (text) header before application data.
 	 *   Default for UDS upstreams.
+	 * - `'proxyProtocolV2'` — Send a PROXY protocol v2 (binary) header before application
+	 *   data. v2 carries a TLV section, which is the carrier for `forwardFingerprint`.
+	 *   Keep opt-in: consumers must speak v2 (HAProxy/nginx do; Harper core's UDS reader
+	 *   currently parses v1 only).
 	 * - `'xForwardedFor'` — Parse the beginning of the HTTP request and insert an
 	 *   `X-Forwarded-For` header. Use this for backends (e.g. Bun) that do not
 	 *   support the PROXY protocol.
 	 * - `'none'` — Do not forward source address information. Default for TCP upstreams.
 	 */
-	sourceAddressHeader?: 'proxyProtocol' | 'xForwardedFor' | 'none';
+	sourceAddressHeader?: 'proxyProtocol' | 'proxyProtocolV2' | 'xForwardedFor' | 'none';
+	/**
+	 * Forward the client's TLS fingerprint (computed from the ClientHello) downstream so the
+	 * upstream can make its own bot/abuse decisions on it.
+	 *
+	 * - `'ja3'` / `'ja4'` — forward that fingerprint.
+	 * - `'none'` (default) — do not forward.
+	 *
+	 * Carrier: a PROXY v2 TLV when `sourceAddressHeader` is `'proxyProtocolV2'` (works in
+	 * passthrough too, since it prefixes the raw TLS bytes); otherwise an injected
+	 * `X-JA3` / `X-JA4` HTTP header, which requires a plaintext HTTP/1 upstream
+	 * (`terminateTls: true` and not `http2`) — it is skipped otherwise. Any client-supplied
+	 * `X-JA3` / `X-JA4` is stripped so the injected value is authoritative.
+	 */
+	forwardFingerprint?: 'ja3' | 'ja4' | 'none';
 	/**
 	 * Advertise HTTP/2 (`h2`) in the TLS ALPN extension so clients can negotiate
 	 * HTTP/2. When true, symphony declares `['h2', 'http/1.1']` in ALPN and the
@@ -221,7 +239,9 @@ export interface ResolveRoute {
 	cert?: CertConfig;
 	mtls?: MtlsConfig;
 	/** How the real client IP is forwarded to the upstream. See RouteConfig.sourceAddressHeader. */
-	sourceAddressHeader?: 'proxyProtocol' | 'xForwardedFor' | 'none';
+	sourceAddressHeader?: 'proxyProtocol' | 'proxyProtocolV2' | 'xForwardedFor' | 'none';
+	/** Which client TLS fingerprint to forward downstream. See RouteConfig.forwardFingerprint. */
+	forwardFingerprint?: 'ja3' | 'ja4' | 'none';
 	/** Advertise h2 in ALPN for this resolved connection. See RouteConfig.http2. */
 	http2?: boolean;
 }

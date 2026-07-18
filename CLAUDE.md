@@ -39,7 +39,7 @@ TCP accept (SO_REUSEPORT per worker thread)
 | `src/http_proxy.rs` | HTTP/1.1 header framing and rewrite helpers shared by the HTTP listener |
 | `src/sni.rs` | MSG_PEEK ClientHello parser; SNI extraction; JA3 fingerprint |
 | `src/router.rs` | RouteTable (exact + wildcard HashMap); ArcSwap hot-swap |
-| `src/upstream.rs` | UpstreamStream enum (Tcp/Uds); connect(); TCP_NODELAY |
+| `src/upstream.rs` | UpstreamStream enum (Tcp/Uds); connect(); TCP_NODELAY; PROXY v1/v2 header encoders; HTTP header injection (XFF, X-JA3/X-JA4) |
 | `src/balancer.rs` | UdsBalancer: AtomicU32 least-connections; IP affinity DashMap |
 | `src/tls.rs` | rustls ServerConfig builder; SHA-256 deduplication cache |
 | `src/mtls.rs` | SymphonyClientVerifier wrapping WebPkiClientVerifier |
@@ -55,6 +55,21 @@ TCP accept (SO_REUSEPORT per worker thread)
 
 ### MSG_PEEK for SNI/JA3
 A single `stream.peek(&mut buf[..512])` reads the ClientHello without consuming any bytes. Cost: 1 syscall, 512-byte stack buffer, zero heap allocation. This gives us both the SNI (for routing) and the JA3 fingerprint (for protection) before the TLS handshake begins. The alternative — a custom TLS acceptor that extracts SNI internally — would require modifying rustls internals.
+
+### Source-address & fingerprint forwarding (`upstream.rs` + `proxy_conn.rs`)
+Per route, `sourceAddressHeader` picks how the client IP reaches the upstream: PROXY v1 (text),
+PROXY **v2** (binary, TLV-capable), `X-Forwarded-For` injection, or none. `forwardFingerprint`
+(`ja3`/`ja4`/`none`) additionally forwards the ClientHello fingerprint symphony already computes
+in `sni.rs`, so backends can make their own bot/abuse decisions on it. Carrier follows the mode:
+a PROXY v2 TLV (custom types `0xE0`=JA3 / `0xE1`=JA4, in HAProxy's `0xE0–0xEF` private range) under
+`proxyProtocolV2` — which works even in passthrough since it prefixes the raw TLS bytes — otherwise
+an injected `X-JA3`/`X-JA4` header. Header injection is gated on `l7_http1` (terminated TLS *and* a
+non-h2 negotiated ALPN); it's a no-op in passthrough or on an h2 upstream, so text is never spliced
+into TLS ciphertext or an h2 frame stream. `inject_request_headers` also strips any client-supplied
+copy of an injected header so the value is authoritative (anti-spoof). `proxy_conn.rs` threads the
+fingerprint + the connection's `local_addr` (the PROXY v2 destination) into `apply_source_header`.
+Keep v2 **opt-in**: HAProxy/nginx speak it, but Harper core's own UDS reader currently parses v1 only,
+so the UDS default stays v1.
 
 ### ArcSwap for RouteTable
 `ArcSwap<RouteTable>` gives us a pointer-swap on writes (single atomic store) and a single `load()` on reads — no lock contention on the hot path. With ≤100 routes, rebuilding the full table on `updateConfig` costs ~microseconds (Arc pointer clones only). A partial-update scheme would be more complex without meaningful benefit.

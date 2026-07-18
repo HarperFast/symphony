@@ -1,6 +1,6 @@
 use crate::metrics::{GlobalMetrics, ListenerMetrics};
 use crate::protection::ProtectionState;
-use crate::router::{Destination, LiveRouteTable, SourceAddressMode};
+use crate::router::{Destination, ForwardFingerprint, LiveRouteTable, SourceAddressMode};
 use crate::sni;
 use crate::suspended::SuspendedRegistry;
 use crate::upstream::{self, UpstreamStream};
@@ -56,6 +56,9 @@ pub struct ConnContext {
 
 pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnContext>) {
 	let peer_ip = peer_addr.ip();
+	// The address the client connected to — the PROXY v2 destination. Captured before the
+	// stream is consumed by the TLS handshake.
+	let local_addr = stream.local_addr().ok();
 
 	// ── 1. Peek: extract SNI + JA3 ───────────────────────────────────────────
 	let peek_info = sni::peek(&stream).await;
@@ -148,6 +151,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 			tls_config: resolved.tls_config,
 			terminate_tls: resolved.terminate_tls,
 			source_address_mode: resolved.source_address_mode,
+			forward_fingerprint: resolved.forward_fingerprint,
 		}
 	} else {
 		EffectiveRoute {
@@ -156,6 +160,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 			tls_config: route.tls_config.clone(),
 			terminate_tls: route.terminate_tls,
 			source_address_mode: route.source_address_mode,
+			forward_fingerprint: route.forward_fingerprint,
 		}
 	};
 
@@ -166,7 +171,14 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		.map(|c| c.tls_handshake_timeout())
 		.unwrap_or(Duration::from_secs(10));
 
-	let source_mode = effective_route.source_address_mode;
+	let sf = SourceForwarding {
+		mode: effective_route.source_address_mode,
+		fingerprint: effective_route.forward_fingerprint,
+		ja3: &peek_info.ja3,
+		ja4: &peek_info.ja4,
+		peer_addr,
+		local_addr,
+	};
 	let upstream_result = if effective_route.terminate_tls {
 		if let Some(tls_cfg) = effective_route.tls_config {
 			let acceptor = TlsAcceptor::from(tls_cfg);
@@ -179,16 +191,10 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 						Some(dest) if negotiated_h2 => dest,
 						_ => &effective_route.destination,
 					};
-					// Static routes reject XFF+h2 at config time, but suspended-route
-					// resolutions supply their own source mode — never splice a header
-					// into an h2 preface; drop the injection instead.
-					let source_mode = if negotiated_h2 && source_mode == SourceAddressMode::XForwardedFor {
-						tracing::debug!("skipping X-Forwarded-For injection on h2 connection from {peer_ip}");
-						SourceAddressMode::None
-					} else {
-						source_mode
-					};
-					proxy_via_tls(tls_stream, destination, peer_addr, source_mode, &ctx).await
+					// Header injection (XFF / X-JA3) never touches an h2 stream: forward()
+					// gates it on the negotiated protocol (l7_http1), covering static and
+					// suspended-route configs alike.
+					proxy_via_tls(tls_stream, destination, sf, &ctx).await
 				}
 				Ok(Err(e)) => {
 					tracing::debug!("TLS handshake error from {peer_ip}: {e}");
@@ -207,7 +213,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		}
 	} else {
 		// Passthrough — proxy raw TCP
-		proxy_raw(stream, &effective_route.destination, peer_addr, source_mode, &ctx).await
+		proxy_raw(stream, &effective_route.destination, sf, &ctx).await
 	};
 
 	if upstream_result.is_err() {
@@ -220,22 +226,21 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 async fn proxy_via_tls(
 	mut client: tokio_rustls::server::TlsStream<TcpStream>,
 	dest: &Destination,
-	peer_addr: SocketAddr,
-	source_mode: SourceAddressMode,
+	sf: SourceForwarding<'_>,
 	ctx: &ConnContext,
 ) -> std::io::Result<()> {
-	let mut upstream = upstream::connect(dest, Some(peer_addr.ip()), ctx.upstream_connect_timeout)
+	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
 		.await
 		.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
+	// HTTP-header injection is only valid for a plaintext HTTP/1 upstream. An h2-negotiated
+	// upstream receives binary frames, so text header insertion would corrupt them.
+	let l7_http1 = client.get_ref().1.alpn_protocol() != Some(b"h2".as_ref());
+
 	match &mut upstream {
-		UpstreamStream::Tcp(ref mut up) => {
-			apply_source_header(&mut client, up, peer_addr, source_mode).await?;
-			copy_with_idle_timeout(ctx.idle_timeout, &mut client, up).await
-		}
+		UpstreamStream::Tcp(ref mut up) => forward(&mut client, up, &sf, l7_http1, ctx.idle_timeout).await,
 		UpstreamStream::Uds { ref mut stream, .. } => {
-			apply_source_header(&mut client, stream, peer_addr, source_mode).await?;
-			copy_with_idle_timeout(ctx.idle_timeout, &mut client, stream).await
+			forward(&mut client, stream, &sf, l7_http1, ctx.idle_timeout).await
 		}
 	}
 }
@@ -243,63 +248,142 @@ async fn proxy_via_tls(
 async fn proxy_raw(
 	mut client: TcpStream,
 	dest: &Destination,
-	peer_addr: SocketAddr,
-	source_mode: SourceAddressMode,
+	sf: SourceForwarding<'_>,
 	ctx: &ConnContext,
 ) -> std::io::Result<()> {
-	let mut upstream = upstream::connect(dest, Some(peer_addr.ip()), ctx.upstream_connect_timeout)
+	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
 		.await
 		.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
+	// Passthrough forwards raw TLS bytes — never a plaintext HTTP/1 stream, so header injection
+	// is disabled (only PROXY protocol carriers apply here).
 	match &mut upstream {
-		UpstreamStream::Tcp(ref mut up) => {
-			apply_source_header(&mut client, up, peer_addr, source_mode).await?;
-			copy_with_idle_timeout(ctx.idle_timeout, &mut client, up).await
-		}
+		UpstreamStream::Tcp(ref mut up) => forward(&mut client, up, &sf, false, ctx.idle_timeout).await,
 		UpstreamStream::Uds { ref mut stream, .. } => {
-			apply_source_header(&mut client, stream, peer_addr, source_mode).await?;
-			copy_with_idle_timeout(ctx.idle_timeout, &mut client, stream).await
+			forward(&mut client, stream, &sf, false, ctx.idle_timeout).await
 		}
 	}
 }
 
-/// Bidirectional copy with an optional idle timeout.
-/// A zero `idle` means no timeout.
-async fn copy_with_idle_timeout<A, B>(idle: Duration, a: &mut A, b: &mut B) -> std::io::Result<()>
-where
-	A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-	B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-	if idle.is_zero() {
-		copy_bidirectional(a, b).await.map(|_| ())
-	} else {
-		timeout(idle, copy_bidirectional(a, b))
-			.await
-			.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout"))?
-			.map(|_| ())
-	}
-}
-
-/// Apply the configured source address forwarding before bidirectional copy.
-async fn apply_source_header<C, U>(
+/// Write the configured source-address prefix (PROXY v1/v2 header) to the upstream, then copy
+/// bidirectionally under the idle timeout. On an HTTP/1 injection route the client→upstream half
+/// is the per-request header rewriter (finding fixes: the header read now lives inside the idle
+/// timeout, and every request — fragmented, pipelined, or keep-alive — is stripped and rewritten,
+/// not just the first read).
+async fn forward<C, U>(
 	client: &mut C,
 	upstream: &mut U,
-	peer_addr: SocketAddr,
-	mode: SourceAddressMode,
+	sf: &SourceForwarding<'_>,
+	l7_http1: bool,
+	idle: Duration,
 ) -> std::io::Result<()>
 where
 	C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 	U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-	match mode {
-		SourceAddressMode::None => Ok(()),
-		SourceAddressMode::ProxyProtocol => {
-			upstream::write_proxy_v1_header(upstream, peer_addr).await
+	let body = async {
+		write_connection_prefix(upstream, sf).await?;
+		let rewrites = header_rewrites(sf, l7_http1);
+		if rewrites.is_empty() {
+			copy_bidirectional(client, upstream).await.map(|_| ())
+		} else {
+			crate::http_proxy::proxy_http1_rewriting(client, upstream, &rewrites).await
 		}
-		SourceAddressMode::XForwardedFor => {
-			upstream::inject_x_forwarded_for(client, upstream, peer_addr).await
+	};
+	if idle.is_zero() {
+		body.await
+	} else {
+		timeout(idle, body)
+			.await
+			.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout"))?
+	}
+}
+
+/// Per-connection source-address + fingerprint forwarding parameters. All fields are `Copy`
+/// (`ja3`/`ja4` borrow the connection's `PeekInfo`), so the struct is passed by value.
+#[derive(Clone, Copy)]
+struct SourceForwarding<'a> {
+	mode: SourceAddressMode,
+	fingerprint: ForwardFingerprint,
+	ja3: &'a str,
+	ja4: &'a str,
+	peer_addr: SocketAddr,
+	local_addr: Option<SocketAddr>,
+}
+
+impl SourceForwarding<'_> {
+	/// The fingerprint string selected for forwarding ("" when none, or unparsed).
+	fn fingerprint_value(&self) -> &str {
+		match self.fingerprint {
+			ForwardFingerprint::None => "",
+			ForwardFingerprint::Ja3 => self.ja3,
+			ForwardFingerprint::Ja4 => self.ja4,
 		}
 	}
+
+	/// The HTTP header name symphony owns for the configured fingerprint mode, if any.
+	fn fingerprint_header_name(&self) -> Option<&'static str> {
+		match self.fingerprint {
+			ForwardFingerprint::Ja3 => Some("X-JA3"),
+			ForwardFingerprint::Ja4 => Some("X-JA4"),
+			ForwardFingerprint::None => None,
+		}
+	}
+}
+
+/// Write the one-shot connection prefix (PROXY v1/v2 header) the mode calls for. HTTP-header
+/// carriers have no prefix — they rewrite the request stream instead (see `header_rewrites`).
+async fn write_connection_prefix<U>(upstream: &mut U, sf: &SourceForwarding<'_>) -> std::io::Result<()>
+where
+	U: tokio::io::AsyncWrite + Unpin,
+{
+	match sf.mode {
+		SourceAddressMode::None | SourceAddressMode::XForwardedFor => Ok(()),
+		SourceAddressMode::ProxyProtocol => upstream::write_proxy_v1_header(upstream, sf.peer_addr).await,
+		SourceAddressMode::ProxyProtocolV2 => {
+			let value = sf.fingerprint_value();
+			let mut tlvs: Vec<(u8, &str)> = Vec::new();
+			match sf.fingerprint {
+				ForwardFingerprint::Ja3 => tlvs.push((upstream::PP2_TYPE_JA3, value)),
+				ForwardFingerprint::Ja4 => tlvs.push((upstream::PP2_TYPE_JA4, value)),
+				ForwardFingerprint::None => {}
+			}
+			upstream::write_proxy_v2_header(upstream, sf.peer_addr, sf.local_addr, &tlvs).await
+		}
+	}
+}
+
+/// The set of headers symphony owns end-to-end on the client→upstream request stream, applied to
+/// every HTTP/1 request. Empty (→ a plain copy, no rewriting) unless the upstream is a plaintext
+/// HTTP/1 stream and the mode injects HTTP headers.
+///
+/// A configured header is *always* stripped from the client's request, even when symphony has no
+/// authoritative value to substitute (`value: None`) — a client must never smuggle its own
+/// `X-JA3`/`X-JA4`/`X-Forwarded-For` through precisely when we can't replace it. PROXY v2 carries
+/// the fingerprint in a TLV, so it adds no header rewrite.
+fn header_rewrites(sf: &SourceForwarding<'_>, l7_http1: bool) -> Vec<crate::http_proxy::HeaderRewrite> {
+	use crate::http_proxy::HeaderRewrite;
+	if !l7_http1 {
+		return Vec::new();
+	}
+	let mut rewrites: Vec<HeaderRewrite> = Vec::new();
+	if matches!(sf.mode, SourceAddressMode::XForwardedFor) {
+		rewrites.push(HeaderRewrite {
+			name: "X-Forwarded-For",
+			value: Some(sf.peer_addr.ip().to_string()),
+		});
+	}
+	// The fingerprint header rides every HTTP-header mode (None/v1/XFF); v2 uses a TLV instead.
+	if !matches!(sf.mode, SourceAddressMode::ProxyProtocolV2) {
+		if let Some(name) = sf.fingerprint_header_name() {
+			let value = sf.fingerprint_value();
+			rewrites.push(HeaderRewrite {
+				name,
+				value: (!value.is_empty()).then(|| value.to_string()),
+			});
+		}
+	}
+	rewrites
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -311,6 +395,7 @@ struct EffectiveRoute {
 	tls_config: Option<Arc<rustls::ServerConfig>>,
 	terminate_tls: bool,
 	source_address_mode: SourceAddressMode,
+	forward_fingerprint: ForwardFingerprint,
 }
 
 struct ActiveGuard {

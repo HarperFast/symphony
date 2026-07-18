@@ -97,10 +97,26 @@ impl RouteTokenBucket {
 pub enum SourceAddressMode {
 	/// No source address forwarding.
 	None,
-	/// Send a PROXY protocol v1 header before any application data.
+	/// Send a PROXY protocol v1 (text) header before any application data.
 	ProxyProtocol,
+	/// Send a PROXY protocol v2 (binary) header before any application data. The v2
+	/// framing carries a TLV section, the carrier used for `ForwardFingerprint`.
+	ProxyProtocolV2,
 	/// Parse the beginning of the HTTP request and insert an X-Forwarded-For header.
 	XForwardedFor,
+}
+
+/// Which client TLS fingerprint (if any) symphony forwards to the upstream so the backend
+/// can act on it itself. Carrier depends on `SourceAddressMode`: a PROXY v2 TLV under
+/// `ProxyProtocolV2`, otherwise an injected `X-JA3`/`X-JA4` HTTP header.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ForwardFingerprint {
+	/// Do not forward a fingerprint.
+	None,
+	/// Forward the JA3 fingerprint.
+	Ja3,
+	/// Forward the JA4 fingerprint.
+	Ja4,
 }
 
 // ── Route destination ─────────────────────────────────────────────────────────
@@ -128,6 +144,8 @@ pub struct Route {
 	pub rate_limiter: Option<Arc<RouteTokenBucket>>,
 	/// How the real client IP is forwarded to the upstream.
 	pub source_address_mode: SourceAddressMode,
+	/// Which client TLS fingerprint (if any) is forwarded to the upstream.
+	pub forward_fingerprint: ForwardFingerprint,
 }
 
 // ── Route table ───────────────────────────────────────────────────────────────
@@ -225,6 +243,8 @@ pub struct RouteSpec {
 	pub burst: Option<f64>,
 	/// How the real client IP is forwarded to the upstream.
 	pub source_address_mode: SourceAddressMode,
+	/// Which client TLS fingerprint (if any) is forwarded to the upstream.
+	pub forward_fingerprint: ForwardFingerprint,
 	/// Advertise h2 in ALPN so clients can negotiate HTTP/2.
 	pub http2: bool,
 }
@@ -426,6 +446,7 @@ fn build_route(
 		suspend_timeout: Duration::from_millis(spec.suspend_timeout_ms.max(1)),
 		rate_limiter,
 		source_address_mode: spec.source_address_mode,
+		forward_fingerprint: spec.forward_fingerprint,
 	})
 }
 
@@ -622,6 +643,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			max_cps: None,
 			burst: None,
 			source_address_mode: SourceAddressMode::None,
+			forward_fingerprint: ForwardFingerprint::None,
 			http2: false,
 		}
 	}
