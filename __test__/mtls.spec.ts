@@ -151,7 +151,7 @@ function startPp2CaptureServer(): Promise<Pp2CaptureServer> {
 
 const clientCa = generateClientCa();
 
-describe('mTLS termination + PROXY v2 client cert forwarding', { skip: clientCa === null && 'openssl unavailable' }, () => {
+describe('mTLS termination + PROXY v2 client cert forwarding', () => {
 	const serverCert = generateSelfSignedCert('localhost');
 	let proxyPort: number;
 	let upstream: Pp2CaptureServer;
@@ -169,7 +169,7 @@ describe('mTLS termination + PROXY v2 client cert forwarding', { skip: clientCa 
 					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: upstream.port }],
 					terminateTls: true,
 					cert: { certChain: serverCert.cert, privateKey: serverCert.key },
-					mtls: { clientCaCert: clientCa!.caCert, requireClientCert: true },
+					mtls: { clientCaCert: clientCa.caCert, requireClientCert: true },
 					sourceAddressHeader: 'proxyProtocolV2',
 				},
 				{
@@ -177,7 +177,7 @@ describe('mTLS termination + PROXY v2 client cert forwarding', { skip: clientCa 
 					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: upstream.port }],
 					terminateTls: true,
 					cert: { certChain: serverCert.cert, privateKey: serverCert.key },
-					mtls: { clientCaCert: clientCa!.caCert, requireClientCert: false },
+					mtls: { clientCaCert: clientCa.caCert, requireClientCert: false },
 					sourceAddressHeader: 'proxyProtocolV2',
 				},
 			],
@@ -198,8 +198,8 @@ describe('mTLS termination + PROXY v2 client cert forwarding', { skip: clientCa 
 				port: proxyPort,
 				servername: 'localhost',
 				caCert: serverCert.cert,
-				clientCert: clientCa!.clientCert,
-				clientKey: clientCa!.clientKey,
+				clientCert: clientCa.clientCert,
+				clientKey: clientCa.clientKey,
 				data: payload,
 			}),
 			upstream.nextConnection(),
@@ -226,7 +226,7 @@ describe('mTLS termination + PROXY v2 client cert forwarding', { skip: clientCa 
 
 		const certTlvs = header.tlvs.filter((t) => t.type === PP2_TYPE_CLIENT_CERT);
 		assert.ok(certTlvs.length >= 1, 'client cert TLV missing');
-		const expectedDer = new crypto.X509Certificate(clientCa!.clientCert).raw;
+		const expectedDer = new crypto.X509Certificate(clientCa.clientCert).raw;
 		assert.deepEqual(certTlvs[0].value, expectedDer, 'leaf DER must match the client cert');
 	});
 
@@ -265,8 +265,8 @@ describe('mTLS termination + PROXY v2 client cert forwarding', { skip: clientCa 
 	});
 
 	it('rejects a client cert signed by a different CA', async () => {
-		const otherCa = generateClientCa('Other CA', 'other-client');
-		assert.ok(otherCa, 'openssl available (suite is not skipped)');
+		const otherCa = generateClientCa(true);
+		
 		await assert.rejects(
 			tlsRoundTrip({
 				port: proxyPort,
@@ -280,7 +280,7 @@ describe('mTLS termination + PROXY v2 client cert forwarding', { skip: clientCa 
 	});
 });
 
-describe('PP2 ALPN TLV with http2 route', { skip: clientCa === null && 'openssl unavailable' }, () => {
+describe('PP2 ALPN TLV with http2 route', () => {
 	const serverCert = generateSelfSignedCert('localhost');
 	let proxyPort: number;
 	let upstream: Pp2CaptureServer;

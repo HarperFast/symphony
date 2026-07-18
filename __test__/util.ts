@@ -134,7 +134,7 @@ function generateCertViaOpenssl(
 	return { cert, key };
 }
 
-// ── CA-signed client certificate generation (for mTLS tests) ──────────────────
+// ── CA-signed client certificates (for mTLS tests) ────────────────────────────
 
 export interface ClientCa {
 	caCert: string;
@@ -142,72 +142,144 @@ export interface ClientCa {
 	clientKey: string;
 }
 
+// Pre-baked test-only fixtures (100-year validity), generated once with OpenSSL 3.
+// Static rather than openssl-at-runtime because rustls's webpki rejects the certs
+// some `openssl` builds emit (macOS LibreSSL produces a CA cert webpki flags as
+// ExtensionValueInvalid) — static PEMs keep the mTLS tests deterministic and
+// platform-independent (no openssl dependency, no per-run key generation).
+const CLIENT_CA: ClientCa = {
+	caCert: `-----BEGIN CERTIFICATE-----
+MIIDZTCCAk2gAwIBAgIUEF7vj9P1L6t/ReRJQeYzN82am8QwDQYJKoZIhvcNAQEL
+BQAwOTEgMB4GA1UEAwwXU3ltcGhvbnkgVGVzdCBDbGllbnQgQ0ExFTATBgNVBAoM
+DFN5bXBob255VGVzdDAgFw0yNjA3MTgxMzQyMTBaGA8yMTI2MDYyNDEzNDIxMFow
+OTEgMB4GA1UEAwwXU3ltcGhvbnkgVGVzdCBDbGllbnQgQ0ExFTATBgNVBAoMDFN5
+bXBob255VGVzdDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAN/YqoWm
+lmt/CMjHjQ9WNL1LCJiZxSbDHScfdZ7xz2dnxcmgKvtnT89KpT/6NkKJTvTi1n3I
+6fCIYex2iaoKYUfaH0QVA//dB1J6a4ChDcdx+ohTvAvlKqWwgKR3lJtY769JpXzI
+e25cVEu2TbxGzPyWc6YtSKtraesYEpVJ+RONvzA2tJe2nVOOoQGNI1gV50oJVI21
+dqWsX8KOFAO7GpHrXb5e47K3Qu1Dzbc0fEWZcUzkKfGjE4qcVMwnb+g41aDZsLBj
+5Hp/KD7C42W9ee1w1DZJXfBIE+GmT/IZJSQJyWHewNL6KBVGy6wkb5RKExWdg84V
+idLMZLAAPlkexDsCAwEAAaNjMGEwHQYDVR0OBBYEFFWMZI8FBTDQXio2v30dFKif
+opwrMB8GA1UdIwQYMBaAFFWMZI8FBTDQXio2v30dFKifopwrMA8GA1UdEwEB/wQF
+MAMBAf8wDgYDVR0PAQH/BAQDAgEGMA0GCSqGSIb3DQEBCwUAA4IBAQBv3QCvePct
+QheCekCR1UaelVw7Dlxr9bTa32l3Jj1fT0A0ieIPEs5HhJjAwajgzsWJhxvpK9Nh
+rzBjqrFFyUfa7gD8jq7eo+SbzRCqfaPb2AbfH3oJGEwjN882yBNlEo6YSUHKgoij
+DGt00LDVckGw3FgRm+r2vOOfgRuViurg1vsrB3Qrp8S59LOP4HefT/gvZJG3LPCP
+XKPFzo9SZbIfxifIR3T+f3VucNftjDexJOdEiUbipg7eaMbtoUOfC9ZtrZhZ6//9
+I10pOHe5pCnHouQbfgdDl9UGf/69u7C9rR5OqTu2fEfMurDtJNdNVrlG584AmvCi
+0HT7B9Ssuw8Z
+-----END CERTIFICATE-----`,
+	clientCert: `-----BEGIN CERTIFICATE-----
+MIIDaDCCAlCgAwIBAgIUEFzv6k57sDnirppErxDK/BrhBZowDQYJKoZIhvcNAQEL
+BQAwOTEgMB4GA1UEAwwXU3ltcGhvbnkgVGVzdCBDbGllbnQgQ0ExFTATBgNVBAoM
+DFN5bXBob255VGVzdDAgFw0yNjA3MTgxMzQyMTFaGA8yMTI2MDYyNDEzNDIxMVow
+LTEUMBIGA1UEAwwLdGVzdC1jbGllbnQxFTATBgNVBAoMDFN5bXBob255VGVzdDCC
+ASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAK4dzF7JEgeW5lkBNSEXifLt
+KVhYwhpM+9jd5i8nQn8mSLz5qNZywDUqbWiUFjCEaGdBxiFekDy/9uhUu5AKGAIu
+C3YNVc591mg9vSvYcDbhmagVW5WDZtdifRKfaxp++AycImtFZze848bRABwYuEx2
+rQAAuelOt4vca4M4Yh7HP5ZVzjPzTYwjWF7EReXgo3QBRJgeh3cIpN8H6bL+WTh5
+dluuj4qdWf1bOJnLwknuRkAOxm+ad/NYOnUvcHOCKSfg/pKeRzTdtedb3GZr6Mj4
+1iUI3uRzfQ9FksXdVa5JkR86zRa0LVJdr5b4HaXaJfiC8Om7YqQDxmhXFatJ96UC
+AwEAAaNyMHAwCQYDVR0TBAIwADAOBgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYI
+KwYBBQUHAwIwHQYDVR0OBBYEFJW1XF3Q5gkI4FphVfKwXeNjizrUMB8GA1UdIwQY
+MBaAFFWMZI8FBTDQXio2v30dFKifopwrMA0GCSqGSIb3DQEBCwUAA4IBAQA7nHbX
+ntSqMqFx2RBMoRAPqxlRK0JTYIbFDK/vmM3J7Z9Yl+0DQVfQ58u4iJYpREj9b+AT
+/QjEEoShhY370z89EqqQThhnFPAorHJ/rZ4rEMlahI69sVvTuYZ17Lyf4aeQ/rtZ
+Bjk1zGeKX5GPpyO3eq615Od3flTd/ooDbzGIybj9bAFKAQ8rcnMi270lP42ub1Kn
+iHe5wWGJaUP7OGP3AEZ0CvFjJfizKb3BdynU7cYCoENV0jGSeoS3TpedVDmT2Fmq
+MW+TFySTK4D9Aa0UMjbQo4breSc/zP2io3saVG3NMhuzn41vqV3GFqElHb/Tn5zf
+f7qyl7d3Q2jk3LN+
+-----END CERTIFICATE-----`,
+	clientKey: `-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCuHcxeyRIHluZZ
+ATUhF4ny7SlYWMIaTPvY3eYvJ0J/Jki8+ajWcsA1Km1olBYwhGhnQcYhXpA8v/bo
+VLuQChgCLgt2DVXOfdZoPb0r2HA24ZmoFVuVg2bXYn0Sn2safvgMnCJrRWc3vOPG
+0QAcGLhMdq0AALnpTreL3GuDOGIexz+WVc4z802MI1hexEXl4KN0AUSYHod3CKTf
+B+my/lk4eXZbro+KnVn9WziZy8JJ7kZADsZvmnfzWDp1L3Bzgikn4P6Snkc03bXn
+W9xma+jI+NYlCN7kc30PRZLF3VWuSZEfOs0WtC1SXa+W+B2l2iX4gvDpu2KkA8Zo
+VxWrSfelAgMBAAECggEACFDtCMlCvrENjx+4eWb7PuqRPc0ozC0eyZoORfSdP58a
+UfL8sO1p0mrp2dkE1va5WSvc5OLJhyqbW40R06HfyVmIpkVMcrXeQ+alqTlHtsn/
+VvYE2fcc4NmtOUf69hjYC8YjULX6ZZZJ13OhCovVtZ/kyGoVzG0RkDEMGN2HC4rg
+JTbS6u3krIOJJNYhIOUH8f4WTZip0WCJxiwZN+97J7H5tg1JOkST18Z5oeYJ0lFY
+OxpISyaBGASQ3ri6ZDAuXPKK3FTceIzrVFvbfif4IRefo8wJPjeEagnrV/rkQ16+
+ctx6keMhvFiZxAG1JMH1ZsRutke0ptDI4kQpDYg78QKBgQDklDF3B0J7yimVvbB5
+cD7S3bx7XFVcjWNu4oxsKzslzO9B9sgxntxvVDtKfNnd5zBARS1f30v7aHYZcwJ7
+NJ02PZD2qtCV93yJBSdb7v2maJVfdEOX9nA63/aWB43XOfyoEpwGdtzhG9XiBcKf
+5XNB7q3rEUy0R3Ommjl1SbFMmQKBgQDDAQbYqPpnUopUSOQX/9lVHgdeaFj+QT+m
+KgUItiw0gn9Azz9hYPQXWrw6eDBph4uj1DV05SlEoI6N1y0SST9whrTcJbXF19bR
+pMF70TvGVMuY+nw2dOi454rZh5dEeYi5NdGD7RxzR9rfogSV0473R74/WZrBSwMA
+fbQ7/QE+7QKBgEm5iqLLkqP+tp73ib4BeCHnJu3bACVT7ShMpeIVp4Qvr1PlVvi6
+Nnsp/d2um065TJTOOy5bBVTXgo/+ymQWukZOYT1OJuzX4DEJmoJKeUF9JgCdrVeM
+QvKaXhxR32v15goHxo9HM0LgCYJXPUj5Zs1zQGE7OTREf4bS44ly9V6xAoGBAKBX
+t8lvKHbM5/Fl/ie9uHbEukpmgsaN4EhBROJk6PREWV5xCyyHDC4n7Z4mNaiQS8Hq
+PApiZAyJ+K2owObIU+Gy4gQi/dQwJfM8BdxJr1zlXIPtczVT7AgeW42CcF9dj467
+MgvIbBxeeRppnluUGXo7A7QTeax2gYFl2014PA4BAoGADyb+jfj8HuDN01xr6EkZ
+Iz4zMqpDVBw5NA/N4VojDfOOX6dMRJVX6x3vWwSefcNVBS+t9ZfHAkx4JDd1z0Ce
+oarboHnLg0PGnHE1GZCMaSwQXxZMohuyVEsZn1IqQPZeiabA05V8ZtPgYs5lxHrY
+IKnIDfpBnIFOjhP/86KP7fU=
+-----END PRIVATE KEY-----`,
+};
+
+// A second, independent CA + client, for the "cert signed by a different CA is rejected" test.
+const OTHER_CLIENT_CA: ClientCa = {
+	caCert: '', // not needed — the route trusts CLIENT_CA, and this client is signed by a different CA
+	clientCert: `-----BEGIN CERTIFICATE-----
+MIIDXzCCAkegAwIBAgIUciD6p9vUW/4ibbb3vjCfuLb4wKAwDQYJKoZIhvcNAQEL
+BQAwLzEWMBQGA1UEAwwNT3RoZXIgVGVzdCBDQTEVMBMGA1UECgwMU3ltcGhvbnlU
+ZXN0MCAXDTI2MDcxODEzNDI0M1oYDzIxMjYwNjI0MTM0MjQzWjAuMRUwEwYDVQQD
+DAxvdGhlci1jbGllbnQxFTATBgNVBAoMDFN5bXBob255VGVzdDCCASIwDQYJKoZI
+hvcNAQEBBQADggEPADCCAQoCggEBAN01SW1PSp8c334f3yL7ft+FIaHxz2dN3zwE
+s2LA8nepPQ/r0Gf0IvChLC7u2HFPqrr8G9bM4+HiG4IhkiVi9NKOOJqjSN3Lam2/
+vhRTBxdhs4kk9vtr+1poUPz5kYJh01rikv/u7QgriYWJPUhkwIPWb1bIpAnBTlwA
+o07ZmNN9RJd6uH7fk+Xf4hICATqB8d9WJMFDgMzhZmZ6NfAmo41tqvZKAdUoz5RU
+1VjJbwCdOELztKsKrLPDQUvnPXhzEy+8tYHCFrFv8eFbD5dy6mi9feeORBIWj7NO
+D0U+TwNU/6kiIetZWeLqr6cndFoNQkzVxsbOAJya9Ua5Iy6L1FECAwEAAaNyMHAw
+CQYDVR0TBAIwADAOBgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwIw
+HQYDVR0OBBYEFC5r2mMAN/5phWHCGdfkrAEMonejMB8GA1UdIwQYMBaAFDawrRwb
+XJ+BgOEp2umE+cXti/tsMA0GCSqGSIb3DQEBCwUAA4IBAQBBwSGaEOG/AVzOmWCr
+LLVkxJ4PhbY8++Zl9JibMXrCc4DA5jlPHix0YOlFFk4ArSQRH1TmxEPlvjP2Itr6
+vzPNcAU1/AvfwIRTKYQbAobKblTFnL9f9enG1HC0/MoeE3flj9g/Spz4at+hYzMG
+r2KJsWz2gBkfpS2Helt8fsoH5mubglmRCk+C6hwuEV6h6EOu7zR/P+F7p/6f3PQa
+ZfIN/AllCl7manc72G5XA0gl8QMosL8FewYYlXTyUmWVEjqV3nH63lD/vZtWYpUr
+y9L+fMyg1yAItytHFc3HNyxrHE2+1CspX6YzOrqU/BuR4mgpWRq76RN+63BlxTMl
+5t1U
+-----END CERTIFICATE-----`,
+	clientKey: `-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDdNUltT0qfHN9+
+H98i+37fhSGh8c9nTd88BLNiwPJ3qT0P69Bn9CLwoSwu7thxT6q6/BvWzOPh4huC
+IZIlYvTSjjiao0jdy2ptv74UUwcXYbOJJPb7a/taaFD8+ZGCYdNa4pL/7u0IK4mF
+iT1IZMCD1m9WyKQJwU5cAKNO2ZjTfUSXerh+35Pl3+ISAgE6gfHfViTBQ4DM4WZm
+ejXwJqONbar2SgHVKM+UVNVYyW8AnThC87SrCqyzw0FL5z14cxMvvLWBwhaxb/Hh
+Ww+XcupovX3njkQSFo+zTg9FPk8DVP+pIiHrWVni6q+nJ3RaDUJM1cbGzgCcmvVG
+uSMui9RRAgMBAAECggEALA+3JnzKwlK/+aFjktZBeUhNYLKHu235bz0Idj00jr05
+GnjANFSeuQuBf3+3wSo7Oa+J5Ak/wviEvjDtqWDCn0YQ5Ext8S/ZbS7qL6YyHWgq
+mMCyKXZixKlOqHUVlMDjlpDW8v+mWyBA7kZd3JOk/R2zY7fnZMIKV60Q2l3hYQ6N
+tr5pjbfGARkas27gT0pP/kEM8z5EjO3XwVE7ilmPTLqJHN9cY0gEvPL5mmF6Uu8Q
+ye7RvG2bhPIIoBVbZJpI7bxigO2mnoR4P1f9mvaJ61spkisR3pfhdmXjoiqy/7lg
+nnfg28ICQ2SwAqEvYHnWuRuwj6dGvcOdbLLMSIvauQKBgQD574cdI5E66tyFyE5g
+Y8jzMrhfTd/WxJVRLYRlSQZ6kjiVM17KmE/W5wZUkAxLUHpZnynF315qjgD3ca21
+4a563T5IZeOizDbqjNcqk4Bi8ZHuxYQudozviiVeQEfLBySblBlDlK7xt/PrmgM6
+1kOre6RUQxnUDoFy2z5HKPwXrwKBgQDik1GJeBGZP27pC0TfCoW09zILfrNT1sCi
+6GEl48euzM+zNXnhLDWm4XolXvnXPKPqHLeLWBlz3qilWrcgthK721AFsdmFCC/q
+CQI/j0KQNslAWYaIutdmsg4tT9Sk9lZt4/9t5aakJkckjNLq/+Z41U2negTsfFNC
+e3pemoXT/wKBgQDn6JNMPFZjfs1D7UqcMbqhvmxJMi8CTsHl4wA4Ivw5+zc5acMI
+5S8fzpmXGVnvACumwQK3sb0fzcej0f1HCLMnGebSsof35NkH5cs4nEjChjfMf8VY
+f3PiSCLIQ4jaIDSdj1up02pIq1FPSUa571o24bDm5qQumY8PjdNJoAPZzQKBgQDd
+jVhpp/Lte02kq9RIlS1xa1aQTvBjxtbPdZOpTTZxAu0GPABV4rkD2e9qo5iCk1Vl
+E3eW1irtVohqSG5RmjhvYWC6cNJWd08C9pQwOpHIGwpn1iLriGggj3O1cx5nwEl7
+Yzrd53YvhQ6D+wAzss9W0J0CaxptdJSlqcBayZabWQKBgDC3k8OVbC/Yqu3EP0Zn
+ImfaP+RWdeTc/p12iw5Nhdae9ysWzkJjqnVuKpS70reSz1q0PbVO3fIpieYGD3zZ
+QATR522/6bbc+Mhs2My3kFJiOCPeHZpHyu7lU7Z0VmYJXbFhQrxhpggsCC81yOT6
+w2EPe5AvnptfwD9cZDbA6PUz
+-----END PRIVATE KEY-----`,
+};
+
 /**
- * Generate a CA and a client certificate signed by it, for mTLS tests.
- * Returns null when openssl is unavailable (callers should skip).
+ * Return the pre-baked CA + client cert for mTLS tests. Never null (static fixtures,
+ * no openssl at runtime). Pass `other: true` for a client signed by a *different* CA.
  */
-export function generateClientCa(caCn = 'Symphony Test CA', clientCn = 'test-client'): ClientCa | null {
-	const { spawnSync } = require('node:child_process');
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-mtls-'));
-	try {
-		const caKeyFile = path.join(dir, 'ca.key');
-		const caCertFile = path.join(dir, 'ca.pem');
-		const clientKeyFile = path.join(dir, 'client.key');
-		const csrFile = path.join(dir, 'client.csr');
-		const clientCertFile = path.join(dir, 'client.pem');
-		const extFile = path.join(dir, 'ext.cnf');
-
-		const caKey = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
-		fs.writeFileSync(caKeyFile, caKey.privateKey.export({ type: 'pkcs8', format: 'pem' }) as string);
-		const clientKeyObj = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
-		const clientKey = clientKeyObj.privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
-		fs.writeFileSync(clientKeyFile, clientKey);
-
-		// Explicit CA basicConstraints: OpenSSL 3 adds it by default for `req -x509`,
-		// LibreSSL (macOS system openssl) does not.
-		const ca = spawnSync(
-			'openssl',
-			[
-				'req', '-new', '-x509', '-key', caKeyFile, '-out', caCertFile, '-days', '1',
-				'-subj', `/CN=${caCn}`,
-				'-addext', 'basicConstraints=critical,CA:TRUE',
-				'-addext', 'keyUsage=keyCertSign,cRLSign',
-			],
-			{ encoding: 'utf8' },
-		);
-		if (ca.status !== 0) return null;
-
-		const csr = spawnSync(
-			'openssl',
-			['req', '-new', '-key', clientKeyFile, '-out', csrFile, '-subj', `/CN=${clientCn}`],
-			{ encoding: 'utf8' },
-		);
-		if (csr.status !== 0) return null;
-
-		fs.writeFileSync(
-			extFile,
-			'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n',
-		);
-		const signed = spawnSync(
-			'openssl',
-			[
-				'x509', '-req', '-in', csrFile, '-CA', caCertFile, '-CAkey', caKeyFile,
-				'-CAcreateserial', '-days', '1', '-out', clientCertFile, '-extfile', extFile,
-			],
-			{ encoding: 'utf8' },
-		);
-		if (signed.status !== 0) return null;
-
-		return {
-			caCert: fs.readFileSync(caCertFile, 'utf8'),
-			clientCert: fs.readFileSync(clientCertFile, 'utf8'),
-			clientKey,
-		};
-	} catch {
-		return null;
-	} finally {
-		fs.rmSync(dir, { recursive: true, force: true });
-	}
+export function generateClientCa(other = false): ClientCa {
+	return other ? OTHER_CLIENT_CA : CLIENT_CA;
 }
 
 // ── Free port helper ───────────────────────────────────────────────────────────
