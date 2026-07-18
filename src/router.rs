@@ -433,6 +433,17 @@ fn build_route(
 		);
 	}
 
+	// A requested fingerprint needs a viable carrier. In passthrough there's no HTTP request
+	// to inject an X-JA3/X-JA4 header into, so the only carrier is a PROXY v2 TLV; without
+	// `proxyProtocolV2` the fingerprint is silently dropped. Warn rather than deploy a
+	// config whose requested signal never reaches the upstream.
+	if fingerprint_has_no_carrier(spec) {
+		eprintln!(
+			"symphony: route '{}': forwardFingerprint is set but has no carrier in passthrough mode (terminateTls=false) unless sourceAddressHeader='proxyProtocolV2' — the fingerprint will not be forwarded",
+			spec.sni
+		);
+	}
+
 	let rate_limiter = spec
 		.max_cps
 		.map(|cps| Arc::new(RouteTokenBucket::new(cps, spec.burst)));
@@ -448,6 +459,16 @@ fn build_route(
 		source_address_mode: spec.source_address_mode,
 		forward_fingerprint: spec.forward_fingerprint,
 	})
+}
+
+/// True when a route requests `forwardFingerprint` but no carrier can deliver it: passthrough
+/// (`terminateTls: false`) has no HTTP request for X-JA3/X-JA4 header injection, and only
+/// `proxyProtocolV2` carries the fingerprint as a connection-scoped TLV. Other modes on a
+/// terminated route can still inject the header for HTTP/1 connections, so they aren't flagged.
+fn fingerprint_has_no_carrier(spec: &RouteSpec) -> bool {
+	!matches!(spec.forward_fingerprint, ForwardFingerprint::None)
+		&& spec.source_address_mode != SourceAddressMode::ProxyProtocolV2
+		&& !spec.terminate_tls
 }
 
 /// Build the route's destinations: the default (h1) destination plus, when any
@@ -699,5 +720,29 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			fresh.resolve(Some("tenant.example.com")).is_none(),
 			"with no prior route there is nothing to retain — the SNI is dropped"
 		);
+	}
+
+	#[test]
+	fn fingerprint_carrier_viability() {
+		let mut spec = tls_route("x", CERT_A, KEY_A);
+
+		// terminated + fingerprint: header injection can carry it for HTTP/1 → not flagged.
+		spec.forward_fingerprint = ForwardFingerprint::Ja3;
+		spec.terminate_tls = true;
+		spec.source_address_mode = SourceAddressMode::None;
+		assert!(!fingerprint_has_no_carrier(&spec));
+
+		// passthrough + fingerprint + non-PP2: no carrier at all → flagged.
+		spec.terminate_tls = false;
+		assert!(fingerprint_has_no_carrier(&spec));
+
+		// passthrough + fingerprint + PP2: the TLV carries it → not flagged.
+		spec.source_address_mode = SourceAddressMode::ProxyProtocolV2;
+		assert!(!fingerprint_has_no_carrier(&spec));
+
+		// no fingerprint requested: never flagged, regardless of mode.
+		spec.forward_fingerprint = ForwardFingerprint::None;
+		spec.source_address_mode = SourceAddressMode::None;
+		assert!(!fingerprint_has_no_carrier(&spec));
 	}
 }
