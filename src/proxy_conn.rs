@@ -60,14 +60,28 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	// stream is consumed by the TLS handshake.
 	let local_addr = stream.local_addr().ok();
 
+	// ── 0. Admission: count this connection from acceptance, for its whole lifetime ────
+	// `maxConnections` is enforced at accept() against this same global counter (listener.rs).
+	// If we only counted a connection as active *after* peek()/protection::check() returned,
+	// the up-to-`REASSEMBLY_TIMEOUT` (5s) peek phase would run uncounted — a flood of slow or
+	// invalid (non-TLS, stalled) ClientHellos could hold open far more than maxConnections
+	// pending tasks/fds at once. Guard from the top so peek is admission-controlled too.
+	ctx.listener_metrics.inc_active();
+	ctx.global_metrics.inc_active();
+	let mut active_guard = ActiveGuard {
+		global: ctx.global_metrics.clone(),
+		listener: ctx.listener_metrics.clone(),
+		ip_state: None,
+	};
+
 	// ── 1. Peek: extract SNI + JA3 ───────────────────────────────────────────
 	let peek_info = sni::peek(&stream).await;
 
 	// ── 2. Protection checks ─────────────────────────────────────────────────
 	// On Allow, check() returns the Arc<IpState> that incremented the active counter.
-	// We hold it in ip_state_held so the ActiveGuard can decrement the SAME entry even
-	// if eviction removes it from the map between admission and connection close (fix 6).
-	let ip_state_held: Option<Arc<IpState>> = if let Some(protection) = &ctx.protection {
+	// We hold it on active_guard so it decrements the SAME entry even if eviction removes
+	// it from the map between admission and connection close (fix 6).
+	if let Some(protection) = &ctx.protection {
 		match protection.check(peer_ip, &peek_info) {
 			crate::protection::Decision::Block(reason) => {
 				ctx.listener_metrics.inc_blocked();
@@ -79,28 +93,16 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 					ja3: peek_info.ja3.clone(),
 					ja4: peek_info.ja4.clone(),
 				});
-				return;
+				return; // active_guard drop decrements the active counters it already bumped
 			}
 			// Allowlisted: active counter was not incremented.
-			crate::protection::Decision::AllowBypassed => None,
-			crate::protection::Decision::Allow(state) => Some(state),
+			crate::protection::Decision::AllowBypassed => {}
+			crate::protection::Decision::Allow(state) => active_guard.ip_state = Some(state),
 		}
-	} else {
-		None
-	};
-
-	// ── Connection is allowed — track it ─────────────────────────────────────
-	ctx.listener_metrics.inc_active();
-	ctx.global_metrics.inc_active();
+	}
 
 	// RAII: decrement counts on scope exit.
-	// Decrement the active counter through the held Arc<IpState> so it always hits the
-	// same entry that was incremented, regardless of concurrent eviction.
-	let _active_guard = ActiveGuard {
-		global: ctx.global_metrics.clone(),
-		listener: ctx.listener_metrics.clone(),
-		ip_state: ip_state_held,
-	};
+	let _active_guard = active_guard;
 
 	// ── 3. Route lookup ───────────────────────────────────────────────────────
 	let table = ctx.route_table.0.load();

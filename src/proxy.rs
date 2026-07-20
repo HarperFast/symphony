@@ -799,15 +799,17 @@ fn parse_protection_config(
 
 	if let Some(ja4s) = &prot.ja4_blocklist {
 		for s in ja4s {
-			// Validate the documented JA4 structure so a malformed entry fails at config
-			// time instead of silently never matching.
-			if !is_valid_ja4(s) {
+			// Normalize to lowercase *before* validating — matching is case-insensitive, so an
+			// otherwise-well-formed uppercase fingerprint must not be rejected here.
+			let lower = s.to_lowercase();
+			// Validate against what `compute_ja4` can actually produce, so a malformed or
+			// unreachable entry fails at config time instead of silently never matching.
+			if !is_valid_ja4(&lower) {
 				return Err(napi::Error::from_reason(format!(
 					"invalid ja4Blocklist entry '{s}': expected JA4 format t<ver><sni><cc><ec><alpn>_<12 hex>_<12 hex> (36 chars)"
 				)));
 			}
-			// Normalize to lowercase for case-insensitive matching.
-			cfg.ja4_blocklist.insert(s.to_lowercase().into_boxed_str());
+			cfg.ja4_blocklist.insert(lower.into_boxed_str());
 		}
 	}
 
@@ -894,19 +896,22 @@ fn num_cpus() -> u32 {
 }
 
 /// Validate a JA4 core-TLS fingerprint string: `t<ver2><sni1><cc2><ec2><alpn2>_<12hex>_<12hex>`
-/// (36 chars), matching what `sni::compute_ja4` emits and standard JA4 tooling. Case-insensitive
-/// on the hash halves.
+/// (36 chars). Expects lowercase input (call sites normalize before validating). Restricted to
+/// exactly what `sni::compute_ja4` can produce — not the full JA4 spec — since a blocklist entry
+/// symphony itself can never emit (a `q`/`d` transport prefix, or a TLS version it doesn't speak)
+/// would pass validation yet can never match, defeating the point of validating it at all.
 fn is_valid_ja4(s: &str) -> bool {
 	let b = s.as_bytes();
 	if b.len() != 36 || b[10] != b'_' || b[23] != b'_' {
 		return false;
 	}
 	let a = &b[..10];
-	// protocol (t=TCP, q=QUIC, d=DTLS), tls version (2 digits), sni presence (d=domain/i=ip),
-	// cipher count (2 digits), extension count (2 digits), alpn first/last (2 alphanumeric).
-	matches!(a[0], b't' | b'q' | b'd')
-		&& a[1].is_ascii_digit()
-		&& a[2].is_ascii_digit()
+	// protocol: symphony only speaks TLS-over-TCP, so only 't' (never 'q'=QUIC, 'd'=DTLS).
+	// tls version: only the 2-digit strings compute_ja4's ver_str match can emit.
+	// sni presence (d=domain/i=ip), cipher count (2 digits), extension count (2 digits),
+	// alpn first/last (2 alphanumeric).
+	a[0] == b't'
+		&& matches!((a[1], a[2]), (b'0', b'0') | (b'1', b'0') | (b'1', b'1') | (b'1', b'2') | (b'1', b'3'))
 		&& matches!(a[3], b'd' | b'i')
 		&& a[4].is_ascii_digit()
 		&& a[5].is_ascii_digit()
@@ -1051,7 +1056,11 @@ mod tests {
 	#[test]
 	fn valid_ja4_accepts_well_formed() {
 		assert!(is_valid_ja4("t13d1516h2_8daaf6152771_02713d6af862"));
-		assert!(is_valid_ja4("q13i070500_1234567890ab_abcdef012345")); // QUIC, no-SNI variant
+		assert!(is_valid_ja4("t00i070500_1234567890ab_abcdef012345")); // version 00, no-SNI variant
+		for ver in ["00", "10", "11", "12", "13"] {
+			let s = format!("t{ver}d1516h2_8daaf6152771_02713d6af862");
+			assert!(is_valid_ja4(&s), "version {ver} should be accepted: {s}");
+		}
 	}
 
 	#[test]
@@ -1064,5 +1073,22 @@ mod tests {
 		assert!(!is_valid_ja4("t13d1516h2_8daaf615277g_02713d6af862"), "non-hex in part B");
 		assert!(!is_valid_ja4("x13d1516h2_8daaf6152771_02713d6af862"), "bad protocol char");
 		assert!(!is_valid_ja4("t1xd1516h2_8daaf6152771_02713d6af862"), "non-digit version");
+		// Uppercase must be rejected here — call sites are expected to normalize before
+		// validating; is_valid_ja4 itself only matches the lowercase output compute_ja4 emits.
+		assert!(!is_valid_ja4("T13D1516H2_8DAAF6152771_02713D6AF862"), "uppercase");
+	}
+
+	#[test]
+	fn valid_ja4_rejects_transports_and_versions_symphony_cannot_emit() {
+		// symphony only speaks TLS-over-TCP: 'q' (QUIC) and 'd' (DTLS) transport prefixes can
+		// never match a fingerprint symphony itself computes.
+		assert!(!is_valid_ja4("q13i070500_1234567890ab_abcdef012345"), "QUIC prefix");
+		assert!(!is_valid_ja4("d13i070500_1234567890ab_abcdef012345"), "DTLS prefix");
+		// compute_ja4's ver_str only ever emits 00/10/11/12/13 — any other 2-digit value can
+		// never match either.
+		for ver in ["01", "02", "14", "20", "99"] {
+			let s = format!("t{ver}d1516h2_8daaf6152771_02713d6af862");
+			assert!(!is_valid_ja4(&s), "version {ver} should be rejected (unreachable): {s}");
+		}
 	}
 }
