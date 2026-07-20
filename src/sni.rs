@@ -42,15 +42,81 @@ impl Default for PeekInfo {
 	}
 }
 
-/// The total ClientHello size declared by the leading TLS record + handshake headers
-/// (`5` record header + `4` handshake header + 3-byte handshake length), or `None` if
-/// fewer than 9 bytes are buffered or the record isn't a handshake.
-fn declared_client_hello_len(buf: &[u8]) -> Option<usize> {
-	if buf.len() < 9 || buf[0] != 0x16 {
-		return None; // not a TLS handshake record
+/// Result of scanning as many buffered TLS records as are available for a ClientHello.
+enum RecordScan {
+	/// The buffered prefix can never become a valid ClientHello (wrong record content-type
+	/// or wrong handshake message-type) — fail fast rather than waiting out the timeout.
+	Invalid,
+	/// Not enough raw bytes buffered yet to make further progress; re-peek once at least
+	/// this many raw wire bytes are available.
+	NeedMoreRaw(usize),
+	/// The complete handshake-layer payload (msg_type(1) + length(3) + body, with every TLS
+	/// record header stripped out) has been reassembled.
+	Complete(Vec<u8>),
+}
+
+/// Walk `raw` (the raw MSG_PEEK'd wire bytes, which may span several TLS records) as a
+/// sequence of TLS record headers, stripping each 5-byte record header and concatenating the
+/// record payloads into the handshake-layer byte stream. A ClientHello whose handshake
+/// message is larger than one TLS record's payload is split across multiple `0x16` Handshake
+/// records — treating the raw buffer as a single record (the previous approach) let a
+/// continuation record's header bytes leak into the parsed body/extensions and could report
+/// `complete=true` before the real payload was fully buffered, silently producing a wrong
+/// fingerprint and bypassing blocklist enforcement.
+fn scan_handshake_records(raw: &[u8]) -> RecordScan {
+	let mut offset = 0usize;
+	let mut hs_buf: Vec<u8> = Vec::new();
+	let mut declared_hs_len: Option<usize> = None; // 4 (handshake header) + handshake body length
+
+	loop {
+		if let Some(total) = declared_hs_len {
+			if hs_buf.len() >= total {
+				hs_buf.truncate(total);
+				return RecordScan::Complete(hs_buf);
+			}
+		}
+
+		// Fail fast on the next expected record's content-type byte as soon as it's visible —
+		// non-TLS traffic (e.g. plain HTTP) or a non-Handshake record can never become a
+		// ClientHello no matter how many more bytes arrive.
+		if raw.len() > offset && raw[offset] != 0x16 {
+			return RecordScan::Invalid;
+		}
+		if raw.len() < offset + 5 {
+			return RecordScan::NeedMoreRaw(offset + 5);
+		}
+		let record_len = u16::from_be_bytes([raw[offset + 3], raw[offset + 4]]) as usize;
+		let record_end = offset + 5 + record_len;
+		if raw.len() < record_end {
+			return RecordScan::NeedMoreRaw(record_end);
+		}
+		hs_buf.extend_from_slice(&raw[offset + 5..record_end]);
+		offset = record_end;
+
+		// Fail fast on the handshake message-type byte as soon as it's visible, and learn the
+		// declared handshake length once the 4-byte handshake header is complete.
+		if declared_hs_len.is_none() && !hs_buf.is_empty() {
+			if hs_buf[0] != 0x01 {
+				return RecordScan::Invalid; // not a ClientHello handshake message
+			}
+			if hs_buf.len() >= 4 {
+				let hs_len = ((hs_buf[1] as usize) << 16) | ((hs_buf[2] as usize) << 8) | (hs_buf[3] as usize);
+				declared_hs_len = Some(4 + hs_len);
+			}
+		}
 	}
-	let handshake_len = ((buf[6] as usize) << 16) | ((buf[7] as usize) << 8) | (buf[8] as usize);
-	Some(5 + 4 + handshake_len)
+}
+
+/// Wrap reassembled handshake-layer bytes (msg_type + length + body) back into the
+/// single-record wire format `parse_client_hello` expects. The record's declared length and
+/// legacy version are placeholders — `parse_client_hello` only skips over them.
+fn wrap_as_record(hs_bytes: &[u8]) -> Vec<u8> {
+	let mut out = Vec::with_capacity(5 + hs_bytes.len());
+	out.push(0x16);
+	out.extend_from_slice(&[0x03, 0x01]);
+	out.extend_from_slice(&(hs_bytes.len() as u16).to_be_bytes());
+	out.extend_from_slice(hs_bytes);
+	out
 }
 
 /// Peek at the stream and parse the TLS ClientHello, reassembling until the full declared
@@ -76,7 +142,8 @@ async fn peek_with_timeout(stream: &TcpStream, timeout: Duration) -> PeekInfo {
 }
 
 /// Peek repeatedly until the full declared ClientHello is buffered or the size cap is hit.
-/// Returns `(buffer, complete)`, or `None` if the stream errored before any bytes.
+/// Returns `(buffer, complete)`, or `None` if the input is not a TLS ClientHello at all (fail
+/// fast) or the stream errored before any bytes.
 async fn peek_reassemble(stream: &TcpStream) -> Option<(Vec<u8>, bool)> {
 	let mut buf = vec![0u8; INITIAL_PEEK];
 	loop {
@@ -85,24 +152,18 @@ async fn peek_reassemble(stream: &TcpStream) -> Option<(Vec<u8>, bool)> {
 			Ok(n) => n,
 			Err(_) => return None,
 		};
-		if let Some(declared) = declared_client_hello_len(&buf[..n]) {
-			if declared > MAX_CLIENT_HELLO {
-				// Declared hello exceeds our cap — parse what we have, marked incomplete.
-				return Some((buf[..n].to_vec(), false));
+		match scan_handshake_records(&buf[..n]) {
+			RecordScan::Invalid => return None,
+			RecordScan::Complete(hs_bytes) => return Some((wrap_as_record(&hs_bytes), true)),
+			RecordScan::NeedMoreRaw(target) => {
+				if target > MAX_CLIENT_HELLO {
+					// Declared hello exceeds our cap — parse what we have, marked incomplete.
+					return Some((buf[..n].to_vec(), false));
+				}
+				if buf.len() < target {
+					buf.resize(target, 0);
+				}
 			}
-			if n >= declared {
-				return Some((buf[..declared].to_vec(), true));
-			}
-			// Need more bytes: grow the buffer to fit the declared size and re-peek (MSG_PEEK
-			// always returns from offset 0, so a larger buffer captures more of the same hello).
-			if buf.len() < declared {
-				buf.resize(declared, 0);
-			}
-		} else if n >= MAX_CLIENT_HELLO {
-			return Some((buf[..n].to_vec(), false));
-		} else if buf.len() < MAX_CLIENT_HELLO {
-			// Not enough bytes yet to even read the declared length — grow and retry.
-			buf.resize((buf.len() * 2).min(MAX_CLIENT_HELLO), 0);
 		}
 		// Wait before re-peeking. The outer timeout bounds the total wait; this just paces
 		// the poll so a stalled partial hello can't spin a core.
@@ -851,16 +912,68 @@ mod tests {
 		assert_eq!(join_hex4(&[0x0403, 0x0804, 0x0001]), "0403,0804,0001");
 	}
 
+	fn scan_complete(raw: &[u8]) -> Option<Vec<u8>> {
+		match scan_handshake_records(raw) {
+			RecordScan::Complete(hs) => Some(hs),
+			_ => None,
+		}
+	}
+
 	#[test]
-	fn test_declared_client_hello_len() {
-		// record header (5) + handshake header (4) + declared handshake length.
+	fn test_scan_handshake_records_single_record() {
 		let ch = make_client_hello(0x0303, &[0x1301], &[]);
 		let hs_len = ((ch[6] as usize) << 16) | ((ch[7] as usize) << 8) | (ch[8] as usize);
-		assert_eq!(declared_client_hello_len(&ch), Some(5 + 4 + hs_len));
-		assert_eq!(declared_client_hello_len(&ch), Some(ch.len()));
-		// Fewer than 9 bytes, or a non-handshake record type, yields None.
-		assert_eq!(declared_client_hello_len(&ch[..8]), None);
-		assert_eq!(declared_client_hello_len(&[0x17, 0x03, 0x03, 0, 0, 0, 0, 0, 5]), None);
+		let hs = scan_complete(&ch).expect("single record should be complete");
+		assert_eq!(hs.len(), 4 + hs_len);
+		assert_eq!(hs, &ch[5..]);
+	}
+
+	#[test]
+	fn test_scan_handshake_records_needs_more() {
+		let ch = make_client_hello(0x0303, &[0x1301], &[]);
+		// Fewer than 5 bytes: still waiting on the record header itself.
+		assert!(matches!(scan_handshake_records(&ch[..4]), RecordScan::NeedMoreRaw(5)));
+		// Record header known, but the record's declared payload isn't fully buffered yet.
+		assert!(matches!(scan_handshake_records(&ch[..8]), RecordScan::NeedMoreRaw(n) if n == ch.len()));
+		assert!(matches!(scan_handshake_records(&ch[..ch.len() - 1]), RecordScan::NeedMoreRaw(n) if n == ch.len()));
+	}
+
+	#[test]
+	fn test_scan_handshake_records_rejects_non_handshake_record() {
+		// content_type 0x17 = application data, not a Handshake record.
+		assert!(matches!(
+			scan_handshake_records(&[0x17, 0x03, 0x03, 0, 5]),
+			RecordScan::Invalid
+		));
+		// A single byte is already enough to know plain HTTP ('G') isn't TLS.
+		assert!(matches!(scan_handshake_records(b"G"), RecordScan::Invalid));
+	}
+
+	#[test]
+	fn test_scan_handshake_records_rejects_non_client_hello_message_type() {
+		// content_type Handshake, but msg_type 0x02 (ServerHello) instead of 0x01 (ClientHello).
+		let mut record = vec![0x16, 0x03, 0x03, 0x00, 0x04];
+		record.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]);
+		assert!(matches!(scan_handshake_records(&record), RecordScan::Invalid));
+	}
+
+	#[test]
+	fn test_scan_handshake_records_reassembles_across_multiple_records() {
+		// One ClientHello handshake message split across two TLS Handshake records — each
+		// with its own 5-byte record header — must reassemble to the same handshake bytes as
+		// the equivalent single-record encoding.
+		let ch = make_client_hello(0x0303, &[0x1301, 0x1302], &[make_sni_ext(b"example.com")]);
+		let hs_layer = &ch[5..]; // handshake header + body, no record header
+		let split = hs_layer.len() / 2;
+		let mut multi = Vec::new();
+		for chunk in [&hs_layer[..split], &hs_layer[split..]] {
+			multi.push(0x16);
+			multi.extend_from_slice(&[0x03, 0x01]);
+			multi.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+			multi.extend_from_slice(chunk);
+		}
+		let hs = scan_complete(&multi).expect("multi-record hello should reassemble to complete");
+		assert_eq!(hs, hs_layer, "reassembled handshake bytes must match the single-record encoding");
 	}
 
 	// ── peek reassembly (fragmented ClientHello) ──────────────────────────────
@@ -930,6 +1043,85 @@ mod tests {
 		.await;
 
 		assert!(!info.complete, "a stalled partial hello must be marked incomplete");
+	}
+
+	#[tokio::test]
+	async fn peek_reassembles_client_hello_split_across_multiple_tls_records() {
+		// The blocklist-bypass case hdbjeff's review flagged: a ClientHello divided across
+		// TWO separate TLS Handshake records (not just two TCP writes of one record). Each
+		// continuation record's own 5-byte header must be stripped, not parsed as hello body.
+		let hello = make_client_hello(
+			0x0303,
+			&[0x1301, 0x1302],
+			&[make_sni_ext(b"example.com"), make_sig_algs_ext(&[0x0403, 0x0804])],
+		);
+		let hs_layer = hello[5..].to_vec(); // handshake header + body, no record header
+		let split = hs_layer.len() / 2;
+		let mut wire = Vec::new();
+		for chunk in [&hs_layer[..split], &hs_layer[split..]] {
+			wire.push(0x16);
+			wire.extend_from_slice(&[0x03, 0x01]);
+			wire.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+			wire.extend_from_slice(chunk);
+		}
+
+		let expected = parse_client_hello(&hello);
+
+		let info = peek_with_client(Duration::from_secs(5), move |mut sock| async move {
+			use tokio::io::AsyncWriteExt;
+			sock.write_all(&wire).await.unwrap();
+			tokio::time::sleep(Duration::from_secs(2)).await;
+		})
+		.await;
+
+		assert!(info.complete, "hello split across TLS records should reassemble to complete");
+		assert_eq!(info.sni.as_deref(), Some("example.com"));
+		assert_eq!(
+			info.ja4, expected.ja4,
+			"fingerprint from a multi-record hello must match the equivalent single-record hello \
+			 — otherwise a JA4 blocklist entry for this client can be bypassed by splitting records"
+		);
+	}
+
+	#[tokio::test]
+	async fn peek_fails_fast_on_non_tls_traffic() {
+		// Plain HTTP (or any non-TLS prefix) must be rejected as soon as the first byte proves
+		// it, not after burning the full reassembly timeout polling for more bytes that will
+		// never turn it into a ClientHello (pre-protection DoS).
+		let start = std::time::Instant::now();
+		let info = peek_with_client(Duration::from_secs(5), |mut sock| async move {
+			use tokio::io::AsyncWriteExt;
+			sock.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+			tokio::time::sleep(Duration::from_secs(2)).await;
+		})
+		.await;
+		assert!(!info.complete);
+		assert!(
+			start.elapsed() < Duration::from_secs(1),
+			"non-TLS input should be rejected promptly, not after the full timeout: {:?}",
+			start.elapsed()
+		);
+	}
+
+	#[tokio::test]
+	async fn peek_fails_fast_on_non_client_hello_handshake() {
+		// A Handshake record whose message type isn't ClientHello (e.g. a stray ServerHello)
+		// must also be rejected promptly rather than polling out the timeout.
+		let mut record = vec![0x16, 0x03, 0x03, 0x00, 0x04];
+		record.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // msg_type = ServerHello
+		let start = std::time::Instant::now();
+		let info = peek_with_client(Duration::from_secs(5), move |mut sock| async move {
+			use tokio::io::AsyncWriteExt;
+			sock.write_all(&record).await.unwrap();
+			tokio::time::sleep(Duration::from_secs(2)).await;
+		})
+		.await;
+		assert!(!info.complete);
+		assert!(
+			start.elapsed() < Duration::from_secs(1),
+			"non-ClientHello handshake should be rejected promptly, not after the full timeout: {:?}",
+			start.elapsed()
+		);
 	}
 
 	#[test]

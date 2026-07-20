@@ -647,4 +647,27 @@ describe('Protection – fingerprint blocklist validation', () => {
 		const proxy = build({ ja3Blocklist: ['0123456789abcdef0123456789abcdef'] });
 		assert.ok(proxy);
 	});
+
+	it('accepts an uppercase ja4Blocklist entry (normalized before validation)', () => {
+		// Matching is documented as case-insensitive; validation must normalize first so a
+		// fully uppercase — but otherwise well-formed — fingerprint isn't wrongly rejected.
+		const proxy = build({ ja4Blocklist: ['T13D1516H2_8DAAF6152771_02713D6AF862'] });
+		assert.ok(proxy);
+	});
+
+	it('rejects a ja4Blocklist entry symphony could never produce', () => {
+		// symphony only computes JA4 for TLS-over-TCP ('t') at versions it actually speaks
+		// (00/10/11/12/13) — a 'q'/'d' transport prefix or an unreachable version passes the
+		// old length/charset-only validation but can never match, so it must be rejected too.
+		assert.throws(
+			() => build({ ja4Blocklist: ['q13i070500_1234567890ab_abcdef012345'] }),
+			/invalid ja4Blocklist/,
+			'QUIC prefix should be rejected',
+		);
+		assert.throws(
+			() => build({ ja4Blocklist: ['t99d1516h2_8daaf6152771_02713d6af862'] }),
+			/invalid ja4Blocklist/,
+			'unreachable version should be rejected',
+		);
+	});
 });
