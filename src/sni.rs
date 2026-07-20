@@ -17,7 +17,10 @@ const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(5);
 const PEEK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Information extracted from a TLS ClientHello via MSG_PEEK.
-#[derive(Debug)]
+///
+/// The derived `Default` (`sni: None`, `ja3`/`ja4` empty, `complete: false`) is exactly the
+/// "unreadable/absent ClientHello" case — an incomplete hello with no trustworthy fingerprint.
+#[derive(Debug, Default)]
 pub struct PeekInfo {
 	/// SNI hostname, if present in the ClientHello.
 	pub sni: Option<String>,
@@ -33,13 +36,6 @@ pub struct PeekInfo {
 	/// for enforcement — a client can fragment the ClientHello to force a different/empty
 	/// fingerprint here while rustls later reads the complete handshake (blocklist bypass).
 	pub complete: bool,
-}
-
-impl Default for PeekInfo {
-	fn default() -> Self {
-		// An unreadable/absent ClientHello is not a complete one.
-		PeekInfo { sni: None, ja3: String::new(), ja4: String::new(), complete: false }
-	}
 }
 
 /// Result of scanning as many buffered TLS records as are available for a ClientHello.
