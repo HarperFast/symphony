@@ -607,7 +607,7 @@ mod tests {
 	}
 
 	fn peek_with_ja3(hex: &str) -> PeekInfo {
-		PeekInfo { ja3: hex.to_string(), ..Default::default() }
+		PeekInfo { ja3: hex.to_string(), complete: true, ..Default::default() }
 	}
 
 	#[test]
