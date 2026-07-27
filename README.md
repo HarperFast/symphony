@@ -599,21 +599,113 @@ attestation roadmap, and the shared-responsibility split for DDoS — see
 
 ## Metrics & monitoring
 
+### In-process (`proxy.metrics()`)
+
 ```typescript
 const m = proxy.metrics();
-// m.activeConnections — connections being proxied right now
-// m.blockedConnections — total blocked since start
-// m.pendingSuspended — connections currently held waiting for resolveConnection()
+// Proxy-wide
+// m.activeConnections     — connections being proxied right now
+// m.blockedConnections    — total rejected since start (protection + maxConnections)
+// m.pendingSuspended      — connections held waiting for resolveConnection()
+// m.suspendedResolved     — suspended connections that were resolved with a route
+// m.suspendedUnresolved   — suspended connections that timed out or were rejected
+// m.routes                — routes in the live table, including the default route
+// m.failingRoutes         — routes whose cert failed to build (see "Per-route certificates")
+
+// Per listener, in configuration order
+for (const l of m.listeners) {
+  // l.address, l.mode ('tls' | 'http')
+  // l.activeConnections, l.accepted
+  // l.bytesReceived — bytes read from clients   (client → upstream)
+  // l.bytesSent     — bytes written to clients  (upstream → client)
+  //   Counted where the proxy sees the bytes: plaintext on a terminated-TLS route, wire bytes
+  //   on a passthrough route. The handshake is not included in either.
+  // l.blockedByReason — [{ reason: 'rate_limited', count: 12 }, ...]
+  // l.errorsByReason  — [{ reason: 'upstream_connect', count: 3 }, ...]
+}
 
 const blocked = proxy.blockedIps();
 // blocked.rateLimited — IPs with a depleted per-second or sustained token bucket
 // blocked.concurrencyLimited — IPs at their maxConcurrentPerIp limit
 // blocked.cidrBlocklist — the configured static CIDR blocklist
 // blocked.penaltyBoxed — IPs currently in the penalty box
+```
 
-setInterval(() => {
-  console.log('active:', proxy.metrics().activeConnections);
-}, 10_000);
+Every reason is reported on every call, including reasons still at zero, so a dashboard series
+exists before the first incident rather than appearing mid-outage. The per-reason counts sum to
+`l.blocked` / `l.errors` by construction.
+
+**Block reasons:** `max_connections`, `cidr_blocked`, `ja3_blocked`, `ja4_blocked`,
+`incomplete_handshake`, `no_sni`, `rate_limited`, `too_many_connections`, `penalty_boxed`.
+
+**Error reasons:** `no_route`, `route_rate_limited`, `suspend_unresolved`, `tls_handshake`,
+`tls_missing_cert`, `upstream_connect`, `idle_timeout`, `stream`, `http_header`.
+
+### Out-of-process (`symphony-server` admin endpoint)
+
+When symphony runs as its own process there is no JS API to call, so the server bin can expose
+the same numbers over HTTP. Add an `admin` block to the config file:
+
+```json
+{
+  "version": 1,
+  "admin": {
+    "socketPath": "/run/symphony/admin.sock",
+    "socketMode": 432,
+    "port": 9095,
+    "host": "127.0.0.1"
+  },
+  "proxies": [ ... ]
+}
+```
+
+Both bindings are optional; give either or both. Omit the `admin` block entirely and nothing is
+exposed. `socketPath` may be relative to the config file's directory, and is chmodded to
+`socketMode` (default `0o660`) after bind. `host` defaults to `127.0.0.1` — metrics carry no
+tenant identifiers, but there is still no reason to publish them off-box.
+
+| Route | Response |
+|---|---|
+| `GET /metrics` | Prometheus text exposition (v0.0.4) |
+| `GET /metrics.json` | the same snapshot as JSON |
+| `GET /health` | `{ ok, pid, version, ports }` |
+
+```
+$ curl --unix-socket /run/symphony/admin.sock http://localhost/metrics
+# HELP symphony_build_info Always 1; the version is carried in the label.
+# TYPE symphony_build_info gauge
+symphony_build_info{version="0.5.0"} 1
+...
+symphony_listener_accepted_total{proxy="80,443",listener="0.0.0.0:443",mode="tls"} 148213
+symphony_listener_blocked_total{proxy="80,443",listener="0.0.0.0:443",mode="tls",reason="rate_limited"} 27
+symphony_listener_errors_total{proxy="80,443",listener="0.0.0.0:443",mode="tls",reason="upstream_connect"} 4
+```
+
+The `proxy` label is the port-set of the proxy entry the listener belongs to (each config entry
+gets its own route table). Blocked and error counts are only ever emitted with their `reason`
+label — the labelled series sum to the total, so use `sum without(reason)` rather than looking
+for a separate unlabelled metric. Likewise the proxy-wide active-connection gauge is
+`sum without(listener) (symphony_listener_active_connections)`.
+
+The endpoint is strictly read-only and best-effort: it never blocks proxying, and a bind failure
+is logged and retried every 5s rather than aborting startup. That matters during a version
+upgrade, where the incumbent still holds the socket while the replacement is already serving
+traffic through `SO_REUSEPORT` — the successor picks up the admin endpoint once the old process
+exits. A socket file left behind by a `SIGKILL`ed process is reclaimed automatically, but only
+after a connect probe proves nobody is listening on it.
+
+The renderer is exported for consumers that want the same output from an embedded proxy:
+
+```typescript
+import { renderPrometheus } from '@harperfast/symphony';
+
+const text = renderPrometheus({
+  pid: process.pid,
+  version: '0.5.0',
+  startedAt,
+  reloadedAt,
+  proxies: [{ ports: '80,443', metrics: proxy.metrics() }],
+});
 ```
 
 ---

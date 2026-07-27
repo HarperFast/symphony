@@ -239,6 +239,22 @@ export class SymphonyProxy extends EventEmitter {
 			activeConnections: m.activeConnections,
 			blockedConnections: m.blockedConnections,
 			pendingSuspended: m.pendingSuspended,
+			suspendedResolved: m.suspendedResolved,
+			suspendedUnresolved: m.suspendedUnresolved,
+			routes: m.routes,
+			failingRoutes: m.failingRoutes,
+			listeners: m.listeners.map((l) => ({
+				address: l.address,
+				mode: l.mode as 'tls' | 'http',
+				activeConnections: l.activeConnections,
+				accepted: l.accepted,
+				blocked: l.blocked,
+				errors: l.errors,
+				bytesReceived: l.bytesReceived,
+				bytesSent: l.bytesSent,
+				blockedByReason: l.blockedByReason.map((c) => ({ reason: c.reason, count: c.count })),
+				errorsByReason: l.errorsByReason.map((c) => ({ reason: c.reason, count: c.count })),
+			})),
 		};
 	}
 
