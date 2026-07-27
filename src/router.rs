@@ -164,6 +164,17 @@ pub struct RouteTable {
 }
 
 impl RouteTable {
+	/// Number of routes serving traffic, including the default route if one is configured.
+	pub fn route_count(&self) -> usize {
+		self.exact.len() + self.wildcard.len() + usize::from(self.default.is_some())
+	}
+
+	/// Number of SNIs whose cert failed to build in this table — either dropped, or serving a
+	/// carried-forward last-good cert. Non-zero means a rotation needs attention.
+	pub fn failing_route_count(&self) -> usize {
+		self.failing_snis.len()
+	}
+
 	pub fn resolve(&self, sni: Option<&str>) -> Option<&Route> {
 		let Some(sni) = sni else {
 			return self.default.as_ref();

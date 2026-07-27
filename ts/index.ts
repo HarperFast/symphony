@@ -12,6 +12,8 @@ export type {
 	RateLimitConfig,
 	HotConfig,
 	ProxyMetrics,
+	ListenerMetrics,
+	LabeledCount,
 	BlockedIpsInfo,
 	SuspendedConnection,
 	ResolveRoute,
@@ -20,3 +22,5 @@ export type {
 	SuspendedEvent,
 	ErrorEvent,
 } from './types.js';
+export { renderPrometheus } from './admin.js';
+export type { AdminConfig, MetricsSnapshot, ProxySnapshot } from './admin.js';

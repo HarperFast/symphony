@@ -118,10 +118,40 @@ export interface JsHotConfig {
    */
   protection?: Array<JsListenerProtectionHotConfig>
 }
+/** A single labelled counter — one entry per block/error reason. */
+export interface JsLabeledCount {
+  reason: string
+  count: number
+}
+export interface JsListenerMetrics {
+  /** "host:port" — matches the `listener` field on emitted events. */
+  address: string
+  /** "tls" or "http". */
+  mode: string
+  activeConnections: number
+  accepted: number
+  blocked: number
+  errors: number
+  /** Bytes read from clients (client → upstream). */
+  bytesReceived: number
+  /** Bytes written to clients (upstream → client). */
+  bytesSent: number
+  blockedByReason: Array<JsLabeledCount>
+  errorsByReason: Array<JsLabeledCount>
+}
 export interface JsProxyMetrics {
   activeConnections: number
   blockedConnections: number
   pendingSuspended: number
+  /** Suspended connections that JS resolved with a route. */
+  suspendedResolved: number
+  /** Suspended connections that timed out or were rejected. */
+  suspendedUnresolved: number
+  /** Routes currently in the live table, including the default route. */
+  routes: number
+  /** Routes whose cert failed to build — dropped, or serving a carried-forward last-good cert. */
+  failingRoutes: number
+  listeners: Array<JsListenerMetrics>
 }
 export interface JsBlockedIpsInfo {
   rateLimited: Array<string>

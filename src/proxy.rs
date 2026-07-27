@@ -147,11 +147,47 @@ pub struct JsHotConfig {
 	pub protection: Option<Vec<JsListenerProtectionHotConfig>>,
 }
 
+/// A single labelled counter — one entry per block/error reason.
+#[napi(object)]
+pub struct JsLabeledCount {
+	pub reason: String,
+	pub count: f64,
+}
+
+#[napi(object)]
+pub struct JsListenerMetrics {
+	/// "host:port" — matches the `listener` field on emitted events.
+	pub address: String,
+	/// "tls" or "http".
+	pub mode: String,
+	pub active_connections: f64,
+	pub accepted: f64,
+	pub blocked: f64,
+	pub errors: f64,
+	/// Bytes read from clients (client → upstream).
+	pub bytes_received: f64,
+	/// Bytes written to clients (upstream → client).
+	pub bytes_sent: f64,
+	pub blocked_by_reason: Vec<JsLabeledCount>,
+	pub errors_by_reason: Vec<JsLabeledCount>,
+}
+
+// Counters are reported as f64 because napi maps u64 to BigInt, which JSON.stringify cannot
+// serialise. f64 is exact to 2^53, so a byte counter stays exact past 9 PB per listener.
 #[napi(object)]
 pub struct JsProxyMetrics {
 	pub active_connections: f64,
 	pub blocked_connections: f64,
 	pub pending_suspended: f64,
+	/// Suspended connections that JS resolved with a route.
+	pub suspended_resolved: f64,
+	/// Suspended connections that timed out or were rejected.
+	pub suspended_unresolved: f64,
+	/// Routes currently in the live table, including the default route.
+	pub routes: f64,
+	/// Routes whose cert failed to build — dropped, or serving a carried-forward last-good cert.
+	pub failing_routes: f64,
+	pub listeners: Vec<JsListenerMetrics>,
 }
 
 #[napi(object)]
@@ -188,6 +224,13 @@ struct InternalListener {
 	addr: SocketAddr,
 	max_connections: u32,
 	mode: ListenerMode,
+}
+
+fn labeled_counts(counts: Vec<(&'static str, u64)>) -> Vec<JsLabeledCount> {
+	counts
+		.into_iter()
+		.map(|(reason, count)| JsLabeledCount { reason: reason.to_string(), count: count as f64 })
+		.collect()
 }
 
 /// Per-listener runtime state.
@@ -553,10 +596,40 @@ impl SymphonyProxyWrap {
 
 	#[napi]
 	pub fn metrics(&self) -> JsProxyMetrics {
+		let table = self.route_table.0.load();
+
+		// `listeners` and `listener_states` are built in lockstep in the constructor and never
+		// mutated, so index i refers to the same listener in both.
+		let listeners = self
+			.listeners
+			.iter()
+			.zip(self.listener_states.iter())
+			.map(|(listener, state)| JsListenerMetrics {
+				address: state.addr.clone(),
+				mode: match listener.mode {
+					ListenerMode::Tls => "tls".to_string(),
+					ListenerMode::Http => "http".to_string(),
+				},
+				active_connections: state.metrics.active_connections.load(Ordering::Relaxed) as f64,
+				accepted: state.metrics.total_accepted.load(Ordering::Relaxed) as f64,
+				blocked: state.metrics.total_blocked.load(Ordering::Relaxed) as f64,
+				errors: state.metrics.total_errors.load(Ordering::Relaxed) as f64,
+				bytes_received: state.metrics.bytes_in.load(Ordering::Relaxed) as f64,
+				bytes_sent: state.metrics.bytes_out.load(Ordering::Relaxed) as f64,
+				blocked_by_reason: labeled_counts(state.metrics.blocked_by_reason()),
+				errors_by_reason: labeled_counts(state.metrics.errors_by_reason()),
+			})
+			.collect();
+
 		JsProxyMetrics {
 			active_connections: self.global_metrics.active_connections.load(Ordering::Relaxed) as f64,
 			blocked_connections: self.global_metrics.total_blocked.load(Ordering::Relaxed) as f64,
 			pending_suspended: self.global_metrics.pending_suspended.load(Ordering::Relaxed) as f64,
+			suspended_resolved: self.global_metrics.suspended_resolved.load(Ordering::Relaxed) as f64,
+			suspended_unresolved: self.global_metrics.suspended_unresolved.load(Ordering::Relaxed) as f64,
+			routes: table.route_count() as f64,
+			failing_routes: table.failing_route_count() as f64,
+			listeners,
 		}
 	}
 

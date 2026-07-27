@@ -1,4 +1,4 @@
-use crate::metrics::{GlobalMetrics, ListenerMetrics};
+use crate::metrics::{BlockKind, CountingStream, ErrorKind, GlobalMetrics, ListenerMetrics};
 use crate::protection::{IpState, ProtectionState};
 use crate::router::{Destination, ForwardFingerprint, LiveRouteTable, SourceAddressMode};
 use crate::sni;
@@ -84,7 +84,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	if let Some(protection) = &ctx.protection {
 		match protection.check(peer_ip, &peek_info) {
 			crate::protection::Decision::Block(reason) => {
-				ctx.listener_metrics.inc_blocked();
+				ctx.listener_metrics.inc_blocked(BlockKind::from(&reason));
 				ctx.global_metrics.inc_blocked();
 				emit(&ctx.js_emit, JsEvent::Blocked {
 					ip: peer_ip.to_string(),
@@ -110,7 +110,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	let route = match table.resolve(sni_str) {
 		Some(r) => r.clone(),
 		None => {
-			ctx.listener_metrics.inc_error();
+			ctx.listener_metrics.inc_error(ErrorKind::NoRoute);
 			return; // No route and no default — drop
 		}
 	};
@@ -118,7 +118,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	// ── 3b. Per-route rate limit ──────────────────────────────────────────────
 	if let Some(rl) = &route.rate_limiter {
 		if !rl.try_acquire() {
-			ctx.listener_metrics.inc_error();
+			ctx.listener_metrics.inc_error(ErrorKind::RouteRateLimited);
 			return;
 		}
 	}
@@ -140,12 +140,13 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 			Ok(Ok(Some(r))) => r,
 			_ => {
 				ctx.suspended_registry.remove(id);
-				ctx.global_metrics.dec_suspended();
+				ctx.global_metrics.dec_suspended(false);
+				ctx.listener_metrics.inc_error(ErrorKind::SuspendUnresolved);
 				return; // Timed out or rejected
 			}
 		};
 
-		ctx.global_metrics.dec_suspended();
+		ctx.global_metrics.dec_suspended(true);
 
 		EffectiveRoute {
 			destination: resolved.destination,
@@ -203,17 +204,17 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 				}
 				Ok(Err(e)) => {
 					tracing::debug!("TLS handshake error from {peer_ip}: {e}");
-					ctx.listener_metrics.inc_error();
+					ctx.listener_metrics.inc_error(ErrorKind::TlsHandshake);
 					return;
 				}
 				Err(_) => {
 					tracing::debug!("TLS handshake timeout from {peer_ip}");
-					ctx.listener_metrics.inc_error();
+					ctx.listener_metrics.inc_error(ErrorKind::TlsHandshake);
 					return;
 				}
 			}
 		} else {
-			ctx.listener_metrics.inc_error();
+			ctx.listener_metrics.inc_error(ErrorKind::TlsMissingCert);
 			return;
 		}
 	} else {
@@ -221,32 +222,38 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		proxy_raw(stream, &effective_route.destination, sf, &ctx).await
 	};
 
-	if upstream_result.is_err() {
-		ctx.listener_metrics.inc_error();
+	if let Err(kind) = upstream_result {
+		ctx.listener_metrics.inc_error(kind);
 	}
 }
 
 // ── Proxy helpers ─────────────────────────────────────────────────────────────
 
 async fn proxy_via_tls(
-	mut client: tokio_rustls::server::TlsStream<TcpStream>,
+	client: tokio_rustls::server::TlsStream<TcpStream>,
 	dest: &Destination,
 	sf: SourceForwarding<'_>,
 	ctx: &ConnContext,
-) -> std::io::Result<()> {
+) -> std::result::Result<(), ErrorKind> {
 	// TLS facts (incl. the verified mTLS client cert chain) forwarded via PROXY v2
 	// TLVs; only collected on routes that can carry them.
 	let tls_forward = matches!(sf.mode, SourceAddressMode::ProxyProtocolV2)
 		.then(|| collect_tls_forward(client.get_ref().1));
 	let sf = SourceForwarding { tls: tls_forward.as_ref(), ..sf };
 
-	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
-		.await
-		.map_err(|e| std::io::Error::other(e.to_string()))?;
-
 	// HTTP-header injection is only valid for a plaintext HTTP/1 upstream. An h2-negotiated
 	// upstream receives binary frames, so text header insertion would corrupt them.
+	// Read before wrapping — the counter has no view of the TLS session.
 	let l7_http1 = client.get_ref().1.alpn_protocol() != Some(b"h2".as_ref());
+
+	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
+		.await
+		.map_err(|e| {
+			tracing::debug!("upstream connect failed for {}: {e}", sf.peer_addr.ip());
+			ErrorKind::UpstreamConnect
+		})?;
+
+	let mut client = CountingStream::new(client, &ctx.listener_metrics);
 
 	match &mut upstream {
 		UpstreamStream::Tcp(ref mut up) => forward(&mut client, up, &sf, l7_http1, ctx.idle_timeout).await,
@@ -257,14 +264,19 @@ async fn proxy_via_tls(
 }
 
 async fn proxy_raw(
-	mut client: TcpStream,
+	client: TcpStream,
 	dest: &Destination,
 	sf: SourceForwarding<'_>,
 	ctx: &ConnContext,
-) -> std::io::Result<()> {
+) -> std::result::Result<(), ErrorKind> {
 	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
 		.await
-		.map_err(|e| std::io::Error::other(e.to_string()))?;
+		.map_err(|e| {
+			tracing::debug!("upstream connect failed for {}: {e}", sf.peer_addr.ip());
+			ErrorKind::UpstreamConnect
+		})?;
+
+	let mut client = CountingStream::new(client, &ctx.listener_metrics);
 
 	// Passthrough forwards raw TLS bytes — never a plaintext HTTP/1 stream, so header injection
 	// is disabled (only PROXY protocol carriers apply here).
@@ -287,7 +299,7 @@ async fn forward<C, U>(
 	sf: &SourceForwarding<'_>,
 	l7_http1: bool,
 	idle: Duration,
-) -> std::io::Result<()>
+) -> std::result::Result<(), ErrorKind>
 where
 	C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 	U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -301,12 +313,15 @@ where
 			crate::http_proxy::proxy_http1_rewriting(client, upstream, &rewrites).await
 		}
 	};
+	// The idle timeout is reported as its own kind rather than inferred from an
+	// `io::ErrorKind::TimedOut`, which a peer's kernel-level ETIMEDOUT would also produce.
 	if idle.is_zero() {
-		body.await
+		body.await.map_err(|_| ErrorKind::Stream)
 	} else {
-		timeout(idle, body)
-			.await
-			.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout"))?
+		match timeout(idle, body).await {
+			Ok(result) => result.map_err(|_| ErrorKind::Stream),
+			Err(_) => Err(ErrorKind::IdleTimeout),
+		}
 	}
 }
 

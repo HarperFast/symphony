@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, renameSync, unlinkSync, watch } from 'node
 import { dirname, isAbsolute, join, basename } from 'node:path';
 import { SymphonyProxy } from './index.js';
 import type { ProxyConfig, ListenerConfig, RouteConfig, CertConfig, MtlsConfig } from './index.js';
+import { AdminServer, type AdminConfig, type MetricsSnapshot } from './admin.js';
 
 // package.json sits at the package root, which is 1 level above dist/server.js (production
 // layout) or 2 levels above dist-test/ts/server.js (test layout) — try both, like loadAddon.
@@ -56,6 +57,8 @@ interface FileProxyConfig {
 
 interface ConfigFile {
 	version?: number;
+	/** Optional read-only metrics/health endpoint. Omit to expose nothing. */
+	admin?: AdminConfig;
 	proxies: FileProxyConfig[];
 }
 
@@ -145,7 +148,9 @@ class ServerState {
 	private readonly statusPath: string;
 	private readonly baseDir: string;
 	private readonly active = new Map<string, ActiveProxy>();
+	private readonly admin: AdminServer;
 	private startedAt = '';
+	private reloadedAt = '';
 	private reloading: Promise<void> = Promise.resolve();
 	private watcher: ReturnType<typeof watch> | null = null;
 	// Cert/key files referenced by the current config, watched for rotation. Keyed by
@@ -159,6 +164,19 @@ class ServerState {
 		this.configPath = configPath;
 		this.statusPath = statusPath;
 		this.baseDir = dirname(configPath);
+		this.admin = new AdminServer(() => this.metricsSnapshot(), log, logErr);
+	}
+
+	// Read live on each request rather than cached, so a scrape never serves counters frozen at
+	// the last reconcile.
+	private metricsSnapshot(): MetricsSnapshot {
+		return {
+			pid: process.pid,
+			version: pkg.version,
+			startedAt: this.startedAt,
+			reloadedAt: this.reloadedAt,
+			proxies: [...this.active].map(([ports, entry]) => ({ ports, metrics: entry.proxy.metrics() })),
+		};
 	}
 
 	private readConfig(): ConfigFile | null {
@@ -337,6 +355,15 @@ class ServerState {
 		// renewal on disk (no config.json write) triggers a reconcile and live reload.
 		this.updateCertWatchers(config);
 
+		// Rebinds only if the admin block changed. Never throws — the endpoint is
+		// observability, and losing it must not abort a reconcile that already applied routes.
+		const admin = config.admin && {
+			...config.admin,
+			socketPath: config.admin.socketPath ? resolvePath(config.admin.socketPath, this.baseDir) : undefined,
+		};
+		await this.admin.update(admin).catch((err) => logErr('admin endpoint update failed:', (err as Error).message));
+
+		this.reloadedAt = new Date().toISOString();
 		this.writeStatus();
 	}
 
@@ -346,7 +373,7 @@ class ServerState {
 			pid: process.pid,
 			version: pkg.version,
 			startedAt: this.startedAt,
-			reloadedAt: new Date().toISOString(),
+			reloadedAt: this.reloadedAt,
 			configPath: this.configPath,
 			ports,
 		};
@@ -386,6 +413,7 @@ class ServerState {
 		}
 		for (const w of this.certWatchers.values()) w.close();
 		this.certWatchers.clear();
+		await this.admin.stop().catch((err) => logErr('stopping admin endpoint:', (err as Error).message));
 		await this.reloading.catch(() => {});
 		for (const [key, entry] of this.active) {
 			await entry.proxy.stop().catch((err) => logErr(`stopping proxy [${key}]:`, err));

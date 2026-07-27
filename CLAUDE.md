@@ -12,6 +12,18 @@ symphony is a **napi-rs cdylib** loaded by Node.js. The tokio multi-thread runti
 
 For consumers that want symphony as its own OS process rather than embedded in their Node app, the package ships a `symphony-server` bin. It reads a JSON config file (`{ version, proxies: [{ listeners, routes }] }` — one entry per port-set, since the route table is per-proxy), constructs a `SymphonyProxy` per entry, and **watches the config file** to hot-reload (route change → `updateConfig`; listener change → recreate that proxy). Cert material may be given inline (`certChain`/`privateKey`) or by path (`certChainFile`/`privateKeyFile`) — the path form is resolved in `server.ts` only, so the napi `CertConfig` stays inline-only. It writes a `status.json` (`{ pid, version, ports, ... }`) for supervisors, and handles `SIGHUP` (reload) / `SIGTERM`/`SIGINT` (graceful stop). host-manager uses this to supervise symphony out-of-process.
 
+### Admin/metrics endpoint (`ts/admin.ts`)
+
+An optional `admin` block in the config file (`{ socketPath?, socketMode?, port?, host? }`) makes `symphony-server` expose `GET /metrics` (Prometheus text), `/metrics.json`, and `/health` over a Unix socket, a loopback TCP port, or both. It exists because an out-of-process symphony has no reachable napi `metrics()` — the endpoint is the only export path for that deployment.
+
+Three properties are load-bearing and easy to regress:
+
+- **It must never affect proxying.** A bind failure is logged and retried on a 5s timer instead of throwing out of `doReconcile()`. This is not defensiveness for its own sake: during a version upgrade host-manager runs both processes concurrently (the Rust listeners overlap via `SO_REUSEPORT`, which a Node HTTP server has no equivalent for), so the successor *will* lose the admin bind for a few seconds and must keep serving traffic anyway.
+- **A stale Unix socket is reclaimed, a live one is not.** `EADDRINUSE` on a socket path triggers a connect probe; only `ECONNREFUSED` (nobody listening) justifies the `unlink`. Unlinking unconditionally would let a starting process silently steal the endpoint from the running one — the same class of bug as the `status.json` ownership guard.
+- **Counters are read per request**, not cached at reconcile, so a scrape never serves numbers frozen at the last config reload.
+
+Prometheus shape: blocked/error counts are emitted **only** under their `reason` label (they sum to the unlabeled total, so a separate total would be a second representation of the same number), and the proxy-wide active gauge is `sum without(listener)`. `renderPrometheus` is exported from the package for embedded consumers.
+
 The server also **watches the cert/key files referenced by the config** (grouped by parent dir, deduped, re-derived on every reconcile so watchers don't leak) → a debounced `reconcile()` on change, so an on-disk cert renewal is picked up live without a `config.json` write or restart. Two details make a listener-level cert rotation actually apply: the per-proxy `listenerSig` is computed over the *resolved* listeners (cert contents included), so a rotated `defaultCert`/mTLS file changes the signature and forces a recreate rather than a route-only hot-swap against the frozen `default_listener_tls`. Basename-filtered dir watching handles in-place / rename rotation (what host-manager does); k8s projected-volume `..data` symlink swaps are not yet covered. Cert-failure resilience lives in `router.rs::build_route_table`: a route whose cert can't be built (e.g. rustls `KeyMismatch` from a rotated key vs a stale inlined chain) is isolated — one bad tenant cert never aborts the whole table; on a hot-swap the last-good route is carried forward for that SNI (mid-rotation the old cert is still valid), and on initial build the SNI is simply dropped.
 
 ### Data flow
@@ -46,7 +58,7 @@ TCP accept (SO_REUSEPORT per worker thread)
 | `src/proxy_conn.rs` | Per-connection handler: the full 7-step flow |
 | `src/protection.rs` | IP rate limiting, concurrency, CIDR lists, JA3 blocking |
 | `src/suspended.rs` | Pending-connection registry (DashMap + oneshot channels) |
-| `src/metrics.rs` | AtomicU64 counters: active, accepted, errors, blocked |
+| `src/metrics.rs` | AtomicU64 counters (active, accepted, bytes, per-reason blocks/errors) + `CountingStream` |
 | `src/error.rs` | SymphonyError enum → napi::Error conversion |
 
 ---
@@ -151,6 +163,18 @@ napi `Buffer` contains raw pointers (`*mut napi_env__`, `*mut napi_ref__`) that 
 4. Add a new `kind` case in `parse_upstream_spec()` in `proxy.rs`
 5. Add a test
 
+### Adding a new metric
+
+1. Add the counter to `ListenerMetrics`/`GlobalMetrics` in `metrics.rs`, or a variant to the
+   `labeled_enum!` block for `BlockKind`/`ErrorKind` — the variant list drives the counter array,
+   the label, and the export, so there is no second list to update.
+2. Increment it at the call site. A new `protection::BlockReason` variant will fail to compile
+   until `From<&BlockReason> for BlockKind` maps it — that is deliberate, so a new protection
+   check can't land in an unlabeled bucket.
+3. Surface it in `JsProxyMetrics`/`JsListenerMetrics` (`proxy.rs`), `ts/types.ts`, and the
+   mapping in `ts/proxy.ts`.
+4. Add the sample to `renderPrometheus` in `ts/admin.ts`, and a case in `__test__/metrics.spec.ts`.
+
 ### Adding a new napi method
 
 1. Implement in `proxy.rs` with `#[napi]`
@@ -169,6 +193,7 @@ Tests live in `__test__/` and use Node's built-in `node:test` runner.
 - **`protection.spec.ts`** — rate limit token bucket exhaustion, CIDR blocklist in `blockedIps()`
 - **`suspended.spec.ts`** — hold → resolve → proxy, hold → null → close, hold → timeout → drop
 - **`mtls.spec.ts`** — mTLS termination + PROXY v2 TLV forwarding of the client cert chain (0xE2, SSL TLV 0x20); skips without openssl
+- **`metrics.spec.ts`** — per-listener breakdown and byte counting, `renderPrometheus` output shape, the admin endpoint over UDS + TCP, and stale-socket reclaim after a `SIGKILL`
 
 Build and run:
 ```bash

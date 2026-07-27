@@ -268,6 +268,28 @@ export interface HotConfig {
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
 
+/** A counter broken out by reason. Every reason is reported, including those still at zero. */
+export interface LabeledCount {
+	reason: string;
+	count: number;
+}
+
+export interface ListenerMetrics {
+	/** "host:port" — matches the `listener` field on emitted events. */
+	address: string;
+	mode: 'tls' | 'http';
+	activeConnections: number;
+	accepted: number;
+	blocked: number;
+	errors: number;
+	/** Bytes read from clients (client → upstream). */
+	bytesReceived: number;
+	/** Bytes written to clients (upstream → client). */
+	bytesSent: number;
+	blockedByReason: LabeledCount[];
+	errorsByReason: LabeledCount[];
+}
+
 export interface ProxyMetrics {
 	/** Number of connections currently being proxied. */
 	activeConnections: number;
@@ -275,6 +297,16 @@ export interface ProxyMetrics {
 	blockedConnections: number;
 	/** Connections currently held waiting for resolveConnection(). */
 	pendingSuspended: number;
+	/** Suspended connections that were resolved with a route. */
+	suspendedResolved: number;
+	/** Suspended connections that timed out or were rejected. */
+	suspendedUnresolved: number;
+	/** Routes in the live table, including the default route. */
+	routes: number;
+	/** Routes whose cert failed to build — dropped, or serving a carried-forward last-good cert. */
+	failingRoutes: number;
+	/** Per-listener breakdown, in configuration order. */
+	listeners: ListenerMetrics[];
 }
 
 export interface BlockedIpsInfo {

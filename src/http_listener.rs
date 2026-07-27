@@ -17,6 +17,7 @@ use crate::http_proxy::{
 	host_header, read_http_headers, request_target, strip_body_framing, with_connection_close,
 };
 use crate::listener::{make_reuseport_socket, set_rlimit_nofile};
+use crate::metrics::{BlockKind, CountingStream, ErrorKind};
 use crate::proxy_conn::ConnContext;
 use crate::upstream::{self, UpstreamStream};
 use std::net::SocketAddr;
@@ -91,7 +92,10 @@ async fn accept_loop(
 							let active = ctx.global_metrics.active_connections.load(std::sync::atomic::Ordering::Relaxed);
 							if active >= max_connections as u64 {
 								drop(stream);
-								ctx.listener_metrics.inc_blocked();
+								// See listener.rs: keep the proxy-level blocked total equal to the
+								// sum across its listeners.
+								ctx.listener_metrics.inc_blocked(BlockKind::MaxConnections);
+								ctx.global_metrics.inc_blocked();
 								continue;
 							}
 						}
@@ -125,12 +129,12 @@ async fn handle_http(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<Conn
 		Ok(Ok(pair)) => pair,
 		Ok(Err(e)) => {
 			tracing::debug!("http :80 header read error from {}: {e}", peer_addr.ip());
-			ctx.listener_metrics.inc_error();
+			ctx.listener_metrics.inc_error(ErrorKind::HttpHeader);
 			return;
 		}
 		Err(_) => {
 			tracing::debug!("http :80 header read timeout from {}", peer_addr.ip());
-			ctx.listener_metrics.inc_error();
+			ctx.listener_metrics.inc_error(ErrorKind::HttpHeader);
 			return;
 		}
 	};
@@ -145,8 +149,8 @@ async fn handle_http(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<Conn
 
 	if target.starts_with(ACME_PATH_PREFIX) {
 		if let Some(host) = host {
-			if proxy_acme(&mut stream, &headers, peer_addr, host, &ctx).await.is_err() {
-				ctx.listener_metrics.inc_error();
+			if let Err(kind) = proxy_acme(&mut stream, &headers, peer_addr, host, &ctx).await {
+				ctx.listener_metrics.inc_error(kind);
 			}
 			return;
 		}
@@ -176,28 +180,30 @@ async fn proxy_acme(
 	peer_addr: SocketAddr,
 	host: &str,
 	ctx: &ConnContext,
-) -> std::io::Result<()> {
+) -> std::result::Result<(), ErrorKind> {
 	let table = ctx.route_table.0.load();
 	let Some(route) = table.resolve(Some(host)) else {
 		// No matching route — answer 404 so the ACME client gets a definitive answer
 		// rather than a hung connection.
 		let _ = write_simple_response(client, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
-		return Ok(());
+		return Err(ErrorKind::NoRoute);
 	};
 
 	// Honour the route's global rate limit the same way the TLS path does, so
 	// a flood of /.well-known/acme-challenge/ requests can't bypass the cap.
 	if let Some(rl) = &route.rate_limiter {
 		if !rl.try_acquire() {
-			ctx.listener_metrics.inc_error();
-			return Ok(());
+			return Err(ErrorKind::RouteRateLimited);
 		}
 	}
 
 	let upstream =
 		upstream::connect(&route.destination, Some(peer_addr.ip()), UPSTREAM_CONNECT_TIMEOUT)
 			.await
-			.map_err(|e| std::io::Error::other(e.to_string()))?;
+			.map_err(|e| {
+				tracing::debug!("acme upstream connect failed for {host}: {e}");
+				ErrorKind::UpstreamConnect
+			})?;
 
 	// ACME HTTP-01 challenges are GET requests with no body.  Strip any
 	// Content-Length / Transfer-Encoding headers so a client that lies about a
@@ -210,19 +216,23 @@ async fn proxy_acme(
 	// redirect path.
 	let forwarded = with_connection_close(&strip_body_framing(headers));
 
-	let result = match upstream {
-		UpstreamStream::Tcp(mut up) => proxy_one_shot(client, &mut up, &forwarded).await,
-		UpstreamStream::Uds { mut stream, _guard } => {
-			let r = proxy_one_shot(client, &mut stream, &forwarded).await;
-			drop(_guard);
-			r
+	// Scoped so the byte counter releases its borrow of `client` before the shutdown below.
+	let result = {
+		let mut counted = CountingStream::new(&mut *client, &ctx.listener_metrics);
+		match upstream {
+			UpstreamStream::Tcp(mut up) => proxy_one_shot(&mut counted, &mut up, &forwarded).await,
+			UpstreamStream::Uds { mut stream, _guard } => {
+				let r = proxy_one_shot(&mut counted, &mut stream, &forwarded).await;
+				drop(_guard);
+				r
+			}
 		}
 	};
 
 	// Always close the client socket after one request/response, regardless of
 	// the upstream outcome.  The HTTP-mode listener never reuses connections.
 	let _ = client.shutdown().await;
-	result
+	result.map_err(|_| ErrorKind::Stream)
 }
 
 /// Send the (sanitized, body-less) request `headers` to `upstream`, then copy
@@ -230,12 +240,13 @@ async fn proxy_acme(
 /// the request bytes flush — any bytes the client already pipelined past the
 /// header boundary are silently dropped, so no pipelined non-ACME payload can
 /// reach the backend.
-async fn proxy_one_shot<U>(
-	client: &mut TcpStream,
+async fn proxy_one_shot<C, U>(
+	client: &mut C,
 	upstream: &mut U,
 	headers: &[u8],
 ) -> std::io::Result<()>
 where
+	C: tokio::io::AsyncWrite + Unpin,
 	U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
 	upstream.write_all(headers).await?;
