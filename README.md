@@ -645,6 +645,10 @@ rather than only adding up while the proxy is idle.
 **Error reasons:** `no_route`, `route_rate_limited`, `suspend_unresolved`, `tls_handshake`,
 `tls_missing_cert`, `upstream_connect`, `idle_timeout`, `stream`, `http_header`.
 
+> `idle_timeout` counts terminations by `idleTimeoutMs`, which today is a *total duration* cap
+> rather than an idleness one — see [#34](https://github.com/HarperFast/symphony/issues/34). Busy
+> long-lived connections land in this bucket, not just quiet ones.
+
 ### Out-of-process (`symphony-server` admin endpoint)
 
 When symphony runs as its own process there is no JS API to call, so the server bin can expose
