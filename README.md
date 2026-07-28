@@ -698,19 +698,11 @@ traffic through `SO_REUSEPORT` — the successor picks up the admin endpoint onc
 exits. A socket file left behind by a `SIGKILL`ed process is reclaimed automatically, but only
 after a connect probe proves nobody is listening on it.
 
-The renderer is exported for consumers that want the same output from an embedded proxy:
-
-```typescript
-import { renderPrometheus } from '@harperfast/symphony';
-
-const text = renderPrometheus({
-  pid: process.pid,
-  version: '0.5.0',
-  startedAt,
-  reloadedAt,
-  proxies: [{ ports: '80,443', metrics: proxy.metrics() }],
-});
-```
+The Prometheus renderer is internal to the standalone server and is not exported from the
+package root: a snapshot carries that process's pid, timestamps, and port-set grouping, which an
+embedded consumer would have to synthesise. An embedded proxy has `proxy.metrics()` directly. If
+a caller genuinely needs Prometheus text from an embedded proxy, open an issue — the right shape
+is a `ProxyMetrics`-based renderer, not this one.
 
 ---
 

@@ -14,7 +14,9 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as net from 'node:net';
 import * as tls from 'node:tls';
-import { SymphonyProxy, renderPrometheus, type MetricsSnapshot } from '../ts/index.js';
+import { SymphonyProxy } from '../ts/index.js';
+// Not exported from the package root — the admin endpoint owns this shape (see ts/index.ts).
+import { renderPrometheus, type MetricsSnapshot } from '../ts/admin.js';
 import { generateSelfSignedCert, getFreePort, startEchoServer, tlsRoundTrip, sleep } from './util.js';
 
 const SERVER_JS = path.join(__dirname, '..', 'ts', 'server.js');
@@ -410,9 +412,11 @@ describe('symphony-server admin endpoint', () => {
 
 	after(async () => {
 		shuttingDown = true;
-		if (child && child.exitCode === null) {
+		if (child && child.exitCode === null && child.signalCode === null) {
 			child.kill('SIGTERM');
-			await waitFor(() => child.exitCode !== null, 3000).catch(() => child.kill('SIGKILL'));
+			await waitFor(() => child.exitCode !== null || child.signalCode !== null, 3000).catch(() =>
+				child.kill('SIGKILL')
+			);
 		}
 		await echo.close().catch(() => {});
 		fs.rmSync(dir, { recursive: true, force: true });
@@ -473,11 +477,19 @@ describe('symphony-server admin endpoint', () => {
 		assert.equal(res.status, 200);
 	});
 
-	it('removes the unix socket on shutdown', async () => {
+	// Shutdown deliberately does NOT unlink the published path — any check-then-unlink can delete
+	// a successor's live socket in the window between the two syscalls. What has to hold is that
+	// the endpoint stops answering; reclaiming the pathname is the next binder's job, atomically.
+	it('stops serving on shutdown and leaves the path safely reclaimable', async () => {
 		shuttingDown = true;
 		child.kill('SIGTERM');
-		await waitFor(() => child.exitCode !== null, 5000);
-		assert.equal(fs.existsSync(socketPath), false, 'the admin socket must not be left behind');
+		await waitFor(() => child.exitCode !== null || child.signalCode !== null, 5000);
+
+		await assert.rejects(
+			() => get({ socketPath }, '/health'),
+			(err: NodeJS.ErrnoException) => err.code === 'ECONNREFUSED',
+			'a dead endpoint must refuse connections, not hang or answer'
+		);
 	});
 });
 
@@ -519,9 +531,9 @@ describe('symphony-server admin endpoint (stale socket recovery)', () => {
 	});
 
 	after(async () => {
-		if (survivor && survivor.exitCode === null) {
+		if (survivor && survivor.exitCode === null && survivor.signalCode === null) {
 			survivor.kill('SIGKILL');
-			await waitFor(() => survivor!.exitCode !== null, 3000).catch(() => {});
+			await waitFor(() => survivor!.exitCode !== null || survivor!.signalCode !== null, 3000).catch(() => {});
 		}
 		fs.rmSync(dir, { recursive: true, force: true });
 	});

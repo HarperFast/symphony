@@ -55,6 +55,7 @@ export interface MetricsSnapshot {
 
 const RETRY_MS = 5_000;
 const KEEP_ALIVE_MS = 5_000;
+const PROBE_TIMEOUT_MS = 1_000;
 /** Hard ceiling on concurrent admin connections — a scrape endpoint needs a handful at most. */
 const MAX_ADMIN_CONNECTIONS = 16;
 
@@ -253,10 +254,19 @@ function socketIsReclaimable(socketPath: string): Promise<boolean> {
 		if (!stats.isSocket()) return resolve(false);
 
 		const probe = connect(socketPath);
+		let settled = false;
 		const done = (reclaimable: boolean) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
 			probe.destroy();
 			resolve(reclaimable);
 		};
+		// A frozen owner or a full accept backlog can leave the connect hanging, which would
+		// stall the reconcile that called us. Treat a hang as "not reclaimable" — something is
+		// there, and refusing to touch it is the safe reading.
+		const timer = setTimeout(() => done(false), PROBE_TIMEOUT_MS);
+		timer.unref();
 		probe.once('connect', () => done(false));
 		probe.once('error', (err: NodeJS.ErrnoException) => done(err.code === 'ECONNREFUSED'));
 	});
@@ -275,8 +285,10 @@ export class AdminServer {
 	private config: AdminConfig | null = null;
 	private retryTimer: NodeJS.Timeout | null = null;
 	private stopped = false;
-	/** The socket path this process published, and the inode it published there. */
-	private publishedSocket: { path: string; ino: number } | null = null;
+	// update(), stop(), and the retry timer all mutate the same listeners, and each of them
+	// awaits. Run them through one chain so a retry that is mid-bind can't publish its server
+	// after a later update() or stop() has already finished tearing things down.
+	private queue: Promise<void> = Promise.resolve();
 
 	constructor(
 		snapshot: () => MetricsSnapshot,
@@ -288,23 +300,32 @@ export class AdminServer {
 		this.logErr = logErr;
 	}
 
-	async update(config: AdminConfig | undefined): Promise<void> {
-		if (this.stopped) return;
-		const signature = JSON.stringify(config ?? null);
-		if (signature === this.signature) return;
-		this.signature = signature;
-		this.config = config ?? null;
-		// Drop a pending retry from the previous config — otherwise it fires seconds later and
-		// tears down the listeners this call is about to bind.
-		this.clearRetry();
-		await this.closeServers();
-		if (config && (config.socketPath || config.port !== undefined)) await this.bind();
+	/** Serialize a mutation of the listener set; failures never break the chain. */
+	private enqueue(operation: () => Promise<void>): Promise<void> {
+		this.queue = this.queue.then(operation, operation);
+		return this.queue;
 	}
 
-	async stop(): Promise<void> {
+	update(config: AdminConfig | undefined): Promise<void> {
+		return this.enqueue(async () => {
+			if (this.stopped) return;
+			const signature = JSON.stringify(config ?? null);
+			if (signature === this.signature) return;
+			this.signature = signature;
+			this.config = config ?? null;
+			// Drop a pending retry from the previous config — otherwise it fires seconds later and
+			// tears down the listeners this call is about to bind.
+			this.clearRetry();
+			await this.closeServers();
+			if (config && (config.socketPath || config.port !== undefined)) await this.bind();
+		});
+	}
+
+	stop(): Promise<void> {
+		// Set before queueing, so an operation already waiting its turn bails instead of binding.
 		this.stopped = true;
 		this.clearRetry();
-		await this.closeServers();
+		return this.enqueue(() => this.closeServers());
 	}
 
 	private clearRetry(): void {
@@ -321,7 +342,8 @@ export class AdminServer {
 		if (this.stopped || this.retryTimer) return;
 		this.retryTimer = setTimeout(() => {
 			this.retryTimer = null;
-			void this.bind();
+			// Queued like everything else, so a retry can't interleave with an update or a stop.
+			void this.enqueue(() => this.bind());
 		}, RETRY_MS);
 		this.retryTimer.unref();
 	}
@@ -364,6 +386,13 @@ export class AdminServer {
 	 * replaces the target in one step, so the path always names a socket somebody is listening
 	 * on. The precheck stays, because rename would otherwise happily clobber a *live* incumbent
 	 * during an upgrade overlap — there we want to lose and retry, not steal the endpoint.
+	 *
+	 * Nothing unlinks the published path, including on a clean shutdown. Any check-then-unlink
+	 * can delete a *successor's* socket in the window between the two syscalls, and that loss is
+	 * not self-repairing: `update()` returns early on an unchanged signature, so the successor
+	 * would keep serving an unreachable socket until its config changed or it restarted. Leaving
+	 * a stale pathname behind costs one inode in a 0o700 directory, and the next binder replaces
+	 * it atomically after proving it stale. Cheap litter beats a silently dead endpoint.
 	 */
 	private socketTarget(path: string, mode: number): BindTarget {
 		const tempPath = `${path}.${process.pid}`;
@@ -378,11 +407,6 @@ export class AdminServer {
 			onBound: () => {
 				chmodSync(tempPath, mode);
 				renameSync(tempPath, path);
-				// server.close() unlinks the path it bound — the temp one — so the published path
-				// is ours to clean up. Record the inode to do that safely: if another process has
-				// since renamed its own socket over this path, the inode differs and we leave it
-				// alone rather than deleting a live endpoint (cf. the status.json ownership guard).
-				this.publishedSocket = { path, ino: lstatSync(path).ino };
 			},
 			cleanup: () => {
 				try {
@@ -479,28 +503,5 @@ export class AdminServer {
 					})
 			)
 		);
-		this.unpublishSocket();
-	}
-
-	/**
-	 * Remove the published socket path, but only while it still names the inode we put there.
-	 *
-	 * The check and the unlink are two syscalls, so this narrows the race rather than closing it:
-	 * a successor that renames its socket into place between them still loses its published path
-	 * (it keeps serving an unlinked inode until its next reconcile republishes). Closing that
-	 * would need file locking, and the exposure is one observability endpoint that self-heals —
-	 * unlike the probe→unlink→bind window this replaced, which could strand a live endpoint
-	 * indefinitely. The same residual applies if two *fresh* publishers race with no live
-	 * incumbent; host-manager's single-successor upgrade model doesn't produce that.
-	 */
-	private unpublishSocket(): void {
-		const published = this.publishedSocket;
-		this.publishedSocket = null;
-		if (!published) return;
-		try {
-			if (lstatSync(published.path).ino === published.ino) unlinkSync(published.path);
-		} catch {
-			// already gone, or replaced by a successor — either way, not ours to remove
-		}
 	}
 }
