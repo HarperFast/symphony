@@ -271,6 +271,31 @@ describe('renderPrometheus', () => {
 		assert.equal(typeLines.filter((l) => l.includes('symphony_suspended_total')).length, 1);
 	});
 
+	// Samples of one metric name must be contiguous under a single HELP/TYPE pair. Emitting in
+	// proxy → listener call order would interleave them once a second proxy exists, and strict
+	// parsers reject or drop the split group.
+	it('keeps every metric name contiguous across multiple proxies', () => {
+		const second = structuredClone(snapshot.proxies[0]);
+		second.ports = '8443';
+		second.metrics.listeners[0].address = '0.0.0.0:8443';
+		const multi = renderPrometheus({ ...snapshot, proxies: [snapshot.proxies[0], second] }).split('\n');
+
+		const seen = new Set<string>();
+		let previous = '';
+		for (const line of multi) {
+			if (!line || line.startsWith('#')) continue;
+			const name = line.slice(0, Math.min(...[line.indexOf('{'), line.indexOf(' ')].filter((i) => i >= 0)));
+			if (name !== previous) {
+				assert.ok(!seen.has(name), `samples for ${name} are split across the output`);
+				seen.add(name);
+				previous = name;
+			}
+		}
+		// Both proxies really are present, so the check above wasn't vacuous.
+		assert.ok(multi.includes('symphony_routes{proxy="80,443"} 7'));
+		assert.ok(multi.includes('symphony_routes{proxy="8443"} 7'));
+	});
+
 	it('labels every proxy-scoped and listener-scoped sample', () => {
 		assert.ok(lines.includes('symphony_routes{proxy="80,443"} 7'));
 		assert.ok(lines.includes('symphony_routes_failing{proxy="80,443"} 1'));
