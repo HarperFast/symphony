@@ -173,8 +173,11 @@ async fn handle_http(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<Conn
 	let response = format!(
 		"HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 	);
-	ctx.listener_metrics.add_bytes_out(response.len() as u64);
-	let _ = stream.write_all(response.as_bytes()).await;
+	// Counted after the write, not before: a partial or failed write would otherwise report bytes
+	// the client never received.
+	if stream.write_all(response.as_bytes()).await.is_ok() {
+		ctx.listener_metrics.add_bytes_out(response.len() as u64);
+	}
 	let _ = stream.shutdown().await;
 }
 
@@ -263,8 +266,8 @@ async fn write_simple_response(
 	response: &[u8],
 	metrics: &crate::metrics::ListenerMetrics,
 ) -> std::io::Result<()> {
-	metrics.add_bytes_out(response.len() as u64);
 	stream.write_all(response).await?;
+	metrics.add_bytes_out(response.len() as u64);
 	stream.shutdown().await
 }
 
