@@ -618,8 +618,10 @@ for (const l of m.listeners) {
   // l.activeConnections, l.accepted
   // l.bytesReceived — bytes read from clients   (client → upstream)
   // l.bytesSent     — bytes written to clients  (upstream → client)
-  //   Counted where the proxy sees the bytes: plaintext on a terminated-TLS route, wire bytes
-  //   on a passthrough route. The handshake is not included in either.
+  //   Counted where the proxy sees the bytes. On a terminated-TLS route that is the plaintext
+  //   stream, and the handshake — which precedes the counter — is excluded. On a passthrough
+  //   route the proxy has no plaintext view and forwards wire bytes, so the handshake records
+  //   are part of the stream and are counted.
   // l.blockedByReason — [{ reason: 'rate_limited', count: 12 }, ...]
   // l.errorsByReason  — [{ reason: 'upstream_connect', count: 3 }, ...]
 }
@@ -632,8 +634,10 @@ const blocked = proxy.blockedIps();
 ```
 
 Every reason is reported on every call, including reasons still at zero, so a dashboard series
-exists before the first incident rather than appearing mid-outage. The per-reason counts sum to
-`l.blocked` / `l.errors` by construction.
+exists before the first incident rather than appearing mid-outage. `l.blocked` / `l.errors` are
+summed from the very reason values reported alongside them, and `m.blockedConnections` from the
+listener values in the same snapshot — so a reading taken mid-traffic is internally consistent
+rather than only adding up while the proxy is idle.
 
 **Block reasons:** `max_connections`, `cidr_blocked`, `ja3_blocked`, `ja4_blocked`,
 `incomplete_handshake`, `no_sni`, `rate_limited`, `too_many_connections`, `penalty_boxed`.

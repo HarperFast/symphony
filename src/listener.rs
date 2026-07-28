@@ -69,10 +69,7 @@ async fn accept_loop(
 							if active >= max_connections as u64 {
 								// Drop the stream — OS will send RST
 								drop(stream);
-								// Both counters, so the proxy-level blocked total stays equal to the
-								// sum of its listeners' — the protection path already does both.
 								ctx.listener_metrics.inc_blocked(BlockKind::MaxConnections);
-								ctx.global_metrics.inc_blocked();
 								continue;
 							}
 						}

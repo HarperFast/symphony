@@ -83,14 +83,13 @@ labeled_enum!(ErrorKind {
 pub struct ListenerMetrics {
 	pub active_connections: AtomicU64,
 	pub total_accepted: AtomicU64,
-	pub total_blocked: AtomicU64,
-	pub total_errors: AtomicU64,
-	/// Bytes read from clients on this listener (client → upstream). Counted at the point the
-	/// proxy sees them, so a terminated-TLS route counts plaintext and a passthrough route
-	/// counts wire bytes; neither includes the handshake, which precedes the counter.
+	/// Bytes read from clients on this listener (client → upstream), counted where the proxy
+	/// sees them. On a terminated-TLS route that is the plaintext stream — the handshake happens
+	/// before the counter is installed and is excluded. On a passthrough route the proxy has no
+	/// plaintext view and simply forwards wire bytes, so the handshake records are part of the
+	/// stream and are counted.
 	pub bytes_in: AtomicU64,
-	/// Bytes written to clients on this listener (upstream → client). Same framing caveat as
-	/// `bytes_in`.
+	/// Bytes written to clients on this listener (upstream → client). Same framing as `bytes_in`.
 	pub bytes_out: AtomicU64,
 	blocked_by_kind: [AtomicU64; BlockKind::COUNT],
 	errors_by_kind: [AtomicU64; ErrorKind::COUNT],
@@ -101,8 +100,6 @@ impl Default for ListenerMetrics {
 		Self {
 			active_connections: AtomicU64::new(0),
 			total_accepted: AtomicU64::new(0),
-			total_blocked: AtomicU64::new(0),
-			total_errors: AtomicU64::new(0),
 			bytes_in: AtomicU64::new(0),
 			bytes_out: AtomicU64::new(0),
 			blocked_by_kind: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -122,12 +119,21 @@ impl ListenerMetrics {
 	}
 
 	pub fn inc_blocked(&self, kind: BlockKind) {
-		self.total_blocked.fetch_add(1, Ordering::Relaxed);
 		self.blocked_by_kind[kind as usize].fetch_add(1, Ordering::Relaxed);
 	}
 
+	/// Direct byte accounting for paths that handle a whole message at once (the HTTP-mode
+	/// listener), where `CountingStream`'s per-connection batching would buy nothing — these
+	/// fire once or twice per connection, not per chunk.
+	pub fn add_bytes_in(&self, bytes: u64) {
+		self.bytes_in.fetch_add(bytes, Ordering::Relaxed);
+	}
+
+	pub fn add_bytes_out(&self, bytes: u64) {
+		self.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+	}
+
 	pub fn inc_error(&self, kind: ErrorKind) {
-		self.total_errors.fetch_add(1, Ordering::Relaxed);
 		self.errors_by_kind[kind as usize].fetch_add(1, Ordering::Relaxed);
 	}
 
@@ -149,10 +155,24 @@ impl ListenerMetrics {
 	}
 }
 
+/// Sums a per-reason breakdown into its total.
+///
+/// The exported totals are derived from the same values the breakdown reports rather than kept
+/// as separate counters. A standalone `total_blocked` incremented next to its reason counter is
+/// two non-atomic writes, so a scrape landing between them observes a total that does not equal
+/// the sum of its parts — the invariant would hold only while the proxy is idle, which is
+/// exactly when nobody is looking. Deriving makes it structural, and removes an atomic from the
+/// block/error paths.
+pub fn total_of(counts: &[(&'static str, u64)]) -> u64 {
+	counts.iter().map(|(_, count)| count).sum()
+}
+
+// No proxy-wide blocked counter: it is derived from the listeners in `metrics()` for the same
+// reason the per-listener totals are derived from their reasons — a separately incremented copy
+// can disagree with its parts under traffic.
 #[derive(Default)]
 pub struct GlobalMetrics {
 	pub active_connections: AtomicU64,
-	pub total_blocked: AtomicU64,
 	pub pending_suspended: AtomicU64,
 	/// Suspended connections that JS resolved with a route.
 	pub suspended_resolved: AtomicU64,
@@ -167,10 +187,6 @@ impl GlobalMetrics {
 
 	pub fn dec_active(&self) {
 		self.active_connections.fetch_sub(1, Ordering::Relaxed);
-	}
-
-	pub fn inc_blocked(&self) {
-		self.total_blocked.fetch_add(1, Ordering::Relaxed);
 	}
 
 	pub fn inc_suspended(&self) {
@@ -326,13 +342,8 @@ mod tests {
 		m.inc_blocked(BlockKind::NoSni);
 		m.inc_error(ErrorKind::UpstreamConnect);
 
-		let blocked: u64 = m.blocked_by_reason().iter().map(|(_, v)| v).sum();
-		assert_eq!(blocked, m.total_blocked.load(Ordering::Relaxed));
-		assert_eq!(blocked, 3);
-
-		let errors: u64 = m.errors_by_reason().iter().map(|(_, v)| v).sum();
-		assert_eq!(errors, m.total_errors.load(Ordering::Relaxed));
-		assert_eq!(errors, 1);
+		assert_eq!(total_of(&m.blocked_by_reason()), 3);
+		assert_eq!(total_of(&m.errors_by_reason()), 1);
 
 		// Every reason is exported, including the ones still at zero.
 		assert_eq!(m.blocked_by_reason().len(), BlockKind::COUNT);

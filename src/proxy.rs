@@ -1,6 +1,6 @@
 use crate::http_listener::spawn_http_listeners;
 use crate::listener::spawn_listeners;
-use crate::metrics::{GlobalMetrics, ListenerMetrics};
+use crate::metrics::{total_of, GlobalMetrics, ListenerMetrics};
 use crate::protection::ProtectionState;
 use crate::proxy_conn::{ConnContext, JsEvent};
 use crate::router::{
@@ -600,30 +600,42 @@ impl SymphonyProxyWrap {
 
 		// `listeners` and `listener_states` are built in lockstep in the constructor and never
 		// mutated, so index i refers to the same listener in both.
-		let listeners = self
+		//
+		// Each listener's totals are summed from the very reason values it reports, so a scrape
+		// taken mid-traffic is internally consistent — a separately maintained total would be a
+		// second write racing the first and could disagree with its own breakdown.
+		let listeners: Vec<JsListenerMetrics> = self
 			.listeners
 			.iter()
 			.zip(self.listener_states.iter())
-			.map(|(listener, state)| JsListenerMetrics {
-				address: state.addr.clone(),
-				mode: match listener.mode {
-					ListenerMode::Tls => "tls".to_string(),
-					ListenerMode::Http => "http".to_string(),
-				},
-				active_connections: state.metrics.active_connections.load(Ordering::Relaxed) as f64,
-				accepted: state.metrics.total_accepted.load(Ordering::Relaxed) as f64,
-				blocked: state.metrics.total_blocked.load(Ordering::Relaxed) as f64,
-				errors: state.metrics.total_errors.load(Ordering::Relaxed) as f64,
-				bytes_received: state.metrics.bytes_in.load(Ordering::Relaxed) as f64,
-				bytes_sent: state.metrics.bytes_out.load(Ordering::Relaxed) as f64,
-				blocked_by_reason: labeled_counts(state.metrics.blocked_by_reason()),
-				errors_by_reason: labeled_counts(state.metrics.errors_by_reason()),
+			.map(|(listener, state)| {
+				let blocked_by_reason = state.metrics.blocked_by_reason();
+				let errors_by_reason = state.metrics.errors_by_reason();
+				JsListenerMetrics {
+					address: state.addr.clone(),
+					mode: match listener.mode {
+						ListenerMode::Tls => "tls".to_string(),
+						ListenerMode::Http => "http".to_string(),
+					},
+					active_connections: state.metrics.active_connections.load(Ordering::Relaxed) as f64,
+					accepted: state.metrics.total_accepted.load(Ordering::Relaxed) as f64,
+					blocked: total_of(&blocked_by_reason) as f64,
+					errors: total_of(&errors_by_reason) as f64,
+					bytes_received: state.metrics.bytes_in.load(Ordering::Relaxed) as f64,
+					bytes_sent: state.metrics.bytes_out.load(Ordering::Relaxed) as f64,
+					blocked_by_reason: labeled_counts(blocked_by_reason),
+					errors_by_reason: labeled_counts(errors_by_reason),
+				}
 			})
 			.collect();
 
+		// Likewise derived, so the proxy-wide total always equals the sum of the listener values
+		// in this same snapshot.
+		let blocked_connections = listeners.iter().map(|l| l.blocked).sum();
+
 		JsProxyMetrics {
 			active_connections: self.global_metrics.active_connections.load(Ordering::Relaxed) as f64,
-			blocked_connections: self.global_metrics.total_blocked.load(Ordering::Relaxed) as f64,
+			blocked_connections,
 			pending_suspended: self.global_metrics.pending_suspended.load(Ordering::Relaxed) as f64,
 			suspended_resolved: self.global_metrics.suspended_resolved.load(Ordering::Relaxed) as f64,
 			suspended_unresolved: self.global_metrics.suspended_unresolved.load(Ordering::Relaxed) as f64,

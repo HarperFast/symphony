@@ -92,10 +92,7 @@ async fn accept_loop(
 							let active = ctx.global_metrics.active_connections.load(std::sync::atomic::Ordering::Relaxed);
 							if active >= max_connections as u64 {
 								drop(stream);
-								// See listener.rs: keep the proxy-level blocked total equal to the
-								// sum across its listeners.
 								ctx.listener_metrics.inc_blocked(BlockKind::MaxConnections);
-								ctx.global_metrics.inc_blocked();
 								continue;
 							}
 						}
@@ -144,6 +141,12 @@ async fn handle_http(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<Conn
 		return;
 	}
 
+	// This listener consumes the request head before any stream wrapper could see it, and its
+	// responses are written directly, so bytes are accounted for explicitly here rather than
+	// through CountingStream. `_excess` is read from the client too, even though it is dropped.
+	ctx.listener_metrics
+		.add_bytes_in((headers.len() + _excess.len()) as u64);
+
 	let target = request_target(&headers);
 	let host = host_header(&headers);
 
@@ -155,13 +158,13 @@ async fn handle_http(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<Conn
 			return;
 		}
 		// Missing or unsafe Host header on an ACME request — fall through to a 400.
-		let _ = write_simple_response(&mut stream, b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+		let _ = write_simple_response(&mut stream, b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &ctx.listener_metrics).await;
 		return;
 	}
 
 	// Default: redirect to https://<host><target>.
 	let Some(host) = host else {
-		let _ = write_simple_response(&mut stream, b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+		let _ = write_simple_response(&mut stream, b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &ctx.listener_metrics).await;
 		return;
 	};
 	let target_str = std::str::from_utf8(target).unwrap_or("/");
@@ -170,6 +173,7 @@ async fn handle_http(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<Conn
 	let response = format!(
 		"HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 	);
+	ctx.listener_metrics.add_bytes_out(response.len() as u64);
 	let _ = stream.write_all(response.as_bytes()).await;
 	let _ = stream.shutdown().await;
 }
@@ -185,7 +189,7 @@ async fn proxy_acme(
 	let Some(route) = table.resolve(Some(host)) else {
 		// No matching route — answer 404 so the ACME client gets a definitive answer
 		// rather than a hung connection.
-		let _ = write_simple_response(client, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+		let _ = write_simple_response(client, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &ctx.listener_metrics).await;
 		return Err(ErrorKind::NoRoute);
 	};
 
@@ -254,7 +258,12 @@ where
 	io::copy(upstream, client).await.map(|_| ())
 }
 
-async fn write_simple_response(stream: &mut TcpStream, response: &[u8]) -> std::io::Result<()> {
+async fn write_simple_response(
+	stream: &mut TcpStream,
+	response: &[u8],
+	metrics: &crate::metrics::ListenerMetrics,
+) -> std::io::Result<()> {
+	metrics.add_bytes_out(response.len() as u64);
 	stream.write_all(response).await?;
 	stream.shutdown().await
 }
