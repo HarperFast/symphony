@@ -13,8 +13,19 @@
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import { connect } from 'node:net';
-import { chmodSync, unlinkSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, renameSync, unlinkSync } from 'node:fs';
 import type { ProxyMetrics } from './types.js';
+
+/** One thing to listen on. `precheck` may reject the bind before a server is created. */
+interface BindTarget {
+	describe: string;
+	listen: (server: Server) => void;
+	precheck?: () => Promise<void>;
+	/** Runs once bound; throwing fails the bind (the caller closes the server and retries). */
+	onBound?: () => void;
+	/** Best-effort removal of anything `listen`/`onBound` left behind on a failed attempt. */
+	cleanup?: () => void;
+}
 
 export interface AdminConfig {
 	/** Unix socket path to listen on. Relative paths resolve against the config file's directory. */
@@ -43,6 +54,9 @@ export interface MetricsSnapshot {
 }
 
 const RETRY_MS = 5_000;
+const KEEP_ALIVE_MS = 5_000;
+/** Hard ceiling on concurrent admin connections — a scrape endpoint needs a handful at most. */
+const MAX_ADMIN_CONNECTIONS = 16;
 
 // ── Prometheus rendering ──────────────────────────────────────────────────────
 
@@ -214,16 +228,37 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
-/** True if something is actively listening on `socketPath` (as opposed to a stale socket file). */
-function socketIsLive(socketPath: string): Promise<boolean> {
+/**
+ * Whether `socketPath` is safe to remove and rebind.
+ *
+ * Reclaimable means two things, and both must hold — the cost of getting this wrong is deleting
+ * a *live* endpoint out from under a running process, which is the failure mode symphony's
+ * status.json ownership guard exists to prevent:
+ *
+ *  - `ECONNREFUSED` specifically, not merely "the probe failed". A live socket with restrictive
+ *    permissions (or one owned by another uid) refuses the probe with `EACCES`; treating every
+ *    error as stale would unlink it. Anything that isn't a definitive "nobody is listening"
+ *    leaves the path alone and the bind is retried instead.
+ *  - The inode is actually a socket. Left to `EADDRINUSE` alone, a `socketPath` misconfigured
+ *    onto a regular file (say, status.json) would see the connect fail and delete that file.
+ */
+function socketIsReclaimable(socketPath: string): Promise<boolean> {
 	return new Promise((resolve) => {
+		let stats;
+		try {
+			stats = lstatSync(socketPath);
+		} catch {
+			return resolve(false); // vanished under us — let the bind retry decide
+		}
+		if (!stats.isSocket()) return resolve(false);
+
 		const probe = connect(socketPath);
-		const done = (live: boolean) => {
+		const done = (reclaimable: boolean) => {
 			probe.destroy();
-			resolve(live);
+			resolve(reclaimable);
 		};
-		probe.once('connect', () => done(true));
-		probe.once('error', () => done(false));
+		probe.once('connect', () => done(false));
+		probe.once('error', (err: NodeJS.ErrnoException) => done(err.code === 'ECONNREFUSED'));
 	});
 }
 
@@ -240,6 +275,8 @@ export class AdminServer {
 	private config: AdminConfig | null = null;
 	private retryTimer: NodeJS.Timeout | null = null;
 	private stopped = false;
+	/** The socket path this process published, and the inode it published there. */
+	private publishedSocket: { path: string; ino: number } | null = null;
 
 	constructor(
 		snapshot: () => MetricsSnapshot,
@@ -294,15 +331,8 @@ export class AdminServer {
 		if (this.stopped || !config) return;
 		await this.closeServers();
 
-		const targets: Array<{ describe: string; listen: (server: Server) => void; onBound?: () => void }> = [];
-		if (config.socketPath) {
-			const path = config.socketPath;
-			targets.push({
-				describe: path,
-				listen: (server) => server.listen(path),
-				onBound: () => chmodSync(path, config.socketMode ?? 0o660),
-			});
-		}
+		const targets: BindTarget[] = [];
+		if (config.socketPath) targets.push(this.socketTarget(config.socketPath, config.socketMode ?? 0o660));
 		if (config.port !== undefined) {
 			const host = config.host ?? '127.0.0.1';
 			targets.push({ describe: `${host}:${config.port}`, listen: (server) => server.listen(config.port, host) });
@@ -310,7 +340,7 @@ export class AdminServer {
 
 		for (const target of targets) {
 			try {
-				const server = await this.listenOne(target, config);
+				const server = await this.listenOne(target);
 				this.servers.push(server);
 				this.log(`admin endpoint listening on ${target.describe}`);
 			} catch (err) {
@@ -324,16 +354,59 @@ export class AdminServer {
 		}
 	}
 
-	private async listenOne(
-		target: { describe: string; listen: (server: Server) => void; onBound?: () => void },
-		config: AdminConfig
-	): Promise<Server> {
-		const server = createServer((req, res) => this.handle(req, res));
-		// Metrics scrapes are short; don't hold sockets open between them.
-		server.keepAliveTimeout = 0;
+	/**
+	 * Bind the Unix socket by listening on a pid-unique temporary path and `rename`-ing it onto
+	 * the real one.
+	 *
+	 * The obvious shape — probe, `unlink`, `listen` — has a window between the probe and the
+	 * unlink. Two processes can both find the path stale, and the second one's unlink then
+	 * deletes the socket the first has already bound and is serving. `rename` is atomic and
+	 * replaces the target in one step, so the path always names a socket somebody is listening
+	 * on. The precheck stays, because rename would otherwise happily clobber a *live* incumbent
+	 * during an upgrade overlap — there we want to lose and retry, not steal the endpoint.
+	 */
+	private socketTarget(path: string, mode: number): BindTarget {
+		const tempPath = `${path}.${process.pid}`;
+		return {
+			describe: path,
+			precheck: async () => {
+				if (existsSync(path) && !(await socketIsReclaimable(path))) {
+					throw new Error(`${path} is in use by another process`);
+				}
+			},
+			listen: (server) => server.listen(tempPath),
+			onBound: () => {
+				chmodSync(tempPath, mode);
+				renameSync(tempPath, path);
+				// server.close() unlinks the path it bound — the temp one — so the published path
+				// is ours to clean up. Record the inode to do that safely: if another process has
+				// since renamed its own socket over this path, the inode differs and we leave it
+				// alone rather than deleting a live endpoint (cf. the status.json ownership guard).
+				this.publishedSocket = { path, ino: lstatSync(path).ino };
+			},
+			cleanup: () => {
+				try {
+					unlinkSync(tempPath);
+				} catch {
+					// never created, or already renamed into place
+				}
+			},
+		};
+	}
 
-		const attempt = (): Promise<Server> =>
-			new Promise<Server>((resolve, reject) => {
+	private async listenOne(target: BindTarget): Promise<Server> {
+		await target.precheck?.();
+
+		const server = createServer((req, res) => this.handle(req, res));
+		// Scrapes are short and infrequent, so reap idle connections quickly. Note this is a
+		// timeout, not a switch: setting it to 0 would disable the reaping, letting a client park
+		// arbitrarily many idle connections against the same process-wide fd budget the proxy
+		// listeners draw from. maxConnections caps that regardless of client behaviour.
+		server.keepAliveTimeout = KEEP_ALIVE_MS;
+		server.maxConnections = MAX_ADMIN_CONNECTIONS;
+
+		try {
+			return await new Promise<Server>((resolve, reject) => {
 				const onError = (err: NodeJS.ErrnoException) => {
 					server.removeListener('listening', onListening);
 					reject(err);
@@ -343,7 +416,11 @@ export class AdminServer {
 					try {
 						target.onBound?.();
 					} catch (err) {
-						this.logErr(`could not set permissions on ${target.describe}:`, (err as Error).message);
+						// The socket is bound but not reachable at its published path — useless, and
+						// it would leak an fd and a temp inode. Fail so the retry starts clean.
+						server.close();
+						reject(err);
+						return;
 					}
 					// Post-bind errors must not crash the process.
 					server.on('error', (err) => this.logErr(`admin endpoint error (${target.describe}):`, err));
@@ -353,20 +430,8 @@ export class AdminServer {
 				server.once('listening', onListening);
 				target.listen(server);
 			});
-
-		try {
-			return await attempt();
 		} catch (err) {
-			// A Unix socket left behind by a process that died without cleaning up blocks the
-			// bind forever. Only remove it once a connect probe proves nobody is listening —
-			// unlinking a live socket would silently steal the endpoint from a running process.
-			const code = (err as NodeJS.ErrnoException).code;
-			if (code === 'EADDRINUSE' && config.socketPath && target.describe === config.socketPath) {
-				if (await socketIsLive(config.socketPath)) throw err;
-				this.log(`removing stale admin socket ${config.socketPath}`);
-				unlinkSync(config.socketPath);
-				return attempt();
-			}
+			target.cleanup?.();
 			throw err;
 		}
 	}
@@ -414,5 +479,18 @@ export class AdminServer {
 					})
 			)
 		);
+		this.unpublishSocket();
+	}
+
+	/** Remove the published socket path, but only while it still names the inode we put there. */
+	private unpublishSocket(): void {
+		const published = this.publishedSocket;
+		this.publishedSocket = null;
+		if (!published) return;
+		try {
+			if (lstatSync(published.path).ino === published.ino) unlinkSync(published.path);
+		} catch {
+			// already gone, or replaced by a successor — either way, not ours to remove
+		}
 	}
 }

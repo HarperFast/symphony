@@ -85,7 +85,6 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		match protection.check(peer_ip, &peek_info) {
 			crate::protection::Decision::Block(reason) => {
 				ctx.listener_metrics.inc_blocked(BlockKind::from(&reason));
-				ctx.global_metrics.inc_blocked();
 				emit(&ctx.js_emit, JsEvent::Blocked {
 					ip: peer_ip.to_string(),
 					reason: reason.as_str().to_string(),

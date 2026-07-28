@@ -12,6 +12,7 @@ import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as net from 'node:net';
 import * as tls from 'node:tls';
 import { SymphonyProxy, renderPrometheus, type MetricsSnapshot } from '../ts/index.js';
 import { generateSelfSignedCert, getFreePort, startEchoServer, tlsRoundTrip, sleep } from './util.js';
@@ -559,6 +560,67 @@ describe('symphony-server admin endpoint (stale socket recovery)', () => {
 			const health = JSON.parse((await get({ socketPath }, '/health')).body) as { pid: number };
 			assert.equal(health.pid, survivor.pid, `the new process must own the socket; stderr:\n${stderr}`);
 		} finally {
+			await echo.close().catch(() => {});
+		}
+	});
+
+	// The inverse, and the one that actually costs something to get wrong: a socket that is still
+	// being served must survive a would-be reclaimer, whatever the probe happens to return. A
+	// permission-denied probe is not evidence that nobody is listening.
+	it('leaves a live socket alone even when the probe cannot connect to it', async () => {
+		const echo = await startEchoServer();
+		const livePath = path.join(dir, 'live.sock');
+		// Stand in for a running symphony: a real listening socket the reclaimer must not delete.
+		const incumbent = net.createServer();
+		await new Promise<void>((resolve) => incumbent.listen(livePath, resolve));
+		const liveIno = fs.statSync(livePath).ino;
+
+		try {
+			// 0o000 makes connect() fail with EACCES rather than ECONNREFUSED. Treating any probe
+			// error as "stale" would unlink this live socket.
+			fs.chmodSync(livePath, 0o000);
+
+			const configPath = path.join(dir, 'contend.json');
+			const statusPath = path.join(dir, 'contend-status.json');
+			fs.writeFileSync(
+				configPath,
+				JSON.stringify({
+					version: 1,
+					admin: { socketPath: livePath },
+					proxies: [
+						{
+							listeners: [{ host: '127.0.0.1', port: await getFreePort() }],
+							routes: [
+								{
+									sni: 'localhost',
+									upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+									terminateTls: true,
+									cert: { certChain: cert.cert, privateKey: cert.key },
+								},
+							],
+						},
+					],
+				})
+			);
+
+			const contender = spawn(process.execPath, [SERVER_JS, '--config', configPath, '--status', statusPath], {
+				stdio: ['ignore', 'pipe', 'pipe'],
+			});
+			try {
+				// It boots and proxies regardless — losing the admin bind must never block startup.
+				await waitFor(() => fs.existsSync(statusPath), 8000);
+				// Give the retry timer a cycle to (wrongly) reclaim, if it were going to.
+				await sleep(1000);
+
+				assert.ok(fs.existsSync(livePath), 'the live socket must not have been unlinked');
+				assert.equal(fs.statSync(livePath).ino, liveIno, 'the live socket must not have been replaced');
+			} finally {
+				contender.kill('SIGKILL');
+				await waitFor(() => contender.exitCode !== null || contender.signalCode !== null, 3000).catch(() => {});
+			}
+		} finally {
+			fs.chmodSync(livePath, 0o660);
+			await new Promise<void>((resolve) => incumbent.close(() => resolve()));
 			await echo.close().catch(() => {});
 		}
 	});
