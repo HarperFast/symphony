@@ -70,7 +70,10 @@ labeled_enum!(ErrorKind {
 	TlsMissingCert => "tls_missing_cert",
 	/// Could not establish the upstream connection.
 	UpstreamConnect => "upstream_connect",
-	/// The proxied session hit the idle timeout.
+	/// The proxied session hit `idleTimeoutMs`. Note that today this fires on *total* duration,
+	/// not idleness — `forward()` wraps the copy in a hard `tokio::time::timeout` that does not
+	/// reset on activity (issue #34, pre-existing). Until that is fixed this counts busy
+	/// connections cut at the deadline, not quiet ones.
 	IdleTimeout => "idle_timeout",
 	/// I/O error while proxying an established session.
 	Stream => "stream",
