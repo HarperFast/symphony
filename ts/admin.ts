@@ -482,7 +482,17 @@ export class AdminServer {
 		this.unpublishSocket();
 	}
 
-	/** Remove the published socket path, but only while it still names the inode we put there. */
+	/**
+	 * Remove the published socket path, but only while it still names the inode we put there.
+	 *
+	 * The check and the unlink are two syscalls, so this narrows the race rather than closing it:
+	 * a successor that renames its socket into place between them still loses its published path
+	 * (it keeps serving an unlinked inode until its next reconcile republishes). Closing that
+	 * would need file locking, and the exposure is one observability endpoint that self-heals —
+	 * unlike the probe→unlink→bind window this replaced, which could strand a live endpoint
+	 * indefinitely. The same residual applies if two *fresh* publishers race with no live
+	 * incumbent; host-manager's single-successor upgrade model doesn't produce that.
+	 */
 	private unpublishSocket(): void {
 		const published = this.publishedSocket;
 		this.publishedSocket = null;
