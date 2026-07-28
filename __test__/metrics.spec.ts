@@ -323,6 +323,23 @@ describe('renderPrometheus', () => {
 		assert.ok(!lines.some((l) => /^symphony_listener_blocked_total\{[^}]*\}\s/.test(l) && !l.includes('reason=')));
 	});
 
+	// Consumers bind this endpoint on loopback, which any local process can reach. That is only
+	// acceptable while the labels stay free of tenant identifiers — a per-SNI or per-route label
+	// would turn aggregate proxy health into a list of which customers a host fronts. This pins
+	// the allowed label set so adding one is a deliberate, visible decision.
+	it('never labels a sample with a tenant identifier', () => {
+		const allowed = new Set(['version', 'proxy', 'listener', 'mode', 'reason', 'outcome']);
+		for (const line of lines) {
+			const labelSet = line.match(/\{(.*)\}/)?.[1];
+			if (!labelSet) continue;
+			// Keys sit at the start or after a comma; a label *value* may itself contain a comma
+			// (proxy="80,443"), so the boundary has to be matched rather than split on.
+			for (const [, , key] of labelSet.matchAll(/(^|,)([a-z_]+)="/g)) {
+				assert.ok(allowed.has(key), `unexpected metric label '${key}' — is it tenant-identifying?`);
+			}
+		}
+	});
+
 	it('carries the version in build_info and timestamps in seconds', () => {
 		assert.ok(lines.includes('symphony_build_info{version="9.9.9"} 1'));
 		assert.ok(lines.includes(`symphony_start_time_seconds ${Date.parse(snapshot.startedAt) / 1000}`));
