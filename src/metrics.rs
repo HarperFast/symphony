@@ -188,20 +188,63 @@ impl GlobalMetrics {
 	}
 }
 
+/// Bytes a connection may accumulate locally before publishing to the shared listener counters.
+/// The whole point of the local buffer is to keep the shared cache line off the per-chunk path
+/// (see `CountingStream`), so this wants to be well above `copy_bidirectional`'s 8 KiB buffer —
+/// at 256 KiB a saturated connection publishes ~32× less often than it would per chunk, while a
+/// scrape still sees a busy connection's traffic within a fraction of a second.
+const COUNTER_FLUSH_BYTES: u64 = 256 * 1024;
+
 /// Wraps the *client* side of a proxied session so byte counts accrue as the copy runs rather
 /// than at completion. Counting `copy_bidirectional`'s return value instead would lose every
 /// byte of any session that ends by idle timeout or reset — i.e. most long-lived ones.
+///
+/// Counts are accumulated per connection and published to the shared `ListenerMetrics` only
+/// every `COUNTER_FLUSH_BYTES` and on drop. A `fetch_add` per chunk would put a single shared
+/// cache line in the path of every 8 KiB of proxied traffic, ping-ponging it across every core —
+/// exactly the cross-core contention `SO_REUSEPORT` per worker exists to avoid.
 ///
 /// Because it wraps the client, the direction naming is from the proxy's point of view: bytes
 /// read here came *from* the client, bytes written here go *to* the client.
 pub struct CountingStream<'a, S> {
 	inner: S,
 	metrics: &'a ListenerMetrics,
+	pending_in: u64,
+	pending_out: u64,
 }
 
 impl<'a, S> CountingStream<'a, S> {
 	pub fn new(inner: S, metrics: &'a ListenerMetrics) -> Self {
-		Self { inner, metrics }
+		Self { inner, metrics, pending_in: 0, pending_out: 0 }
+	}
+
+	fn record_in(&mut self, bytes: u64) {
+		self.pending_in += bytes;
+		if self.pending_in >= COUNTER_FLUSH_BYTES {
+			self.metrics.bytes_in.fetch_add(self.pending_in, Ordering::Relaxed);
+			self.pending_in = 0;
+		}
+	}
+
+	fn record_out(&mut self, bytes: u64) {
+		self.pending_out += bytes;
+		if self.pending_out >= COUNTER_FLUSH_BYTES {
+			self.metrics.bytes_out.fetch_add(self.pending_out, Ordering::Relaxed);
+			self.pending_out = 0;
+		}
+	}
+}
+
+// Publishes whatever is left when the session ends — including when the connection task is
+// aborted at shutdown, since that drops the future and with it this stream.
+impl<S> Drop for CountingStream<'_, S> {
+	fn drop(&mut self) {
+		if self.pending_in > 0 {
+			self.metrics.bytes_in.fetch_add(self.pending_in, Ordering::Relaxed);
+		}
+		if self.pending_out > 0 {
+			self.metrics.bytes_out.fetch_add(self.pending_out, Ordering::Relaxed);
+		}
 	}
 }
 
@@ -213,7 +256,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<'_, S> {
 		if matches!(result, Poll::Ready(Ok(()))) {
 			let read = buf.filled().len().saturating_sub(before);
 			if read > 0 {
-				this.metrics.bytes_in.fetch_add(read as u64, Ordering::Relaxed);
+				this.record_in(read as u64);
 			}
 		}
 		result
@@ -225,7 +268,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<'_, S> {
 		let this = self.get_mut();
 		let result = Pin::new(&mut this.inner).poll_write(cx, buf);
 		if let Poll::Ready(Ok(written)) = &result {
-			this.metrics.bytes_out.fetch_add(*written as u64, Ordering::Relaxed);
+			this.record_out(*written as u64);
 		}
 		result
 	}
@@ -238,7 +281,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<'_, S> {
 		let this = self.get_mut();
 		let result = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
 		if let Poll::Ready(Ok(written)) = &result {
-			this.metrics.bytes_out.fetch_add(*written as u64, Ordering::Relaxed);
+			this.record_out(*written as u64);
 		}
 		result
 	}
@@ -297,7 +340,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn counting_stream_records_both_directions() {
+	async fn counting_stream_publishes_both_directions_on_drop() {
 		use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 		let metrics = ListenerMetrics::default();
@@ -310,7 +353,40 @@ mod tests {
 		counted.read_exact(&mut buf).await.unwrap();
 		counted.write_all(b"world!").await.unwrap();
 
+		// Below the flush threshold, so the shared counters stay untouched until the session ends.
+		assert_eq!(metrics.bytes_in.load(Ordering::Relaxed), 0);
+		assert_eq!(metrics.bytes_out.load(Ordering::Relaxed), 0);
+
+		drop(counted);
 		assert_eq!(metrics.bytes_in.load(Ordering::Relaxed), 5);
 		assert_eq!(metrics.bytes_out.load(Ordering::Relaxed), 6);
+	}
+
+	// A long-lived connection must not withhold its traffic from scrapes until it closes.
+	#[tokio::test]
+	async fn counting_stream_publishes_once_past_the_flush_threshold() {
+		use tokio::io::AsyncWriteExt;
+
+		let metrics = ListenerMetrics::default();
+		let (client, mut peer) = tokio::io::duplex(COUNTER_FLUSH_BYTES as usize * 4);
+		let mut counted = CountingStream::new(client, &metrics);
+
+		let chunk = vec![0u8; 8 * 1024];
+		let mut written = 0u64;
+		while written < COUNTER_FLUSH_BYTES {
+			counted.write_all(&chunk).await.unwrap();
+			written += chunk.len() as u64;
+		}
+
+		assert_eq!(
+			metrics.bytes_out.load(Ordering::Relaxed),
+			written,
+			"crossing the threshold must publish everything accumulated so far"
+		);
+
+		// Drain so the duplex peer doesn't hold the buffer, then confirm drop double-counts nothing.
+		drop(counted);
+		peer.shutdown().await.ok();
+		assert_eq!(metrics.bytes_out.load(Ordering::Relaxed), written);
 	}
 }

@@ -58,11 +58,18 @@ function labels(pairs: Record<string, string>): string {
 	return rendered ? `{${rendered}}` : '';
 }
 
+/**
+ * Accumulates samples grouped by metric name.
+ *
+ * The exposition format requires every sample of a metric name to be contiguous, under a single
+ * HELP/TYPE pair. Emitting in call order would interleave them — with more than one proxy
+ * configured, `symphony_routes` for the second proxy would land after the first proxy's listener
+ * samples, and strict parsers reject or drop the split group. Grouping here means the callers
+ * below can stay in the natural proxy → listener iteration order.
+ */
 class Exposition {
-	private readonly lines: string[] = [];
-	private declared = new Set<string>();
+	private readonly groups = new Map<string, { type: 'counter' | 'gauge'; help: string; samples: string[] }>();
 
-	/** Emit HELP/TYPE once per metric name, then a sample. */
 	sample(
 		name: string,
 		type: 'counter' | 'gauge',
@@ -70,15 +77,17 @@ class Exposition {
 		value: number,
 		tags: Record<string, string> = {}
 	): void {
-		if (!this.declared.has(name)) {
-			this.declared.add(name);
-			this.lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} ${type}`);
-		}
-		this.lines.push(`${name}${labels(tags)} ${value}`);
+		let group = this.groups.get(name);
+		if (!group) this.groups.set(name, (group = { type, help, samples: [] }));
+		group.samples.push(`${name}${labels(tags)} ${value}`);
 	}
 
 	toString(): string {
-		return `${this.lines.join('\n')}\n`;
+		const lines: string[] = [];
+		for (const [name, { type, help, samples }] of this.groups) {
+			lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} ${type}`, ...samples);
+		}
+		return `${lines.join('\n')}\n`;
 	}
 }
 
@@ -248,6 +257,9 @@ export class AdminServer {
 		if (signature === this.signature) return;
 		this.signature = signature;
 		this.config = config ?? null;
+		// Drop a pending retry from the previous config — otherwise it fires seconds later and
+		// tears down the listeners this call is about to bind.
+		this.clearRetry();
 		await this.closeServers();
 		if (config && (config.socketPath || config.port !== undefined)) await this.bind();
 	}
