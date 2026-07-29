@@ -764,7 +764,7 @@ not it is transferring anything. So buffer memory scales with *connection count*
 buffer bytes = 2 × readBufferSize × connections
 ```
 
-At the 8192-byte default that is 16 KiB per connection: 4 GiB at 262k connections, 5.2 GiB at 333k.
+At the 8192-byte default that is 16 KiB per connection: 4.0 GiB at 262k connections, 5.1 GiB at 333k.
 The knob is per proxy, and the right value is the opposite for the two shapes of traffic symphony
 carries:
 
@@ -777,12 +777,30 @@ carries:
 
 MQTT is worth splitting by direction: after `SUBSCRIBE` a client sends almost nothing but `PINGREQ`,
 while the broker carries the whole fan-out. `1024`/`4096` is 5 KiB per connection against the
-default's 16 KiB — 3.6 GB saved at 333k connections — and buys more downstream headroom than a
+default's 16 KiB — 3.75 GB saved at 333k connections — and buys more downstream headroom than a
 symmetric 2048 would.
 
 Going small costs CPU, not correctness: a payload larger than the buffer is simply copied in more
 iterations. On a TLS-terminating listener those extra iterations are not even syscalls, since the
 reads come out of rustls's already-decrypted buffer.
+
+Two limits on where these settings apply:
+
+- **Only the plain proxying path.** A route that injects HTTP headers (`sourceAddressHeader:
+  'xForwardedFor'`, or a header-carried `forwardFingerprint`) is framed per-request by
+  `proxy_http1_rewriting`, which uses its own fixed 8 KiB buffers — the same size as the default
+  here, so the default is unaffected, but a raised or lowered value has no effect on those routes.
+  PROXY-protocol routes, including every UDS route, take the plain path and are governed normally.
+- **A config reload cannot change these.** They are frozen when the proxy is constructed, so
+  `symphony-server` recreates the proxy (seamlessly, via `SO_REUSEPORT`) when one of them changes
+  rather than hot-swapping it.
+
+> **Upgrading:** before this setting was applied to the copy loop, `readBufferSize` had no effect —
+> every connection got 8 KiB per direction regardless of what the config said, and the default
+> documented here was `65536`. A config that leaves it unset is unaffected. A config that *sets* it
+> explicitly now gets what it asked for, so a value copied from the old documented default becomes
+> 128 KiB per connection instead of 16 KiB. Drop or remove such a value before upgrading a
+> high-connection-count deployment.
 
 Two caveats when sizing a node from this:
 

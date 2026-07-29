@@ -15,11 +15,15 @@ use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
 /// Default per-direction copy buffer. Matches what `tokio::io::copy_bidirectional` uses
-/// internally, so wiring the previously-inert `readBufferSize` through changed no deployment's
-/// memory footprint. Do not raise this default: both buffers are held for the whole life of every
-/// connection whether or not it is transferring, so the number multiplies straight into
-/// per-connection memory (`2 × size × connections`) — at a million mostly-idle MQTT subscribers,
-/// the difference between 8 KiB and 64 KiB is ~7 GiB per node of buffers that are never read.
+/// internally, so wiring the previously-inert `readBufferSize` through leaves any config that
+/// does not set it on exactly the footprint it already had. Do not raise this default: both
+/// buffers are held for the whole life of every connection whether or not it is transferring, so
+/// the number multiplies straight into per-connection memory (`2 × size × connections`) — across
+/// a million mostly-idle MQTT subscribers, 64 KiB instead of 8 KiB is ~107 GiB of buffers that are
+/// never read.
+///
+/// Applies to the plain proxying path. A route that injects HTTP headers takes
+/// `http_proxy::proxy_http1_rewriting` instead, which frames with its own fixed buffers.
 pub const DEFAULT_COPY_BUFFER_SIZE: usize = 8 * 1024;
 /// A zero-length buffer would make the copy loop read into an empty slice, and `Ok(0)` there is
 /// indistinguishable from EOF — the connection would close instead of proxying. 512 also keeps a
@@ -263,7 +267,7 @@ async fn proxy_via_tls(
 	// HTTP-header injection is only valid for a plaintext HTTP/1 upstream. An h2-negotiated
 	// upstream receives binary frames, so text header insertion would corrupt them.
 	// Read before wrapping — the counter has no view of the TLS session.
-	let l7_http1 = is_http1_alpn(client.get_ref().1.alpn_protocol());
+	let l7_http1 = client.get_ref().1.alpn_protocol() != Some(b"h2".as_ref());
 
 	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
 		.await
@@ -350,28 +354,6 @@ where
 			Ok(result) => result.map_err(|_| ErrorKind::Stream),
 			Err(_) => Err(ErrorKind::IdleTimeout),
 		}
-	}
-}
-
-/// Whether a negotiated ALPN means the terminated stream carries HTTP/1 requests, i.e. whether
-/// header rewriting may run over it.
-///
-/// A negotiated protocol other than `http/1.1`/`http/1.0` is taken at its word: `h2` was always
-/// excluded, but so must `mqtt` be — on an MQTT listener with `sourceAddressHeader:
-/// 'xForwardedFor'` the rewriter would sit waiting for a `\r\n\r\n` that never arrives and stall
-/// the connection until the idle timeout.
-///
-/// An *absent* ALPN stays permissive, because HTTPS clients that offer no ALPN at all are real and
-/// must keep getting their `X-Forwarded-For`. That leaves the gap this can't close from here: a
-/// native MQTT client that negotiates no ALPN is still indistinguishable from such a client, so a
-/// route-level protocol declaration is the complete fix. Until then, MQTT routes want a
-/// PROXY-protocol `sourceAddressHeader` (the default for UDS) rather than header injection.
-fn is_http1_alpn(alpn: Option<&[u8]>) -> bool {
-	const HTTP_1_1: &[u8] = b"http/1.1";
-	const HTTP_1_0: &[u8] = b"http/1.0";
-	match alpn {
-		None => true,
-		Some(p) => p == HTTP_1_1 || p == HTTP_1_0,
 	}
 }
 
@@ -581,31 +563,3 @@ fn emit(tsf: &ThreadsafeFunction<JsEvent>, event: JsEvent) {
 	tsf.call(Ok(event), napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking);
 }
 
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn h2_is_not_http1() {
-		assert!(!is_http1_alpn(Some(b"h2".as_slice())));
-	}
-
-	#[test]
-	fn http1_alpns_are_http1() {
-		assert!(is_http1_alpn(Some(b"http/1.1".as_slice())));
-		assert!(is_http1_alpn(Some(b"http/1.0".as_slice())));
-	}
-
-	#[test]
-	fn mqtt_is_not_http1() {
-		// Header rewriting over an MQTT stream waits for a \r\n\r\n that never arrives and
-		// stalls the connection until the idle timeout.
-		assert!(!is_http1_alpn(Some(b"mqtt".as_slice())));
-	}
-
-	#[test]
-	fn absent_alpn_stays_permissive() {
-		// HTTPS clients that offer no ALPN are real and must keep getting X-Forwarded-For.
-		assert!(is_http1_alpn(None));
-	}
-}
