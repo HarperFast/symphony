@@ -37,7 +37,8 @@ TCP accept (SO_REUSEPORT per worker thread)
   └─ [suspended.rs  register, emit 'suspended', await oneshot]
   └─ tls.rs       TlsAcceptor::accept() with handshake timeout (if terminate_tls)
   └─ upstream.rs  connect(Destination, peer_ip) → UpstreamStream
-  └─ tokio::io::copy_bidirectional wrapped in idle_timeout
+  └─ tokio::io::copy_bidirectional_with_sizes wrapped in idle_timeout
+       (per-direction buffers from readBufferSize / client|upstreamReadBufferSize)
   └─ RAII drop: BalancerGuard, ActiveGuard — all counter decrements happen here
 ```
 

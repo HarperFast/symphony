@@ -209,9 +209,10 @@ impl GlobalMetrics {
 
 /// Bytes a connection may accumulate locally before publishing to the shared listener counters.
 /// The whole point of the local buffer is to keep the shared cache line off the per-chunk path
-/// (see `CountingStream`), so this wants to be well above `copy_bidirectional`'s 8 KiB buffer —
-/// at 256 KiB a saturated connection publishes ~32× less often than it would per chunk, while a
-/// scrape still sees a busy connection's traffic within a fraction of a second.
+/// (see `CountingStream`), so this wants to be well above the per-direction copy buffer
+/// (`DEFAULT_COPY_BUFFER_SIZE`, 8 KiB) — at 256 KiB a saturated connection publishes ~32× less
+/// often than it would per chunk, while a scrape still sees a busy connection's traffic within a
+/// fraction of a second. A smaller configured buffer only means more chunks per flush.
 const COUNTER_FLUSH_BYTES: u64 = 256 * 1024;
 
 /// Wraps the *client* side of a proxied session so byte counts accrue as the copy runs rather

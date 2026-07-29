@@ -68,7 +68,9 @@ console.log('proxy listening on :443');
 | `listeners` | `ListenerConfig[]` | required | One entry per listening address |
 | `routes` | `RouteConfig[]` | required | SNI routing table |
 | `workerThreads` | `number` | CPU count | Tokio worker threads; also controls `SO_REUSEPORT` socket count per listener |
-| `readBufferSize` | `number` | `65536` | Internal copy buffer size in bytes |
+| `readBufferSize` | `number` | `8192` | Per-direction copy buffer size in bytes, clamped to `[512, 1048576]`. See [Copy buffers and per-connection memory](#copy-buffers-and-per-connection-memory) |
+| `clientReadBufferSize` | `number` | `readBufferSize` | Overrides `readBufferSize` for the client→upstream direction only |
+| `upstreamReadBufferSize` | `number` | `readBufferSize` | Overrides `readBufferSize` for the upstream→client direction only |
 
 ### `ListenerConfig`
 
@@ -752,6 +754,45 @@ docker run --rm -v $(pwd):/build -w /build \
 ```
 
 ---
+
+## Copy buffers and per-connection memory
+
+Each proxied connection holds two copy buffers — one per direction — for its entire life, whether or
+not it is transferring anything. So buffer memory scales with *connection count*, not with traffic:
+
+```
+buffer bytes = 2 × readBufferSize × connections
+```
+
+At the 8192-byte default that is 16 KiB per connection: 4 GiB at 262k connections, 5.2 GiB at 333k.
+The knob is per proxy, and the right value is the opposite for the two shapes of traffic symphony
+carries:
+
+| Traffic | Connections | Payloads | Suggested |
+|---|---|---|---|
+| Native MQTT (`8883`) | 100k–1M | hundreds of bytes | `clientReadBufferSize: 1024`, `upstreamReadBufferSize: 4096` |
+| HTTPS (`443`) | thousands | mixed | leave at the default |
+| Operations API (`9925`) | tens | can be large | leave at the default |
+| Replication (`9933`) | ~6 | bulk streams | leave, or raise — 64 KiB across 6 connections is 768 KB total |
+
+MQTT is worth splitting by direction: after `SUBSCRIBE` a client sends almost nothing but `PINGREQ`,
+while the broker carries the whole fan-out. `1024`/`4096` is 5 KiB per connection against the
+default's 16 KiB — 3.6 GB saved at 333k connections — and buys more downstream headroom than a
+symmetric 2048 would.
+
+Going small costs CPU, not correctness: a payload larger than the buffer is simply copied in more
+iterations. On a TLS-terminating listener those extra iterations are not even syscalls, since the
+reads come out of rustls's already-decrypted buffer.
+
+Two caveats when sizing a node from this:
+
+- Buffers are one term, not the whole per-connection cost. A TLS-terminating listener also carries
+  rustls session state per connection, plus kernel socket memory (bounded in aggregate by
+  `net.ipv4.tcp_mem`). Measure the actual slope — `activeConnections` from the admin endpoint
+  against process RSS — before deciding a connection target is reachable.
+- Buffer memory is not what caps connection count. File descriptors (2 per proxied connection,
+  against `RLIMIT_NOFILE`) and `nf_conntrack_max` bind first; see
+  [Linux kernel tuning](#linux-kernel-tuning).
 
 ## Linux kernel tuning
 

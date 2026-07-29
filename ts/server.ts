@@ -53,6 +53,8 @@ interface FileProxyConfig {
 	routes: FileRouteConfig[];
 	workerThreads?: number;
 	readBufferSize?: number;
+	clientReadBufferSize?: number;
+	upstreamReadBufferSize?: number;
 }
 
 interface ConfigFile {
@@ -126,7 +128,14 @@ function toProxyConfig(spec: FileProxyConfig, baseDir: string): ProxyConfig {
 		mtls: l.mtls ? resolveMtls(l.mtls, baseDir) : undefined,
 	}));
 	const routes: RouteConfig[] = spec.routes.map((r) => resolveRoute(r, baseDir));
-	return { listeners, routes, workerThreads: spec.workerThreads, readBufferSize: spec.readBufferSize };
+	return {
+		listeners,
+		routes,
+		workerThreads: spec.workerThreads,
+		readBufferSize: spec.readBufferSize,
+		clientReadBufferSize: spec.clientReadBufferSize,
+		upstreamReadBufferSize: spec.upstreamReadBufferSize,
+	};
 }
 
 // Sorted listener ports identify a proxy across reloads (the route table is per-proxy,
