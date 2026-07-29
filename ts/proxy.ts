@@ -171,6 +171,8 @@ export class SymphonyProxy extends EventEmitter {
 			routes: config.routes.map(toJsRoute),
 			workerThreads: config.workerThreads,
 			readBufferSize: config.readBufferSize,
+			clientReadBufferSize: config.clientReadBufferSize,
+			upstreamReadBufferSize: config.upstreamReadBufferSize,
 		};
 
 		this._inner = new Wrap(jsConfig, (err, raw) => {

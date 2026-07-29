@@ -103,7 +103,16 @@ export interface JsProxyConfig {
   listeners: Array<JsListenerConfig>
   routes: Array<JsRouteConfig>
   workerThreads?: number
+  /**
+   * Per-direction copy buffer, in bytes (default 8192). Two of these are held for the whole
+   * life of every proxied connection, idle or not, so it is a direct multiplier on
+   * per-connection memory: `2 × readBufferSize × connections`.
+   */
   readBufferSize?: number
+  /** Overrides `readBufferSize` for the client→upstream direction only. */
+  clientReadBufferSize?: number
+  /** Overrides `readBufferSize` for the upstream→client direction only. */
+  upstreamReadBufferSize?: number
 }
 export interface JsListenerProtectionHotConfig {
   /** Port of the listener to update. Must match a listener configured at start. */

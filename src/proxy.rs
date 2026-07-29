@@ -2,7 +2,9 @@ use crate::http_listener::spawn_http_listeners;
 use crate::listener::spawn_listeners;
 use crate::metrics::{total_of, GlobalMetrics, ListenerMetrics};
 use crate::protection::ProtectionState;
-use crate::proxy_conn::{ConnContext, JsEvent};
+use crate::proxy_conn::{
+	ConnContext, JsEvent, DEFAULT_COPY_BUFFER_SIZE, MAX_COPY_BUFFER_SIZE, MIN_COPY_BUFFER_SIZE,
+};
 use crate::router::{
 	build_route_table, ForwardFingerprint, ListenerTlsSpec, LiveRouteTable, RouteSpec,
 	SourceAddressMode, UpstreamSpec,
@@ -129,7 +131,14 @@ pub struct JsProxyConfig {
 	pub listeners: Vec<JsListenerConfig>,
 	pub routes: Vec<JsRouteConfig>,
 	pub worker_threads: Option<u32>,
+	/// Per-direction copy buffer, in bytes (default 8192). Two of these are held for the whole
+	/// life of every proxied connection, idle or not, so it is a direct multiplier on
+	/// per-connection memory: `2 × readBufferSize × connections`.
 	pub read_buffer_size: Option<u32>,
+	/// Overrides `readBufferSize` for the client→upstream direction only.
+	pub client_read_buffer_size: Option<u32>,
+	/// Overrides `readBufferSize` for the upstream→client direction only.
+	pub upstream_read_buffer_size: Option<u32>,
 }
 
 #[napi(object)]
@@ -250,7 +259,8 @@ pub struct SymphonyProxyWrap {
 	default_listener_tls: ListenerTlsSpec,
 	worker_threads: usize,
 	idle_timeout: Duration,
-	read_buffer_size: usize,
+	client_read_buffer_size: usize,
+	upstream_read_buffer_size: usize,
 	// Shared runtime state
 	route_table: Arc<LiveRouteTable>,
 	suspended_registry: Arc<SuspendedRegistry>,
@@ -306,7 +316,14 @@ impl SymphonyProxyWrap {
 		} else {
 			Duration::ZERO
 		};
-		let read_buffer_size = config.read_buffer_size.unwrap_or(65_536) as usize;
+		let client_read_buffer_size = resolve_copy_buffer_size(
+			config.client_read_buffer_size.or(config.read_buffer_size),
+			"clientReadBufferSize",
+		);
+		let upstream_read_buffer_size = resolve_copy_buffer_size(
+			config.upstream_read_buffer_size.or(config.read_buffer_size),
+			"upstreamReadBufferSize",
+		);
 
 		let mut internal_listeners = Vec::new();
 		let mut listener_states = Vec::new();
@@ -403,7 +420,8 @@ impl SymphonyProxyWrap {
 			default_listener_tls,
 			worker_threads,
 			idle_timeout,
-			read_buffer_size,
+			client_read_buffer_size,
+			upstream_read_buffer_size,
 			route_table: Arc::new(LiveRouteTable(arc_swap::ArcSwap::new(Arc::new(table)))),
 			suspended_registry: SuspendedRegistry::new(),
 			global_metrics: Arc::new(GlobalMetrics::default()),
@@ -439,7 +457,8 @@ impl SymphonyProxyWrap {
 				listener_addr: state.addr.clone(),
 				idle_timeout: self.idle_timeout,
 				upstream_connect_timeout,
-				read_buffer_size: self.read_buffer_size,
+				client_read_buffer_size: self.client_read_buffer_size,
+				upstream_read_buffer_size: self.upstream_read_buffer_size,
 				js_emit: self.js_emit.clone(),
 			});
 
@@ -935,6 +954,21 @@ fn listener_tls_spec(l: &JsListenerConfig) -> ListenerTlsSpec {
 	}
 }
 
+/// Resolve one direction's copy buffer size, clamping rather than rejecting: a buffer of 0 would
+/// make the copy loop read into an empty slice and mistake the `Ok(0)` for EOF, so the floor is a
+/// correctness guard, not a preference. Out-of-range values are logged so a silently-ignored
+/// config value can't masquerade as an applied one.
+fn resolve_copy_buffer_size(configured: Option<u32>, label: &str) -> usize {
+	let requested = configured.map_or(DEFAULT_COPY_BUFFER_SIZE, |v| v as usize);
+	let clamped = requested.clamp(MIN_COPY_BUFFER_SIZE, MAX_COPY_BUFFER_SIZE);
+	if clamped != requested {
+		tracing::warn!(
+			"{label} {requested} is outside [{MIN_COPY_BUFFER_SIZE}, {MAX_COPY_BUFFER_SIZE}]; using {clamped}"
+		);
+	}
+	clamped
+}
+
 fn pem_bytes(v: &Either<String, Buffer>) -> Vec<u8> {
 	match v {
 		Either::A(s) => s.as_bytes().to_vec(),
@@ -1074,6 +1108,21 @@ mod tests {
 			..no_rate_limit_prot()
 		};
 		assert!(parse_protection_config(&prot).is_err(), "zero cps must error");
+	}
+
+	#[test]
+	fn copy_buffer_default_matches_the_copy_loop() {
+		// The default has to equal what the copy loop used while `readBufferSize` was inert,
+		// or wiring it through would have silently changed every deployment's footprint.
+		assert_eq!(resolve_copy_buffer_size(None, "test"), DEFAULT_COPY_BUFFER_SIZE);
+	}
+
+	#[test]
+	fn copy_buffer_size_is_clamped_not_rejected() {
+		// Zero would make the copy loop read into an empty slice and read the Ok(0) as EOF.
+		assert_eq!(resolve_copy_buffer_size(Some(0), "test"), MIN_COPY_BUFFER_SIZE);
+		assert_eq!(resolve_copy_buffer_size(Some(u32::MAX), "test"), MAX_COPY_BUFFER_SIZE);
+		assert_eq!(resolve_copy_buffer_size(Some(1024), "test"), 1024);
 	}
 
 	#[test]

@@ -9,10 +9,25 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::marker::Unpin;
-use tokio::io::copy_bidirectional;
+use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
+
+/// Default per-direction copy buffer. Matches what `tokio::io::copy_bidirectional` uses
+/// internally, so wiring the previously-inert `readBufferSize` through changed no deployment's
+/// memory footprint. Do not raise this default: both buffers are held for the whole life of every
+/// connection whether or not it is transferring, so the number multiplies straight into
+/// per-connection memory (`2 × size × connections`) — at a million mostly-idle MQTT subscribers,
+/// the difference between 8 KiB and 64 KiB is ~7 GiB per node of buffers that are never read.
+pub const DEFAULT_COPY_BUFFER_SIZE: usize = 8 * 1024;
+/// A zero-length buffer would make the copy loop read into an empty slice, and `Ok(0)` there is
+/// indistinguishable from EOF — the connection would close instead of proxying. 512 also keeps a
+/// pathological config from turning every byte into its own syscall.
+pub const MIN_COPY_BUFFER_SIZE: usize = 512;
+/// 1 MiB per direction is already 2 MiB per connection; beyond this a config value is far more
+/// likely to be a units mistake than an intent.
+pub const MAX_COPY_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// JS event types emitted from connection tasks back to Node.
 #[derive(Debug)]
@@ -50,7 +65,12 @@ pub struct ConnContext {
 	pub idle_timeout: Duration,
 	/// Timeout for establishing upstream connections (TCP connect / UDS connect).
 	pub upstream_connect_timeout: Duration,
-	pub read_buffer_size: usize,
+	/// Copy buffer for the client→upstream direction. See `DEFAULT_COPY_BUFFER_SIZE`.
+	pub client_read_buffer_size: usize,
+	/// Copy buffer for the upstream→client direction. Split from the client direction because
+	/// MQTT is strongly asymmetric: after SUBSCRIBE a client sends almost nothing but PINGREQ,
+	/// while the broker carries the whole fan-out.
+	pub upstream_read_buffer_size: usize,
 	pub js_emit: Arc<ThreadsafeFunction<JsEvent>>,
 }
 
@@ -243,7 +263,7 @@ async fn proxy_via_tls(
 	// HTTP-header injection is only valid for a plaintext HTTP/1 upstream. An h2-negotiated
 	// upstream receives binary frames, so text header insertion would corrupt them.
 	// Read before wrapping — the counter has no view of the TLS session.
-	let l7_http1 = client.get_ref().1.alpn_protocol() != Some(b"h2".as_ref());
+	let l7_http1 = is_http1_alpn(client.get_ref().1.alpn_protocol());
 
 	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
 		.await
@@ -255,9 +275,9 @@ async fn proxy_via_tls(
 	let mut client = CountingStream::new(client, &ctx.listener_metrics);
 
 	match &mut upstream {
-		UpstreamStream::Tcp(ref mut up) => forward(&mut client, up, &sf, l7_http1, ctx.idle_timeout).await,
+		UpstreamStream::Tcp(ref mut up) => forward(&mut client, up, &sf, l7_http1, ctx).await,
 		UpstreamStream::Uds { ref mut stream, .. } => {
-			forward(&mut client, stream, &sf, l7_http1, ctx.idle_timeout).await
+			forward(&mut client, stream, &sf, l7_http1, ctx).await
 		}
 	}
 }
@@ -280,9 +300,9 @@ async fn proxy_raw(
 	// Passthrough forwards raw TLS bytes — never a plaintext HTTP/1 stream, so header injection
 	// is disabled (only PROXY protocol carriers apply here).
 	match &mut upstream {
-		UpstreamStream::Tcp(ref mut up) => forward(&mut client, up, &sf, false, ctx.idle_timeout).await,
+		UpstreamStream::Tcp(ref mut up) => forward(&mut client, up, &sf, false, ctx).await,
 		UpstreamStream::Uds { ref mut stream, .. } => {
-			forward(&mut client, stream, &sf, false, ctx.idle_timeout).await
+			forward(&mut client, stream, &sf, false, ctx).await
 		}
 	}
 }
@@ -297,7 +317,7 @@ async fn forward<C, U>(
 	upstream: &mut U,
 	sf: &SourceForwarding<'_>,
 	l7_http1: bool,
-	idle: Duration,
+	ctx: &ConnContext,
 ) -> std::result::Result<(), ErrorKind>
 where
 	C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -307,20 +327,51 @@ where
 		write_connection_prefix(upstream, sf).await?;
 		let rewrites = header_rewrites(sf, l7_http1);
 		if rewrites.is_empty() {
-			copy_bidirectional(client, upstream).await.map(|_| ())
+			// Argument order is (a, b, a_to_b, b_to_a) with a = client, so the client buffer
+			// sizes the client→upstream half and the upstream buffer the fan-out half.
+			copy_bidirectional_with_sizes(
+				client,
+				upstream,
+				ctx.client_read_buffer_size,
+				ctx.upstream_read_buffer_size,
+			)
+			.await
+			.map(|_| ())
 		} else {
 			crate::http_proxy::proxy_http1_rewriting(client, upstream, &rewrites).await
 		}
 	};
 	// The idle timeout is reported as its own kind rather than inferred from an
 	// `io::ErrorKind::TimedOut`, which a peer's kernel-level ETIMEDOUT would also produce.
-	if idle.is_zero() {
+	if ctx.idle_timeout.is_zero() {
 		body.await.map_err(|_| ErrorKind::Stream)
 	} else {
-		match timeout(idle, body).await {
+		match timeout(ctx.idle_timeout, body).await {
 			Ok(result) => result.map_err(|_| ErrorKind::Stream),
 			Err(_) => Err(ErrorKind::IdleTimeout),
 		}
+	}
+}
+
+/// Whether a negotiated ALPN means the terminated stream carries HTTP/1 requests, i.e. whether
+/// header rewriting may run over it.
+///
+/// A negotiated protocol other than `http/1.1`/`http/1.0` is taken at its word: `h2` was always
+/// excluded, but so must `mqtt` be — on an MQTT listener with `sourceAddressHeader:
+/// 'xForwardedFor'` the rewriter would sit waiting for a `\r\n\r\n` that never arrives and stall
+/// the connection until the idle timeout.
+///
+/// An *absent* ALPN stays permissive, because HTTPS clients that offer no ALPN at all are real and
+/// must keep getting their `X-Forwarded-For`. That leaves the gap this can't close from here: a
+/// native MQTT client that negotiates no ALPN is still indistinguishable from such a client, so a
+/// route-level protocol declaration is the complete fix. Until then, MQTT routes want a
+/// PROXY-protocol `sourceAddressHeader` (the default for UDS) rather than header injection.
+fn is_http1_alpn(alpn: Option<&[u8]>) -> bool {
+	const HTTP_1_1: &[u8] = b"http/1.1";
+	const HTTP_1_0: &[u8] = b"http/1.0";
+	match alpn {
+		None => true,
+		Some(p) => p == HTTP_1_1 || p == HTTP_1_0,
 	}
 }
 
@@ -528,4 +579,33 @@ impl Drop for ActiveGuard {
 fn emit(tsf: &ThreadsafeFunction<JsEvent>, event: JsEvent) {
 	// Non-blocking — drop the event if the JS queue is full
 	tsf.call(Ok(event), napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking);
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn h2_is_not_http1() {
+		assert!(!is_http1_alpn(Some(b"h2".as_slice())));
+	}
+
+	#[test]
+	fn http1_alpns_are_http1() {
+		assert!(is_http1_alpn(Some(b"http/1.1".as_slice())));
+		assert!(is_http1_alpn(Some(b"http/1.0".as_slice())));
+	}
+
+	#[test]
+	fn mqtt_is_not_http1() {
+		// Header rewriting over an MQTT stream waits for a \r\n\r\n that never arrives and
+		// stalls the connection until the idle timeout.
+		assert!(!is_http1_alpn(Some(b"mqtt".as_slice())));
+	}
+
+	#[test]
+	fn absent_alpn_stays_permissive() {
+		// HTTPS clients that offer no ALPN are real and must keep getting X-Forwarded-For.
+		assert!(is_http1_alpn(None));
+	}
 }
