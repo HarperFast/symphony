@@ -777,7 +777,7 @@ carries:
 
 MQTT is worth splitting by direction: after `SUBSCRIBE` a client sends almost nothing but `PINGREQ`,
 while the broker carries the whole fan-out. `1024`/`4096` is 5 KiB per connection against the
-default's 16 KiB — 3.75 GB saved at 333k connections — and buys more downstream headroom than a
+default's 16 KiB — 3.5 GiB saved at 333k connections — and buys more downstream headroom than a
 symmetric 2048 would.
 
 Going small costs CPU, not correctness: a payload larger than the buffer is simply copied in more
