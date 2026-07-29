@@ -316,14 +316,14 @@ impl SymphonyProxyWrap {
 		} else {
 			Duration::ZERO
 		};
-		let client_read_buffer_size = resolve_copy_buffer_size(
-			config.client_read_buffer_size.or(config.read_buffer_size),
-			"clientReadBufferSize",
-		);
-		let upstream_read_buffer_size = resolve_copy_buffer_size(
-			config.upstream_read_buffer_size.or(config.read_buffer_size),
-			"upstreamReadBufferSize",
-		);
+		let client_read_buffer_size = match config.client_read_buffer_size {
+			Some(v) => resolve_copy_buffer_size(Some(v), "clientReadBufferSize"),
+			None => resolve_copy_buffer_size(config.read_buffer_size, "readBufferSize"),
+		};
+		let upstream_read_buffer_size = match config.upstream_read_buffer_size {
+			Some(v) => resolve_copy_buffer_size(Some(v), "upstreamReadBufferSize"),
+			None => resolve_copy_buffer_size(config.read_buffer_size, "readBufferSize"),
+		};
 
 		let mut internal_listeners = Vec::new();
 		let mut listener_states = Vec::new();
@@ -957,7 +957,8 @@ fn listener_tls_spec(l: &JsListenerConfig) -> ListenerTlsSpec {
 /// Resolve one direction's copy buffer size, clamping rather than rejecting: a buffer of 0 would
 /// make the copy loop read into an empty slice and mistake the `Ok(0)` for EOF, so the floor is a
 /// correctness guard, not a preference. Out-of-range values are logged so a silently-ignored
-/// config value can't masquerade as an applied one.
+/// config value can't masquerade as an applied one — `label` is the key the operator actually set,
+/// not the direction being resolved, or the warning names a field they never wrote.
 fn resolve_copy_buffer_size(configured: Option<u32>, label: &str) -> usize {
 	let requested = configured.map_or(DEFAULT_COPY_BUFFER_SIZE, |v| v as usize);
 	let clamped = requested.clamp(MIN_COPY_BUFFER_SIZE, MAX_COPY_BUFFER_SIZE);

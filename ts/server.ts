@@ -149,7 +149,7 @@ function portKey(listeners: { port: number }[]): string {
 
 interface ActiveProxy {
 	proxy: SymphonyProxy;
-	listenerSig: string;
+	constructionSig: string;
 }
 
 class ServerState {
@@ -315,13 +315,22 @@ class ServerState {
 				// some→none transitions force a seamless recreate so the new listener is
 				// constructed with the correct Option<ProtectionState>. Protection CONTENTS are
 				// excluded so a contents-only change stays on the hot-swap path without recreating.
-				const listenerSig = JSON.stringify(
-					proxyConfig.listeners.map(({ protection, ...rest }) => ({
+				//
+				// The proxy-level fields below are frozen at construction on the Rust side too, and
+				// updateConfig reaches neither: without them in the signature, editing only a buffer
+				// size (or workerThreads) leaves the sig unchanged, so the reload takes the hot-swap
+				// branch, reports success, and keeps running the old value.
+				const constructionSig = JSON.stringify({
+					listeners: proxyConfig.listeners.map(({ protection, ...rest }) => ({
 						...rest,
 						hasProtection: protection != null,
 					})),
-				);
-				if (existing && existing.listenerSig === listenerSig) {
+					workerThreads: proxyConfig.workerThreads,
+					readBufferSize: proxyConfig.readBufferSize,
+					clientReadBufferSize: proxyConfig.clientReadBufferSize,
+					upstreamReadBufferSize: proxyConfig.upstreamReadBufferSize,
+				});
+				if (existing && existing.constructionSig === constructionSig) {
 					// Same listeners (presence-unchanged) → hot-swap routes and protection contents.
 					// All listeners here either had protection from the start (Some) or never did
 					// (None, excluded by filter). none→some / some→none went through the recreate path.
@@ -332,7 +341,7 @@ class ServerState {
 							.map((l) => ({ port: l.port, protection: l.protection! })),
 					});
 				} else {
-					// New port-set, or listener settings changed → (re)create. SO_REUSEPORT lets the
+					// New port-set, or a construction-frozen setting changed → (re)create. SO_REUSEPORT lets the
 					// new listener bind before the old one is dropped, so there is no bind gap.
 					const proxy = new SymphonyProxy(proxyConfig);
 					proxy.on('error', (err, ctx) =>
@@ -340,7 +349,7 @@ class ServerState {
 					);
 					await proxy.start();
 					if (existing) await existing.proxy.stop().catch((err) => logErr(`stopping old proxy [${key}]:`, err));
-					this.active.set(key, { proxy, listenerSig });
+					this.active.set(key, { proxy, constructionSig });
 					log(`proxy listening on ports [${key}]`);
 				}
 			} catch (err) {
