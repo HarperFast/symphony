@@ -760,11 +760,12 @@ docker run --rm -v $(pwd):/build -w /build \
 `readBufferSize` (and its per-direction overrides) is a *maximum*, not a permanent allocation. Each
 direction starts at a small fixed floor (1 KiB total across both directions) and escalates to the
 configured maximum only once it observes a sustained burst — two consecutive reads that fill the
-current buffer — dropping straight back to the floor as soon as a read comes back under capacity or
-the direction goes idle. So only the memory *above* that floor scales with concurrently bursting
-transfers; the 1 KiB/connection floor itself still scales with connection count, same as before. A
-million idle MQTT subscribers cost about 0.95 GiB in floors (1 KiB × 1,000,000 connections), not
-`readBufferSize × 2 × 1,000,000`.
+current buffer — dropping straight back to the floor once the direction actually parks with nothing
+left to write, not on every single under-capacity read (that would reallocate a connection that is
+still continuously active but simply has variably-sized traffic). So only the memory *above* that
+floor scales with concurrently bursting transfers; the 1 KiB/connection floor itself still scales
+with connection count, same as before. A million idle MQTT subscribers cost about 0.95 GiB in floors
+(1 KiB × 1,000,000 connections), not `readBufferSize × 2 × 1,000,000`.
 
 ```
 worst-case buffer bytes = (clientReadBufferSize + upstreamReadBufferSize) × connections bursting right now

@@ -13,13 +13,12 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
-/// Default per-direction copy buffer. Matches what `tokio::io::copy_bidirectional` uses
-/// internally, so wiring the previously-inert `readBufferSize` through leaves any config that
-/// does not set it on exactly the footprint it already had. Do not raise this default: both
-/// buffers are held for the whole life of every connection whether or not it is transferring, so
-/// the number multiplies straight into per-connection memory (`(client + upstream) × connections`)
-/// — across a million mostly-idle MQTT subscribers, 64 KiB per direction instead of 8 KiB is
-/// ~107 GiB of buffers that are never read.
+/// Default per-direction copy buffer *maximum*. Matches what `tokio::io::copy_bidirectional` used
+/// to hold permanently, so wiring the previously-inert `readBufferSize` through leaves any config
+/// that does not set it on exactly the footprint it already had. `copy::LazyCopyBuffer` only grows
+/// to this ceiling for a direction observed mid-burst, and shrinks back to a small fixed floor once
+/// it parks — so this default is not a permanent per-connection cost, but it does bound how large a
+/// buffer every route that doesn't override it may grow to while actively bursting.
 ///
 /// Applies to the plain proxying path. A route that injects HTTP headers takes
 /// `http_proxy::proxy_http1_rewriting` instead, which frames with its own fixed buffers.

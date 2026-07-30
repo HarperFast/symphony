@@ -137,12 +137,16 @@ state machine (`transfer_one_direction` + `TransferState::Running/ShuttingDown/D
 over both directions), with one addition: `LazyCopyBuffer` starts each direction at a small fixed
 size (`PROBE_BUFFER_SIZE`, 512 B) and escalates straight to the full configured `max_buf_size`
 only once **two consecutive** reads exactly saturate the current buffer — real evidence of a
-sustained burst — dropping straight back to the floor the first time a read comes back under
-capacity. One full read isn't enough evidence: a message that happens to exactly match the
-current (small) buffer size is a coincidence, not a burst, and escalating on it would leave the
-(now oversized) buffer resident for however long the connection then sits idle, however large
-`max_buf_size` is configured. Requiring a second confirming read bounds that coincidence to the
-floor size at the cost of one extra small-buffer round trip on every genuine burst — negligible.
+sustained burst — dropping straight back to the floor once the direction actually **parks** with
+nothing left to write, not on the first under-capacity read. One full read isn't enough escalation
+evidence: a message that happens to exactly match the current (small) buffer size is a coincidence,
+not a burst, and escalating on it would leave the (now oversized) buffer resident for however long
+the connection then sits idle, however large `max_buf_size` is configured. Requiring a second
+confirming read bounds that coincidence to the floor size at the cost of one extra small-buffer
+round trip on every genuine burst — negligible. Symmetrically, shrinking is deferred to the actual
+park rather than the first under-capacity read: a connection with continuously active but
+variably-sized traffic (never actually idle) would otherwise reallocate on every undersized read
+only to grow right back on the next burst.
 
 Reusing tokio's own poll-based structure (rather than `tokio::io::split` plus independent
 per-direction `async fn`s, tried first) matters for two reasons found by an independent review of
