@@ -214,7 +214,17 @@ export class SymphonyProxy extends EventEmitter {
 						break;
 				}
 			} catch (listenerErr) {
-				this.emit('error', listenerErr instanceof Error ? listenerErr : new Error(String(listenerErr)));
+				// If nothing is listening for 'error', emit('error', ...) itself throws (Node's
+				// EventEmitter contract — every consumer of this class must attach one), which
+				// would otherwise recurse right back into this catch with no way out, escaping as
+				// an unhandled double-throw that also replaces the original stack with a generic
+				// one. Re-emit only when a listener actually exists; otherwise propagate the
+				// original error as-is rather than trying (and failing) to route it through 'error'.
+				if (this.listenerCount('error') > 0) {
+					this.emit('error', listenerErr instanceof Error ? listenerErr : new Error(String(listenerErr)));
+				} else {
+					throw listenerErr;
+				}
 			}
 		});
 	}
