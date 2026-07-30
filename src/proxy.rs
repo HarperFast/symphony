@@ -131,9 +131,10 @@ pub struct JsProxyConfig {
 	pub listeners: Vec<JsListenerConfig>,
 	pub routes: Vec<JsRouteConfig>,
 	pub worker_threads: Option<u32>,
-	/// Per-direction copy buffer, in bytes (default 8192). Two of these are held for the whole
-	/// life of every proxied connection, idle or not, so it is a direct multiplier on
-	/// per-connection memory: `2 × readBufferSize × connections`.
+	/// Per-direction copy buffer, in bytes (default 8192). One buffer per direction is held for
+	/// the whole life of every proxied connection, idle or not, so these are a direct multiplier
+	/// on per-connection memory: `(client + upstream) × connections`, i.e.
+	/// `2 × readBufferSize × connections` when both directions use this value.
 	pub read_buffer_size: Option<u32>,
 	/// Overrides `readBufferSize` for the client→upstream direction only.
 	pub client_read_buffer_size: Option<u32>,

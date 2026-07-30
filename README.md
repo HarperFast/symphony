@@ -761,10 +761,13 @@ Each proxied connection holds two copy buffers — one per direction — for its
 not it is transferring anything. So buffer memory scales with *connection count*, not with traffic:
 
 ```
-buffer bytes = 2 × readBufferSize × connections
+buffer bytes = (clientReadBufferSize + upstreamReadBufferSize) × connections
 ```
 
-At the 8192-byte default that is 16 KiB per connection: 4.0 GiB at 262k connections, 5.1 GiB at 333k.
+Each unset override falls back to `readBufferSize`, so with symmetric sizing that is just
+`2 × readBufferSize × connections`. At the 8192-byte default it is 16 KiB per connection: 4.0 GiB at
+262k connections, 5.1 GiB at 333k. The asymmetric MQTT setting recommended below is
+`1024 + 4096` = 5 KiB per connection, which is where the general form matters.
 The knob is per proxy, and the right value is the opposite for the two shapes of traffic symphony
 carries:
 
