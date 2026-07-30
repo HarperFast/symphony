@@ -101,6 +101,7 @@ console.log('proxy listening on :443');
 | `http2` | `boolean` | `false` | Advertise `h2` in ALPN so clients negotiate HTTP/2. Raw H2 frames flow through to the upstream unchanged. Requires `terminateTls: true`. |
 | `sourceAddressHeader` | `'proxyProtocol' \| 'proxyProtocolV2' \| 'xForwardedFor' \| 'none'` | `'proxyProtocol'` for UDS, `'none'` for TCP | How the real client IP is forwarded to the upstream. See [Source address forwarding](#source-address-forwarding). |
 | `forwardFingerprint` | `'ja3' \| 'ja4' \| 'none'` | `'none'` | Forward the client TLS fingerprint downstream. See [Forwarding the fingerprint](#forwarding-the-fingerprint-downstream). |
+| `protocol` | `'http' \| 'opaque'` | `'opaque'` | The route's application protocol. Required to be `'http'` before `sourceAddressHeader: 'xForwardedFor'` or a header-carried `forwardFingerprint` is accepted — see [Source address forwarding](#source-address-forwarding). |
 
 ### `Upstream`
 
@@ -355,8 +356,27 @@ Use `sourceAddressHeader` on a route to control how the real client IP is commun
 |---|---|
 | `'proxyProtocol'` | Sends a PROXY protocol v1 (text) header (`PROXY TCP4 <src-ip> <dst-ip> <src-port> 0\r\n`) before any application data. Default for UDS upstreams. |
 | `'proxyProtocolV2'` | Sends a PROXY protocol v2 (binary) header before any application data. v2 adds a TLV section — the carrier for `forwardFingerprint` below and for [mTLS client cert forwarding](#forwarding-mtls-client-certificates). Keep it opt-in: the consumer must speak v2 (nginx/HAProxy do; Harper core's UDS reader parses v1 only before Harper 5.2). |
-| `'xForwardedFor'` | Reads the first chunk of the HTTP request, inserts an `X-Forwarded-For` header after the request line, then copies the rest verbatim. No per-request parsing overhead for keep-alive connections. Default for TCP upstreams (disabled). |
+| `'xForwardedFor'` | Reads the first chunk of the HTTP request, inserts an `X-Forwarded-For` header after the request line, then copies the rest verbatim. No per-request parsing overhead for keep-alive connections. Default for TCP upstreams (disabled). Requires `protocol: 'http'` on the route (below). |
 | `'none'` | Does not forward source address information. Default for TCP upstreams. |
+
+### Declaring the route protocol
+
+`sourceAddressHeader: 'xForwardedFor'`, and `forwardFingerprint` under any mode other than `'proxyProtocolV2'`, rewrite an HTTP/1 request — they need a route that says it actually carries HTTP. Set `protocol: 'http'` to opt in:
+
+```typescript
+{
+  sni: 'app.example.com',
+  upstreams: [{ kind: 'uds', path: '/run/app/worker.sock' }],
+  terminateTls: true,
+  cert: { certChain, privateKey },
+  sourceAddressHeader: 'xForwardedFor',
+  protocol: 'http', // required — omitting this is a config error, not a silent no-op
+}
+```
+
+`protocol` defaults to `'opaque'` — a route for a non-HTTP application protocol (MQTT, or any other raw TCP/TLS protocol), limited to the PROXY-protocol carriers, which work on any byte stream. The declaration exists because ALPN can't stand in for it: a native protocol that negotiates no ALPN (MQTT does not) is indistinguishable at the TLS layer from an HTTPS client that simply didn't offer one. A route that requests a header-injection mode without declaring `protocol: 'http'` fails at construction with a descriptive error — it never silently stops injecting the header, since a backend that silently sees the wrong (or no) client IP is worse than a config that fails to build.
+
+This is a breaking change for a hand-written route that already uses `sourceAddressHeader: 'xForwardedFor'` (or a header-carried `forwardFingerprint`) without `protocol: 'http'` — add the declaration when upgrading.
 
 ### PROXY protocol (default for UDS)
 
@@ -383,6 +403,7 @@ Bun's built-in HTTP server does not support PROXY protocol. Use `'xForwardedFor'
   terminateTls: true,
   cert: { certChain, privateKey },
   sourceAddressHeader: 'xForwardedFor',
+  protocol: 'http',
 }
 ```
 
@@ -410,10 +431,10 @@ symphony computes the client's JA3/JA4 fingerprint from the ClientHello (the sam
 
 The **carrier depends on `sourceAddressHeader`**:
 
-- With `'proxyProtocolV2'`, the fingerprint rides a PROXY v2 **TLV** — type `0xE0` for JA3, `0xE1` for JA4 (in HAProxy's `0xE0–0xEF` private range). This works even in passthrough (`terminateTls: false`), since the header prefixes the raw TLS bytes.
-- Otherwise, symphony injects an **`X-JA3` / `X-JA4` HTTP header**. This requires a plaintext HTTP/1 upstream (`terminateTls: true` and not `http2`); it is skipped for passthrough or HTTP/2 upstreams (use `'proxyProtocolV2'` there). Any client-supplied `X-JA3`/`X-JA4` is stripped so the injected value is authoritative and can't be spoofed.
+- With `'proxyProtocolV2'`, the fingerprint rides a PROXY v2 **TLV** — type `0xE0` for JA3, `0xE1` for JA4 (in HAProxy's `0xE0–0xEF` private range). This works even in passthrough (`terminateTls: false`), since the header prefixes the raw TLS bytes. No `protocol` declaration is needed — the TLV carries it regardless of the route's application protocol.
+- Otherwise, symphony injects an **`X-JA3` / `X-JA4` HTTP header**. This requires `protocol: 'http'` on the route (see [Declaring the route protocol](#declaring-the-route-protocol)) and a plaintext HTTP/1 upstream (`terminateTls: true` and not `http2`); it is skipped for HTTP/2 upstreams (use `'proxyProtocolV2'` there). Any client-supplied `X-JA3`/`X-JA4` is stripped so the injected value is authoritative and can't be spoofed.
 
-A config that requests `forwardFingerprint` with no viable carrier — passthrough (`terminateTls: false`) without `sourceAddressHeader: 'proxyProtocolV2'`, where there's neither an HTTP request to inject a header into nor a v2 TLV — logs a startup warning rather than silently dropping the signal.
+A config that requests a header-carried `forwardFingerprint` without declaring `protocol: 'http'` fails at construction — the same fail-loud rule as `sourceAddressHeader: 'xForwardedFor'`. A config that requests `forwardFingerprint` with no viable carrier at all — passthrough (`terminateTls: false`) without `sourceAddressHeader: 'proxyProtocolV2'`, where there's neither an HTTP request to inject a header into nor a v2 TLV — logs a startup warning rather than silently dropping the signal.
 
 ```typescript
 // TLV carrier — works for any upstream that speaks PROXY v2, including passthrough
@@ -434,6 +455,7 @@ A config that requests `forwardFingerprint` with no viable carrier — passthrou
   cert: { certChain, privateKey },
   sourceAddressHeader: 'xForwardedFor',
   forwardFingerprint: 'ja3', // upstream reads X-JA3 alongside X-Forwarded-For
+  protocol: 'http',
 }
 ```
 

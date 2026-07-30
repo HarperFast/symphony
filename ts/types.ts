@@ -126,6 +126,25 @@ export interface RouteConfig {
 	 * Requires `terminateTls: true`. Default: false.
 	 */
 	http2?: boolean;
+	/**
+	 * The route's application protocol.
+	 *
+	 * - `'http'` — the byte stream (once TLS is terminated and h2 isn't negotiated) is
+	 *   HTTP/1.x. Required to use `sourceAddressHeader: 'xForwardedFor'`, or
+	 *   `forwardFingerprint` under any mode other than `'proxyProtocolV2'` — both rewrite
+	 *   an HTTP request, which is only safe on a route that says it carries one.
+	 * - `'opaque'` (default) — not HTTP: MQTT, a raw TCP protocol, or anything else
+	 *   symphony doesn't parse. Source-address forwarding is limited to the
+	 *   `'proxyProtocol'` / `'proxyProtocolV2'` carriers, which work on any byte stream.
+	 *
+	 * ALPN cannot stand in for this declaration: a native non-HTTP client that offers no
+	 * ALPN is indistinguishable from an HTTPS client that simply didn't offer one, so a
+	 * route requesting a header-injection mode without declaring `protocol: 'http'` is a
+	 * config error, not a route that quietly stops injecting the header. This is a breaking
+	 * change for a hand-written route using `sourceAddressHeader: 'xForwardedFor'` (or a
+	 * header-carried `forwardFingerprint`) without `protocol: 'http'` — add the declaration.
+	 */
+	protocol?: 'http' | 'opaque';
 }
 
 // ── Protection ────────────────────────────────────────────────────────────────
@@ -358,6 +377,8 @@ export interface ResolveRoute {
 	forwardFingerprint?: 'ja3' | 'ja4' | 'none';
 	/** Advertise h2 in ALPN for this resolved connection. See RouteConfig.http2. */
 	http2?: boolean;
+	/** The resolved connection's application protocol. See RouteConfig.protocol. */
+	protocol?: 'http' | 'opaque';
 }
 
 // ── Event payloads ────────────────────────────────────────────────────────────

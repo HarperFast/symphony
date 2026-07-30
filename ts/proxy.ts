@@ -105,6 +105,7 @@ function toJsRoute(r: RouteConfig): JsRouteConfig {
 		sourceAddressHeader: r.sourceAddressHeader,
 		forwardFingerprint: r.forwardFingerprint,
 		http2: r.http2,
+		protocol: r.protocol,
 	};
 }
 
@@ -286,6 +287,7 @@ export class SymphonyProxy extends EventEmitter {
 			sourceAddressHeader: route.sourceAddressHeader,
 			forwardFingerprint: route.forwardFingerprint,
 			http2: route.http2,
+			protocol: route.protocol,
 		});
 	}
 }

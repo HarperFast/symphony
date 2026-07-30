@@ -119,6 +119,34 @@ pub enum ForwardFingerprint {
 	Ja4,
 }
 
+// ── Route application protocol ────────────────────────────────────────────────
+
+/// The application protocol of a route's byte stream, declared explicitly rather than
+/// inferred from ALPN. ALPN alone cannot distinguish a native protocol that negotiates no
+/// ALPN (e.g. MQTT) from an HTTPS client that simply offered none — both observe as `None`
+/// (issue #38). Gates HTTP/1 header rewriting (`X-Forwarded-For` / `X-JA3` / `X-JA4`
+/// injection): only a route that declares `Http` is ever fed to the header rewriter, and
+/// only once TLS is terminated and h2 isn't negotiated (an h2 stream is excluded either way
+/// — header injection would corrupt its binary frames).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RouteProtocol {
+	/// Not HTTP: MQTT, a raw TCP protocol, or any application protocol symphony doesn't
+	/// parse. Source-address forwarding is limited to the PROXY-protocol carriers.
+	Opaque,
+	/// The decrypted byte stream is HTTP/1.x — eligible for header-based forwarding modes.
+	Http,
+}
+
+/// True when a route's forwarding config would need to inject a plaintext HTTP header
+/// (`X-Forwarded-For`, or a header-carried `X-JA3`/`X-JA4`) rather than a carrier that works
+/// on any byte stream. These are exactly the modes that require `RouteProtocol::Http` to be
+/// declared explicitly — `forwardFingerprint` under `proxyProtocolV2` is exempt, since it
+/// rides a TLV, not a header.
+pub fn requires_http_protocol(mode: SourceAddressMode, fingerprint: ForwardFingerprint) -> bool {
+	mode == SourceAddressMode::XForwardedFor
+		|| (fingerprint != ForwardFingerprint::None && mode != SourceAddressMode::ProxyProtocolV2)
+}
+
 // ── Route destination ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -146,6 +174,8 @@ pub struct Route {
 	pub source_address_mode: SourceAddressMode,
 	/// Which client TLS fingerprint (if any) is forwarded to the upstream.
 	pub forward_fingerprint: ForwardFingerprint,
+	/// The route's declared application protocol — gates HTTP/1 header rewriting.
+	pub protocol: RouteProtocol,
 }
 
 // ── Route table ───────────────────────────────────────────────────────────────
@@ -258,6 +288,10 @@ pub struct RouteSpec {
 	pub forward_fingerprint: ForwardFingerprint,
 	/// Advertise h2 in ALPN so clients can negotiate HTTP/2.
 	pub http2: bool,
+	/// The route's declared application protocol — gates HTTP/1 header rewriting. Validated
+	/// against `source_address_mode`/`forward_fingerprint` at parse time (`proxy.rs`), so by
+	/// the time a `RouteSpec` reaches `build_route` the combination is already known-valid.
+	pub protocol: RouteProtocol,
 }
 
 /// Listener-level fallback cert/mTLS spec.
@@ -469,6 +503,7 @@ fn build_route(
 		rate_limiter,
 		source_address_mode: spec.source_address_mode,
 		forward_fingerprint: spec.forward_fingerprint,
+		protocol: spec.protocol,
 	})
 }
 
@@ -677,6 +712,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			source_address_mode: SourceAddressMode::None,
 			forward_fingerprint: ForwardFingerprint::None,
 			http2: false,
+			protocol: RouteProtocol::Opaque,
 		}
 	}
 
@@ -755,5 +791,19 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		spec.forward_fingerprint = ForwardFingerprint::None;
 		spec.source_address_mode = SourceAddressMode::None;
 		assert!(!fingerprint_has_no_carrier(&spec));
+	}
+
+	#[test]
+	fn header_injection_detection() {
+		// xForwardedFor always needs protocol: 'http', regardless of fingerprint.
+		assert!(requires_http_protocol(SourceAddressMode::XForwardedFor, ForwardFingerprint::None));
+		// A header-carried fingerprint (any mode other than proxyProtocolV2) needs it too.
+		assert!(requires_http_protocol(SourceAddressMode::None, ForwardFingerprint::Ja3));
+		assert!(requires_http_protocol(SourceAddressMode::ProxyProtocol, ForwardFingerprint::Ja4));
+		// proxyProtocolV2 carries the fingerprint as a TLV — never needs the declaration.
+		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocolV2, ForwardFingerprint::Ja3));
+		// No header-injection mode requested at all.
+		assert!(!requires_http_protocol(SourceAddressMode::None, ForwardFingerprint::None));
+		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocol, ForwardFingerprint::None));
 	}
 }

@@ -1,6 +1,6 @@
 use crate::metrics::{BlockKind, CountingStream, ErrorKind, GlobalMetrics, ListenerMetrics};
 use crate::protection::{IpState, ProtectionState};
-use crate::router::{Destination, ForwardFingerprint, LiveRouteTable, SourceAddressMode};
+use crate::router::{Destination, ForwardFingerprint, LiveRouteTable, RouteProtocol, SourceAddressMode};
 use crate::sni;
 use crate::suspended::SuspendedRegistry;
 use crate::upstream::{self, UpstreamStream};
@@ -179,6 +179,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 			terminate_tls: resolved.terminate_tls,
 			source_address_mode: resolved.source_address_mode,
 			forward_fingerprint: resolved.forward_fingerprint,
+			protocol: resolved.protocol,
 		}
 	} else {
 		EffectiveRoute {
@@ -188,6 +189,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 			terminate_tls: route.terminate_tls,
 			source_address_mode: route.source_address_mode,
 			forward_fingerprint: route.forward_fingerprint,
+			protocol: route.protocol,
 		}
 	};
 
@@ -201,6 +203,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	let sf = SourceForwarding {
 		mode: effective_route.source_address_mode,
 		fingerprint: effective_route.forward_fingerprint,
+		protocol: effective_route.protocol,
 		ja3: &peek_info.ja3,
 		ja4: &peek_info.ja4,
 		sni: sni_str,
@@ -221,8 +224,8 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 						_ => &effective_route.destination,
 					};
 					// Header injection (XFF / X-JA3) never touches an h2 stream: forward()
-					// gates it on the negotiated protocol (l7_http1), covering static and
-					// suspended-route configs alike.
+					// gates it on the route's declared protocol (RouteProtocol::Http) plus
+					// the negotiated ALPN, covering static and suspended-route configs alike.
 					proxy_via_tls(tls_stream, destination, sf, &ctx).await
 				}
 				Ok(Err(e)) => {
@@ -264,10 +267,15 @@ async fn proxy_via_tls(
 		.then(|| collect_tls_forward(client.get_ref().1));
 	let sf = SourceForwarding { tls: tls_forward.as_ref(), ..sf };
 
-	// HTTP-header injection is only valid for a plaintext HTTP/1 upstream. An h2-negotiated
-	// upstream receives binary frames, so text header insertion would corrupt them.
-	// Read before wrapping — the counter has no view of the TLS session.
-	let l7_http1 = client.get_ref().1.alpn_protocol() != Some(b"h2".as_ref());
+	// HTTP-header injection is only valid for a plaintext HTTP/1 upstream: the route must have
+	// explicitly declared protocol: 'http' (issue #38 — ALPN alone can't tell a native
+	// non-HTTP protocol, which negotiates no ALPN, from an HTTPS client that simply offered
+	// none), and the connection must not have negotiated h2 (an h2-negotiated upstream
+	// receives binary frames, so text header insertion would corrupt them; this exclusion
+	// applies even on a protocol: 'http' route). Read before wrapping — the counter has no
+	// view of the TLS session.
+	let negotiated_h2 = client.get_ref().1.alpn_protocol() == Some(b"h2".as_ref());
+	let l7_http1 = matches!(sf.protocol, RouteProtocol::Http) && !negotiated_h2;
 
 	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
 		.await
@@ -376,6 +384,8 @@ where
 struct SourceForwarding<'a> {
 	mode: SourceAddressMode,
 	fingerprint: ForwardFingerprint,
+	/// The route's declared application protocol — gates HTTP/1 header rewriting.
+	protocol: RouteProtocol,
 	ja3: &'a str,
 	ja4: &'a str,
 	/// SNI from the ClientHello, forwarded as PP2_TYPE_AUTHORITY.
@@ -550,6 +560,7 @@ struct EffectiveRoute {
 	terminate_tls: bool,
 	source_address_mode: SourceAddressMode,
 	forward_fingerprint: ForwardFingerprint,
+	protocol: RouteProtocol,
 }
 
 struct ActiveGuard {
