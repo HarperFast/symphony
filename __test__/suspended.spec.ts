@@ -12,7 +12,9 @@
  */
 
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import * as net from 'node:net';
+import * as path from 'node:path';
 import * as tls from 'node:tls';
 import { after, before, describe, it } from 'node:test';
 import { SymphonyProxy } from '../ts/proxy.js';
@@ -235,7 +237,7 @@ describe('Suspended routes – reject with null', () => {
 // code and crash the whole process — not just this instance — the very first time ANY native
 // error fires (a resolveConnection() validation failure, a TLS error, anything) on a proxy whose
 // owner hasn't gotten around to attaching an 'error' listener yet. The constructor installs a
-// permanent no-op listener specifically to make this impossible; this test pins that a fresh
+// permanent default listener specifically to make this impossible; this test pins that a fresh
 // proxy with zero listeners of its own survives an 'error' emission.
 describe('SymphonyProxy never crashes from emit("error") with no listener attached', () => {
 	it('a proxy with no "error" listener at all does not throw when an error is emitted', () => {
@@ -244,6 +246,46 @@ describe('SymphonyProxy never crashes from emit("error") with no listener attach
 		assert.doesNotThrow(
 			() => proxy.emit('error', new Error('simulated native error, no consumer listener attached')),
 			'emit("error", ...) must never throw for lack of a listener — this is the crash the round-5 review flagged as a blocker'
+		);
+	});
+});
+
+// The test above (and the others in this file) only ever exercise `proxy.emit(...)` called
+// in-process — never a listener that throws while dispatch is reached via the real napi
+// threadsafe-function callback in its own child process. This pins the actual, observable
+// contract in a real process rather than an in-process EventEmitter call: a throwing 'error'
+// listener, hit through a genuine resolveConnection() validation failure delivered by the native
+// callback, must surface via Node's ordinary `uncaughtException` mechanism (a clean stack trace,
+// a normal exit) — not hang, not silently vanish, and not kill the process by a signal. See the
+// nextTick comment in ts/proxy.ts's constructor for why the fix is kept as defense-in-depth even
+// though this exact scenario already routed through `uncaughtException` cleanly before it too, in
+// this napi/Node version.
+describe('crash boundary: a throwing "error" listener, hit via the real napi callback', () => {
+	it('surfaces via uncaughtException instead of hanging or being killed by a signal', async () => {
+		const fixture = path.join(__dirname, 'fixtures', 'crash-boundary-repro.js');
+		const stdout = await new Promise<string>((resolve, reject) => {
+			const child = spawn(process.execPath, [fixture], { stdio: ['ignore', 'pipe', 'pipe'] });
+			let out = '';
+			let err = '';
+			child.stdout.on('data', (d) => (out += d.toString()));
+			child.stderr.on('data', (d) => (err += d.toString()));
+			child.on('exit', (code, signal) => {
+				if (signal) {
+					reject(new Error(`repro process was killed by signal ${signal} (a real crash, not a caught exception) — stderr: ${err}`));
+				} else {
+					resolve(out);
+				}
+			});
+			setTimeout(() => {
+				child.kill();
+				reject(new Error(`repro process hung — stdout so far: ${out}, stderr: ${err}`));
+			}, 5000);
+		});
+
+		assert.match(
+			stdout,
+			/^CAUGHT: /m,
+			`expected the throwing listener's error to surface via process.on('uncaughtException'), got: ${stdout}`
 		);
 	});
 });

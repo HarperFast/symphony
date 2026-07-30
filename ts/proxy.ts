@@ -165,17 +165,14 @@ export class SymphonyProxy extends EventEmitter {
 
 	constructor(config: ProxyConfig) {
 		super();
-		// EventEmitter's 'error' event is special-cased: emitting it with zero listeners attached
-		// throws synchronously instead of silently dropping the event. Every emit('error', ...) in
-		// this class happens inside the napi threadsafe-function callback below — an uncaught throw
-		// there escapes into native code and kills the whole process, not just this instance. A
-		// config-validation failure surfaced via resolveConnection() (see resolve_connection in
-		// proxy.rs) now always goes through this exact channel, so a consumer that hasn't gotten
-		// around to attaching its own 'error' listener yet must not crash the process for it. This
-		// permanent no-op listener guarantees emit('error', ...) can never throw for lack of a
-		// listener; any listener a consumer attaches still fires normally alongside it, so real
-		// error observability is unaffected — only the "nobody's listening" crash is removed.
-		this.on('error', () => {});
+		// A default 'error' listener so a background failure (e.g. a resolveConnection() validation
+		// rejection — see resolve_connection in proxy.rs) is never silent for a consumer who hasn't
+		// gotten around to attaching their own listener yet. It logs rather than swallows: an
+		// operator should be able to tell a suspended route is failing without a proxy.on('error')
+		// wired up, and any listener the consumer does attach still fires normally alongside this one.
+		this.on('error', (err: Error, ctx?: { listener?: string }) => {
+			console.error(`symphony: unhandled proxy error${ctx?.listener ? ` [${ctx.listener}]` : ''}:`, err);
+		});
 		const { SymphonyProxyWrap: Wrap } = loadAddon();
 
 		const jsConfig = {
@@ -188,18 +185,26 @@ export class SymphonyProxy extends EventEmitter {
 		};
 
 		this._inner = new Wrap(jsConfig, (err, raw) => {
-			if (err) {
-				this.emit('error', err);
-				return;
-			}
-			// A listener can throw synchronously — most notably a 'suspended' handler that calls
-			// resolveConnection() with a route the new protocol/carrier validation rejects, which
-			// used to be a silent no-op and is now a thrown Error. EventEmitter.emit() propagates a
-			// listener's throw straight back to its caller, which here is this napi threadsafe
-			// function callback: left unguarded, that throw escapes into native code as an uncaught
-			// exception and takes the whole process down. Route it to 'error' instead, matching how
-			// every other proxy-level error already reaches user code.
-			try {
+			// Defer dispatch to the next tick instead of emitting synchronously from inside this napi
+			// threadsafe-function callback. The attack surface here is "arbitrary listener code can run
+			// synchronously inside a native callback frame" — a listener bug, an args-mismatch in our
+			// own emit calls, emit('error', ...) itself throwing because nothing is listening — and no
+			// amount of try/catch around individual emit() calls fences that surface completely (each
+			// prior fix in this area closed one specific escape and another was found). Empirically, in
+			// this napi/Node version a pending exception from inside the tsfn callback already routes
+			// through the ordinary `process.on('uncaughtException')` path rather than a hard native
+			// abort, so this deferral is not covering an observed crash difference here — verified by
+			// reproducing several throw scenarios (a throwing listener, `removeAllListeners('error')`,
+			// no handler at all) against both the synchronous and deferred forms and finding identical,
+			// clean `uncaughtException` behavior in both. It's kept anyway as the more principled
+			// invariant to hold regardless of napi-version-specific pending-exception routing: listener
+			// code should run as an ordinary JS event-loop turn, not inside a native call stack, on
+			// general defense-in-depth grounds rather than a reproduced local crash.
+			process.nextTick(() => {
+				if (err) {
+					this.emit('error', err);
+					return;
+				}
 				const event = raw as ProxyEvent;
 				switch (event.type) {
 					case 'blocked':
@@ -224,21 +229,7 @@ export class SymphonyProxy extends EventEmitter {
 						this.emit('error', new Error(event.message), { listener: event.listener });
 						break;
 				}
-			} catch (listenerErr) {
-				// The constructor installs a permanent no-op 'error' listener specifically so
-				// emit('error', ...) can never throw for lack of one — but a consumer calling
-				// removeAllListeners('error') (or with no args) removes that safety net too. This
-				// check is defense-in-depth for that case: if nothing is listening, emit('error', ...)
-				// itself throws (Node's EventEmitter contract), which would otherwise recurse right
-				// back into this catch with no way out, escaping as an unhandled double-throw that
-				// also replaces the original stack with a generic one. Re-emit only when a listener
-				// actually exists; otherwise propagate the original error as-is.
-				if (this.listenerCount('error') > 0) {
-					this.emit('error', listenerErr instanceof Error ? listenerErr : new Error(String(listenerErr)));
-				} else {
-					throw listenerErr;
-				}
-			}
+			});
 		});
 	}
 
