@@ -396,7 +396,7 @@ Most backends that consume PROXY protocol (nginx, HAProxy, HarperDB) read the he
 
 ### X-Forwarded-For (for Bun and other HTTP backends)
 
-Bun's built-in HTTP server does not support PROXY protocol. Use `'xForwardedFor'` instead — symphony injects the header into the first HTTP request of each connection:
+Bun's built-in HTTP server does not support PROXY protocol. Use `'xForwardedFor'` instead — symphony injects the header into every HTTP request on the connection, not just the first:
 
 ```typescript
 {

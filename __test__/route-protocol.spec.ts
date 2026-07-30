@@ -209,50 +209,65 @@ describe('SymphonyProxy – route protocol declaration', () => {
 	// resolveConnection() parses and validates its `route` argument independently of the
 	// suspended-connection id (parse_resolve_spec runs before the id is even looked up), so these
 	// checks can be exercised directly against a fresh proxy without a real suspended connection.
-	describe('resolveConnection() protocol validation (symmetric with the static route table)', () => {
+	//
+	// Unlike the static route table, an invalid resolveConnection() route must never *throw*: the
+	// call is documented to happen from inside a 'suspended' listener (sync or async), and a thrown
+	// exception there has no safe path back to the caller — an async listener's rejection is never
+	// awaited by EventEmitter, and even a synchronous throw only reaches user code if an 'error'
+	// listener happens to be attached. So a validation failure instead drops the connection (the
+	// same outcome as resolveConnection(id, null)) and surfaces the reason via the 'error' event.
+	describe('resolveConnection() protocol validation (symmetric with the static route table, fails via "error" event not a throw)', () => {
 		let proxy: SymphonyProxy;
 
 		before(() => {
 			proxy = new SymphonyProxy({ listeners: [{ host: '127.0.0.1', port: 0 }], routes: [] });
 		});
 
-		it('rejects xForwardedFor without a protocol: "http" declaration', () => {
-			assert.throws(
-				() =>
-					proxy.resolveConnection('1', {
-						upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
-						terminateTls: true,
-						sourceAddressHeader: 'xForwardedFor',
-					}),
-				/protocol/i,
-				'resolveConnection must reject an undeclared xForwardedFor route just like the static route table'
-			);
+		/** Call resolveConnection with `route` and resolve with the message of the next 'error' event. */
+		function resolveAndCaptureError(id: string, route: Parameters<SymphonyProxy['resolveConnection']>[1]): Promise<string> {
+			return new Promise((resolve, reject) => {
+				proxy.once('error', (err: Error) => resolve(err.message));
+				try {
+					proxy.resolveConnection(id, route);
+				} catch (e) {
+					reject(new Error(`resolveConnection() must never throw for a validation failure: ${e}`));
+				}
+			});
+		}
+
+		it('rejects xForwardedFor without a protocol: "http" declaration', async () => {
+			const message = await resolveAndCaptureError('1', {
+				upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
+				terminateTls: true,
+				sourceAddressHeader: 'xForwardedFor',
+			});
+			assert.match(message, /protocol/i, 'resolveConnection must reject an undeclared xForwardedFor route just like the static route table');
 		});
 
-		it('rejects a header-carried forwardFingerprint on a passthrough route as having no carrier', () => {
-			assert.throws(
-				() =>
-					proxy.resolveConnection('2', {
-						upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
-						terminateTls: false,
-						forwardFingerprint: 'ja3',
-						protocol: 'http',
-					}),
+		it('rejects a header-carried forwardFingerprint on a passthrough route as having no carrier', async () => {
+			const message = await resolveAndCaptureError('2', {
+				upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
+				terminateTls: false,
+				forwardFingerprint: 'ja3',
+				protocol: 'http',
+			});
+			assert.match(
+				message,
 				/no carrier/i,
 				'resolveConnection must reject passthrough + header-carried forwardFingerprint just like the static route table'
 			);
 		});
 
-		it('rejects xForwardedFor combined with http2 (header injection would corrupt h2 frames)', () => {
-			assert.throws(
-				() =>
-					proxy.resolveConnection('3', {
-						upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
-						terminateTls: true,
-						sourceAddressHeader: 'xForwardedFor',
-						protocol: 'http',
-						http2: true,
-					}),
+		it('rejects xForwardedFor combined with http2 (header injection would corrupt h2 frames)', async () => {
+			const message = await resolveAndCaptureError('3', {
+				upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
+				terminateTls: true,
+				sourceAddressHeader: 'xForwardedFor',
+				protocol: 'http',
+				http2: true,
+			});
+			assert.match(
+				message,
 				/http2/i,
 				'resolveConnection must reject xForwardedFor + http2 just like build_route does for the static route table'
 			);
