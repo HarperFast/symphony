@@ -234,9 +234,10 @@ export interface ProxyConfig {
 	/**
 	 * Per-direction copy buffer size in bytes. Default: 8192. Clamped to [512, 1048576].
 	 *
-	 * Two of these are allocated per proxied connection and held for its whole life, transferring
-	 * or not, so this is a direct multiplier on per-connection memory: `2 x readBufferSize x
-	 * connections`. Raising it buys throughput on a handful of bulk streams (replication) and
+	 * One buffer per direction is allocated per proxied connection and held for its whole life,
+	 * transferring or not, so these are a direct multiplier on per-connection memory:
+	 * `(client + upstream) x connections`, which is `2 x readBufferSize x connections` only when
+	 * both directions use this value. Raising it buys throughput on a handful of bulk streams (replication) and
 	 * costs gigabytes on hundreds of thousands of mostly-idle ones (MQTT subscribers). Since the
 	 * value is per proxy, tune it per port-set rather than fleet-wide.
 	 */

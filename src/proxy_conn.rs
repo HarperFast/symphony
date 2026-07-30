@@ -18,9 +18,9 @@ use tokio_rustls::TlsAcceptor;
 /// internally, so wiring the previously-inert `readBufferSize` through leaves any config that
 /// does not set it on exactly the footprint it already had. Do not raise this default: both
 /// buffers are held for the whole life of every connection whether or not it is transferring, so
-/// the number multiplies straight into per-connection memory (`2 × size × connections`) — across
-/// a million mostly-idle MQTT subscribers, 64 KiB instead of 8 KiB is ~107 GiB of buffers that are
-/// never read.
+/// the number multiplies straight into per-connection memory (`(client + upstream) × connections`)
+/// — across a million mostly-idle MQTT subscribers, 64 KiB per direction instead of 8 KiB is
+/// ~107 GiB of buffers that are never read.
 ///
 /// Applies to the plain proxying path. A route that injects HTTP headers takes
 /// `http_proxy::proxy_http1_rewriting` instead, which frames with its own fixed buffers.
@@ -331,16 +331,8 @@ where
 		write_connection_prefix(upstream, sf).await?;
 		let rewrites = header_rewrites(sf, l7_http1);
 		if rewrites.is_empty() {
-			// Argument order is (a, b, a_to_b, b_to_a) with a = client, so the client buffer
-			// sizes the client→upstream half and the upstream buffer the fan-out half.
-			copy_bidirectional_with_sizes(
-				client,
-				upstream,
-				ctx.client_read_buffer_size,
-				ctx.upstream_read_buffer_size,
-			)
-			.await
-			.map(|_| ())
+			copy_both_ways(client, upstream, ctx.client_read_buffer_size, ctx.upstream_read_buffer_size)
+				.await
 		} else {
 			crate::http_proxy::proxy_http1_rewriting(client, upstream, &rewrites).await
 		}
@@ -355,6 +347,27 @@ where
 			Err(_) => Err(ErrorKind::IdleTimeout),
 		}
 	}
+}
+
+/// The plain proxying copy. Split out from `forward` so a test can hand it instrumented streams
+/// and observe which configured size reached which direction — a swapped mapping here is invisible
+/// to a round-trip test, since both directions still deliver every byte.
+///
+/// `copy_bidirectional_with_sizes` takes `(a, b, a_to_b, b_to_a)`, so with `a` = the client the
+/// client buffer sizes reads *from* the client and the upstream buffer sizes the fan-out half.
+async fn copy_both_ways<C, U>(
+	client: &mut C,
+	upstream: &mut U,
+	client_read_buffer_size: usize,
+	upstream_read_buffer_size: usize,
+) -> std::io::Result<()>
+where
+	C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+	copy_bidirectional_with_sizes(client, upstream, client_read_buffer_size, upstream_read_buffer_size)
+		.await
+		.map(|_| ())
 }
 
 /// Per-connection source-address + fingerprint forwarding parameters. All fields are `Copy`
@@ -563,3 +576,85 @@ fn emit(tsf: &ThreadsafeFunction<JsEvent>, event: JsEvent) {
 	tsf.call(Ok(event), napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking);
 }
 
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::io;
+	use std::pin::Pin;
+	use std::sync::Mutex;
+	use std::task::{Context, Poll};
+	use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+	/// A stream that records the capacity of every `ReadBuf` the copy loop hands it. The recorded
+	/// capacity IS the configured buffer size for that direction, so it distinguishes "the size
+	/// reached this half" from "the size was accepted and dropped" — and would catch the two
+	/// directions being swapped, which a byte-for-byte round-trip cannot.
+	struct CapacityRecorder {
+		remaining: usize,
+		observed: Arc<Mutex<Vec<usize>>>,
+	}
+
+	impl CapacityRecorder {
+		fn new(bytes: usize, observed: Arc<Mutex<Vec<usize>>>) -> Self {
+			Self { remaining: bytes, observed }
+		}
+	}
+
+	impl AsyncRead for CapacityRecorder {
+		fn poll_read(
+			mut self: Pin<&mut Self>,
+			_cx: &mut Context<'_>,
+			buf: &mut ReadBuf<'_>,
+		) -> Poll<io::Result<()>> {
+			self.observed.lock().unwrap().push(buf.remaining());
+			let n = self.remaining.min(buf.remaining());
+			if n > 0 {
+				buf.initialize_unfilled_to(n);
+				buf.advance(n);
+				self.remaining -= n;
+			}
+			Poll::Ready(Ok(())) // n == 0 is EOF, which ends this half of the copy
+		}
+	}
+
+	impl AsyncWrite for CapacityRecorder {
+		fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+			Poll::Ready(Ok(buf.len()))
+		}
+		fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+		fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+	}
+
+	async fn observed_read_sizes(client_size: usize, upstream_size: usize) -> (usize, usize) {
+		let from_client = Arc::new(Mutex::new(Vec::new()));
+		let from_upstream = Arc::new(Mutex::new(Vec::new()));
+		let mut client = CapacityRecorder::new(64 * 1024, from_client.clone());
+		let mut upstream = CapacityRecorder::new(64 * 1024, from_upstream.clone());
+		copy_both_ways(&mut client, &mut upstream, client_size, upstream_size).await.unwrap();
+		let max_of = |v: &Arc<Mutex<Vec<usize>>>| *v.lock().unwrap().iter().max().unwrap();
+		(max_of(&from_client), max_of(&from_upstream))
+	}
+
+	#[tokio::test]
+	async fn each_configured_size_reaches_its_own_direction() {
+		// Deliberately asymmetric, and not the default, so a config that is accepted-then-ignored
+		// (the regression this PR exists to prevent) fails here rather than passing a round-trip.
+		let (from_client, from_upstream) = observed_read_sizes(1024, 4096).await;
+		assert_eq!(from_client, 1024, "client buffer must size reads from the client");
+		assert_eq!(from_upstream, 4096, "upstream buffer must size reads from the upstream");
+	}
+
+	#[tokio::test]
+	async fn the_directions_are_not_swapped() {
+		// Same two values, exchanged: an implementation that transposed them would satisfy the
+		// test above's value set while failing here.
+		let (from_client, from_upstream) = observed_read_sizes(4096, 1024).await;
+		assert_eq!(from_client, 4096);
+		assert_eq!(from_upstream, 1024);
+	}
+}
