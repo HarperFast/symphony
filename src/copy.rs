@@ -209,6 +209,15 @@ impl LazyCopyBuffer {
 		// write never return `Pending` (a fast loopback pair, or two directions that keep
 		// topping each other off) can spin through this loop indefinitely inside one `poll`
 		// call and monopolize its worker thread instead of yielding back to the scheduler.
+		//
+		// One deliberate divergence from tokio's own accounting: tokio's `poll_proceed` only
+		// commits a budget unit when the poll goes on to make progress (`RestoreOnPending`
+		// gives the unit back otherwise); this always commits on entry. A connection parked on
+		// many no-progress wakeups therefore burns budget — and forces a coop yield — faster
+		// here than tokio would. That's simpler (no progress-tracking to thread through this
+		// port) and not unsafe: `consume_budget()` registers the waker before returning
+		// `Pending` (`poll_proceed` → `register_waker`), so an early return here can't strand a
+		// wakeup. It just yields somewhat more eagerly than tokio's own loop would.
 		if std::pin::pin!(tokio::task::coop::consume_budget()).poll(cx).is_pending() {
 			return Poll::Pending;
 		}

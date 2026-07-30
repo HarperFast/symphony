@@ -37,6 +37,7 @@
 		"benchmark:throughput": "tsc -p tsconfig.test.json && node dist-test/__test__/benchmark-throughput.js",
 		"benchmark:copy-memory": "tsc -p tsconfig.test.json && node --expose-gc dist-test/__test__/bench-copy-memory.js",
 		"benchmark:copy-throughput": "tsc -p tsconfig.test.json && node dist-test/__test__/bench-copy-throughput.js",
+		"benchmark:copy-burst-idle": "tsc -p tsconfig.test.json && node --expose-gc dist-test/__test__/bench-copy-burst-idle.js",
 		"diagnostic:keepalive": "tsc -p tsconfig.test.json && node dist-test/__test__/diagnostic-uds-keepalive.js"
 	},
 	"devDependencies": {
