@@ -399,6 +399,28 @@ fn build_route(
 	listener_tls: &ListenerTlsSpec,
 	cache: &mut TlsConfigCache,
 ) -> crate::error::Result<Route> {
+	let requires_http = requires_http_protocol(spec.source_address_mode, spec.forward_fingerprint);
+
+	// Passthrough (terminateTls=false) never decrypts the stream, so a header-carried mode has no
+	// carrier at all regardless of `protocol` — declaring 'http' wouldn't help. Checked before (and
+	// distinct from) the declaration requirement below: it's not that the route mislabeled its
+	// protocol, it's that no protocol declaration could make this work. Isolated here (rather than
+	// at parse time in proxy.rs) so one route's misconfiguration is dropped/last-good-carried like
+	// a bad cert, instead of aborting construction or updateConfig for every other route.
+	if requires_http && !spec.terminate_tls {
+		return Err(crate::error::SymphonyError::Config(format!(
+			"route '{}': sourceAddressHeader 'xForwardedFor', or forwardFingerprint via an HTTP header (any mode other than 'proxyProtocolV2'), has no carrier when terminateTls=false (passthrough never decrypts the stream, so no header can be injected) — use sourceAddressHeader='proxyProtocolV2' (carries both source address and fingerprint), or remove forwardFingerprint",
+			spec.sni
+		)));
+	}
+
+	if requires_http && spec.protocol != RouteProtocol::Http {
+		return Err(crate::error::SymphonyError::Config(format!(
+			"route '{}': sourceAddressHeader 'xForwardedFor', or forwardFingerprint via an HTTP header (any mode other than 'proxyProtocolV2'), requires protocol: 'http' — declare it explicitly, or switch away from the header-carried mode: 'proxyProtocol'/'proxyProtocolV2' both work on any protocol for source-address forwarding, but only 'proxyProtocolV2' carries a fingerprint (v1 does not)",
+			spec.sni
+		)));
+	}
+
 	let tls_config = if spec.terminate_tls {
 		let cert_pem = spec
 			.cert_pem

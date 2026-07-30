@@ -150,25 +150,41 @@ describe('SymphonyProxy – route protocol declaration', () => {
 		await capture.close();
 	});
 
-	it('rejects xForwardedFor without a protocol: "http" declaration at construction time (fail loud, not a silent no-op)', async () => {
-		assert.throws(
-			() =>
-				new SymphonyProxy({
-					listeners: [{ host: '127.0.0.1', port: 0 }],
-					routes: [
-						{
-							sni: 'mqtt.example.com',
-							upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: 1 }],
-							terminateTls: true,
-							cert: { certChain: cert.cert, privateKey: cert.key },
-							sourceAddressHeader: 'xForwardedFor',
-							// protocol left unset — defaults to 'opaque', must be rejected, not silently accepted.
-						},
-					],
-				}),
-			/protocol/i,
-			'construction must throw a descriptive error, not silently build a route that never injects the header'
+	// Undeclared xForwardedFor, and passthrough + header-carried forwardFingerprint (below), are
+	// both rejected — but isolated per-route (build_route, router.rs) rather than failing the whole
+	// `new SymphonyProxy()`/`updateConfig()` call, exactly like a bad cert or the existing
+	// xForwardedFor+http2 check: the bad route is dropped (its SNI resolves to nothing) and the
+	// rejection is logged, but other routes on the same port-set are unaffected. This was a
+	// deliberate design decision (see PR #40 review discussion): failing the entire call for one
+	// route's config mistake would let a single tenant's typo freeze config updates — or block the
+	// port from binding at all on a cold start — for every other tenant on the same port-set.
+	it('rejects xForwardedFor without a protocol: "http" declaration by dropping just that route (not the whole construction)', async () => {
+		const upstream = await startEchoServer();
+		const proxyPort = await getFreePort();
+		const proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: proxyPort }],
+			routes: [
+				{
+					sni: 'mqtt.example.com',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: upstream.port }],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+					sourceAddressHeader: 'xForwardedFor',
+					// protocol left unset — defaults to 'opaque', must be rejected, not silently accepted.
+				},
+			],
+		});
+		await proxy.start();
+		await sleep(50);
+
+		await assert.rejects(
+			tlsRoundTrip({ port: proxyPort, servername: 'mqtt.example.com', caCert: cert.cert, data: 'x' }),
+			/timeout|ECONNRESET|EPROTO|socket hang up|closed/i,
+			'the undeclared route must be dropped (no route for its SNI), not silently built with the header uninjected'
 		);
+
+		await proxy.stop();
+		await upstream.close();
 	});
 
 	// A passthrough route (terminateTls: false, e.g. an MQTT-over-TLS route) never decrypts the
@@ -176,34 +192,34 @@ describe('SymphonyProxy – route protocol declaration', () => {
 	// declaration can fix that. This must be rejected as a distinct "no carrier" error, not
 	// steered toward `protocol: 'http'` (which is both semantically wrong for an opaque
 	// passthrough route and, since header injection genuinely can't happen without termination,
-	// would still not make the config work).
+	// would still not make the config work) — and, like the case above, isolated per-route rather
+	// than failing the whole construction.
 	it('rejects forwardFingerprint on a passthrough route as having no carrier, regardless of protocol declaration', async () => {
-		const baseRoute = {
-			sni: 'mqtt.example.com',
-			upstreams: [{ kind: 'tcp' as const, host: '127.0.0.1', port: 1 }],
-			terminateTls: false,
-			forwardFingerprint: 'ja3' as const,
-		};
+		const upstream = await startEchoServer();
+		const proxyPort = await getFreePort();
+		const proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: proxyPort }],
+			routes: [
+				{
+					sni: 'mqtt.example.com',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: upstream.port }],
+					terminateTls: false,
+					forwardFingerprint: 'ja3',
+					protocol: 'http', // declaring 'http' must not paper over a passthrough route with no carrier
+				},
+			],
+		});
+		await proxy.start();
+		await sleep(50);
 
-		assert.throws(
-			() =>
-				new SymphonyProxy({
-					listeners: [{ host: '127.0.0.1', port: 0 }],
-					routes: [baseRoute],
-				}),
-			/no carrier/i,
-			'passthrough + header-carried forwardFingerprint must fail construction with a "no carrier" error'
+		await assert.rejects(
+			tlsRoundTrip({ port: proxyPort, servername: 'mqtt.example.com', caCert: cert.cert, data: 'x' }),
+			/timeout|ECONNRESET|EPROTO|socket hang up|closed/i,
+			'passthrough + header-carried forwardFingerprint has no carrier — the route must be dropped regardless of a protocol: "http" declaration'
 		);
 
-		assert.throws(
-			() =>
-				new SymphonyProxy({
-					listeners: [{ host: '127.0.0.1', port: 0 }],
-					routes: [{ ...baseRoute, protocol: 'http' }],
-				}),
-			/no carrier/i,
-			'declaring protocol: "http" must not paper over a passthrough route with no header carrier'
-		);
+		await proxy.stop();
+		await upstream.close();
 	});
 
 	// resolveConnection() parses and validates its `route` argument only once the id is confirmed
