@@ -146,7 +146,7 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 		out.sample(
 			'symphony_routes_failing',
 			'gauge',
-			'Routes whose cert failed to build — dropped, or serving a carried-forward last-good cert.',
+			'Routes rejected at build time (a cert that failed to build, or a route that failed protocol/carrier validation) — dropped, or (cert failures only) serving a carried-forward last-good cert.',
 			metrics.failingRoutes,
 			proxy
 		);

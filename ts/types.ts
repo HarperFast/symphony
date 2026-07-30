@@ -341,7 +341,11 @@ export interface ProxyMetrics {
 	suspendedUnresolved: number;
 	/** Routes in the live table, including the default route. */
 	routes: number;
-	/** Routes whose cert failed to build — dropped, or serving a carried-forward last-good cert. */
+	/**
+	 * Routes rejected at build time — a cert that failed to build, or a route that failed the
+	 * protocol/carrier validation — either dropped, or (cert failures only) serving a
+	 * carried-forward last-good cert.
+	 */
 	failingRoutes: number;
 	/** Per-listener breakdown, in configuration order. */
 	listeners: ListenerMetrics[];

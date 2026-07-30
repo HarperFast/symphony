@@ -233,20 +233,60 @@ describe('Suspended routes – reject with null', () => {
 
 // Node's EventEmitter special-cases 'error': emitting it with zero listeners attached throws
 // synchronously instead of dropping the event. Every 'error' emission in SymphonyProxy happens
-// inside the napi threadsafe-function callback, so that throw would otherwise escape into native
-// code and crash the whole process — not just this instance — the very first time ANY native
-// error fires (a resolveConnection() validation failure, a TLS error, anything) on a proxy whose
-// owner hasn't gotten around to attaching an 'error' listener yet. The constructor installs a
-// permanent default listener specifically to make this impossible; this test pins that a fresh
-// proxy with zero listeners of its own survives an 'error' emission.
-describe('SymphonyProxy never crashes from emit("error") with no listener attached', () => {
-	it('a proxy with no "error" listener at all does not throw when an error is emitted', () => {
-		const proxy = new SymphonyProxy({ listeners: [{ host: '127.0.0.1', port: 0 }], routes: [] });
-		assert.equal(proxy.listenerCount('error'), 1, 'the constructor must install exactly one default listener');
-		assert.doesNotThrow(
-			() => proxy.emit('error', new Error('simulated native error, no consumer listener attached')),
-			'emit("error", ...) must never throw for lack of a listener — this is the crash the round-5 review flagged as a blocker'
-		);
+// inside the napi threadsafe-function callback (deferred one tick), so that throw would otherwise
+// escape as an uncaught exception the very first time ANY native error fires (a resolveConnection()
+// validation failure, a TLS error, anything) on a proxy whose owner hasn't gotten around to
+// attaching an 'error' listener yet. Rather than a permanent listener (which a consumer's own
+// `removeAllListeners('error')` would remove, reopening the hole), every 'error' emission site
+// checks listenerCount first and logs directly when nothing is listening — this test drives a
+// real validation failure through resolveConnection() with zero listeners attached and confirms
+// it logs instead of crashing.
+describe('SymphonyProxy never crashes emitting "error" with no listener attached', () => {
+	const cert = generateSelfSignedCert('localhost');
+
+	it('logs to stderr instead of throwing when a background error fires with no "error" listener', async () => {
+		const proxyPort = await getFreePort();
+		const proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: proxyPort }],
+			routes: [
+				{
+					sni: 'localhost',
+					upstreams: [],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+					suspended: true,
+					suspendTimeoutMs: 5000,
+				},
+			],
+		});
+		assert.equal(proxy.listenerCount('error'), 0, 'no default listener should be pre-installed');
+
+		const originalConsoleError = console.error;
+		const logged: unknown[][] = [];
+		console.error = (...args: unknown[]) => logged.push(args);
+
+		proxy.on('suspended', (conn) => {
+			// Undeclared xForwardedFor — rejected by parse_resolve_spec, no 'error' listener attached.
+			proxy.resolveConnection(conn.id, {
+				upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
+				terminateTls: true,
+				sourceAddressHeader: 'xForwardedFor',
+			});
+		});
+
+		await proxy.start();
+		await sleep(50);
+
+		const socket = startTlsSocket(proxyPort, 'localhost', cert.cert);
+		socket.on('error', () => {});
+		await sleep(200);
+
+		console.error = originalConsoleError;
+		await proxy.stop();
+
+		assert.equal(logged.length, 1, 'the validation failure must be logged exactly once, not thrown');
+		assert.match(String(logged[0][0]), /unhandled proxy error/i);
+		assert.match(String(logged[0][1]), /protocol/i);
 	});
 });
 
