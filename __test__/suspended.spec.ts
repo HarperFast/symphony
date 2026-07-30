@@ -228,3 +228,65 @@ describe('Suspended routes – reject with null', () => {
 		assert.ok(socket.destroyed || !socket.writable, 'socket should be closed after rejection');
 	});
 });
+
+describe('Suspended routes – resolveConnection() validation error inside the listener', () => {
+	const cert = generateSelfSignedCert('localhost');
+	let proxyPort: number;
+	let proxy: SymphonyProxy;
+	let capturedConn: SuspendedConnection | null = null;
+
+	before(async () => {
+		proxyPort = await getFreePort();
+
+		proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: proxyPort }],
+			routes: [
+				{
+					sni: 'localhost',
+					upstreams: [],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+					suspended: true,
+					suspendTimeoutMs: 5000,
+				},
+			],
+		});
+
+		await proxy.start();
+		await sleep(50);
+	});
+
+	after(async () => {
+		await proxy.stop();
+	});
+
+	// resolveConnection() is meant to be called synchronously from inside a 'suspended' listener
+	// (every other test in this file does exactly that). Calling it with a route the protocol/
+	// carrier validation rejects (issue #38's construction-time checks, also applied to
+	// resolveConnection) throws synchronously — and that throw crosses back through
+	// EventEmitter.emit() into the napi threadsafe-function callback. Without a guard there, this
+	// took down the whole host process instead of surfacing as a normal proxy error; this test
+	// pins the fix (ts/proxy.ts's tsfn callback now catches and re-emits as 'error').
+	it('emits "error" instead of crashing the process when resolveConnection() throws inside the "suspended" listener', async () => {
+		const errors: Error[] = [];
+		proxy.on('error', (err: Error) => errors.push(err));
+		proxy.on('suspended', (conn) => {
+			capturedConn = conn;
+			// Undeclared xForwardedFor — rejected by parse_resolve_spec's protocol-declaration check.
+			proxy.resolveConnection(conn.id, {
+				upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
+				terminateTls: true,
+				sourceAddressHeader: 'xForwardedFor',
+			});
+		});
+
+		const socket = startTlsSocket(proxyPort, 'localhost', cert.cert);
+		await sleep(200);
+
+		assert.ok(capturedConn !== null, 'expected suspended event to have fired');
+		assert.equal(errors.length, 1, 'the validation throw must surface as exactly one "error" event, not crash the process');
+		assert.match(errors[0].message, /protocol/i, 'the surfaced error must be the protocol-declaration rejection');
+
+		socket.destroy();
+	});
+});

@@ -181,29 +181,40 @@ export class SymphonyProxy extends EventEmitter {
 				this.emit('error', err);
 				return;
 			}
-			const event = raw as ProxyEvent;
-			switch (event.type) {
-				case 'blocked':
-					this.emit('blocked', {
-						ip: event.ip,
-						reason: event.reason,
-						listener: event.listener,
-						ja3: event.ja3,
-						ja4: event.ja4,
-					});
-					break;
-				case 'suspended':
-					this.emit('suspended', {
-						id: event.id,
-						sni: event.sni,
-						peerIp: event.peerIp,
-						peerPort: event.peerPort,
-						listener: event.listener,
-					} satisfies SuspendedConnection);
-					break;
-				case 'error':
-					this.emit('error', new Error(event.message), { listener: event.listener });
-					break;
+			// A listener can throw synchronously — most notably a 'suspended' handler that calls
+			// resolveConnection() with a route the new protocol/carrier validation rejects, which
+			// used to be a silent no-op and is now a thrown Error. EventEmitter.emit() propagates a
+			// listener's throw straight back to its caller, which here is this napi threadsafe
+			// function callback: left unguarded, that throw escapes into native code as an uncaught
+			// exception and takes the whole process down. Route it to 'error' instead, matching how
+			// every other proxy-level error already reaches user code.
+			try {
+				const event = raw as ProxyEvent;
+				switch (event.type) {
+					case 'blocked':
+						this.emit('blocked', {
+							ip: event.ip,
+							reason: event.reason,
+							listener: event.listener,
+							ja3: event.ja3,
+							ja4: event.ja4,
+						});
+						break;
+					case 'suspended':
+						this.emit('suspended', {
+							id: event.id,
+							sni: event.sni,
+							peerIp: event.peerIp,
+							peerPort: event.peerPort,
+							listener: event.listener,
+						} satisfies SuspendedConnection);
+						break;
+					case 'error':
+						this.emit('error', new Error(event.message), { listener: event.listener });
+						break;
+				}
+			} catch (listenerErr) {
+				this.emit('error', listenerErr instanceof Error ? listenerErr : new Error(String(listenerErr)));
 			}
 		});
 	}
