@@ -98,14 +98,23 @@ async function main() {
 		await Promise.all(
 			sockets.map((s) => new Promise<void>((resolve) => {
 				let received = 0;
+				const cleanup = () => {
+					s.off('data', onData);
+					s.off('error', onDone);
+					s.off('close', onDone);
+					resolve();
+				};
 				const onData = (chunk: Buffer) => {
 					received += chunk.length;
-					if (received >= burst.length) {
-						s.off('data', onData);
-						resolve();
-					}
+					if (received >= burst.length) cleanup();
 				};
+				// A socket that errors or closes mid-cycle (loopback flakiness at thousands of
+				// connections) must still resolve this promise — otherwise that one socket's
+				// `Promise.all` never settles and the whole run wedges with no diagnostic.
+				const onDone = () => cleanup();
 				s.on('data', onData);
+				s.once('error', onDone);
+				s.once('close', onDone);
 				s.write(burst);
 			})),
 		);
