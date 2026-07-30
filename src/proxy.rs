@@ -747,8 +747,20 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 	let source_address_mode = parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
 	let forward_fingerprint = parse_forward_fingerprint(r.forward_fingerprint.as_deref())?;
 	let protocol = parse_route_protocol(r.protocol.as_deref())?;
+	let requires_http = requires_http_protocol(source_address_mode, forward_fingerprint);
 
-	if requires_http_protocol(source_address_mode, forward_fingerprint) && protocol != RouteProtocol::Http {
+	// Passthrough (terminateTls=false) never decrypts the stream, so a header-carried mode has
+	// no carrier at all regardless of `protocol` — declaring 'http' wouldn't help. This is
+	// distinct from (and checked before) the declaration requirement below: it's not that the
+	// route mislabeled its protocol, it's that no protocol declaration could make this work.
+	if requires_http && !r.terminate_tls {
+		return Err(napi::Error::from_reason(format!(
+			"route '{}': sourceAddressHeader 'xForwardedFor', or forwardFingerprint via an HTTP header (any mode other than 'proxyProtocolV2'), has no carrier when terminateTls=false (passthrough never decrypts the stream, so no header can be injected) — use sourceAddressHeader='proxyProtocolV2' (carries both source address and fingerprint), or remove forwardFingerprint",
+			r.sni
+		)));
+	}
+
+	if requires_http && protocol != RouteProtocol::Http {
 		return Err(napi::Error::from_reason(format!(
 			"route '{}': sourceAddressHeader 'xForwardedFor', or forwardFingerprint via an HTTP header (any mode other than 'proxyProtocolV2'), requires protocol: 'http' — declare it explicitly, or switch to 'proxyProtocol'/'proxyProtocolV2' which work on any protocol",
 			r.sni
@@ -776,15 +788,17 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 	if spec.http2 && !spec.terminate_tls {
 		eprintln!("symphony: route '{}': http2=true has no effect when terminateTls=false (passthrough mode)", spec.sni);
 	}
-	// An injected X-JA3/X-JA4 header needs a plaintext HTTP/1 upstream (terminated, not h2); the
-	// runtime skips it otherwise. The PROXY v2 TLV carrier works everywhere (it prefixes the raw
-	// bytes), so steer non-HTTP/1 routes to it.
-	if forward_fingerprint != ForwardFingerprint::None
-		&& source_address_mode != SourceAddressMode::ProxyProtocolV2
-		&& (!spec.terminate_tls || spec.http2)
-	{
+	// A header-carried mode (xForwardedFor, or forwardFingerprint outside proxyProtocolV2) needs
+	// a plaintext HTTP/1 upstream — terminated and not h2 — or the runtime silently skips the
+	// rewriter (`eligible_for_header_rewriting` in proxy_conn.rs) and, for xForwardedFor, a
+	// client-supplied header reaches the upstream unstripped. The passthrough case is already a
+	// hard error above, so `requires_http` reaching here implies terminate_tls; the only
+	// remaining silent-miss case is http2, which is a soft warning rather than a hard error
+	// because ALPN negotiation is per-connection — declaring http2=true doesn't guarantee every
+	// client actually negotiates h2.
+	if requires_http && spec.http2 {
 		eprintln!(
-			"symphony: route '{}': forwardFingerprint via HTTP header has no effect on a non-HTTP/1 upstream (terminateTls=false or http2=true); use sourceAddressHeader='proxyProtocolV2'",
+			"symphony: route '{}': header-injection forwarding (xForwardedFor / a header-carried forwardFingerprint) has no effect for any client that negotiates h2 (http2=true), and a client-supplied X-Forwarded-For reaches the upstream unstripped in that case; consider sourceAddressHeader='proxyProtocolV2'",
 			spec.sni
 		);
 	}
@@ -852,8 +866,17 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 	let source_address_mode = parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
 	let forward_fingerprint = parse_forward_fingerprint(r.forward_fingerprint.as_deref())?;
 	let protocol = parse_route_protocol(r.protocol.as_deref())?;
+	let requires_http = requires_http_protocol(source_address_mode, forward_fingerprint);
 
-	if requires_http_protocol(source_address_mode, forward_fingerprint) && protocol != RouteProtocol::Http {
+	// See parse_route_spec: passthrough has no carrier for a header-based mode regardless of
+	// `protocol`, so it's rejected before (and distinctly from) the declaration check below.
+	if requires_http && !r.terminate_tls {
+		return Err(napi::Error::from_reason(
+			"resolveConnection: sourceAddressHeader 'xForwardedFor', or forwardFingerprint via an HTTP header (any mode other than 'proxyProtocolV2'), has no carrier when terminateTls=false (passthrough never decrypts the stream, so no header can be injected) — use sourceAddressHeader='proxyProtocolV2' (carries both source address and fingerprint), or remove forwardFingerprint".to_string(),
+		));
+	}
+
+	if requires_http && protocol != RouteProtocol::Http {
 		return Err(napi::Error::from_reason(
 			"resolveConnection: sourceAddressHeader 'xForwardedFor', or forwardFingerprint via an HTTP header (any mode other than 'proxyProtocolV2'), requires protocol: 'http' — declare it explicitly, or switch to 'proxyProtocol'/'proxyProtocolV2' which work on any protocol".to_string(),
 		));

@@ -128,7 +128,7 @@ pub enum ForwardFingerprint {
 /// injection): only a route that declares `Http` is ever fed to the header rewriter, and
 /// only once TLS is terminated and h2 isn't negotiated (an h2 stream is excluded either way
 /// — header injection would corrupt its binary frames).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteProtocol {
 	/// Not HTTP: MQTT, a raw TCP protocol, or any application protocol symphony doesn't
 	/// parse. Source-address forwarding is limited to the PROXY-protocol carriers.

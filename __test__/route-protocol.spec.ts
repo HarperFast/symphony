@@ -30,14 +30,16 @@ function tlsSend(port: number, servername: string, caCert: string, data: Buffer 
 describe('SymphonyProxy – route protocol declaration', () => {
 	const cert = generateSelfSignedCert('localhost');
 
-	// The regression this whole issue is about: a terminated non-HTTP route (MQTT over TLS is
-	// the motivating case) must proxy the decrypted byte stream verbatim and promptly. Under the
-	// old ALPN heuristic (`alpn_protocol() != Some(b"h2")`), a terminated MQTT connection — which
-	// negotiates no ALPN — was indistinguishable from an HTTP/1 client and could be fed to
-	// `proxy_http1_rewriting`, which waits for a `\r\n\r\n` that never arrives (a hang, not an
-	// error). An MQTT CONNECT packet is used as the payload: it starts with 0x10 (never an HTTP
-	// method token) and contains no CRLFCRLF anywhere.
-	it('an opaque route proxies a non-HTTP byte stream end-to-end without entering the header rewriter', async () => {
+	// Opaque-route smoke test, not a regression test for the fix itself: this route has neither
+	// `sourceAddressHeader` nor `forwardFingerprint` configured, so `header_rewrites()` returns
+	// empty regardless of the `RouteProtocol::Http && !negotiated_h2` gate — it would pass
+	// against the pre-fix ALPN heuristic too. It still earns its keep as an end-to-end sanity
+	// check that a terminated non-HTTP byte stream (MQTT over TLS is the motivating case, issue
+	// #38) round-trips promptly through `copy_bidirectional` with no header framing assumed.
+	// Regression coverage for the runtime gate itself — `eligible_for_header_rewriting` — lives
+	// in `src/proxy_conn.rs`'s unit tests (`opaque_protocol_is_never_eligible_regardless_of_alpn`,
+	// `http_protocol_with_negotiated_h2_is_not_eligible`).
+	it('smoke test: an opaque route proxies a non-HTTP byte stream end-to-end without hanging on HTTP framing', async () => {
 		const upstream = await startEchoServer();
 		const proxyPort = await getFreePort();
 		// A short idle timeout: if the connection were mistakenly fed to the header rewriter,
@@ -168,6 +170,41 @@ describe('SymphonyProxy – route protocol declaration', () => {
 				}),
 			/protocol/i,
 			'construction must throw a descriptive error, not silently build a route that never injects the header'
+		);
+	});
+
+	// A passthrough route (terminateTls: false, e.g. an MQTT-over-TLS route) never decrypts the
+	// stream, so a header-carried forwardFingerprint mode has no carrier at all — no `protocol`
+	// declaration can fix that. This must be rejected as a distinct "no carrier" error, not
+	// steered toward `protocol: 'http'` (which is both semantically wrong for an opaque
+	// passthrough route and, since header injection genuinely can't happen without termination,
+	// would still not make the config work).
+	it('rejects forwardFingerprint on a passthrough route as having no carrier, regardless of protocol declaration', async () => {
+		const baseRoute = {
+			sni: 'mqtt.example.com',
+			upstreams: [{ kind: 'tcp' as const, host: '127.0.0.1', port: 1 }],
+			terminateTls: false,
+			forwardFingerprint: 'ja3' as const,
+		};
+
+		assert.throws(
+			() =>
+				new SymphonyProxy({
+					listeners: [{ host: '127.0.0.1', port: 0 }],
+					routes: [baseRoute],
+				}),
+			/no carrier/i,
+			'passthrough + header-carried forwardFingerprint must fail construction with a "no carrier" error'
+		);
+
+		assert.throws(
+			() =>
+				new SymphonyProxy({
+					listeners: [{ host: '127.0.0.1', port: 0 }],
+					routes: [{ ...baseRoute, protocol: 'http' }],
+				}),
+			/no carrier/i,
+			'declaring protocol: "http" must not paper over a passthrough route with no header carrier'
 		);
 	});
 });
