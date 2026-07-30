@@ -9,7 +9,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::marker::Unpin;
-use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
@@ -353,8 +352,10 @@ where
 /// and observe which configured size reached which direction — a swapped mapping here is invisible
 /// to a round-trip test, since both directions still deliver every byte.
 ///
-/// `copy_bidirectional_with_sizes` takes `(a, b, a_to_b, b_to_a)`, so with `a` = the client the
-/// client buffer sizes reads *from* the client and the upstream buffer sizes the fan-out half.
+/// Delegates to `copy::copy_bidirectional_lazy` (escalating per-direction buffers, see
+/// `src/copy.rs`) rather than `tokio::io::copy_bidirectional_with_sizes`; the argument order is
+/// the same either way — `client_read_buffer_size` sizes reads *from* the client, `upstream_read_buffer_size`
+/// sizes the fan-out half.
 async fn copy_both_ways<C, U>(
 	client: &mut C,
 	upstream: &mut U,
@@ -365,9 +366,7 @@ where
 	C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 	U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-	copy_bidirectional_with_sizes(client, upstream, client_read_buffer_size, upstream_read_buffer_size)
-		.await
-		.map(|_| ())
+	crate::copy::copy_bidirectional_lazy(client, upstream, client_read_buffer_size, upstream_read_buffer_size).await
 }
 
 /// Per-connection source-address + fingerprint forwarding parameters. All fields are `Copy`

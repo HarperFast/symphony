@@ -37,8 +37,9 @@ TCP accept (SO_REUSEPORT per worker thread)
   └─ [suspended.rs  register, emit 'suspended', await oneshot]
   └─ tls.rs       TlsAcceptor::accept() with handshake timeout (if terminate_tls)
   └─ upstream.rs  connect(Destination, peer_ip) → UpstreamStream
-  └─ tokio::io::copy_bidirectional_with_sizes wrapped in idle_timeout
-       (per-direction buffers from readBufferSize / client|upstreamReadBufferSize)
+  └─ copy::copy_bidirectional_lazy wrapped in idle_timeout
+       (readBufferSize / client|upstreamReadBufferSize is a per-direction MAXIMUM, not a
+       permanent allocation — see src/copy.rs)
   └─ RAII drop: BalancerGuard, ActiveGuard — all counter decrements happen here
 ```
 
@@ -126,6 +127,25 @@ Each tokio worker thread gets its own listening socket on the same address via `
 
 ### Suspended connections via oneshot channels
 Each suspended connection gets a `tokio::sync::oneshot::channel`. The sender is stored in a `DashMap<u64, Sender>`. `resolveConnection()` removes the sender and fires it — synchronous from the JS side (no async needed). `oneshot` is used rather than `mpsc` because exactly one resolution is possible per connection. If no resolution arrives within `suspendTimeoutMs`, the `timeout(rx.await)` in `proxy_conn.rs` returns an error and the TCP stream is dropped.
+
+### Escalating copy buffer instead of a permanent per-connection allocation (`src/copy.rs`)
+`tokio::io::copy_bidirectional_with_sizes` allocates its two per-direction `CopyBuffer`s once and
+holds them for the connection's whole life, whether or not it is transferring — at a million
+mostly-idle MQTT subscribers, `readBufferSize × 2` held forever per connection is dead weight.
+`copy_bidirectional_lazy`/`pump` instead start each direction at a small fixed size
+(`PROBE_BUFFER_SIZE`, 512 B — cheap enough to hold for the connection's life) and escalate to the
+full configured `max_buf_size` only once a read *proves* there's a sustained burst (a read that
+exactly fills the current buffer), dropping back down the first time a read comes back under
+capacity. Every read is a single ordinary blocking `.await` — no manual `poll_read`/non-blocking
+peek: an earlier version tried a non-blocking opportunistic drain via a `Waker::noop()` poll to
+batch up "whatever's already queued" without an extra iteration, and under load it silently
+stranded a connection's wakeup (reproduced empirically — an increasing fraction of connections
+stopped responding as concurrency grew). Growing the buffer one iteration late costs one extra
+small-buffer round trip per burst; that's the entire price for every step being provably
+deadlock-free. `readBufferSize`/`client|upstreamReadBufferSize` are therefore a per-transfer
+*maximum*, not a permanent allocation. `tokio::try_join!` (not `join!`) on the two directions
+preserves `copy_bidirectional`'s error semantics exactly: an error on either side ends the whole
+copy immediately rather than waiting for the other direction to also finish.
 
 ### Per-route Arc<ServerConfig> deduplication (TlsConfigCache)
 Routes that share the same cert+mTLS combination share a single `Arc<ServerConfig>` allocation. The cache key is `(sha256(cert_pem + key_pem), sha256(mtls_ca_pem))`. Built at config-parse time in `tls.rs::TlsConfigCache`. Important for deployments where many routes share a wildcard cert.

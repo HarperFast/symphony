@@ -35,6 +35,8 @@
 		"test:integration": "tsc -p tsconfig.test.json && node --test --test-force-exit dist-test/__test__/harper-integration.spec.js",
 		"benchmark": "tsc -p tsconfig.test.json && node dist-test/__test__/benchmark.js",
 		"benchmark:throughput": "tsc -p tsconfig.test.json && node dist-test/__test__/benchmark-throughput.js",
+		"benchmark:copy-memory": "tsc -p tsconfig.test.json && node --expose-gc dist-test/__test__/bench-copy-memory.js",
+		"benchmark:copy-throughput": "tsc -p tsconfig.test.json && node dist-test/__test__/bench-copy-throughput.js",
 		"diagnostic:keepalive": "tsc -p tsconfig.test.json && node dist-test/__test__/diagnostic-uds-keepalive.js"
 	},
 	"devDependencies": {

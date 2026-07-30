@@ -4,6 +4,7 @@
 extern crate napi_derive;
 
 mod balancer;
+mod copy;
 mod error;
 mod http_listener;
 mod http_proxy;
