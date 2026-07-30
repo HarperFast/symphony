@@ -8,9 +8,11 @@
 //! nearly all its time doing nothing. `LazyCopyBuffer` below holds only a small fixed floor
 //! (`PROBE_BUFFER_SIZE`) while idle or exchanging small discrete messages, escalating straight to
 //! the full `max_buf_size` only once *two consecutive* reads land at capacity, and dropping
-//! straight back to the floor the first time a read comes back under capacity. `readBufferSize`
-//! (and its per-direction overrides) becomes the *maximum* per-transfer buffer size rather than a
-//! permanent allocation.
+//! straight back to the floor once the direction actually parks with nothing left to write — not
+//! on every single under-capacity read, which would shrink (and then immediately re-grow) a
+//! connection that is still continuously active but simply has variably-sized traffic.
+//! `readBufferSize` (and its per-direction overrides) becomes the *maximum* per-transfer buffer
+//! size rather than a permanent allocation.
 //!
 //! Why two consecutive full reads, not one: escalating on a single full read means a message
 //! that happens to exactly fill the current (small) buffer — coincidence, not evidence of a
@@ -277,14 +279,15 @@ impl LazyCopyBuffer {
 					self.buf = vec![0u8; self.max_buf_size];
 				}
 			} else {
-				// Came back under capacity — traffic has dropped off (or was never sustained).
-				// Reset the streak and drop straight back to the floor so a connection that is
-				// done bursting stops paying for the buffer immediately, rather than sitting at
-				// whatever size it last reached for as long as it then stays idle.
+				// Came back under capacity — this cycle's burst evidence is gone, so require two
+				// fresh full reads before escalating again. Deliberately does NOT shrink the
+				// buffer here: a connection with continuously active but variably-sized traffic
+				// (never actually idle) would otherwise reallocate on every undersized read only
+				// to grow right back on the next burst — heap-thrashing a connection that never
+				// stopped transferring. The buffer only shrinks once the direction actually parks
+				// (see the `Poll::Pending` branch above), which is the one point that reliably
+				// distinguishes "genuinely idle" from "momentarily between packets."
 				self.full_streak = 0;
-				if self.buf.len() > self.small_size {
-					self.buf = vec![0u8; self.small_size];
-				}
 			}
 		}
 	}
@@ -692,7 +695,8 @@ mod tests {
 	/// Drives `LazyCopyBuffer::poll_copy` directly (no sockets, no tokio scheduler) so the two
 	/// state transitions the escalate/shrink design depends on can be asserted directly instead
 	/// of inferred from end-to-end timing: `full_streak` reaching 2 grows `buf` to `max_buf_size`,
-	/// and the very next under-capacity read shrinks it back to `small_size`.
+	/// and parking with nothing left to write (the burst has ended and the reader has nothing
+	/// more ready) shrinks it back to `small_size`.
 	#[test]
 	fn buf_len_transitions_through_a_burst_and_back() {
 		/// Fills every requested read fully (whatever the buffer's current capacity is) for the
@@ -758,5 +762,71 @@ mod tests {
 		);
 		assert_eq!(lazy_buf.buf.len(), small_size, "buffer must have shrunk back to the floor after the burst ended");
 		assert_eq!(lazy_buf.full_streak, 0, "the under-capacity read must reset the streak");
+	}
+
+	/// A single under-capacity read must NOT shrink the buffer while the connection is still
+	/// actively transferring (more data already ready right after) — only parking does. Without
+	/// this, a connection with continuously active but variably-sized traffic would reallocate on
+	/// every undersized read only to grow right back on the next burst: heap-thrashing a
+	/// connection that never actually went idle.
+	#[test]
+	fn a_single_undersized_read_mid_burst_does_not_shrink_the_buffer() {
+		/// full reads, then one under-capacity read, then full reads again, then parks forever —
+		/// modeling a connection that dips below capacity once but never actually goes idle.
+		struct DipThenResumeBurst {
+			calls: usize,
+		}
+		impl AsyncRead for DipThenResumeBurst {
+			fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+				self.calls += 1;
+				match self.calls {
+					1 | 2 | 3 | 5 => {
+						let n = buf.remaining();
+						buf.put_slice(&vec![7u8; n]);
+						Poll::Ready(Ok(()))
+					}
+					4 => {
+						buf.put_slice(&[9u8]);
+						Poll::Ready(Ok(()))
+					}
+					_ => Poll::Pending,
+				}
+			}
+		}
+
+		struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<usize>>>);
+		impl AsyncWrite for RecordingWriter {
+			fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+				self.0.lock().unwrap().push(buf.len());
+				Poll::Ready(Ok(buf.len()))
+			}
+			fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+				Poll::Ready(Ok(()))
+			}
+			fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+				Poll::Ready(Ok(()))
+			}
+		}
+
+		const MAX: usize = 8192;
+		let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+		let mut reader = DipThenResumeBurst { calls: 0 };
+		let mut writer = RecordingWriter(writes.clone());
+		let mut lazy_buf = LazyCopyBuffer::new(MAX);
+		let small_size = lazy_buf.small_size;
+
+		let waker = std::task::Waker::noop();
+		let mut cx = Context::from_waker(waker);
+		let result = lazy_buf.poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer));
+
+		assert!(result.is_pending(), "reader parks at the end, so this call must not resolve");
+		assert_eq!(
+			*writes.lock().unwrap(),
+			vec![small_size, small_size, MAX, 1, MAX],
+			"the write right after the under-capacity read must still be MAX-sized — the buffer must not have shrunk from the single dip"
+		);
+		// Only parking (the reader's final Pending) shrinks it — proven separately by the
+		// previous test; here the point is that call 4 alone did not.
+		assert_eq!(lazy_buf.buf.len(), small_size, "buffer shrinks once the reader actually parks");
 	}
 }
