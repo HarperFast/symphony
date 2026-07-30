@@ -762,7 +762,7 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 
 	if requires_http && protocol != RouteProtocol::Http {
 		return Err(napi::Error::from_reason(format!(
-			"route '{}': sourceAddressHeader 'xForwardedFor', or forwardFingerprint via an HTTP header (any mode other than 'proxyProtocolV2'), requires protocol: 'http' — declare it explicitly, or switch to 'proxyProtocol'/'proxyProtocolV2' which work on any protocol",
+			"route '{}': sourceAddressHeader 'xForwardedFor', or forwardFingerprint via an HTTP header (any mode other than 'proxyProtocolV2'), requires protocol: 'http' — declare it explicitly, or switch away from the header-carried mode: 'proxyProtocol'/'proxyProtocolV2' both work on any protocol for source-address forwarding, but only 'proxyProtocolV2' carries a fingerprint (v1 does not)",
 			r.sni
 		)));
 	}
@@ -788,17 +788,22 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 	if spec.http2 && !spec.terminate_tls {
 		eprintln!("symphony: route '{}': http2=true has no effect when terminateTls=false (passthrough mode)", spec.sni);
 	}
-	// A header-carried mode (xForwardedFor, or forwardFingerprint outside proxyProtocolV2) needs
-	// a plaintext HTTP/1 upstream — terminated and not h2 — or the runtime silently skips the
-	// rewriter (`eligible_for_header_rewriting` in proxy_conn.rs) and, for xForwardedFor, a
-	// client-supplied header reaches the upstream unstripped. The passthrough case is already a
-	// hard error above, so `requires_http` reaching here implies terminate_tls; the only
-	// remaining silent-miss case is http2, which is a soft warning rather than a hard error
-	// because ALPN negotiation is per-connection — declaring http2=true doesn't guarantee every
-	// client actually negotiates h2.
+	// xForwardedFor + http2 is a hard error (build_route, router.rs) since it's unconditionally
+	// unsafe — an h2 client's XFF would be neither injected nor stripped, forwarding an arbitrary
+	// client-supplied value as if authoritative. A header-carried forwardFingerprint in the same
+	// spot is intentionally only a warning, not a hard error: unlike XFF, which no route needs at
+	// all if it drops h2, some deployments accept "an h2 client can choose to not have its
+	// fingerprint forwarded (or forward its own)" as a known best-effort limitation of a signal
+	// that's advisory in the first place. Name whichever mode actually triggered this so the
+	// message doesn't blame X-Forwarded-For when the route never configured it.
 	if requires_http && spec.http2 {
+		let mode_desc = if source_address_mode == SourceAddressMode::XForwardedFor {
+			"xForwardedFor"
+		} else {
+			"a header-carried forwardFingerprint (X-JA3/X-JA4)"
+		};
 		eprintln!(
-			"symphony: route '{}': header-injection forwarding (xForwardedFor / a header-carried forwardFingerprint) has no effect for any client that negotiates h2 (http2=true), and a client-supplied X-Forwarded-For reaches the upstream unstripped in that case; consider sourceAddressHeader='proxyProtocolV2'",
+			"symphony: route '{}': {mode_desc} has no effect for any client that negotiates h2 (http2=true) — injection and client-supplied-header stripping are both skipped, so an h2 client's own value reaches the upstream unmodified; consider sourceAddressHeader='proxyProtocolV2'",
 			spec.sni
 		);
 	}
@@ -879,7 +884,7 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 
 	if requires_http && protocol != RouteProtocol::Http {
 		return Err(napi::Error::from_reason(
-			"resolveConnection: sourceAddressHeader 'xForwardedFor', or forwardFingerprint via an HTTP header (any mode other than 'proxyProtocolV2'), requires protocol: 'http' — declare it explicitly, or switch to 'proxyProtocol'/'proxyProtocolV2' which work on any protocol".to_string(),
+			"resolveConnection: sourceAddressHeader 'xForwardedFor', or forwardFingerprint via an HTTP header (any mode other than 'proxyProtocolV2'), requires protocol: 'http' — declare it explicitly, or switch away from the header-carried mode: 'proxyProtocol'/'proxyProtocolV2' both work on any protocol for source-address forwarding, but only 'proxyProtocolV2' carries a fingerprint (v1 does not)".to_string(),
 		));
 	}
 
@@ -887,7 +892,9 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 	// has no split h2 destination, but an h2-negotiated client on a terminated, http2:true route
 	// still disables the HTTP/1 rewriter, so a client-supplied X-Forwarded-For would reach the
 	// upstream neither injected nor stripped. This gap predates this PR's checks above; closing it
-	// here rather than leaving the two protocol checks as the only symmetric ones.
+	// here rather than leaving the two protocol checks as the only symmetric ones. (Unlike XFF,
+	// forwardFingerprint + http2 is intentionally only a warning, not a hard error here either —
+	// see the matching comment in parse_route_spec.)
 	if source_address_mode == SourceAddressMode::XForwardedFor && http2 && r.terminate_tls {
 		return Err(napi::Error::from_reason(
 			"resolveConnection: sourceAddressHeader 'xForwardedFor' cannot be combined with http2 (header injection would corrupt h2 frames, and a client-supplied X-Forwarded-For would reach the upstream unstripped); use 'proxyProtocol'/'proxyProtocolV2' or 'none'".to_string(),
