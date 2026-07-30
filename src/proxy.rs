@@ -317,13 +317,14 @@ impl SymphonyProxyWrap {
 		} else {
 			Duration::ZERO
 		};
+		let base_read_buffer_size = resolve_copy_buffer_size(config.read_buffer_size, "readBufferSize");
 		let client_read_buffer_size = match config.client_read_buffer_size {
 			Some(v) => resolve_copy_buffer_size(Some(v), "clientReadBufferSize"),
-			None => resolve_copy_buffer_size(config.read_buffer_size, "readBufferSize"),
+			None => base_read_buffer_size,
 		};
 		let upstream_read_buffer_size = match config.upstream_read_buffer_size {
 			Some(v) => resolve_copy_buffer_size(Some(v), "upstreamReadBufferSize"),
-			None => resolve_copy_buffer_size(config.read_buffer_size, "readBufferSize"),
+			None => base_read_buffer_size,
 		};
 
 		let mut internal_listeners = Vec::new();

@@ -795,8 +795,10 @@ Two limits on where these settings apply:
   here, so the default is unaffected, but a raised or lowered value has no effect on those routes.
   PROXY-protocol routes, including every UDS route, take the plain path and are governed normally.
 - **A config reload cannot change these.** They are frozen when the proxy is constructed, so
-  `symphony-server` recreates the proxy (seamlessly, via `SO_REUSEPORT`) when one of them changes
-  rather than hot-swapping it.
+  changing one makes `symphony-server` recreate the proxy rather than hot-swap it. `SO_REUSEPORT`
+  means there is no *bind* gap, but established connections on the old proxy are **not** drained —
+  `stop()` waits 100 ms and connection tasks are detached — so they are all dropped. On a
+  high-connection-count listener, treat a buffer-size edit as a reconnect event, not a live tune.
 
 > **Upgrading:** before this setting was applied to the copy loop, `readBufferSize` had no effect —
 > every connection got 8 KiB per direction regardless of what the config said, and the default
