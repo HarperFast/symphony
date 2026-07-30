@@ -247,6 +247,20 @@ export interface ProxyConfig {
 	clientReadBufferSize?: number;
 	/** Overrides `readBufferSize` for the upstream -> client direction only. */
 	upstreamReadBufferSize?: number;
+	/**
+	 * Proxy-wide active connections at or above which the copy buffers escalate and release
+	 * rather than each connection holding its full buffer for its whole life. Default 1000.
+	 *
+	 * The memory saving scales with connection count; the per-burst cost of growing and releasing
+	 * a buffer does not. A port-set carrying a few bulk streams (replication) therefore stays
+	 * below this and keeps one full-size buffer per direction — no resize churn at all — while an
+	 * MQTT fan-out port-set with tens of thousands of parked subscribers is far above it, where
+	 * `2 x readBufferSize` per parked connection is the cost that matters.
+	 *
+	 * `0` engages it always. A value above this proxy's peak concurrency disables it, which is
+	 * exactly the pre-existing behaviour (one full-size buffer per direction, allocated once).
+	 */
+	lazyCopyBufferThreshold?: number;
 }
 
 // ── Hot-swap config ───────────────────────────────────────────────────────────

@@ -3,7 +3,8 @@ use crate::listener::spawn_listeners;
 use crate::metrics::{total_of, GlobalMetrics, ListenerMetrics};
 use crate::protection::ProtectionState;
 use crate::proxy_conn::{
-	ConnContext, JsEvent, DEFAULT_COPY_BUFFER_SIZE, MAX_COPY_BUFFER_SIZE, MIN_COPY_BUFFER_SIZE,
+	ConnContext, JsEvent, DEFAULT_COPY_BUFFER_SIZE, DEFAULT_LAZY_COPY_BUFFER_THRESHOLD, MAX_COPY_BUFFER_SIZE,
+	MIN_COPY_BUFFER_SIZE,
 };
 use crate::router::{
 	build_route_table, ForwardFingerprint, ListenerTlsSpec, LiveRouteTable, RouteSpec,
@@ -141,6 +142,12 @@ pub struct JsProxyConfig {
 	pub client_read_buffer_size: Option<u32>,
 	/// Overrides `readBufferSize` for the upstream→client direction only.
 	pub upstream_read_buffer_size: Option<u32>,
+	/// Active connections at or above which the copy buffers escalate and release rather than
+	/// being held at full size for each connection's whole life (default 1000). `0` engages that
+	/// always; a value above this proxy's peak concurrency disables it, giving each direction one
+	/// full-size buffer with no resize churn. Per proxy, so a replication port-set and an MQTT
+	/// fan-out port-set can differ.
+	pub lazy_copy_buffer_threshold: Option<u32>,
 }
 
 #[napi(object)]
@@ -263,6 +270,7 @@ pub struct SymphonyProxyWrap {
 	idle_timeout: Duration,
 	client_read_buffer_size: usize,
 	upstream_read_buffer_size: usize,
+	lazy_copy_buffer_threshold: u64,
 	// Shared runtime state
 	route_table: Arc<LiveRouteTable>,
 	suspended_registry: Arc<SuspendedRegistry>,
@@ -327,6 +335,8 @@ impl SymphonyProxyWrap {
 			Some(v) => resolve_copy_buffer_size(Some(v), "upstreamReadBufferSize"),
 			None => base_read_buffer_size,
 		};
+		let lazy_copy_buffer_threshold =
+			u64::from(config.lazy_copy_buffer_threshold.unwrap_or(DEFAULT_LAZY_COPY_BUFFER_THRESHOLD));
 
 		let mut internal_listeners = Vec::new();
 		let mut listener_states = Vec::new();
@@ -425,6 +435,7 @@ impl SymphonyProxyWrap {
 			idle_timeout,
 			client_read_buffer_size,
 			upstream_read_buffer_size,
+			lazy_copy_buffer_threshold,
 			route_table: Arc::new(LiveRouteTable(arc_swap::ArcSwap::new(Arc::new(table)))),
 			suspended_registry: SuspendedRegistry::new(),
 			global_metrics: Arc::new(GlobalMetrics::default()),
@@ -462,6 +473,7 @@ impl SymphonyProxyWrap {
 				upstream_connect_timeout,
 				client_read_buffer_size: self.client_read_buffer_size,
 				upstream_read_buffer_size: self.upstream_read_buffer_size,
+				lazy_copy_buffer_threshold: self.lazy_copy_buffer_threshold,
 				js_emit: self.js_emit.clone(),
 			});
 

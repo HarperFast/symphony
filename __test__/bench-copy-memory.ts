@@ -28,7 +28,7 @@
  *
  * Run with:
  *   npm run build:debug
- *   node --expose-gc dist-test/__test__/bench-copy-memory.js [connectionCount] [readBufferSize]
+ *   node --expose-gc dist-test/__test__/bench-copy-memory.js [connectionCount] [readBufferSize] [lazyCopyBufferThreshold]
  */
 import * as tls from 'node:tls';
 import { SymphonyProxy } from '../ts/proxy.js';
@@ -38,6 +38,10 @@ const CONNECTIONS = Number(process.argv[2] ?? 30000);
 // Deliberately large: the whole point of the fix is that a big configured buffer no longer
 // means every idle connection pays for it. A small default would hide a regression.
 const READ_BUFFER_SIZE = Number(process.argv[3] ?? 65536);
+// Escalation is gated on active connections (src/copy.rs LazyBufferGate). 0 forces the escalating
+// path whatever the connection count; pass a value above `connectionCount` to measure the static
+// path — that pair is what isolates what the gate is actually buying.
+const LAZY_THRESHOLD = Number(process.argv[4] ?? 0);
 const BATCH = 250;
 
 // A single loopback source address only has ~28k usable ephemeral ports
@@ -69,6 +73,7 @@ async function main() {
 			},
 		],
 		readBufferSize: READ_BUFFER_SIZE,
+		lazyCopyBufferThreshold: LAZY_THRESHOLD,
 	});
 	await proxy.start();
 

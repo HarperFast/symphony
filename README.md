@@ -71,6 +71,7 @@ console.log('proxy listening on :443');
 | `readBufferSize` | `number` | `8192` | Per-direction copy buffer size in bytes, clamped to `[512, 1048576]`. See [Copy buffers and per-connection memory](#copy-buffers-and-per-connection-memory) |
 | `clientReadBufferSize` | `number` | `readBufferSize` | Overrides `readBufferSize` for the client→upstream direction only |
 | `upstreamReadBufferSize` | `number` | `readBufferSize` | Overrides `readBufferSize` for the upstream→client direction only |
+| `lazyCopyBufferThreshold` | `number` | `1000` | Active connections at or above which copy buffers escalate and release instead of being held at full size. `0` always; above peak concurrency disables it. See [Copy buffers and per-connection memory](#copy-buffers-and-per-connection-memory) |
 
 ### `ListenerConfig`
 
@@ -767,6 +768,31 @@ floor scales with concurrently bursting transfers; the 1 KiB/connection floor it
 with connection count, same as before. A million idle MQTT subscribers cost about 0.95 GiB in floors
 (1 KiB × 1,000,000 connections), not `readBufferSize × 2 × 1,000,000`.
 
+### When escalation is active: `lazyCopyBufferThreshold`
+
+The escalate/release behaviour above is not unconditional, because its economics are one-sided. The
+memory it saves scales with connection count, while its cost — two allocations plus the zeroing of
+the new buffer, per burst — does not. A replication port-set carrying six bulk streams would pay
+that on every burst to save a few hundred KiB it was never short of; a hundred thousand parked MQTT
+subscribers are the entire reason the mechanism exists.
+
+So it engages only once the proxy is actually carrying enough connections for the saving to be
+worth having. `lazyCopyBufferThreshold` (default `1000`) is the proxy-wide active connection count
+at or above which buffers escalate and release. Below it, each direction gets its full configured
+buffer once and never resizes — identical to symphony's behaviour before this mechanism existed,
+with no resize churn at all.
+
+The default puts the two shapes symphony carries on opposite sides without anyone configuring it: a
+replication port-set (~6 connections) stays static, an MQTT fan-out port-set (100k+) escalates. Set
+it to `0` to engage always, or above the port-set's peak concurrency to disable it entirely. It is
+per proxy, so those two port-sets can differ.
+
+The count is re-read at each resize decision rather than fixed when a connection is established.
+That matters for the case this exists for: connections that arrive while the proxy is quiet would
+otherwise hold a full-size buffer for their entire lives no matter how busy it later got, and
+long-lived connections accumulating while idle is precisely the MQTT shape. Instead they begin
+releasing at their next park once the proxy crosses the threshold.
+
 ```
 worst-case buffer bytes = (clientReadBufferSize + upstreamReadBufferSize) × connections bursting right now
 ```
@@ -805,9 +831,14 @@ Two limits on where these settings apply:
   PROXY-protocol routes, including every UDS route, take the plain path and are governed normally.
 - **A config reload cannot change these.** They are frozen when the proxy is constructed, so
   changing one makes `symphony-server` recreate the proxy rather than hot-swap it. `SO_REUSEPORT`
-  means there is no *bind* gap, but established connections on the old proxy are **not** drained —
-  `stop()` waits 100 ms and connection tasks are detached — so they are all dropped. On a
-  high-connection-count listener, treat a buffer-size edit as a reconnect event, not a live tune.
+  means there is no *bind* gap. Established connections on the old proxy are **not** drained and
+  **not** dropped either: `stop()` sends the shutdown broadcast, which ends the accept loops, then
+  sleeps 100 ms — it never aborts connection tasks, and the tokio runtime lives inside the addon
+  until the old proxy is garbage-collected. Those sessions keep running on the *old* buffer sizes
+  for as long as they stay open. So a buffer-size edit applies to new connections only, and on a
+  listener whose connections are long-lived by design (MQTT subscribers) that can mean the change
+  reaches almost nothing until those clients reconnect. Plan the edit around a reconnect rather
+  than expecting it to take effect fleet-wide on reload.
 
 > **Upgrading:** before this setting was applied to the copy loop, `readBufferSize` had no effect —
 > every connection got a fixed 8 KiB per direction regardless of what the config said (held for the

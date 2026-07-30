@@ -148,6 +148,27 @@ park rather than the first under-capacity read: a connection with continuously a
 variably-sized traffic (never actually idle) would otherwise reallocate on every undersized read
 only to grow right back on the next burst.
 
+**None of it is unconditional.** The saving scales with connection count and the per-burst cost of
+growing/releasing a buffer does not, so the behaviour is gated on the proxy's live
+`GlobalMetrics::active_connections` (`copy::LazyBufferGate`, config `lazyCopyBufferThreshold`,
+default 1000). Below the threshold each direction allocates its full configured buffer once and
+never resizes — byte-for-byte the old `copy_bidirectional_with_sizes` behaviour — so the six-stream
+replication port-set pays nothing for a memory problem it does not have, while the 100k-subscriber
+MQTT port-set is far above the threshold and gets the full mechanism. `0` engages always; a value
+above peak concurrency disables it. The gauge is re-read at **every** resize decision rather than
+latched per connection: a connection established while the proxy was quiet would otherwise hold a
+full-size buffer for its whole life however busy the proxy later became, and long-lived connections
+accumulating while idle is exactly the shape this exists for.
+
+**A recreate does not drop established connections.** `stop()` sends the shutdown broadcast (ending
+the accept loops) and sleeps 100 ms; it never aborts connection tasks, and the runtime lives in the
+napi wrap until GC. So the construction-frozen proxy fields (`readBufferSize`, its two overrides,
+`lazyCopyBufferThreshold`, `workerThreads`) apply to *new* connections only — existing sessions keep
+running on the old values for as long as they stay open. `__test__/server.spec.ts` pins both halves
+of this: that editing one of those fields forces a recreate (the signature does its job, with a
+route-only control proving it is the signature and not "recreates on every write"), and that a held
+connection survives that recreate and still proxies.
+
 Reusing tokio's own poll-based structure (rather than `tokio::io::split` plus independent
 per-direction `async fn`s, tried first) matters for two reasons found by an independent review of
 that version: `split` wraps each side in an `Arc<Mutex<_>>` — two heap allocations and a

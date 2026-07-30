@@ -49,6 +49,10 @@ async function main() {
 				upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: upstreamPort }],
 			},
 		],
+		// This benchmark runs a handful of sustained streams, which is well below the default
+		// `lazyCopyBufferThreshold` — so without pinning it here it would measure the static path
+		// and report nothing about the escalating buffers it exists to check for regressions in.
+		lazyCopyBufferThreshold: 0,
 	});
 	await proxy.start();
 

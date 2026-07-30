@@ -44,7 +44,7 @@ describe('copy buffers', () => {
 	async function startProxy(
 		buffers: Pick<
 			ProxyConfig,
-			'readBufferSize' | 'clientReadBufferSize' | 'upstreamReadBufferSize'
+			'readBufferSize' | 'clientReadBufferSize' | 'upstreamReadBufferSize' | 'lazyCopyBufferThreshold'
 		>,
 	): Promise<number> {
 		const port = await getFreePort();
@@ -97,6 +97,28 @@ describe('copy buffers', () => {
 
 	it('accepts a per-direction override alongside the base value', async () => {
 		const port = await startProxy({ readBufferSize: 2048, upstreamReadBufferSize: 16384 });
+		await assertRoundTrip(port, patterned(LARGE_PAYLOAD));
+	});
+
+	// The gate picks the buffer strategy but must never change what comes out the other end.
+	// Both sides of the threshold are exercised on the real addon: a single test connection is
+	// always below any positive threshold, so `0` is the only way to reach the escalating path
+	// from here, and a high value is the only way to reach the static one.
+
+	it('round-trips with escalating buffers forced on (threshold 0)', async () => {
+		const port = await startProxy({ readBufferSize: 4096, lazyCopyBufferThreshold: 0 });
+		await assertRoundTrip(port, patterned(LARGE_PAYLOAD));
+	});
+
+	it('round-trips with escalating buffers disabled (threshold above peak concurrency)', async () => {
+		const port = await startProxy({ readBufferSize: 4096, lazyCopyBufferThreshold: 1_000_000 });
+		await assertRoundTrip(port, patterned(LARGE_PAYLOAD));
+	});
+
+	it('round-trips a payload far larger than the buffer with the gate disengaged', async () => {
+		// The static path has to keep working for the large-payload case too: with no escalation
+		// the buffer never grows, so every one of these bytes crosses in 512-byte reads.
+		const port = await startProxy({ readBufferSize: 512, lazyCopyBufferThreshold: 1_000_000 });
 		await assertRoundTrip(port, patterned(LARGE_PAYLOAD));
 	});
 });

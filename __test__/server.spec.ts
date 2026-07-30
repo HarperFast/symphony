@@ -14,6 +14,7 @@ import { spawn, ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as tls from 'node:tls';
 import { generateSelfSignedCert, getFreePort, startEchoServer, tlsRoundTrip, sleep } from './util.js';
 
 // server.js sits next to this compiled spec's sibling ts/ dir: dist-test/ts/server.js
@@ -41,20 +42,24 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
 interface RunningServer {
 	child: ChildProcess;
 	getStderr: () => string;
+	/** stdout carries the server's own lifecycle log lines (log(), not logErr()). */
+	getStdout: () => string;
 	markShutdown: () => void;
 }
 
 function spawnServer(configPath: string, statusPath?: string): RunningServer {
 	let stderr = '';
+	let stdout = '';
 	let shuttingDown = false;
 	const args = [SERVER_JS, '--config', configPath];
 	if (statusPath) args.push('--status', statusPath);
 	const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 	child.stderr?.on('data', (d) => (stderr += d.toString()));
+	child.stdout?.on('data', (d) => (stdout += d.toString()));
 	child.on('exit', (code, sig) => {
 		if (!shuttingDown) stderr += `\n[child exited early code=${code} sig=${sig}]`;
 	});
-	return { child, getStderr: () => stderr, markShutdown: () => (shuttingDown = true) };
+	return { child, getStderr: () => stderr, getStdout: () => stdout, markShutdown: () => (shuttingDown = true) };
 }
 
 async function killServer(server: RunningServer): Promise<void> {
@@ -703,5 +708,144 @@ describe('symphony-server (status.json ownership guard)', () => {
 			foreignPid,
 			'the successor-owned status.json must be left untouched'
 		);
+	});
+});
+
+describe('symphony-server (construction-frozen proxy fields force a recreate)', () => {
+	// readBufferSize, its two per-direction overrides, and lazyCopyBufferThreshold are all frozen
+	// in SymphonyProxyWrap at construction — updateConfig() reaches none of them. If they were
+	// missing from the reconcile's construction signature, editing one would leave the signature
+	// unchanged, take the route-only hot-swap branch, and report a successful reload while the
+	// proxy kept running the old value. Silent, and only ever visible as "the setting we shipped
+	// didn't do anything".
+	//
+	// The observable is the server's own "proxy listening on ports" line, which the recreate
+	// branch emits and the hot-swap branch does not. Note it is NOT connection loss: stop() ends
+	// the accept loops but in-flight connection tasks run to completion, so established
+	// connections survive a recreate and keep the old buffer sizes — which is exactly why the
+	// README calls a buffer-size edit a reconnect event.
+	//
+	// The route-only case is the control. Without it this would pass equally well against a
+	// server that recreated on every config write, which would prove nothing about the signature.
+	const cert = generateSelfSignedCert('localhost');
+	let dir: string;
+	let configPath: string;
+	let statusPath: string;
+	let proxyPort: number;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	let server: RunningServer;
+
+	const LISTENING_LINE = /proxy listening on ports/g;
+	const listenCount = () => (server.getStdout().match(LISTENING_LINE) ?? []).length;
+
+	const baseConfig = (extra: Record<string, unknown>, routeSnis: string[] = ['localhost']) => ({
+		version: 1,
+		proxies: [
+			{
+				listeners: [{ host: '127.0.0.1', port: proxyPort }],
+				routes: routeSnis.map((sni) => ({
+					sni,
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+				})),
+				...extra,
+			},
+		],
+	});
+
+	before(async () => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-recreate-'));
+		configPath = path.join(dir, 'config.json');
+		statusPath = path.join(dir, 'status.json');
+		echo = await startEchoServer();
+		proxyPort = await getFreePort();
+		writeConfigAtomic(configPath, baseConfig({ readBufferSize: 4096, lazyCopyBufferThreshold: 0 }));
+		server = spawnServer(configPath);
+		await waitFor(() => fs.existsSync(statusPath));
+		await waitFor(() => listenCount() >= 1);
+	});
+
+	after(async () => {
+		await killServer(server);
+		await echo.close().catch(() => {});
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it('recreates the proxy when lazyCopyBufferThreshold changes', async () => {
+		const before = listenCount();
+		writeConfigAtomic(configPath, baseConfig({ readBufferSize: 4096, lazyCopyBufferThreshold: 5000 }));
+		await waitFor(() => listenCount() > before, 8000, 100);
+
+		// Healthy on the new value, not merely torn down and rebuilt into nothing.
+		const fresh = await tlsRoundTrip({ port: proxyPort, servername: 'localhost', caCert: cert.cert, data: Buffer.from('after-threshold'), rejectUnauthorized: false });
+		assert.equal(fresh.toString(), 'after-threshold');
+	});
+
+	it('recreates the proxy when readBufferSize changes', async () => {
+		const before = listenCount();
+		writeConfigAtomic(configPath, baseConfig({ readBufferSize: 16384, lazyCopyBufferThreshold: 5000 }));
+		await waitFor(() => listenCount() > before, 8000, 100);
+
+		const fresh = await tlsRoundTrip({ port: proxyPort, servername: 'localhost', caCert: cert.cert, data: Buffer.from('after-bufsize'), rejectUnauthorized: false });
+		assert.equal(fresh.toString(), 'after-bufsize');
+	});
+
+	it('leaves established connections running on the old proxy across a recreate', async () => {
+		// Documents what a recreate actually does to in-flight sessions, which is NOT what the
+		// mechanism suggests at a glance: stop() sends the shutdown broadcast (ending the accept
+		// loops) and sleeps 100ms, but it never aborts connection tasks, and the tokio runtime
+		// lives inside the napi wrap until JS garbage-collects it. So established sessions keep
+		// running — on the OLD buffer settings — rather than being dropped.
+		//
+		// This matters most for exactly the deployment the setting targets: long-lived MQTT
+		// subscribers would keep their old buffers indefinitely after an operator lowered the
+		// value to reclaim memory.
+		const held = await new Promise<tls.TLSSocket>((resolve, reject) => {
+			const s = tls.connect(
+				{ port: proxyPort, host: '127.0.0.1', servername: 'localhost', ca: cert.cert, rejectUnauthorized: false },
+				() => resolve(s),
+			);
+			s.on('error', reject);
+		});
+		const echoOn = (payload: string) =>
+			new Promise<string>((resolve, reject) => {
+				const t = setTimeout(() => reject(new Error('no echo on held connection')), 3000);
+				held.once('data', (d: Buffer) => {
+					clearTimeout(t);
+					resolve(d.toString());
+				});
+				held.write(payload);
+			});
+
+		assert.equal(await echoOn('pre-recreate'), 'pre-recreate');
+
+		const before = listenCount();
+		writeConfigAtomic(configPath, baseConfig({ readBufferSize: 32768, lazyCopyBufferThreshold: 5000 }));
+		await waitFor(() => listenCount() > before, 8000, 100);
+
+		assert.equal(held.destroyed, false, 'the held connection must survive the recreate');
+		assert.equal(await echoOn('post-recreate'), 'post-recreate', 'and must still proxy on the old proxy');
+		held.destroy();
+	});
+
+	it('hot-swaps instead of recreating for a route-only change (control)', async () => {
+		const before = listenCount();
+		// Same listeners, same proxy-level fields — only the route table grows, which is what the
+		// hot-swap path exists for.
+		writeConfigAtomic(configPath, baseConfig({ readBufferSize: 16384, lazyCopyBufferThreshold: 5000 }, ['localhost', 'other.localhost']));
+
+		// The added route proving the reload really applied — otherwise "no recreate" would also
+		// be satisfied by the server having ignored the edit entirely.
+		await waitFor(async () => {
+			try {
+				const r = await tlsRoundTrip({ port: proxyPort, servername: 'other.localhost', caCert: cert.cert, data: Buffer.from('hi'), rejectUnauthorized: false });
+				return r.toString() === 'hi';
+			} catch {
+				return false;
+			}
+		}, 8000, 100);
+
+		assert.equal(listenCount(), before, `a route-only edit must hot-swap, not recreate. stdout:\n${server.getStdout()}`);
 	});
 });

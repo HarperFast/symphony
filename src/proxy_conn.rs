@@ -30,6 +30,17 @@ pub const MIN_COPY_BUFFER_SIZE: usize = 512;
 /// 1 MiB per direction is already 2 MiB per connection; beyond this a config value is far more
 /// likely to be a units mistake than an intent.
 pub const MAX_COPY_BUFFER_SIZE: usize = 1024 * 1024;
+/// Proxy-wide active connections at or above which `copy::LazyCopyBuffer` starts escalating and
+/// releasing its buffers instead of holding one full-size buffer per direction (`copy::LazyBufferGate`).
+///
+/// Chosen so the two shapes symphony actually carries land on opposite sides without anyone
+/// configuring it. A replication port-set runs a handful of bulk streams: it stays under this,
+/// keeps a static buffer, and pays no resize churn for a per-connection saving it would never
+/// notice. An MQTT fan-out port-set runs tens or hundreds of thousands of mostly-parked
+/// subscribers: it is far above this, and 2 x `readBufferSize` per parked connection is the cost
+/// that matters. At the threshold itself the held-buffer cost is ~128 MiB at a 64 KiB
+/// `readBufferSize` — enough to be worth reclaiming, low enough that nothing under it is at risk.
+pub const DEFAULT_LAZY_COPY_BUFFER_THRESHOLD: u32 = 1000;
 
 /// JS event types emitted from connection tasks back to Node.
 #[derive(Debug)]
@@ -73,6 +84,10 @@ pub struct ConnContext {
 	/// MQTT is strongly asymmetric: after SUBSCRIBE a client sends almost nothing but PINGREQ,
 	/// while the broker carries the whole fan-out.
 	pub upstream_read_buffer_size: usize,
+	/// Active connections at or above which the copy buffers escalate/release rather than being
+	/// held at full size. `0` always, above peak concurrency never. See
+	/// `DEFAULT_LAZY_COPY_BUFFER_THRESHOLD` and `copy::LazyBufferGate`.
+	pub lazy_copy_buffer_threshold: u64,
 	pub js_emit: Arc<ThreadsafeFunction<JsEvent>>,
 }
 
@@ -329,8 +344,14 @@ where
 		write_connection_prefix(upstream, sf).await?;
 		let rewrites = header_rewrites(sf, l7_http1);
 		if rewrites.is_empty() {
-			copy_both_ways(client, upstream, ctx.client_read_buffer_size, ctx.upstream_read_buffer_size)
-				.await
+			copy_both_ways(
+				client,
+				upstream,
+				ctx.client_read_buffer_size,
+				ctx.upstream_read_buffer_size,
+				crate::copy::LazyBufferGate::new(ctx.global_metrics.clone(), ctx.lazy_copy_buffer_threshold),
+			)
+			.await
 		} else {
 			crate::http_proxy::proxy_http1_rewriting(client, upstream, &rewrites).await
 		}
@@ -360,12 +381,13 @@ async fn copy_both_ways<C, U>(
 	upstream: &mut U,
 	client_read_buffer_size: usize,
 	upstream_read_buffer_size: usize,
+	gate: crate::copy::LazyBufferGate,
 ) -> std::io::Result<()>
 where
 	C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 	U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-	crate::copy::copy_bidirectional_lazy(client, upstream, client_read_buffer_size, upstream_read_buffer_size).await
+	crate::copy::copy_bidirectional_lazy(client, upstream, client_read_buffer_size, upstream_read_buffer_size, gate).await
 }
 
 /// Per-connection source-address + fingerprint forwarding parameters. All fields are `Copy`
@@ -633,7 +655,7 @@ mod tests {
 		let from_upstream = Arc::new(Mutex::new(Vec::new()));
 		let mut client = CapacityRecorder::new(64 * 1024, from_client.clone());
 		let mut upstream = CapacityRecorder::new(64 * 1024, from_upstream.clone());
-		copy_both_ways(&mut client, &mut upstream, client_size, upstream_size).await.unwrap();
+		copy_both_ways(&mut client, &mut upstream, client_size, upstream_size, crate::copy::LazyBufferGate::always()).await.unwrap();
 		let max_of = |v: &Arc<Mutex<Vec<usize>>>| *v.lock().unwrap().iter().max().unwrap();
 		(max_of(&from_client), max_of(&from_upstream))
 	}

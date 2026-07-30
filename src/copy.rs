@@ -14,6 +14,14 @@
 //! `readBufferSize` (and its per-direction overrides) becomes the *maximum* per-transfer buffer
 //! size rather than a permanent allocation.
 //!
+//! None of this is unconditional. The saving scales with connection count and the cost does not,
+//! so the escalate/shrink behavior is gated on the proxy's live active-connection count
+//! (`LazyBufferGate`, configured by `lazyCopyBufferThreshold`). Below the threshold each direction
+//! gets its full configured buffer once and never resizes — byte-for-byte the
+//! `tokio::io::copy_bidirectional_with_sizes` behavior this module replaced — so a proxy carrying
+//! a few bulk replication streams pays nothing for a memory problem it does not have. Above it,
+//! everything below applies.
+//!
 //! Why two consecutive full reads, not one: escalating on a single full read means a message
 //! that happens to exactly fill the current (small) buffer — coincidence, not evidence of a
 //! burst — jumps straight to the configured maximum and then sits there for however long the
@@ -40,8 +48,68 @@
 use std::future::{poll_fn, Future};
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use crate::metrics::GlobalMetrics;
+
+/// Decides, at each resize point, whether escalating buffers are worth their cost *right now*.
+///
+/// The saving scales with connection count; the cost does not. Growing and releasing a buffer
+/// costs two allocations plus the zeroing of `vec![0u8; n]` per burst, and a proxy carrying four
+/// bulk replication streams pays that on every burst while saving a few hundred KiB it was never
+/// short of. The same behavior across a hundred thousand parked MQTT subscribers is the whole
+/// point of the module. So the behavior is gated on how busy the proxy actually is rather than
+/// chosen once, fleet-wide, by whoever wrote the config.
+///
+/// `threshold` is the proxy-wide active connection count at or above which escalation engages.
+/// `0` engages it always; a value above peak concurrency disables it, leaving each direction on a
+/// full-size buffer allocated once — byte-for-byte the `tokio::io::copy_bidirectional_with_sizes`
+/// behavior this module replaced, with no resize churn at all.
+///
+/// Deliberately re-read at every resize point rather than latched per connection. A connection
+/// established while the proxy was quiet would otherwise hold a full-size buffer for its entire
+/// life however busy the proxy later became — and long-lived connections accumulating while idle
+/// is exactly the shape that motivates this. Re-reading means those connections start releasing
+/// their buffers at their next park once the proxy crosses the threshold.
+#[derive(Clone)]
+pub struct LazyBufferGate {
+	metrics: Arc<GlobalMetrics>,
+	threshold: u64,
+}
+
+impl LazyBufferGate {
+	pub fn new(metrics: Arc<GlobalMetrics>, threshold: u64) -> Self {
+		Self { metrics, threshold }
+	}
+
+	/// `Relaxed` matches how the gauge is maintained and is all this needs: the result only picks
+	/// a buffer size, so a read that is momentarily stale costs one connection one resize
+	/// decision, never correctness.
+	fn engaged(&self) -> bool {
+		self.threshold == 0 || self.metrics.active_connections.load(Ordering::Relaxed) >= self.threshold
+	}
+}
+
+#[cfg(test)]
+impl LazyBufferGate {
+	/// Engaged regardless of connection count — the escalate/release behavior under test.
+	pub fn always() -> Self {
+		Self::new(Arc::new(GlobalMetrics::default()), 0)
+	}
+
+	/// Never engaged — one full-size buffer per direction, held for the connection's life.
+	pub fn never() -> Self {
+		Self::new(Arc::new(GlobalMetrics::default()), u64::MAX)
+	}
+
+	/// A gate over a counter the test drives directly, for the threshold-crossing cases.
+	pub fn with_metrics(metrics: Arc<GlobalMetrics>, threshold: u64) -> Self {
+		Self::new(metrics, threshold)
+	}
+}
 
 /// Resident buffer size while a direction is idle or only exchanging small, discrete messages
 /// (PINGREQ, a short request). Deliberately tiny and fixed, not zero: a zero-length read buffer
@@ -59,20 +127,22 @@ const PROBE_BUFFER_SIZE: usize = 512;
 ///   propagates — ends the whole copy immediately rather than waiting for the other direction.
 ///   This is what makes an RST on one leg end the session instead of hanging until idle_timeout.
 ///
-/// `client_buf_size`/`upstream_buf_size` bound the buffer each direction may grow to; neither is
-/// held at that size permanently (see the module docs and `LazyCopyBuffer`).
+/// `client_buf_size`/`upstream_buf_size` bound the buffer each direction may grow to; whether
+/// either is held at that size permanently depends on `gate` (see `LazyBufferGate` and the module
+/// docs).
 pub async fn copy_bidirectional_lazy<C, U>(
 	client: &mut C,
 	upstream: &mut U,
 	client_buf_size: usize,
 	upstream_buf_size: usize,
+	gate: LazyBufferGate,
 ) -> io::Result<()>
 where
 	C: AsyncRead + AsyncWrite + Unpin,
 	U: AsyncRead + AsyncWrite + Unpin,
 {
-	let mut client_to_upstream = TransferState::Running(LazyCopyBuffer::new(client_buf_size));
-	let mut upstream_to_client = TransferState::Running(LazyCopyBuffer::new(upstream_buf_size));
+	let mut client_to_upstream = TransferState::Running(LazyCopyBuffer::new(client_buf_size, gate.clone()));
+	let mut upstream_to_client = TransferState::Running(LazyCopyBuffer::new(upstream_buf_size, gate));
 	poll_fn(|cx| {
 		let a = transfer_one_direction(cx, &mut client_to_upstream, client, upstream)?;
 		let b = transfer_one_direction(cx, &mut upstream_to_client, upstream, client)?;
@@ -141,11 +211,19 @@ struct LazyCopyBuffer {
 	/// Consecutive read cycles that exactly saturated `buf`. Escalation requires two, not one —
 	/// see the module docs for why a single full read isn't enough evidence of a sustained burst.
 	full_streak: u32,
+	/// Consulted at each resize point, not latched, so a connection follows the proxy's load
+	/// rather than the conditions it happened to be established under. See `LazyBufferGate`.
+	gate: LazyBufferGate,
 }
 
 impl LazyCopyBuffer {
-	fn new(max_buf_size: usize) -> Self {
+	fn new(max_buf_size: usize, gate: LazyBufferGate) -> Self {
 		let small_size = max_buf_size.min(PROBE_BUFFER_SIZE);
+		// Start at the floor only if the gate is engaged. Disengaged, this allocates the full
+		// buffer once and (with the shrink below equally gated) never resizes it again, which is
+		// exactly what tokio's `CopyBuffer` did — so a proxy under the threshold pays none of
+		// this module's churn, not a reduced amount of it.
+		let initial_size = if gate.engaged() { small_size } else { max_buf_size };
 		Self {
 			small_size,
 			max_buf_size,
@@ -154,7 +232,8 @@ impl LazyCopyBuffer {
 			need_flush: false,
 			pos: 0,
 			cap: 0,
-			buf: vec![0u8; small_size],
+			buf: vec![0u8; initial_size],
+			gate,
 		}
 	}
 
@@ -247,7 +326,12 @@ impl LazyCopyBuffer {
 							// costs the same one-round-trip re-escalation the design already pays
 							// for growth, and a real sustained burst won't reach this branch (more
 							// input is already buffered in the kernel, so the next read is Ready).
-							if self.buf.len() > self.small_size {
+							//
+							// Gated: below the threshold the buffer is left where it is, so a proxy
+							// carrying a handful of bulk streams never pays a resize. Re-read here
+							// rather than latched at construction, so a connection established while
+							// the proxy was quiet does start releasing once it gets busy.
+							if self.gate.engaged() && self.buf.len() > self.small_size {
 								self.buf = vec![0u8; self.small_size];
 							}
 							self.full_streak = 0;
@@ -343,7 +427,7 @@ mod tests {
 			buf
 		});
 
-		let copy = copy_bidirectional_lazy(&mut client, &mut upstream, 512, 512);
+		let copy = copy_bidirectional_lazy(&mut client, &mut upstream, 512, 512, LazyBufferGate::always());
 		let (copy_result, write_result, received) = tokio::join!(copy, write_task, read_task);
 		copy_result.unwrap();
 		write_result.unwrap();
@@ -418,7 +502,7 @@ mod tests {
 
 		let result = tokio::time::timeout(
 			std::time::Duration::from_secs(5),
-			copy_bidirectional_lazy(&mut client_rw, &mut upstream, 512, 512),
+			copy_bidirectional_lazy(&mut client_rw, &mut upstream, 512, 512, LazyBufferGate::always()),
 		)
 		.await
 		.expect("copy must resolve promptly on RST, not hang for the upstream leg");
@@ -445,7 +529,7 @@ mod tests {
 			buf
 		});
 
-		copy_bidirectional_lazy(&mut client, &mut upstream, 512, 512).await.unwrap();
+		copy_bidirectional_lazy(&mut client, &mut upstream, 512, 512, LazyBufferGate::always()).await.unwrap();
 		upstream_write.await.unwrap();
 		let received = read_task.await.unwrap();
 		assert_eq!(received, b"late data");
@@ -469,7 +553,7 @@ mod tests {
 			buf
 		});
 
-		copy_bidirectional_lazy(&mut client, &mut upstream, 512, 512).await.unwrap();
+		copy_bidirectional_lazy(&mut client, &mut upstream, 512, 512, LazyBufferGate::always()).await.unwrap();
 		client_write.await.unwrap();
 		let received = read_task.await.unwrap();
 		assert_eq!(received, b"queued request");
@@ -499,7 +583,7 @@ mod tests {
 
 		tokio::time::timeout(
 			std::time::Duration::from_secs(5),
-			copy_bidirectional_lazy(&mut client, &mut upstream, 65536, 65536),
+			copy_bidirectional_lazy(&mut client, &mut upstream, 65536, 65536, LazyBufferGate::always()),
 		)
 		.await
 		.expect("a single queued byte must be forwarded promptly, not held waiting for more")
@@ -588,7 +672,7 @@ mod tests {
 		// against `driver` instead. The real assertion is that `driver` completes at all — its
 		// `read_exact` only succeeds if the reply was actually flushed to the wire rather than
 		// left buffered while the pump parked on the next (never-arriving) client read.
-		let copy_fut = copy_bidirectional_lazy(&mut client, &mut upstream, 512, 512);
+		let copy_fut = copy_bidirectional_lazy(&mut client, &mut upstream, 512, 512, LazyBufferGate::always());
 		tokio::pin!(copy_fut);
 		tokio::time::timeout(std::time::Duration::from_secs(5), async {
 			tokio::select! {
@@ -640,7 +724,7 @@ mod tests {
 
 		let result = tokio::time::timeout(
 			std::time::Duration::from_secs(5),
-			copy_bidirectional_lazy(&mut client, &mut upstream, 512, 512),
+			copy_bidirectional_lazy(&mut client, &mut upstream, 512, 512, LazyBufferGate::always()),
 		)
 		.await
 		.expect("a failed shutdown must end the copy promptly, not hang waiting on the other direction");
@@ -692,7 +776,7 @@ mod tests {
 
 		tokio::time::timeout(
 			std::time::Duration::from_secs(10),
-			copy_bidirectional_lazy(&mut client, &mut upstream, MAX, MAX),
+			copy_bidirectional_lazy(&mut client, &mut upstream, MAX, MAX, LazyBufferGate::always()),
 		)
 		.await
 		.expect("burst then small message must complete without stalling")
@@ -753,7 +837,7 @@ mod tests {
 		// actually observe (and write out) the escalated size.
 		let mut reader = BurstThenOneByte { full_reads: 3, calls: 0 };
 		let mut writer = RecordingWriter(writes.clone());
-		let mut lazy_buf = LazyCopyBuffer::new(MAX);
+		let mut lazy_buf = LazyCopyBuffer::new(MAX, LazyBufferGate::always());
 		let small_size = lazy_buf.small_size;
 
 		let waker = std::task::Waker::noop();
@@ -771,6 +855,120 @@ mod tests {
 		);
 		assert_eq!(lazy_buf.buf.len(), small_size, "buffer must have shrunk back to the floor after the burst ended");
 		assert_eq!(lazy_buf.full_streak, 0, "the under-capacity read must reset the streak");
+	}
+
+	/// Fills every read to the buffer's current capacity `full_reads` times, then returns one
+	/// under-capacity byte to end the burst, then parks. Shared by the gate tests below.
+	struct BurstThenPark {
+		full_reads: usize,
+		calls: usize,
+	}
+	impl AsyncRead for BurstThenPark {
+		fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+			self.calls += 1;
+			if self.calls <= self.full_reads {
+				let n = buf.remaining();
+				buf.put_slice(&vec![7u8; n]);
+				Poll::Ready(Ok(()))
+			} else if self.calls == self.full_reads + 1 {
+				buf.put_slice(&[9u8]);
+				Poll::Ready(Ok(()))
+			} else {
+				Poll::Pending
+			}
+		}
+	}
+
+	/// Accepts every write immediately and records its length.
+	struct SizeRecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<usize>>>);
+	impl AsyncWrite for SizeRecordingWriter {
+		fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+			self.0.lock().unwrap().push(buf.len());
+			Poll::Ready(Ok(buf.len()))
+		}
+		fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+		fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+	}
+
+	/// Below the threshold the module must behave exactly like the `tokio::io::CopyBuffer` it
+	/// replaced: one full-size allocation up front, no probing at the floor, and no shrink on
+	/// park. This is the property that makes the gate worth having — a proxy carrying a few bulk
+	/// streams pays *none* of the churn, not a reduced amount of it.
+	#[test]
+	fn a_disengaged_gate_allocates_full_size_once_and_never_resizes() {
+		const MAX: usize = 8192;
+		let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+		let mut reader = BurstThenPark { full_reads: 3, calls: 0 };
+		let mut writer = SizeRecordingWriter(writes.clone());
+		let mut lazy_buf = LazyCopyBuffer::new(MAX, LazyBufferGate::never());
+
+		assert_eq!(lazy_buf.buf.len(), MAX, "a disengaged gate must allocate the full buffer up front, not the floor");
+
+		let waker = std::task::Waker::noop();
+		let mut cx = Context::from_waker(waker);
+		let result = lazy_buf.poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer));
+
+		assert!(result.is_pending(), "the reader parks after the burst");
+		assert_eq!(
+			*writes.lock().unwrap(),
+			vec![MAX, MAX, MAX, 1],
+			"every read should have been served at full size — no floor-sized probing"
+		);
+		assert_eq!(lazy_buf.buf.len(), MAX, "a disengaged gate must not shrink on park");
+	}
+
+	/// The gate is re-read at each resize point rather than latched at construction. A connection
+	/// established while the proxy was quiet must start releasing its buffer once the proxy gets
+	/// busy — otherwise long-lived connections that accumulate while idle, the exact shape this
+	/// module exists for, would each keep a full-size buffer forever.
+	#[test]
+	fn crossing_the_threshold_makes_an_already_established_connection_release() {
+		const MAX: usize = 8192;
+		const THRESHOLD: u64 = 10;
+		let metrics = Arc::new(GlobalMetrics::default());
+		let gate = LazyBufferGate::with_metrics(metrics.clone(), THRESHOLD);
+
+		// Established while quiet: full-size buffer, gate disengaged.
+		let mut lazy_buf = LazyCopyBuffer::new(MAX, gate);
+		assert_eq!(lazy_buf.buf.len(), MAX, "established below the threshold, so it starts full-size");
+		let small_size = lazy_buf.small_size;
+
+		// The proxy fills up. Exactly at the threshold, which must count as engaged.
+		metrics.active_connections.store(THRESHOLD, Ordering::Relaxed);
+
+		let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+		let mut reader = BurstThenPark { full_reads: 3, calls: 0 };
+		let mut writer = SizeRecordingWriter(writes.clone());
+		let waker = std::task::Waker::noop();
+		let mut cx = Context::from_waker(waker);
+		let result = lazy_buf.poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer));
+
+		assert!(result.is_pending(), "the reader parks after the burst");
+		assert_eq!(
+			lazy_buf.buf.len(),
+			small_size,
+			"once active connections reach the threshold, the next park must release the full-size buffer"
+		);
+	}
+
+	/// One below the threshold is still disengaged — the boundary is `>=`, and a test that only
+	/// checked 0-vs-huge would not catch an off-by-one there.
+	#[test]
+	fn just_under_the_threshold_stays_disengaged() {
+		const MAX: usize = 8192;
+		const THRESHOLD: u64 = 10;
+		let metrics = Arc::new(GlobalMetrics::default());
+		metrics.active_connections.store(THRESHOLD - 1, Ordering::Relaxed);
+		let lazy_buf = LazyCopyBuffer::new(MAX, LazyBufferGate::with_metrics(metrics.clone(), THRESHOLD));
+		assert_eq!(lazy_buf.buf.len(), MAX, "one connection below the threshold must still be disengaged");
+
+		metrics.active_connections.store(THRESHOLD, Ordering::Relaxed);
+		let engaged_buf = LazyCopyBuffer::new(MAX, LazyBufferGate::with_metrics(metrics, THRESHOLD));
+		assert_eq!(engaged_buf.buf.len(), engaged_buf.small_size, "at the threshold it must engage");
 	}
 
 	/// A single under-capacity read must NOT shrink the buffer while the connection is still
@@ -821,7 +1019,7 @@ mod tests {
 		let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 		let mut reader = DipThenResumeBurst { calls: 0 };
 		let mut writer = RecordingWriter(writes.clone());
-		let mut lazy_buf = LazyCopyBuffer::new(MAX);
+		let mut lazy_buf = LazyCopyBuffer::new(MAX, LazyBufferGate::always());
 		let small_size = lazy_buf.small_size;
 
 		let waker = std::task::Waker::noop();

@@ -20,7 +20,7 @@
  *
  * Run with:
  *   npm run build:debug
- *   node --expose-gc dist-test/__test__/bench-copy-burst-idle.js [connections] [readBufferSize] [cycles] [idleMs]
+ *   node --expose-gc dist-test/__test__/bench-copy-burst-idle.js [connections] [readBufferSize] [cycles] [idleMs] [lazyCopyBufferThreshold]
  */
 import * as tls from 'node:tls';
 import { SymphonyProxy } from '../ts/proxy.js';
@@ -30,6 +30,10 @@ const CONNECTIONS = Number(process.argv[2] ?? 2000);
 const READ_BUFFER_SIZE = Number(process.argv[3] ?? 65536);
 const CYCLES = Number(process.argv[4] ?? 15);
 const IDLE_MS = Number(process.argv[5] ?? 250);
+// Escalation is gated on active connections (see src/copy.rs LazyBufferGate). Pinned to 0 by
+// default so the benchmark measures the escalating path whatever connection count it is given;
+// pass a value above `connections` to measure the static path for comparison.
+const LAZY_THRESHOLD = Number(process.argv[6] ?? 0);
 const CONNECT_BATCH = 250;
 
 // See bench-copy-memory.ts: spreading client sockets across several loopback source addresses
@@ -61,6 +65,7 @@ async function main() {
 			},
 		],
 		readBufferSize: READ_BUFFER_SIZE,
+		lazyCopyBufferThreshold: LAZY_THRESHOLD,
 	});
 	await proxy.start();
 

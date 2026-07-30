@@ -115,6 +115,14 @@ export interface JsProxyConfig {
   clientReadBufferSize?: number
   /** Overrides `readBufferSize` for the upstream→client direction only. */
   upstreamReadBufferSize?: number
+  /**
+   * Active connections at or above which the copy buffers escalate and release rather than
+   * being held at full size for each connection's whole life (default 1000). `0` engages that
+   * always; a value above this proxy's peak concurrency disables it, giving each direction one
+   * full-size buffer with no resize churn. Per proxy, so a replication port-set and an MQTT
+   * fan-out port-set can differ.
+   */
+  lazyCopyBufferThreshold?: number
 }
 export interface JsListenerProtectionHotConfig {
   /** Port of the listener to update. Must match a listener configured at start. */

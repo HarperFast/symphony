@@ -55,6 +55,7 @@ interface FileProxyConfig {
 	readBufferSize?: number;
 	clientReadBufferSize?: number;
 	upstreamReadBufferSize?: number;
+	lazyCopyBufferThreshold?: number;
 }
 
 interface ConfigFile {
@@ -135,6 +136,7 @@ function toProxyConfig(spec: FileProxyConfig, baseDir: string): ProxyConfig {
 		readBufferSize: spec.readBufferSize,
 		clientReadBufferSize: spec.clientReadBufferSize,
 		upstreamReadBufferSize: spec.upstreamReadBufferSize,
+		lazyCopyBufferThreshold: spec.lazyCopyBufferThreshold,
 	};
 }
 
@@ -329,6 +331,7 @@ class ServerState {
 					readBufferSize: proxyConfig.readBufferSize,
 					clientReadBufferSize: proxyConfig.clientReadBufferSize,
 					upstreamReadBufferSize: proxyConfig.upstreamReadBufferSize,
+					lazyCopyBufferThreshold: proxyConfig.lazyCopyBufferThreshold,
 				});
 				if (existing && existing.constructionSig === constructionSig) {
 					// Same listeners (presence-unchanged) → hot-swap routes and protection contents.
