@@ -115,8 +115,11 @@ export interface RouteConfig {
 	 * Carrier: a PROXY v2 TLV when `sourceAddressHeader` is `'proxyProtocolV2'` (works in
 	 * passthrough too, since it prefixes the raw TLS bytes); otherwise an injected
 	 * `X-JA3` / `X-JA4` HTTP header, which requires a plaintext HTTP/1 upstream
-	 * (`terminateTls: true` and not `http2`) — it is skipped otherwise. Any client-supplied
-	 * `X-JA3` / `X-JA4` is stripped so the injected value is authoritative.
+	 * (`terminateTls: true` and not `http2`) — it is skipped otherwise. For that HTTP/1 case,
+	 * any client-supplied `X-JA3` / `X-JA4` is stripped so the injected value is authoritative —
+	 * but this does NOT hold on an h2-negotiated connection on an `http2: true` route: injection
+	 * and stripping are both skipped there, so a client-supplied `X-JA3` / `X-JA4` reaches the
+	 * upstream unmodified. Use `'proxyProtocolV2'` wherever h2 is possible.
 	 */
 	forwardFingerprint?: 'ja3' | 'ja4' | 'none';
 	/**

@@ -517,14 +517,6 @@ where
 	}
 }
 
-/// The set of headers symphony owns end-to-end on the client→upstream request stream, applied to
-/// every HTTP/1 request. Empty (→ a plain copy, no rewriting) unless the upstream is a plaintext
-/// HTTP/1 stream and the mode injects HTTP headers.
-///
-/// A configured header is *always* stripped from the client's request, even when symphony has no
-/// authoritative value to substitute (`value: None`) — a client must never smuggle its own
-/// `X-JA3`/`X-JA4`/`X-Forwarded-For` through precisely when we can't replace it. PROXY v2 carries
-/// the fingerprint in a TLV, so it adds no header rewrite.
 /// Whether header-based forwarding (XFF / X-JA3 / X-JA4) is eligible for this connection: the
 /// route must declare `protocol: 'http'` (issue #38 — ALPN alone can't tell a native non-HTTP
 /// protocol from an HTTPS client that simply negotiated no ALPN) and the connection must not
@@ -534,6 +526,14 @@ fn eligible_for_header_rewriting(protocol: RouteProtocol, negotiated_h2: bool) -
 	protocol == RouteProtocol::Http && !negotiated_h2
 }
 
+/// The set of headers symphony owns end-to-end on the client→upstream request stream, applied to
+/// every HTTP/1 request. Empty (→ a plain copy, no rewriting) unless the upstream is a plaintext
+/// HTTP/1 stream and the mode injects HTTP headers.
+///
+/// A configured header is *always* stripped from the client's request, even when symphony has no
+/// authoritative value to substitute (`value: None`) — a client must never smuggle its own
+/// `X-JA3`/`X-JA4`/`X-Forwarded-For` through precisely when we can't replace it. PROXY v2 carries
+/// the fingerprint in a TLV, so it adds no header rewrite.
 fn header_rewrites(sf: &SourceForwarding<'_>, l7_http1: bool) -> Vec<crate::http_proxy::HeaderRewrite> {
 	use crate::http_proxy::HeaderRewrite;
 	if !l7_http1 {
@@ -591,7 +591,7 @@ impl Drop for ActiveGuard {
 	}
 }
 
-fn emit(tsf: &ThreadsafeFunction<JsEvent>, event: JsEvent) {
+pub(crate) fn emit(tsf: &ThreadsafeFunction<JsEvent>, event: JsEvent) {
 	// Non-blocking — drop the event if the JS queue is full
 	tsf.call(Ok(event), napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking);
 }

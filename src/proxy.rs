@@ -718,14 +718,27 @@ impl SymphonyProxyWrap {
 			.parse()
 			.map_err(|_| napi::Error::from_reason(format!("invalid connection id: {id}")))?;
 
-		let resolved = match route {
+		// A resolveConnection() call for a live id must always terminate that suspension — the
+		// caller may be a synchronous or an async 'suspended' listener, and either way there is no
+		// safe way for a config-validation failure to propagate back to it as a thrown exception:
+		// EventEmitter.emit() doesn't await an async listener, so a throw after an `await` becomes
+		// an unhandled rejection, and even a synchronous throw only reaches user code safely if an
+		// 'error' listener happens to be attached (emitting 'error' with none throws too). So a
+		// validation failure here never propagates as an exception: drop the connection exactly as
+		// `resolveConnection(id, null)` would, and surface the reason via the existing JsEvent::Error
+		// → 'error' event path, the same channel every other native-originated error already uses.
+		let route_result = route.map(|r| {
+			parse_resolve_spec(&r)
+				.map_err(|e| e.reason)
+				.and_then(|spec| build_resolved_route(&spec).map_err(|e| e.to_string()))
+		});
+
+		let resolved = match route_result {
 			None => None,
-			Some(r) => {
-				let spec = parse_resolve_spec(&r)?;
-				Some(
-					build_resolved_route(&spec)
-						.map_err(|e| napi::Error::from_reason(e.to_string()))?,
-				)
+			Some(Ok(resolved)) => Some(resolved),
+			Some(Err(message)) => {
+				crate::proxy_conn::emit(&self.js_emit, JsEvent::Error { message, listener: String::new() });
+				None
 			}
 		};
 

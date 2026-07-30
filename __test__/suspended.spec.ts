@@ -229,7 +229,7 @@ describe('Suspended routes – reject with null', () => {
 	});
 });
 
-describe('Suspended routes – resolveConnection() validation error inside the listener', () => {
+describe('Suspended routes – resolveConnection() with an invalid route never throws', () => {
 	const cert = generateSelfSignedCert('localhost');
 	let proxyPort: number;
 	let proxy: SymphonyProxy;
@@ -260,19 +260,71 @@ describe('Suspended routes – resolveConnection() validation error inside the l
 		await proxy.stop();
 	});
 
-	// resolveConnection() is meant to be called synchronously from inside a 'suspended' listener
-	// (every other test in this file does exactly that). Calling it with a route the protocol/
-	// carrier validation rejects (issue #38's construction-time checks, also applied to
-	// resolveConnection) throws synchronously — and that throw crosses back through
-	// EventEmitter.emit() into the napi threadsafe-function callback. Without a guard there, this
-	// took down the whole host process instead of surfacing as a normal proxy error; this test
-	// pins the fix (ts/proxy.ts's tsfn callback now catches and re-emits as 'error').
-	it('emits "error" instead of crashing the process when resolveConnection() throws inside the "suspended" listener', async () => {
+	// resolveConnection() is meant to be called synchronously — or, per the documented usage,
+	// from an *async* 'suspended' listener — and either way there is no safe way for a config-
+	// validation failure (issue #38's protocol/carrier checks, also applied to resolveConnection)
+	// to reach the caller as a thrown exception: EventEmitter.emit() never awaits an async
+	// listener, so a throw after an `await` becomes an unhandled rejection regardless of any
+	// guard around `emit()`, and even a synchronous throw only reaches user code safely if an
+	// 'error' listener happens to be attached. So resolveConnection() itself never throws for a
+	// validation failure (src/proxy.rs) — it drops the connection exactly as
+	// resolveConnection(id, null) would (closing this test's socket promptly, not leaking it for
+	// the full suspendTimeoutMs) and surfaces the reason via the existing 'error' event, the same
+	// channel every other native-originated error already uses.
+	it('drops the connection and emits "error" — without throwing — when resolveConnection() is given an invalid route', async () => {
 		const errors: Error[] = [];
-		proxy.on('error', (err: Error) => errors.push(err));
-		proxy.on('suspended', (conn) => {
+		// .once, not .on: this describe block runs more than one test against the same shared
+		// `proxy`, and a listener left attached from an earlier test would fire again here too,
+		// double-counting errors (or, for 'suspended', calling resolveConnection twice for the
+		// same connection).
+		proxy.once('error', (err: Error) => errors.push(err));
+		proxy.once('suspended', (conn) => {
 			capturedConn = conn;
 			// Undeclared xForwardedFor — rejected by parse_resolve_spec's protocol-declaration check.
+			assert.doesNotThrow(() =>
+				proxy.resolveConnection(conn.id, {
+					upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
+					terminateTls: true,
+					sourceAddressHeader: 'xForwardedFor',
+				})
+			);
+		});
+
+		const socket = startTlsSocket(proxyPort, 'localhost', cert.cert);
+		// The connection is dropped as soon as resolveConnection() runs inside the 'suspended'
+		// listener above — i.e. before this test body reaches waitForClose() below — so the error
+		// listener must be attached up front, not only once we get around to waiting for it.
+		socket.on('error', () => {});
+		await sleep(200);
+
+		assert.ok(capturedConn !== null, 'expected suspended event to have fired');
+		assert.equal(errors.length, 1, 'the validation failure must surface as exactly one "error" event');
+		assert.match(errors[0].message, /protocol/i, 'the surfaced error must be the protocol-declaration rejection');
+
+		// The connection must be dropped promptly (like resolveConnection(id, null)), not held open
+		// for the full 5s suspendTimeoutMs — that hold-open-until-timeout was the resource-retention
+		// half of the bug this fix closes.
+		await waitForClose(socket, 2000);
+		assert.ok(socket.destroyed || !socket.writable, 'socket must close promptly, not linger until suspendTimeoutMs');
+
+		socket.destroy();
+	});
+
+	// The README documents `proxy.on('suspended', async (conn) => { ... })`. EventEmitter.emit()
+	// does not await an async listener, so a throw after an `await` would become an
+	// unhandledRejection no ts/proxy.ts-level try/catch around emit() could ever intercept — the
+	// only robust fix is the one under test above: resolveConnection() itself must not throw. This
+	// test pins that the async-listener shape is safe too, not just the synchronous one.
+	it('is also safe from an async "suspended" listener (the documented usage)', async () => {
+		const errors: Error[] = [];
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+		process.on('unhandledRejection', onUnhandledRejection);
+
+		proxy.once('error', (err: Error) => errors.push(err));
+		proxy.once('suspended', async (conn) => {
+			capturedConn = conn;
+			await sleep(10); // simulate an async lookup before resolving, per the documented pattern
 			proxy.resolveConnection(conn.id, {
 				upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
 				terminateTls: true,
@@ -281,10 +333,14 @@ describe('Suspended routes – resolveConnection() validation error inside the l
 		});
 
 		const socket = startTlsSocket(proxyPort, 'localhost', cert.cert);
-		await sleep(200);
+		socket.on('error', () => {}); // the connection is dropped once resolveConnection() runs above
+		await sleep(300);
+
+		process.off('unhandledRejection', onUnhandledRejection);
 
 		assert.ok(capturedConn !== null, 'expected suspended event to have fired');
-		assert.equal(errors.length, 1, 'the validation throw must surface as exactly one "error" event, not crash the process');
+		assert.equal(unhandledRejections.length, 0, 'an async listener rejecting after resolveConnection() must not produce an unhandledRejection');
+		assert.equal(errors.length, 1, 'the validation failure must still surface as exactly one "error" event');
 		assert.match(errors[0].message, /protocol/i, 'the surfaced error must be the protocol-declaration rejection');
 
 		socket.destroy();
