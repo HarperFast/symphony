@@ -761,9 +761,10 @@ docker run --rm -v $(pwd):/build -w /build \
 direction starts at a small fixed floor (1 KiB total across both directions) and escalates to the
 configured maximum only once it observes a sustained burst — two consecutive reads that fill the
 current buffer — dropping straight back to the floor as soon as a read comes back under capacity or
-the direction goes idle. So buffer memory scales with *concurrently bursting transfers*, not with
-connection count: a million idle MQTT subscribers cost on the order of 1 MiB of buffer memory total,
-not `readBufferSize × 2 × 1,000,000`.
+the direction goes idle. So only the memory *above* that floor scales with concurrently bursting
+transfers; the 1 KiB/connection floor itself still scales with connection count, same as before. A
+million idle MQTT subscribers cost about 0.95 GiB in floors (1 KiB × 1,000,000 connections), not
+`readBufferSize × 2 × 1,000,000`.
 
 ```
 worst-case buffer bytes = (clientReadBufferSize + upstreamReadBufferSize) × connections bursting right now
