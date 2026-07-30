@@ -57,6 +57,15 @@ export interface JsRouteConfig {
   forwardFingerprint?: string
   /** Advertise h2 in ALPN so clients can negotiate HTTP/2. Default: false. */
   http2?: boolean
+  /**
+   * The route's application protocol: `'http'` or `'opaque'` (non-HTTP, e.g. MQTT).
+   * Required — as a parse-time error, not a silent no-op — whenever the route requests a
+   * header-injection forwarding mode (`sourceAddressHeader: 'xForwardedFor'`, or
+   * `forwardFingerprint` under any mode other than `'proxyProtocolV2'`): ALPN alone can't
+   * tell a native non-HTTP protocol (which negotiates no ALPN) from an HTTPS client that
+   * simply offered none, so the declaration must be explicit. Default: `'opaque'`.
+   */
+  protocol?: string
 }
 export interface JsRateLimitConfig {
   connectionsPerSecond: number
@@ -178,6 +187,11 @@ export interface JsResolveRoute {
   sourceAddressHeader?: string
   forwardFingerprint?: string
   http2?: boolean
+  /**
+   * See `JsRouteConfig::protocol` — the same declaration, required under the same
+   * conditions, for a route resolved via `resolveConnection()`.
+   */
+  protocol?: string
 }
 export declare class SymphonyProxyWrap {
   constructor(config: JsProxyConfig, emitFn: (...args: any[]) => any)

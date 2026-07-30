@@ -1,5 +1,5 @@
 use crate::balancer::{UdsBalancer, UdsSlotSpec};
-use crate::router::{Destination, ForwardFingerprint, SourceAddressMode};
+use crate::router::{Destination, ForwardFingerprint, RouteProtocol, SourceAddressMode};
 use dashmap::DashMap;
 use rustls::ServerConfig;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +13,7 @@ pub struct ResolvedRoute {
 	pub terminate_tls: bool,
 	pub source_address_mode: SourceAddressMode,
 	pub forward_fingerprint: ForwardFingerprint,
+	pub protocol: RouteProtocol,
 }
 
 /// Registry of suspended connections waiting for `resolveConnection()`.
@@ -72,6 +73,7 @@ pub struct ResolveSpec {
 	pub source_address_mode: SourceAddressMode,
 	pub forward_fingerprint: ForwardFingerprint,
 	pub http2: bool,
+	pub protocol: RouteProtocol,
 }
 
 #[derive(Debug)]
@@ -126,5 +128,6 @@ pub fn build_resolved_route(spec: &ResolveSpec) -> crate::error::Result<Resolved
 		terminate_tls: spec.terminate_tls,
 		source_address_mode: spec.source_address_mode,
 		forward_fingerprint: spec.forward_fingerprint,
+		protocol: spec.protocol,
 	})
 }

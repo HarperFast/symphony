@@ -150,6 +150,7 @@ describe('PROXY protocol v2 + fingerprint forwarding', () => {
 					cert: { certChain: cert.cert, privateKey: cert.key },
 					sourceAddressHeader: 'xForwardedFor',
 					forwardFingerprint: 'ja3',
+					protocol: 'http',
 				},
 			],
 		});
@@ -182,6 +183,10 @@ describe('PROXY protocol v2 + fingerprint forwarding', () => {
 					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: upstream.port }],
 					terminateTls: false,
 					forwardFingerprint: 'ja3',
+					// protocol: 'http' declared even though passthrough can never actually inject a
+					// header (there's no decrypted HTTP request to rewrite) — the point of this test is
+					// that the carrier is a runtime no-op regardless of the declaration.
+					protocol: 'http',
 				},
 			],
 		});
@@ -217,6 +222,7 @@ describe('PROXY protocol v2 + fingerprint forwarding', () => {
 					cert: { certChain: cert.cert, privateKey: cert.key },
 					sourceAddressHeader: 'xForwardedFor',
 					forwardFingerprint: 'ja3',
+					protocol: 'http',
 				},
 			],
 		});
@@ -261,6 +267,7 @@ describe('PROXY protocol v2 + fingerprint forwarding', () => {
 					cert: { certChain: cert.cert, privateKey: cert.key },
 					sourceAddressHeader: 'xForwardedFor',
 					forwardFingerprint: 'ja3',
+					protocol: 'http',
 				},
 			],
 		});
@@ -299,6 +306,7 @@ describe('PROXY protocol v2 + fingerprint forwarding', () => {
 					cert: { certChain: cert.cert, privateKey: cert.key },
 					sourceAddressHeader: 'xForwardedFor',
 					forwardFingerprint: 'ja3',
+					protocol: 'http',
 				},
 			],
 		});
@@ -339,6 +347,7 @@ describe('PROXY protocol v2 + fingerprint forwarding', () => {
 					http2: true,
 					sourceAddressHeader: 'none',
 					forwardFingerprint: 'ja3',
+					protocol: 'http',
 				},
 			],
 		});
