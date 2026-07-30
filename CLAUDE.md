@@ -132,20 +132,37 @@ Each suspended connection gets a `tokio::sync::oneshot::channel`. The sender is 
 `tokio::io::copy_bidirectional_with_sizes` allocates its two per-direction `CopyBuffer`s once and
 holds them for the connection's whole life, whether or not it is transferring — at a million
 mostly-idle MQTT subscribers, `readBufferSize × 2` held forever per connection is dead weight.
-`copy_bidirectional_lazy`/`pump` instead start each direction at a small fixed size
-(`PROBE_BUFFER_SIZE`, 512 B — cheap enough to hold for the connection's life) and escalate to the
-full configured `max_buf_size` only once a read *proves* there's a sustained burst (a read that
-exactly fills the current buffer), dropping back down the first time a read comes back under
-capacity. Every read is a single ordinary blocking `.await` — no manual `poll_read`/non-blocking
-peek: an earlier version tried a non-blocking opportunistic drain via a `Waker::noop()` poll to
-batch up "whatever's already queued" without an extra iteration, and under load it silently
-stranded a connection's wakeup (reproduced empirically — an increasing fraction of connections
-stopped responding as concurrency grew). Growing the buffer one iteration late costs one extra
-small-buffer round trip per burst; that's the entire price for every step being provably
-deadlock-free. `readBufferSize`/`client|upstreamReadBufferSize` are therefore a per-transfer
-*maximum*, not a permanent allocation. `tokio::try_join!` (not `join!`) on the two directions
-preserves `copy_bidirectional`'s error semantics exactly: an error on either side ends the whole
-copy immediately rather than waiting for the other direction to also finish.
+`copy_bidirectional_lazy` is a direct port of tokio's own `copy_bidirectional_impl`/`CopyBuffer`
+state machine (`transfer_one_direction` + `TransferState::Running/ShuttingDown/Done`, `poll_fn`
+over both directions), with one addition: `LazyCopyBuffer` starts each direction at a small fixed
+size (`PROBE_BUFFER_SIZE`, 512 B) and escalates straight to the full configured `max_buf_size`
+only once **two consecutive** reads exactly saturate the current buffer — real evidence of a
+sustained burst — dropping straight back to the floor the first time a read comes back under
+capacity. One full read isn't enough evidence: a message that happens to exactly match the
+current (small) buffer size is a coincidence, not a burst, and escalating on it would leave the
+(now oversized) buffer resident for however long the connection then sits idle, however large
+`max_buf_size` is configured. Requiring a second confirming read bounds that coincidence to the
+floor size at the cost of one extra small-buffer round trip on every genuine burst — negligible.
+
+Reusing tokio's own poll-based structure (rather than `tokio::io::split` plus independent
+per-direction `async fn`s, tried first) matters for two reasons found by an independent review of
+that version: `split` wraps each side in an `Arc<Mutex<_>>` — two heap allocations and a
+lock/unlock on every read/write/flush/shutdown, *per connection*, which itself scales with
+connection count, exactly what this change exists to avoid — and a hand-rolled `async fn` pump
+that just calls `write_all` does not flush before parking on the next read the way tokio's
+`poll_copy` does. That gap is real: `write_all` only guarantees the data reached the writer's
+internal buffer, not the wire (`tokio-rustls` in particular defers sending encrypted records
+until `poll_flush`) — a TLS client that sends one request and waits for the reply would never see
+it, both sides sitting idle until `idle_timeout` cleaned up the session. A non-blocking
+`poll_read`-with-`Waker::noop()` peek was also tried, to opportunistically drain "whatever's
+already queued" without the extra confirming iteration; under load it silently stranded a
+connection's wakeup (reproduced empirically — an increasing fraction of connections stopped
+responding as concurrency grew) and was dropped in favor of the two-consecutive-full-reads scheme,
+which uses only ordinary polling. `readBufferSize`/`client|upstreamReadBufferSize` are therefore a
+per-transfer *maximum*, not a permanent allocation. Propagating a failed `poll_shutdown()` (not
+swallowing it) is what makes `try_join!`-equivalent short-circuiting work: an error on either
+side — including a shutdown failure — ends the whole copy immediately rather than waiting on the
+other direction.
 
 ### Per-route Arc<ServerConfig> deduplication (TlsConfigCache)
 Routes that share the same cert+mTLS combination share a single `Arc<ServerConfig>` allocation. The cache key is `(sha256(cert_pem + key_pem), sha256(mtls_ca_pem))`. Built at config-parse time in `tls.rs::TlsConfigCache`. Important for deployments where many routes share a wildcard cert.
