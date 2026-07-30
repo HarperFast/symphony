@@ -816,18 +816,15 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 	}
 	// xForwardedFor + http2 is a hard error (build_route, router.rs) since it's unconditionally
 	// unsafe — an h2 client's XFF would be neither injected nor stripped, forwarding an arbitrary
-	// client-supplied value as if authoritative. A header-carried forwardFingerprint in the same
-	// spot is intentionally only a warning here, not a hard error, even though the risk is the
-	// same in kind (an h2 client can forge X-JA3/X-JA4, not merely go unforwarded) — see
-	// README.md's "Forwarding the fingerprint downstream" section for the tradeoff this leaves
-	// open and why it isn't a hard error like XFF. Name whichever mode actually triggered this so
-	// the message doesn't blame X-Forwarded-For when the route never configured it.
-	if requires_http && spec.http2 {
-		let mode_desc = if source_address_mode == SourceAddressMode::XForwardedFor {
-			"xForwardedFor"
-		} else {
-			"a header-carried forwardFingerprint (X-JA3/X-JA4)"
-		};
+	// client-supplied value as if authoritative — so it's excluded here: this warning would always
+	// be immediately followed by that hard rejection, misleadingly implying the route still works
+	// (minus the header) when the whole route is in fact dropped. A header-carried
+	// forwardFingerprint in the same spot is intentionally only a warning, not a hard error, even
+	// though the risk is the same in kind (an h2 client can forge X-JA3/X-JA4, not merely go
+	// unforwarded) — see README.md's "Forwarding the fingerprint downstream" section for the
+	// tradeoff this leaves open and why it isn't a hard error like XFF.
+	if requires_http && spec.http2 && source_address_mode != SourceAddressMode::XForwardedFor {
+		let mode_desc = "a header-carried forwardFingerprint (X-JA3/X-JA4)";
 		eprintln!(
 			"symphony: route '{}': {mode_desc} has no effect for any client that negotiates h2 (http2=true) — injection and client-supplied-header stripping are both skipped, so an h2 client's own value reaches the upstream unmodified; consider sourceAddressHeader='proxyProtocolV2'",
 			spec.sni
