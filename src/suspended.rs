@@ -53,6 +53,14 @@ impl SuspendedRegistry {
 		self.pending.remove(&id);
 	}
 
+	/// Whether `id` is still a live pending suspension. Lets `resolveConnection()` skip parsing
+	/// and building a route (cert/TLS work included) for an id that has already timed out or was
+	/// never valid — that work would be wasted, and any resulting error would be spurious, since
+	/// `resolve()` already treats an unknown id as a silent no-op.
+	pub fn contains(&self, id: u64) -> bool {
+		self.pending.contains_key(&id)
+	}
+
 	/// Number of currently pending suspended connections.
 	pub fn pending_count(&self) -> u64 {
 		self.pending.len() as u64

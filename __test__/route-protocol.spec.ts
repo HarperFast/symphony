@@ -206,9 +206,11 @@ describe('SymphonyProxy – route protocol declaration', () => {
 		);
 	});
 
-	// resolveConnection() parses and validates its `route` argument independently of the
-	// suspended-connection id (parse_resolve_spec runs before the id is even looked up), so these
-	// checks can be exercised directly against a fresh proxy without a real suspended connection.
+	// resolveConnection() parses and validates its `route` argument only once the id is confirmed
+	// still live (an id that already timed out is a documented no-op — SuspendedRegistry::contains
+	// — so it never reaches route validation at all). These tests therefore need a *real* suspended
+	// connection per case, not an arbitrary id: a fabricated id would short-circuit before the
+	// validation logic under test ever runs.
 	//
 	// Unlike the static route table, an invalid resolveConnection() route must never *throw*: the
 	// call is documented to happen from inside a 'suspended' listener (sync or async), and a thrown
@@ -217,26 +219,62 @@ describe('SymphonyProxy – route protocol declaration', () => {
 	// listener happens to be attached. So a validation failure instead drops the connection (the
 	// same outcome as resolveConnection(id, null)) and surfaces the reason via the 'error' event.
 	describe('resolveConnection() protocol validation (symmetric with the static route table, fails via "error" event not a throw)', () => {
+		const cert = generateSelfSignedCert('localhost');
 		let proxy: SymphonyProxy;
+		let proxyPort: number;
 
-		before(() => {
-			proxy = new SymphonyProxy({ listeners: [{ host: '127.0.0.1', port: 0 }], routes: [] });
+		before(async () => {
+			proxyPort = await getFreePort();
+			proxy = new SymphonyProxy({
+				listeners: [{ host: '127.0.0.1', port: proxyPort }],
+				routes: [
+					{
+						sni: 'localhost',
+						upstreams: [],
+						terminateTls: true,
+						cert: { certChain: cert.cert, privateKey: cert.key },
+						suspended: true,
+						suspendTimeoutMs: 5000,
+					},
+				],
+			});
+			await proxy.start();
+			await sleep(50);
 		});
 
-		/** Call resolveConnection with `route` and resolve with the message of the next 'error' event. */
-		function resolveAndCaptureError(id: string, route: Parameters<SymphonyProxy['resolveConnection']>[1]): Promise<string> {
+		after(async () => {
+			await proxy.stop();
+		});
+
+		/** Open a real suspended connection and resolve with its id once the 'suspended' event fires. */
+		function getLiveSuspendedId(): Promise<{ id: string; socket: tls.TLSSocket }> {
 			return new Promise((resolve, reject) => {
-				proxy.once('error', (err: Error) => resolve(err.message));
-				try {
-					proxy.resolveConnection(id, route);
-				} catch (e) {
-					reject(new Error(`resolveConnection() must never throw for a validation failure: ${e}`));
-				}
+				const socket = tls.connect({ port: proxyPort, host: '127.0.0.1', servername: 'localhost', ca: cert.cert, rejectUnauthorized: false });
+				socket.on('error', () => {}); // resolved with an invalid route below — the connection gets dropped
+				proxy.once('suspended', (conn) => resolve({ id: conn.id, socket }));
+				setTimeout(() => reject(new Error('suspended event timeout')), 2000);
 			});
 		}
 
+		/** Call resolveConnection with `route` on a live id and resolve with the next 'error' event's message. */
+		async function resolveAndCaptureError(route: Parameters<SymphonyProxy['resolveConnection']>[1]): Promise<string> {
+			const { id, socket } = await getLiveSuspendedId();
+			try {
+				return await new Promise((resolve, reject) => {
+					proxy.once('error', (err: Error) => resolve(err.message));
+					try {
+						proxy.resolveConnection(id, route);
+					} catch (e) {
+						reject(new Error(`resolveConnection() must never throw for a validation failure: ${e}`));
+					}
+				});
+			} finally {
+				socket.destroy();
+			}
+		}
+
 		it('rejects xForwardedFor without a protocol: "http" declaration', async () => {
-			const message = await resolveAndCaptureError('1', {
+			const message = await resolveAndCaptureError({
 				upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
 				terminateTls: true,
 				sourceAddressHeader: 'xForwardedFor',
@@ -245,7 +283,7 @@ describe('SymphonyProxy – route protocol declaration', () => {
 		});
 
 		it('rejects a header-carried forwardFingerprint on a passthrough route as having no carrier', async () => {
-			const message = await resolveAndCaptureError('2', {
+			const message = await resolveAndCaptureError({
 				upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
 				terminateTls: false,
 				forwardFingerprint: 'ja3',
@@ -259,7 +297,7 @@ describe('SymphonyProxy – route protocol declaration', () => {
 		});
 
 		it('rejects xForwardedFor combined with http2 (header injection would corrupt h2 frames)', async () => {
-			const message = await resolveAndCaptureError('3', {
+			const message = await resolveAndCaptureError({
 				upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
 				terminateTls: true,
 				sourceAddressHeader: 'xForwardedFor',
@@ -273,11 +311,20 @@ describe('SymphonyProxy – route protocol declaration', () => {
 			);
 		});
 
+		// A malformed id fails to parse before the liveness check even runs, so this one still uses
+		// an arbitrary (non-numeric) id rather than a real suspended connection.
 		it('rejects an unparseable connection id via the "error" event instead of throwing', async () => {
-			const message = await resolveAndCaptureError('not-a-real-id', {
-				upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
-				terminateTls: true,
-				protocol: 'opaque',
+			const message = await new Promise<string>((resolve, reject) => {
+				proxy.once('error', (err: Error) => resolve(err.message));
+				try {
+					proxy.resolveConnection('not-a-real-id', {
+						upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
+						terminateTls: true,
+						protocol: 'opaque',
+					});
+				} catch (e) {
+					reject(new Error(`resolveConnection() must never throw for a validation failure: ${e}`));
+				}
 			});
 			assert.match(message, /invalid connection id/i, 'a malformed id must surface via "error", not a thrown exception');
 		});
