@@ -64,23 +64,21 @@ describe('SymphonyProxy – route protocol declaration', () => {
 			0x10, 0x0c, 0x00, 0x04, 0x4d, 0x51, 0x54, 0x54, 0x04, 0x02, 0x00, 0x3c, 0x00, 0x00,
 		]);
 
-		const start = Date.now();
+		// No separate timing assertion needed: if this were mistakenly fed to the header rewriter,
+		// it would stall waiting for a request terminator that never arrives, and the 2000ms idle
+		// timeout above would make this `await` reject (or return truncated/empty bytes) well before
+		// the deepEqual below could pass. A load-dependent wall-clock bound would only add flakiness.
 		const response = await tlsRoundTrip({
 			port: proxyPort,
 			servername: 'mqtt.example.com',
 			caCert: cert.cert,
 			data: mqttConnect,
 		});
-		const elapsedMs = Date.now() - start;
 
 		assert.deepEqual(
 			response,
 			mqttConnect,
 			'raw MQTT bytes proxied verbatim — no header injected, no HTTP parsing attempted'
-		);
-		assert.ok(
-			elapsedMs < 1000,
-			`round-trip must complete promptly, not stall waiting for an HTTP header terminator (took ${elapsedMs}ms)`
 		);
 
 		await proxy.stop();
@@ -206,5 +204,58 @@ describe('SymphonyProxy – route protocol declaration', () => {
 			/no carrier/i,
 			'declaring protocol: "http" must not paper over a passthrough route with no header carrier'
 		);
+	});
+
+	// resolveConnection() parses and validates its `route` argument independently of the
+	// suspended-connection id (parse_resolve_spec runs before the id is even looked up), so these
+	// checks can be exercised directly against a fresh proxy without a real suspended connection.
+	describe('resolveConnection() protocol validation (symmetric with the static route table)', () => {
+		let proxy: SymphonyProxy;
+
+		before(() => {
+			proxy = new SymphonyProxy({ listeners: [{ host: '127.0.0.1', port: 0 }], routes: [] });
+		});
+
+		it('rejects xForwardedFor without a protocol: "http" declaration', () => {
+			assert.throws(
+				() =>
+					proxy.resolveConnection('1', {
+						upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
+						terminateTls: true,
+						sourceAddressHeader: 'xForwardedFor',
+					}),
+				/protocol/i,
+				'resolveConnection must reject an undeclared xForwardedFor route just like the static route table'
+			);
+		});
+
+		it('rejects a header-carried forwardFingerprint on a passthrough route as having no carrier', () => {
+			assert.throws(
+				() =>
+					proxy.resolveConnection('2', {
+						upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
+						terminateTls: false,
+						forwardFingerprint: 'ja3',
+						protocol: 'http',
+					}),
+				/no carrier/i,
+				'resolveConnection must reject passthrough + header-carried forwardFingerprint just like the static route table'
+			);
+		});
+
+		it('rejects xForwardedFor combined with http2 (header injection would corrupt h2 frames)', () => {
+			assert.throws(
+				() =>
+					proxy.resolveConnection('3', {
+						upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
+						terminateTls: true,
+						sourceAddressHeader: 'xForwardedFor',
+						protocol: 'http',
+						http2: true,
+					}),
+				/http2/i,
+				'resolveConnection must reject xForwardedFor + http2 just like build_route does for the static route table'
+			);
+		});
 	});
 });

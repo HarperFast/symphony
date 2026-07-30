@@ -867,6 +867,7 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 	let forward_fingerprint = parse_forward_fingerprint(r.forward_fingerprint.as_deref())?;
 	let protocol = parse_route_protocol(r.protocol.as_deref())?;
 	let requires_http = requires_http_protocol(source_address_mode, forward_fingerprint);
+	let http2 = r.http2.unwrap_or(false);
 
 	// See parse_route_spec: passthrough has no carrier for a header-based mode regardless of
 	// `protocol`, so it's rejected before (and distinctly from) the declaration check below.
@@ -882,6 +883,17 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 		));
 	}
 
+	// Mirrors build_route's XFF+h2 guard (router.rs) for the static route table — resolveConnection
+	// has no split h2 destination, but an h2-negotiated client on a terminated, http2:true route
+	// still disables the HTTP/1 rewriter, so a client-supplied X-Forwarded-For would reach the
+	// upstream neither injected nor stripped. This gap predates this PR's checks above; closing it
+	// here rather than leaving the two protocol checks as the only symmetric ones.
+	if source_address_mode == SourceAddressMode::XForwardedFor && http2 && r.terminate_tls {
+		return Err(napi::Error::from_reason(
+			"resolveConnection: sourceAddressHeader 'xForwardedFor' cannot be combined with http2 (header injection would corrupt h2 frames, and a client-supplied X-Forwarded-For would reach the upstream unstripped); use 'proxyProtocol'/'proxyProtocolV2' or 'none'".to_string(),
+		));
+	}
+
 	Ok(ResolveSpec {
 		upstream,
 		terminate_tls: r.terminate_tls,
@@ -891,7 +903,7 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 		require_client_cert: r.mtls.as_ref().and_then(|m| m.require_client_cert).unwrap_or(false),
 		source_address_mode,
 		forward_fingerprint,
-		http2: r.http2.unwrap_or(false),
+		http2,
 		protocol,
 	})
 }
