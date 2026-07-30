@@ -783,23 +783,13 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 	let protocol = parse_route_protocol(r.protocol.as_deref())?;
 	let requires_http = requires_http_protocol(source_address_mode, forward_fingerprint);
 
-	// Passthrough (terminateTls=false) never decrypts the stream, so a header-carried mode has
-	// no carrier at all regardless of `protocol` — declaring 'http' wouldn't help. This is
-	// distinct from (and checked before) the declaration requirement below: it's not that the
-	// route mislabeled its protocol, it's that no protocol declaration could make this work.
-	if requires_http && !r.terminate_tls {
-		return Err(napi::Error::from_reason(format!(
-			"route '{}': sourceAddressHeader 'xForwardedFor', or forwardFingerprint via an HTTP header (any mode other than 'proxyProtocolV2'), has no carrier when terminateTls=false (passthrough never decrypts the stream, so no header can be injected) — use sourceAddressHeader='proxyProtocolV2' (carries both source address and fingerprint), or remove forwardFingerprint",
-			r.sni
-		)));
-	}
-
-	if requires_http && protocol != RouteProtocol::Http {
-		return Err(napi::Error::from_reason(format!(
-			"route '{}': sourceAddressHeader 'xForwardedFor', or forwardFingerprint via an HTTP header (any mode other than 'proxyProtocolV2'), requires protocol: 'http' — declare it explicitly, or switch away from the header-carried mode: 'proxyProtocol'/'proxyProtocolV2' both work on any protocol for source-address forwarding, but only 'proxyProtocolV2' carries a fingerprint (v1 does not)",
-			r.sni
-		)));
-	}
+	// The "no carrier" and "declare protocol: 'http'" checks live in `build_route` (router.rs),
+	// not here: they need to fail the same way a bad cert or the xForwardedFor+h2 combination
+	// does — isolate the one bad route (drop the SNI, or carry the last-good route forward on a
+	// hot-swap) rather than aborting the entire `new SymphonyProxy()`/`updateConfig()` call and
+	// taking every other route on the port-set down with it. `parse_route_spec` runs inside a
+	// `.collect::<Result<Vec<_>>>()?` across all routes, so an error returned from here has no
+	// such isolation — only `build_route_table` provides it.
 
 	let spec = RouteSpec {
 		sni: r.sni.clone(),

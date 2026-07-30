@@ -143,9 +143,12 @@ export interface RouteConfig {
 	 * ALPN cannot stand in for this declaration: a native non-HTTP client that offers no
 	 * ALPN is indistinguishable from an HTTPS client that simply didn't offer one, so a
 	 * route requesting a header-injection mode without declaring `protocol: 'http'` is a
-	 * config error, not a route that quietly stops injecting the header. This is a breaking
-	 * change for a hand-written route using `sourceAddressHeader: 'xForwardedFor'` (or a
-	 * header-carried `forwardFingerprint`) without `protocol: 'http'` — add the declaration.
+	 * config error, not a route that quietly stops injecting the header — the route is
+	 * rejected and dropped (isolated the same way a route with a bad cert is, not failing
+	 * `new SymphonyProxy()`/`updateConfig()` for every other route on the port-set). This is
+	 * a breaking change for a hand-written route using `sourceAddressHeader: 'xForwardedFor'`
+	 * (or a header-carried `forwardFingerprint`) without `protocol: 'http'` — add the
+	 * declaration, or that route will stop serving traffic on upgrade.
 	 */
 	protocol?: 'http' | 'opaque';
 }

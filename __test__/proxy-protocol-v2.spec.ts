@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import * as tls from 'node:tls';
 import { after, before, describe, it } from 'node:test';
 import { SymphonyProxy } from '../ts/proxy.js';
-import { generateSelfSignedCert, getFreePort, startCaptureServer, sleep } from './util.js';
+import { generateSelfSignedCert, getFreePort, startCaptureServer, tlsRoundTrip, sleep } from './util.js';
 
 const PROXY_V2_SIGNATURE = Buffer.from([0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a]);
 const PP2_TYPE_JA3 = 0xe0;
@@ -164,28 +164,36 @@ describe('PROXY protocol v2 + fingerprint forwarding', () => {
 
 	// Passthrough forwards raw TLS bytes to a TLS upstream — there's no decrypted HTTP request to
 	// splice a header into, and a header-carried fingerprint mode has no carrier at all here
-	// regardless of `protocol`. This used to build successfully and silently forward nothing;
-	// it now fails construction with a "no carrier" error instead (see route-protocol.spec.ts for
-	// focused coverage), so a passthrough + header-carried forwardFingerprint config can no longer
-	// look "working" while quietly forwarding no fingerprint.
-	it('rejects a header-carried fingerprint on a passthrough route at construction (no carrier, not a silent no-op)', async () => {
-		assert.throws(
-			() =>
-				new SymphonyProxy({
-					listeners: [{ host: '127.0.0.1', port: 0 }],
-					routes: [
-						{
-							sni: 'localhost',
-							upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: 1 }],
-							terminateTls: false,
-							forwardFingerprint: 'ja3',
-							protocol: 'http',
-						},
-					],
-				}),
-			/no carrier/i,
-			'passthrough + header-carried forwardFingerprint must fail construction, not silently drop the fingerprint at runtime'
+	// regardless of `protocol`. This used to build successfully and silently forward nothing; it
+	// now rejects the route with a "no carrier" error instead (see route-protocol.spec.ts for
+	// focused coverage of the rejection itself), so a passthrough + header-carried forwardFingerprint
+	// config can no longer look "working" while quietly forwarding no fingerprint. Isolated per-route
+	// (build_route, router.rs) rather than failing the whole construction — a bad route's SNI simply
+	// resolves to nothing, same as a bad cert.
+	it('rejects a header-carried fingerprint on a passthrough route by dropping it (no carrier, not a silent no-op)', async () => {
+		const proxyPort = await getFreePort();
+		const proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: proxyPort }],
+			routes: [
+				{
+					sni: 'localhost',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: 1 }],
+					terminateTls: false,
+					forwardFingerprint: 'ja3',
+					protocol: 'http',
+				},
+			],
+		});
+		await proxy.start();
+		await sleep(50);
+
+		await assert.rejects(
+			tlsRoundTrip({ port: proxyPort, servername: 'localhost', caCert: cert.cert, data: 'x' }),
+			/timeout|ECONNRESET|EPROTO|socket hang up|closed/i,
+			'passthrough + header-carried forwardFingerprint has no carrier — the route must be dropped, not silently built to forward no fingerprint'
 		);
+
+		await proxy.stop();
 	});
 
 	// Finding 1 (Critical — Slowloris): a client that completes the TLS handshake and then stalls
