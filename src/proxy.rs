@@ -1252,98 +1252,59 @@ mod tests {
 		assert!(!is_valid_ja4("T13D1516H2_8DAAF6152771_02713D6AF862"), "uppercase");
 	}
 
-	fn base_route_config(sni: &str) -> JsRouteConfig {
-		JsRouteConfig {
-			sni: sni.to_string(),
-			upstreams: vec![JsUpstream {
-				kind: "tcp".to_string(),
-				host: Some("127.0.0.1".to_string()),
-				port: Some(8080),
-				path: None,
-				ip_affinity: None,
-				ip_affinity_ttl_ms: None,
-				pid: None,
-				tid: None,
-				protocol: None,
-			}],
-			terminate_tls: false,
-			cert: None,
-			mtls: None,
-			suspended: None,
-			suspend_timeout_ms: None,
-			max_connections_per_second: None,
-			burst: None,
-			source_address_header: None,
-			forward_fingerprint: None,
-			http2: None,
-			protocol: None,
-		}
+	// These test the pure `router::requires_http_protocol` / `parse_route_protocol` logic
+	// directly rather than round-tripping through `parse_route_spec(&JsRouteConfig)`.
+	// `JsRouteConfig`/`JsUpstream` carry an `Option<JsCertConfig>` (`Either<String, Buffer>`),
+	// and instantiating one — even with every field `None` — requires drop-glue for
+	// `napi::bindgen_prelude::Buffer`, which pulls in raw `napi_*` C-ABI symbols that only
+	// the Node.js host process provides. A standalone `cargo test` binary is a real
+	// executable with no such host, so linking it fails; end-to-end coverage of the full
+	// `JsRouteConfig` parse path (including this error message) lives in
+	// `__test__/route-protocol.spec.ts`, which runs against the built native addon.
+
+	#[test]
+	fn xff_requires_http_protocol_declaration() {
+		assert!(requires_http_protocol(SourceAddressMode::XForwardedFor, ForwardFingerprint::None));
 	}
 
 	#[test]
-	fn xff_without_protocol_declaration_is_rejected() {
-		let mut r = base_route_config("mqtt.example.com");
-		r.source_address_header = Some("xForwardedFor".to_string());
-		let err = parse_route_spec(&r).expect_err("xForwardedFor without protocol: 'http' must error");
-		assert!(
-			err.to_string().contains("protocol"),
-			"error message must mention the missing declaration: {err}"
-		);
+	fn xff_requires_declaration_regardless_of_fingerprint() {
+		assert!(requires_http_protocol(SourceAddressMode::XForwardedFor, ForwardFingerprint::Ja4));
 	}
 
 	#[test]
-	fn xff_with_http_protocol_declared_is_accepted() {
-		let mut r = base_route_config("app.example.com");
-		r.source_address_header = Some("xForwardedFor".to_string());
-		r.protocol = Some("http".to_string());
-		assert!(parse_route_spec(&r).is_ok(), "xForwardedFor with protocol: 'http' must be accepted");
-	}
-
-	#[test]
-	fn opaque_route_with_proxy_protocol_is_accepted() {
-		let mut r = base_route_config("mqtt.example.com");
-		r.source_address_header = Some("proxyProtocol".to_string());
-		// protocol left unset (defaults to 'opaque') — PROXY protocol works on any byte stream.
-		assert!(parse_route_spec(&r).is_ok(), "opaque route with proxyProtocol must be accepted");
-	}
-
-	#[test]
-	fn opaque_route_requesting_xff_is_rejected() {
-		let mut r = base_route_config("mqtt.example.com");
-		r.source_address_header = Some("xForwardedFor".to_string());
-		r.protocol = Some("opaque".to_string());
-		assert!(
-			parse_route_spec(&r).is_err(),
-			"an explicitly opaque route requesting xForwardedFor must still be rejected"
-		);
-	}
-
-	#[test]
-	fn header_carried_fingerprint_without_protocol_declaration_is_rejected() {
-		let mut r = base_route_config("app.example.com");
-		r.forward_fingerprint = Some("ja3".to_string());
-		// source_address_header left at 'none' — not proxyProtocolV2, so the fingerprint
-		// would ride an X-JA3 header and needs the declaration too.
-		assert!(
-			parse_route_spec(&r).is_err(),
-			"header-carried forwardFingerprint without protocol: 'http' must error"
-		);
+	fn header_carried_fingerprint_requires_http_protocol_declaration() {
+		// source_address_mode is 'none' — not proxyProtocolV2, so the fingerprint would ride
+		// an X-JA3 header and needs the declaration too.
+		assert!(requires_http_protocol(SourceAddressMode::None, ForwardFingerprint::Ja3));
 	}
 
 	#[test]
 	fn fingerprint_under_proxy_protocol_v2_needs_no_declaration() {
-		let mut r = base_route_config("mqtt.example.com");
-		r.source_address_header = Some("proxyProtocolV2".to_string());
-		r.forward_fingerprint = Some("ja4".to_string());
 		// TLV carrier, not a header — no protocol declaration required.
-		assert!(parse_route_spec(&r).is_ok(), "forwardFingerprint under proxyProtocolV2 must not require protocol");
+		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocolV2, ForwardFingerprint::Ja4));
 	}
 
 	#[test]
-	fn unknown_protocol_value_is_rejected() {
-		let mut r = base_route_config("app.example.com");
-		r.protocol = Some("mqtt".to_string());
-		assert!(parse_route_spec(&r).is_err(), "an unrecognized protocol value must error");
+	fn proxy_protocol_without_fingerprint_needs_no_declaration() {
+		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocol, ForwardFingerprint::None));
+	}
+
+	#[test]
+	fn parse_route_protocol_defaults_to_opaque() {
+		assert_eq!(parse_route_protocol(None).unwrap(), RouteProtocol::Opaque);
+		assert_eq!(parse_route_protocol(Some("opaque")).unwrap(), RouteProtocol::Opaque);
+	}
+
+	#[test]
+	fn parse_route_protocol_accepts_http() {
+		assert_eq!(parse_route_protocol(Some("http")).unwrap(), RouteProtocol::Http);
+	}
+
+	#[test]
+	fn parse_route_protocol_rejects_unknown_value() {
+		let err = parse_route_protocol(Some("mqtt")).expect_err("an unrecognized protocol value must error");
+		assert!(err.to_string().contains("mqtt"), "error message must mention the offending value: {err}");
 	}
 
 	#[test]
