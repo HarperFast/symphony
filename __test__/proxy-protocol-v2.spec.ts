@@ -10,14 +10,7 @@ import assert from 'node:assert/strict';
 import * as tls from 'node:tls';
 import { after, before, describe, it } from 'node:test';
 import { SymphonyProxy } from '../ts/proxy.js';
-import {
-	generateSelfSignedCert,
-	getFreePort,
-	startCaptureServer,
-	startTlsEchoServer,
-	tlsRoundTrip,
-	sleep,
-} from './util.js';
+import { generateSelfSignedCert, getFreePort, startCaptureServer, sleep } from './util.js';
 
 const PROXY_V2_SIGNATURE = Buffer.from([0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a]);
 const PP2_TYPE_JA3 = 0xe0;
@@ -169,41 +162,30 @@ describe('PROXY protocol v2 + fingerprint forwarding', () => {
 		await capture.close();
 	});
 
-	// Passthrough forwards raw TLS bytes to a TLS upstream. A header carrier must be a no-op here:
-	// splicing X-JA3 into the ClientHello ciphertext would break the upstream handshake. A working
-	// end-to-end round-trip proves nothing was injected.
-	it('does not inject a fingerprint header in passthrough mode', async () => {
-		const upstream = await startTlsEchoServer(cert.cert, cert.key);
-		const proxyPort = await getFreePort();
-		const proxy = new SymphonyProxy({
-			listeners: [{ host: '127.0.0.1', port: proxyPort }],
-			routes: [
-				{
-					sni: 'localhost',
-					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: upstream.port }],
-					terminateTls: false,
-					forwardFingerprint: 'ja3',
-					// protocol: 'http' declared even though passthrough can never actually inject a
-					// header (there's no decrypted HTTP request to rewrite) — the point of this test is
-					// that the carrier is a runtime no-op regardless of the declaration.
-					protocol: 'http',
-				},
-			],
-		});
-		await proxy.start();
-		await sleep(50);
-
-		const payload = Buffer.from('passthrough-ok');
-		const response = await tlsRoundTrip({
-			port: proxyPort,
-			servername: 'localhost',
-			caCert: cert.cert,
-			data: payload,
-		});
-		assert.deepEqual(response, payload, 'end-to-end TLS round-trip intact (no injected header)');
-
-		await proxy.stop();
-		await upstream.close();
+	// Passthrough forwards raw TLS bytes to a TLS upstream — there's no decrypted HTTP request to
+	// splice a header into, and a header-carried fingerprint mode has no carrier at all here
+	// regardless of `protocol`. This used to build successfully and silently forward nothing;
+	// it now fails construction with a "no carrier" error instead (see route-protocol.spec.ts for
+	// focused coverage), so a passthrough + header-carried forwardFingerprint config can no longer
+	// look "working" while quietly forwarding no fingerprint.
+	it('rejects a header-carried fingerprint on a passthrough route at construction (no carrier, not a silent no-op)', async () => {
+		assert.throws(
+			() =>
+				new SymphonyProxy({
+					listeners: [{ host: '127.0.0.1', port: 0 }],
+					routes: [
+						{
+							sni: 'localhost',
+							upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: 1 }],
+							terminateTls: false,
+							forwardFingerprint: 'ja3',
+							protocol: 'http',
+						},
+					],
+				}),
+			/no carrier/i,
+			'passthrough + header-carried forwardFingerprint must fail construction, not silently drop the fingerprint at runtime'
+		);
 	});
 
 	// Finding 1 (Critical — Slowloris): a client that completes the TLS handshake and then stalls

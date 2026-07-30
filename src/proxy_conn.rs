@@ -275,7 +275,7 @@ async fn proxy_via_tls(
 	// applies even on a protocol: 'http' route). Read before wrapping — the counter has no
 	// view of the TLS session.
 	let negotiated_h2 = client.get_ref().1.alpn_protocol() == Some(b"h2".as_ref());
-	let l7_http1 = matches!(sf.protocol, RouteProtocol::Http) && !negotiated_h2;
+	let l7_http1 = eligible_for_header_rewriting(sf.protocol, negotiated_h2);
 
 	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
 		.await
@@ -525,6 +525,15 @@ where
 /// authoritative value to substitute (`value: None`) — a client must never smuggle its own
 /// `X-JA3`/`X-JA4`/`X-Forwarded-For` through precisely when we can't replace it. PROXY v2 carries
 /// the fingerprint in a TLV, so it adds no header rewrite.
+/// Whether header-based forwarding (XFF / X-JA3 / X-JA4) is eligible for this connection: the
+/// route must declare `protocol: 'http'` (issue #38 — ALPN alone can't tell a native non-HTTP
+/// protocol from an HTTPS client that simply negotiated no ALPN) and the connection must not
+/// have negotiated h2 (an h2 stream is binary-framed; text header insertion would corrupt it,
+/// so this exclusion applies even on a `protocol: 'http'` route).
+fn eligible_for_header_rewriting(protocol: RouteProtocol, negotiated_h2: bool) -> bool {
+	protocol == RouteProtocol::Http && !negotiated_h2
+}
+
 fn header_rewrites(sf: &SourceForwarding<'_>, l7_http1: bool) -> Vec<crate::http_proxy::HeaderRewrite> {
 	use crate::http_proxy::HeaderRewrite;
 	if !l7_http1 {
@@ -667,5 +676,25 @@ mod tests {
 		let (from_client, from_upstream) = observed_read_sizes(4096, 1024).await;
 		assert_eq!(from_client, 4096);
 		assert_eq!(from_upstream, 1024);
+	}
+
+	// Direct coverage of the runtime gate itself, independent of the construction-time
+	// `requires_http_protocol` guard in `proxy.rs` — this is the predicate `proxy_via_tls`
+	// evaluates per connection to decide whether the HTTP/1 header rewriter runs at all.
+
+	#[test]
+	fn http_protocol_without_h2_is_eligible() {
+		assert!(eligible_for_header_rewriting(RouteProtocol::Http, false));
+	}
+
+	#[test]
+	fn http_protocol_with_negotiated_h2_is_not_eligible() {
+		assert!(!eligible_for_header_rewriting(RouteProtocol::Http, true));
+	}
+
+	#[test]
+	fn opaque_protocol_is_never_eligible_regardless_of_alpn() {
+		assert!(!eligible_for_header_rewriting(RouteProtocol::Opaque, false));
+		assert!(!eligible_for_header_rewriting(RouteProtocol::Opaque, true));
 	}
 }
