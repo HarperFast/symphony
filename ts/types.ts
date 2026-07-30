@@ -232,14 +232,15 @@ export interface ProxyConfig {
 	/** Number of tokio worker threads. Defaults to available CPU count. */
 	workerThreads?: number;
 	/**
-	 * Per-direction copy buffer size in bytes. Default: 8192. Clamped to [512, 1048576].
+	 * Per-direction copy buffer *maximum* in bytes. Default: 8192. Clamped to [512, 1048576].
 	 *
-	 * One buffer per direction is allocated per proxied connection and held for its whole life,
-	 * transferring or not, so these are a direct multiplier on per-connection memory:
-	 * `(client + upstream) x connections`, which is `2 x readBufferSize x connections` only when
-	 * both directions use this value. Raising it buys throughput on a handful of bulk streams (replication) and
-	 * costs gigabytes on hundreds of thousands of mostly-idle ones (MQTT subscribers). Since the
-	 * value is per proxy, tune it per port-set rather than fleet-wide.
+	 * Each direction starts at a small fixed floor and escalates to this value only once a
+	 * sustained burst is observed, dropping back to the floor as soon as the burst ends — it is
+	 * not a permanent per-connection allocation, so raising it does not cost this much memory
+	 * per idle connection. It does bound how large a buffer a genuinely bursty transfer (e.g.
+	 * replication) may grow to, which trades off against the per-transfer memory a proxy running
+	 * many concurrent bursty transfers at once will hold. Since the value is per proxy, tune it
+	 * per port-set rather than fleet-wide.
 	 */
 	readBufferSize?: number;
 	/** Overrides `readBufferSize` for the client -> upstream direction only. */

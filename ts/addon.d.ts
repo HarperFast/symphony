@@ -104,10 +104,11 @@ export interface JsProxyConfig {
   routes: Array<JsRouteConfig>
   workerThreads?: number
   /**
-   * Per-direction copy buffer, in bytes (default 8192). One buffer per direction is held for
-   * the whole life of every proxied connection, idle or not, so these are a direct multiplier
-   * on per-connection memory: `(client + upstream) × connections`, i.e.
-   * `2 × readBufferSize × connections` when both directions use this value.
+   * Per-direction copy buffer *maximum*, in bytes (default 8192). Each direction starts at a
+   * small fixed floor and escalates to this value only for a sustained burst, dropping back to
+   * the floor once the burst ends — it is not a permanent per-connection allocation. It bounds
+   * how large a single bursty transfer's buffer may grow, which is what to weigh against many
+   * concurrent bursty transfers held at that size at once.
    */
   readBufferSize?: number
   /** Overrides `readBufferSize` for the client→upstream direction only. */

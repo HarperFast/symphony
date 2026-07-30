@@ -35,7 +35,7 @@
 //! session — because the pump had already moved on to (blocking on) the next read before the
 //! previous write was actually flushed.
 
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
@@ -202,6 +202,14 @@ impl LazyCopyBuffer {
 		R: AsyncRead + ?Sized,
 		W: AsyncWrite + ?Sized,
 	{
+		// Mirror tokio's own `CopyBuffer::poll_copy`: consume one unit of the task's
+		// cooperative-scheduling budget on entry. Without this, a direction whose read and
+		// write never return `Pending` (a fast loopback pair, or two directions that keep
+		// topping each other off) can spin through this loop indefinitely inside one `poll`
+		// call and monopolize its worker thread instead of yielding back to the scheduler.
+		if std::pin::pin!(tokio::task::coop::consume_budget()).poll(cx).is_pending() {
+			return Poll::Pending;
+		}
 		loop {
 			if self.cap < self.buf.len() && !self.read_done {
 				match self.poll_fill_buf(cx, reader.as_mut()) {
@@ -218,6 +226,20 @@ impl LazyCopyBuffer {
 								ready!(writer.as_mut().poll_flush(cx))?;
 								self.need_flush = false;
 							}
+							// The buffer is fully drained and no more data is ready right now —
+							// shrink to the floor before parking. Without this, a burst whose size
+							// happens to land exactly on a buffer boundary ends by parking right
+							// here still holding the escalated (max-sized) buffer: the shrink below
+							// only runs after a *completed* under-capacity read, and if the
+							// connection now goes idle — precisely the case this buffer exists to
+							// keep cheap — that under-capacity read may never come. Shrinking here
+							// costs the same one-round-trip re-escalation the design already pays
+							// for growth, and a real sustained burst won't reach this branch (more
+							// input is already buffered in the kernel, so the next read is Ready).
+							if self.buf.len() > self.small_size {
+								self.buf = vec![0u8; self.small_size];
+							}
+							self.full_streak = 0;
 							return Poll::Pending;
 						}
 					}
@@ -637,8 +659,9 @@ mod tests {
 
 		let driver = tokio::spawn(async move {
 			// A burst several times larger than PROBE_BUFFER_SIZE, forcing escalation past two
-			// consecutive full reads — this must complete (proving the buffer actually grew to
-			// carry it), not stall.
+			// consecutive full reads. This proves round-trip correctness *despite* the buffer
+			// resizing mid-transfer, not that it actually resized — `buf_len_transitions_through_a_burst_and_back`
+			// below inspects the buffer directly for that.
 			let burst = vec![7u8; MAX * 4];
 			client_peer.write_all(&burst).await.unwrap();
 			let mut readback = vec![0u8; burst.len()];
@@ -664,5 +687,76 @@ mod tests {
 		.unwrap();
 		driver.await.unwrap();
 		echo.await.unwrap();
+	}
+
+	/// Drives `LazyCopyBuffer::poll_copy` directly (no sockets, no tokio scheduler) so the two
+	/// state transitions the escalate/shrink design depends on can be asserted directly instead
+	/// of inferred from end-to-end timing: `full_streak` reaching 2 grows `buf` to `max_buf_size`,
+	/// and the very next under-capacity read shrinks it back to `small_size`.
+	#[test]
+	fn buf_len_transitions_through_a_burst_and_back() {
+		/// Fills every requested read fully (whatever the buffer's current capacity is) for the
+		/// first `full_reads` calls, then a single byte (deliberately under capacity) to end the
+		/// burst, then parks forever.
+		struct BurstThenOneByte {
+			full_reads: usize,
+			calls: usize,
+		}
+		impl AsyncRead for BurstThenOneByte {
+			fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+				self.calls += 1;
+				if self.calls <= self.full_reads {
+					let n = buf.remaining();
+					buf.put_slice(&vec![7u8; n]);
+					Poll::Ready(Ok(()))
+				} else if self.calls == self.full_reads + 1 {
+					buf.put_slice(&[9u8]);
+					Poll::Ready(Ok(()))
+				} else {
+					Poll::Pending
+				}
+			}
+		}
+
+		/// Records the length of every write it receives and always accepts immediately.
+		struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<usize>>>);
+		impl AsyncWrite for RecordingWriter {
+			fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+				self.0.lock().unwrap().push(buf.len());
+				Poll::Ready(Ok(buf.len()))
+			}
+			fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+				Poll::Ready(Ok(()))
+			}
+			fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+				Poll::Ready(Ok(()))
+			}
+		}
+
+		const MAX: usize = 8192;
+		let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+		// Reads 1–2 (at the floor size) drive `full_streak` to 2 and trigger escalation; read 3
+		// is the first one issued against the now-`MAX`-sized buffer, so it's the one that must
+		// actually observe (and write out) the escalated size.
+		let mut reader = BurstThenOneByte { full_reads: 3, calls: 0 };
+		let mut writer = RecordingWriter(writes.clone());
+		let mut lazy_buf = LazyCopyBuffer::new(MAX);
+		let small_size = lazy_buf.small_size;
+
+		let waker = std::task::Waker::noop();
+		let mut cx = Context::from_waker(waker);
+		// A single call: `poll_copy`'s inner loop only ever returns on `Pending` or completion, so
+		// it runs the two full reads, the escalation, the under-capacity read, and the shrink
+		// entirely within this one call before parking on the reader's subsequent `Pending`.
+		let result = lazy_buf.poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer));
+
+		assert!(result.is_pending(), "reader parks after the burst ends, so this call must not resolve");
+		assert_eq!(
+			*writes.lock().unwrap(),
+			vec![small_size, small_size, MAX, 1],
+			"two floor-sized writes, then escalation to MAX on the third, then the under-capacity write that ends the burst"
+		);
+		assert_eq!(lazy_buf.buf.len(), small_size, "buffer must have shrunk back to the floor after the burst ended");
+		assert_eq!(lazy_buf.full_streak, 0, "the under-capacity read must reset the streak");
 	}
 }

@@ -757,35 +757,42 @@ docker run --rm -v $(pwd):/build -w /build \
 
 ## Copy buffers and per-connection memory
 
-Each proxied connection holds two copy buffers — one per direction — for its entire life, whether or
-not it is transferring anything. So buffer memory scales with *connection count*, not with traffic:
+`readBufferSize` (and its per-direction overrides) is a *maximum*, not a permanent allocation. Each
+direction starts at a small fixed floor (1 KiB total across both directions) and escalates to the
+configured maximum only once it observes a sustained burst — two consecutive reads that fill the
+current buffer — dropping straight back to the floor as soon as a read comes back under capacity or
+the direction goes idle. So buffer memory scales with *concurrently bursting transfers*, not with
+connection count: a million idle MQTT subscribers cost on the order of 1 MiB of buffer memory total,
+not `readBufferSize × 2 × 1,000,000`.
 
 ```
-buffer bytes = (clientReadBufferSize + upstreamReadBufferSize) × connections
+worst-case buffer bytes = (clientReadBufferSize + upstreamReadBufferSize) × connections bursting right now
 ```
 
-Each unset override falls back to `readBufferSize`, so with symmetric sizing that is just
-`2 × readBufferSize × connections`. At the 8192-byte default it is 16 KiB per connection: 4.0 GiB at
-262k connections, 5.1 GiB at 333k. The asymmetric MQTT setting recommended below is
-`1024 + 4096` = 5 KiB per connection, which is where the general form matters.
-The knob is per proxy, and the right value is the opposite for the two shapes of traffic symphony
-carries:
+That's the ceiling if every connection happened to be mid-burst simultaneously — a useful number to
+size against, but not the steady-state cost, which sits near the 1 KiB/connection floor regardless of
+`readBufferSize`. Each unset override falls back to `readBufferSize`, so with symmetric sizing the
+ceiling is `2 × readBufferSize × connections bursting right now`. At the 8192-byte default that is 16
+KiB per bursting connection. The asymmetric MQTT setting recommended below is `1024 + 4096` = 5 KiB
+per bursting connection, which is where the general form matters.
+The knob still bounds how large a *single* transfer's buffer may grow, and the right bound is the
+opposite for the two shapes of traffic symphony carries:
 
 | Traffic | Connections | Payloads | Suggested |
 |---|---|---|---|
 | Native MQTT (`8883`) | 100k–1M | hundreds of bytes | `clientReadBufferSize: 1024`, `upstreamReadBufferSize: 4096` |
 | HTTPS (`443`) | thousands | mixed | leave at the default |
 | Operations API (`9925`) | tens | can be large | leave at the default |
-| Replication (`9933`) | ~6 | bulk streams | leave, or raise — 64 KiB across 6 connections is 768 KB total |
+| Replication (`9933`) | ~6 | bulk streams | leave, or raise — 64 KiB across 6 connections bursting at once is 768 KB total |
 
 MQTT is worth splitting by direction: after `SUBSCRIBE` a client sends almost nothing but `PINGREQ`,
-while the broker carries the whole fan-out. `1024`/`4096` is 5 KiB per connection against the
-default's 16 KiB — 3.5 GiB saved at 333k connections — and buys more downstream headroom than a
-symmetric 2048 would.
+while the broker carries the whole fan-out. `1024`/`4096` bounds a bursting connection to 5 KiB
+against the default's 16 KiB ceiling, and buys more downstream headroom than a symmetric 2048 would.
 
 Going small costs CPU, not correctness: a payload larger than the buffer is simply copied in more
-iterations. On a TLS-terminating listener those extra iterations are not even syscalls, since the
-reads come out of rustls's already-decrypted buffer.
+iterations, and a connection that keeps bursting re-escalates after two full reads. On a
+TLS-terminating listener those extra iterations are not even syscalls, since the reads come out of
+rustls's already-decrypted buffer.
 
 Two limits on where these settings apply:
 
@@ -801,11 +808,12 @@ Two limits on where these settings apply:
   high-connection-count listener, treat a buffer-size edit as a reconnect event, not a live tune.
 
 > **Upgrading:** before this setting was applied to the copy loop, `readBufferSize` had no effect —
-> every connection got 8 KiB per direction regardless of what the config said, and the default
-> documented here was `65536`. A config that leaves it unset is unaffected. A config that *sets* it
-> explicitly now gets what it asked for, so a value copied from the old documented default becomes
-> 128 KiB per connection instead of 16 KiB. Drop or remove such a value before upgrading a
-> high-connection-count deployment.
+> every connection got a fixed 8 KiB per direction regardless of what the config said (held for the
+> connection's whole life, not escalating/shrinking), and the default documented here was `65536`. A
+> config that leaves it unset is unaffected. A config that *sets* it explicitly now gets what it
+> asked for as a per-transfer ceiling, so a value copied from the old documented default raises that
+> ceiling to 128 KiB per bursting connection instead of 16 KiB. Drop or remove such a value before
+> upgrading a high-connection-count deployment.
 
 Two caveats when sizing a node from this:
 
