@@ -165,6 +165,17 @@ export class SymphonyProxy extends EventEmitter {
 
 	constructor(config: ProxyConfig) {
 		super();
+		// EventEmitter's 'error' event is special-cased: emitting it with zero listeners attached
+		// throws synchronously instead of silently dropping the event. Every emit('error', ...) in
+		// this class happens inside the napi threadsafe-function callback below — an uncaught throw
+		// there escapes into native code and kills the whole process, not just this instance. A
+		// config-validation failure surfaced via resolveConnection() (see resolve_connection in
+		// proxy.rs) now always goes through this exact channel, so a consumer that hasn't gotten
+		// around to attaching its own 'error' listener yet must not crash the process for it. This
+		// permanent no-op listener guarantees emit('error', ...) can never throw for lack of a
+		// listener; any listener a consumer attaches still fires normally alongside it, so real
+		// error observability is unaffected — only the "nobody's listening" crash is removed.
+		this.on('error', () => {});
 		const { SymphonyProxyWrap: Wrap } = loadAddon();
 
 		const jsConfig = {
@@ -214,12 +225,14 @@ export class SymphonyProxy extends EventEmitter {
 						break;
 				}
 			} catch (listenerErr) {
-				// If nothing is listening for 'error', emit('error', ...) itself throws (Node's
-				// EventEmitter contract — every consumer of this class must attach one), which
-				// would otherwise recurse right back into this catch with no way out, escaping as
-				// an unhandled double-throw that also replaces the original stack with a generic
-				// one. Re-emit only when a listener actually exists; otherwise propagate the
-				// original error as-is rather than trying (and failing) to route it through 'error'.
+				// The constructor installs a permanent no-op 'error' listener specifically so
+				// emit('error', ...) can never throw for lack of one — but a consumer calling
+				// removeAllListeners('error') (or with no args) removes that safety net too. This
+				// check is defense-in-depth for that case: if nothing is listening, emit('error', ...)
+				// itself throws (Node's EventEmitter contract), which would otherwise recurse right
+				// back into this catch with no way out, escaping as an unhandled double-throw that
+				// also replaces the original stack with a generic one. Re-emit only when a listener
+				// actually exists; otherwise propagate the original error as-is.
 				if (this.listenerCount('error') > 0) {
 					this.emit('error', listenerErr instanceof Error ? listenerErr : new Error(String(listenerErr)));
 				} else {

@@ -229,6 +229,25 @@ describe('Suspended routes – reject with null', () => {
 	});
 });
 
+// Node's EventEmitter special-cases 'error': emitting it with zero listeners attached throws
+// synchronously instead of dropping the event. Every 'error' emission in SymphonyProxy happens
+// inside the napi threadsafe-function callback, so that throw would otherwise escape into native
+// code and crash the whole process — not just this instance — the very first time ANY native
+// error fires (a resolveConnection() validation failure, a TLS error, anything) on a proxy whose
+// owner hasn't gotten around to attaching an 'error' listener yet. The constructor installs a
+// permanent no-op listener specifically to make this impossible; this test pins that a fresh
+// proxy with zero listeners of its own survives an 'error' emission.
+describe('SymphonyProxy never crashes from emit("error") with no listener attached', () => {
+	it('a proxy with no "error" listener at all does not throw when an error is emitted', () => {
+		const proxy = new SymphonyProxy({ listeners: [{ host: '127.0.0.1', port: 0 }], routes: [] });
+		assert.equal(proxy.listenerCount('error'), 1, 'the constructor must install exactly one default listener');
+		assert.doesNotThrow(
+			() => proxy.emit('error', new Error('simulated native error, no consumer listener attached')),
+			'emit("error", ...) must never throw for lack of a listener — this is the crash the round-5 review flagged as a blocker'
+		);
+	});
+});
+
 describe('Suspended routes – resolveConnection() with an invalid route never throws', () => {
 	const cert = generateSelfSignedCert('localhost');
 	let proxyPort: number;

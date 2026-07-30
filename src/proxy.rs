@@ -737,6 +737,14 @@ impl SymphonyProxyWrap {
 			}
 		};
 
+		// An id that has already timed out (or was never valid) is a documented no-op
+		// (`SuspendedRegistry::resolve`) — check before doing any parse/build work for `route`, not
+		// after: building a terminating route's TLS config is real work, and an error emitted for a
+		// connection that's already gone would be spurious noise, not a signal an operator can act on.
+		if !self.suspended_registry.contains(id_num) {
+			return Ok(());
+		}
+
 		let route_result = route.map(|r| {
 			parse_resolve_spec(&r)
 				.map_err(|e| e.reason)
