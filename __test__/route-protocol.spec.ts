@@ -222,6 +222,53 @@ describe('SymphonyProxy – route protocol declaration', () => {
 		await upstream.close();
 	});
 
+	// The two tests above prove the bad route's own SNI is unreachable, but that's also what a
+	// regression that dropped the *whole table* (defeating the isolation this PR exists to
+	// preserve) would look like. This test proves the isolation itself: a healthy co-tenant route
+	// on the same port-set must keep serving traffic while an unrelated sibling route is rejected.
+	it('a healthy co-tenant route keeps serving traffic when a sibling route is rejected', async () => {
+		const goodUpstream = await startEchoServer();
+		const badUpstream = await startEchoServer();
+		const proxyPort = await getFreePort();
+		const proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: proxyPort }],
+			routes: [
+				{
+					sni: 'good.example.com',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: goodUpstream.port }],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+					// A plain opaque route — no header-carried mode configured, so it round-trips raw
+					// bytes and isn't itself subject to the check under test. The point of this route
+					// is just to prove it keeps working, not to re-exercise HTTP header injection.
+				},
+				{
+					sni: 'bad.example.com',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: badUpstream.port }],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+					sourceAddressHeader: 'xForwardedFor',
+					// protocol left unset — rejected, but must not take good.example.com down with it.
+				},
+			],
+		});
+		await proxy.start();
+		await sleep(50);
+
+		await assert.rejects(
+			tlsRoundTrip({ port: proxyPort, servername: 'bad.example.com', caCert: cert.cert, data: 'x' }),
+			/timeout|ECONNRESET|EPROTO|socket hang up|closed/i,
+			'the undeclared sibling route must still be dropped'
+		);
+
+		const response = await tlsRoundTrip({ port: proxyPort, servername: 'good.example.com', caCert: cert.cert, data: 'x' });
+		assert.deepEqual(response, Buffer.from('x'), 'the healthy co-tenant route must round-trip normally, unaffected by the rejected sibling');
+
+		await proxy.stop();
+		await goodUpstream.close();
+		await badUpstream.close();
+	});
+
 	// resolveConnection() parses and validates its `route` argument only once the id is confirmed
 	// still live (an id that already timed out is a documented no-op — SuspendedRegistry::contains
 	// — so it never reaches route validation at all). These tests therefore need a *real* suspended

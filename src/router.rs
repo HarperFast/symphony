@@ -180,6 +180,19 @@ pub struct Route {
 
 // ── Route table ───────────────────────────────────────────────────────────────
 
+/// True when `sni` matches exactly one left-most label against `suffix` (a wildcard's stored
+/// suffix, without the `*.` prefix) — e.g. "foo.example.com" matches suffix "example.com" but
+/// "a.b.example.com" does not.
+fn wildcard_suffix_matches(sni: &str, suffix: &str) -> bool {
+	if sni.len() <= suffix.len() + 1 {
+		return false;
+	}
+	let dot_pos = sni.len() - suffix.len() - 1;
+	let rest = &sni[sni.len() - suffix.len()..];
+	let prefix = &sni[..dot_pos];
+	!prefix.contains('.') && rest == suffix && sni.as_bytes()[dot_pos] == b'.'
+}
+
 pub struct RouteTable {
 	exact: HashMap<Arc<str>, Route>,
 	/// (suffix_without_star_dot, route) — "*.example.com" stored as "example.com"
@@ -191,6 +204,18 @@ pub struct RouteTable {
 	/// SNIs whose cert failed to build in this table. Carried across a hot-swap so a
 	/// persistently-broken route is logged only on the good→bad transition, not every reconcile.
 	failing_snis: HashSet<Arc<str>>,
+	/// Exact SNIs dropped with no last-good route to carry forward (a subset of `failing_snis` —
+	/// this excludes SNIs whose last-good route IS still present in `exact`/`wildcard` and
+	/// serving traffic). `resolve()` must fail closed for these rather than falling through to a
+	/// wildcard or default route: a route absent from `exact` because it was rejected is not the
+	/// same as a route that was simply never configured, and letting the former silently match a
+	/// broader wildcard would misroute that tenant's traffic to an unrelated upstream instead of
+	/// refusing the connection.
+	dropped_exact: HashSet<Arc<str>>,
+	/// Wildcard suffixes (without the `*.` prefix) dropped with no last-good route — same
+	/// fail-closed reasoning as `dropped_exact`, checked against incoming SNIs with the same
+	/// suffix-matching rule as `wildcard` itself.
+	dropped_wildcard: Vec<Arc<str>>,
 }
 
 impl RouteTable {
@@ -210,6 +235,14 @@ impl RouteTable {
 			return self.default.as_ref();
 		};
 
+		// A route rejected outright (no last-good to carry forward) must fail closed, not fall
+		// through to a broader wildcard or the default route: it was configured for this SNI, just
+		// rejected, which is not the same as "no route was ever configured here." Checked before
+		// any match below, exact or wildcard, so a poisoned entry always wins over a fallback.
+		if self.dropped_exact.contains(sni) || self.dropped_wildcard.iter().any(|suffix| wildcard_suffix_matches(sni, suffix)) {
+			return None;
+		}
+
 		// Exact match first
 		if let Some(r) = self.exact.get(sni) {
 			return Some(r);
@@ -218,16 +251,8 @@ impl RouteTable {
 		// Wildcard: match exactly one left-most label against stored suffixes.
 		// e.g. "foo.example.com" matches "*.example.com" but "a.b.example.com" does not.
 		for (suffix, route) in &self.wildcard {
-			if sni.len() > suffix.len() + 1 {
-				let dot_pos = sni.len() - suffix.len() - 1;
-				let rest = &sni[sni.len() - suffix.len()..];
-				let prefix = &sni[..dot_pos];
-				if !prefix.contains('.')
-					&& rest == suffix.as_ref()
-					&& sni.as_bytes()[dot_pos] == b'.'
-				{
-					return Some(route);
-				}
+			if wildcard_suffix_matches(sni, suffix) {
+				return Some(route);
 			}
 		}
 
@@ -330,6 +355,8 @@ pub fn build_route_table(
 	let mut wildcard: Vec<(Arc<str>, Route)> = Vec::new();
 	let mut monitored_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
 	let mut failing_snis: HashSet<Arc<str>> = HashSet::new();
+	let mut dropped_exact: HashSet<Arc<str>> = HashSet::new();
+	let mut dropped_wildcard: Vec<Arc<str>> = Vec::new();
 
 	for spec in specs {
 		// Isolate per-route failures: a single route whose cert can't be built (e.g. a
@@ -360,12 +387,20 @@ pub fn build_route_table(
 						}
 						prev.clone()
 					}
-					// No prior route (initial build, or a newly-added route): drop this SNI. The
-					// missing route simply resolves to nothing — strictly better than a host-wide
-					// abort that would take down every other tenant on the listener.
+					// No prior route (initial build, or a newly-added route): drop this SNI. It must
+					// resolve to nothing, not silently fall through to a broader wildcard or the
+					// default route — this SNI *was* configured, just rejected, which is a different
+					// (and worse, if left unhandled) case than "no route was ever set up for it": a
+					// dropped exact route shadowed by an unrelated wildcard would otherwise misroute
+					// that tenant's traffic to a different upstream with no visible error.
 					None => {
 						if newly_failing {
 							eprintln!("symphony: skipping route '{}': {}", spec.sni, e);
+						}
+						if let Some(suffix) = spec.sni.strip_prefix("*.") {
+							dropped_wildcard.push(Arc::from(suffix));
+						} else {
+							dropped_exact.insert(Arc::from(spec.sni.as_str()));
 						}
 						continue;
 					}
@@ -391,7 +426,7 @@ pub fn build_route_table(
 		}
 	}
 
-	Ok(RouteTable { exact, wildcard, default: None, monitored_balancers, failing_snis })
+	Ok(RouteTable { exact, wildcard, default: None, monitored_balancers, failing_snis, dropped_exact, dropped_wildcard })
 }
 
 fn build_route(
@@ -736,6 +771,43 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		assert!(
 			table.resolve(Some("bad.example.com")).is_none(),
 			"the unbuildable route must be absent (no default fallback)"
+		);
+	}
+
+	// A dropped route must fail closed, not silently fall through to a broader wildcard: it was
+	// configured for this SNI, just rejected — very different from "no route was ever set up
+	// here." Without this, a rejected exact route shadowed by a wildcard would misroute that
+	// tenant's traffic to the wildcard's (unrelated) upstream with no visible error.
+	#[test]
+	fn dropped_exact_route_does_not_fall_through_to_wildcard() {
+		let specs = vec![
+			tls_route("api.acme.com", CERT_A, KEY_B), // KeyMismatch — dropped, no last-good
+			tls_route("*.acme.com", CERT_A, KEY_A),
+		];
+
+		let table = build_route_table(&specs, &ListenerTlsSpec::empty(), None).expect("build");
+
+		assert!(
+			table.resolve(Some("api.acme.com")).is_none(),
+			"a dropped exact route must resolve to nothing, not the wildcard's upstream"
+		);
+		assert!(
+			table.resolve(Some("other.acme.com")).is_some(),
+			"an unrelated subdomain must still reach the (valid) wildcard route"
+		);
+	}
+
+	// Same fail-closed requirement when the *wildcard* itself is the one that's dropped: a
+	// matching subdomain must not fall through to the default route either.
+	#[test]
+	fn dropped_wildcard_route_does_not_fall_through_to_default() {
+		let specs = vec![tls_route("*.acme.com", CERT_A, KEY_B)]; // KeyMismatch — dropped
+
+		let table = build_route_table(&specs, &ListenerTlsSpec::empty(), None).expect("build");
+
+		assert!(
+			table.resolve(Some("api.acme.com")).is_none(),
+			"a subdomain matching a dropped wildcard must resolve to nothing, not fall through to default"
 		);
 	}
 

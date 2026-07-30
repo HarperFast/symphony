@@ -165,14 +165,6 @@ export class SymphonyProxy extends EventEmitter {
 
 	constructor(config: ProxyConfig) {
 		super();
-		// A default 'error' listener so a background failure (e.g. a resolveConnection() validation
-		// rejection — see resolve_connection in proxy.rs) is never silent for a consumer who hasn't
-		// gotten around to attaching their own listener yet. It logs rather than swallows: an
-		// operator should be able to tell a suspended route is failing without a proxy.on('error')
-		// wired up, and any listener the consumer does attach still fires normally alongside this one.
-		this.on('error', (err: Error, ctx?: { listener?: string }) => {
-			console.error(`symphony: unhandled proxy error${ctx?.listener ? ` [${ctx.listener}]` : ''}:`, err);
-		});
 		const { SymphonyProxyWrap: Wrap } = loadAddon();
 
 		const jsConfig = {
@@ -202,7 +194,7 @@ export class SymphonyProxy extends EventEmitter {
 			// general defense-in-depth grounds rather than a reproduced local crash.
 			process.nextTick(() => {
 				if (err) {
-					this.emit('error', err);
+					this._emitError(err);
 					return;
 				}
 				const event = raw as ProxyEvent;
@@ -226,11 +218,29 @@ export class SymphonyProxy extends EventEmitter {
 						} satisfies SuspendedConnection);
 						break;
 					case 'error':
-						this.emit('error', new Error(event.message), { listener: event.listener });
+						this._emitError(new Error(event.message), { listener: event.listener });
 						break;
 				}
 			});
 		});
+	}
+
+	// EventEmitter throws synchronously when 'error' is emitted with zero listeners attached — a
+	// permanent default listener installed in the constructor would guard against that only until
+	// a consumer calls removeAllListeners('error') (or with no args), which reopens the hole a
+	// pre-installed listener can't defend against from the inside. Checking listenerCount at each
+	// emission site instead means there is never a moment where emit('error', ...) can throw for
+	// lack of a listener, regardless of what the consumer does to their listeners in between. When
+	// nothing is listening, log directly rather than swallowing: an operator should be able to tell
+	// a background failure (e.g. a resolveConnection() validation rejection) happened without
+	// having wired up their own 'error' listener, and this never fires redundantly alongside a
+	// listener that already handles it — unlike a permanent listener, which logged every time.
+	private _emitError(err: Error, ctx?: { listener?: string }): void {
+		if (this.listenerCount('error') > 0) {
+			this.emit('error', err, ctx);
+		} else {
+			console.error(`symphony: unhandled proxy error${ctx?.listener ? ` [${ctx.listener}]` : ''}:`, err);
+		}
 	}
 
 	async start(): Promise<void> {

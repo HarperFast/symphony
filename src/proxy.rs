@@ -202,7 +202,9 @@ pub struct JsProxyMetrics {
 	pub suspended_unresolved: f64,
 	/// Routes currently in the live table, including the default route.
 	pub routes: f64,
-	/// Routes whose cert failed to build — dropped, or serving a carried-forward last-good cert.
+	/// Routes rejected at build time — a cert that failed to build, or a route that failed the
+	/// protocol/carrier validation — either dropped, or (cert failures only) serving a
+	/// carried-forward last-good cert.
 	pub failing_routes: f64,
 	pub listeners: Vec<JsListenerMetrics>,
 }
@@ -815,11 +817,11 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 	// xForwardedFor + http2 is a hard error (build_route, router.rs) since it's unconditionally
 	// unsafe — an h2 client's XFF would be neither injected nor stripped, forwarding an arbitrary
 	// client-supplied value as if authoritative. A header-carried forwardFingerprint in the same
-	// spot is intentionally only a warning, not a hard error: unlike XFF, which no route needs at
-	// all if it drops h2, some deployments accept "an h2 client can choose to not have its
-	// fingerprint forwarded (or forward its own)" as a known best-effort limitation of a signal
-	// that's advisory in the first place. Name whichever mode actually triggered this so the
-	// message doesn't blame X-Forwarded-For when the route never configured it.
+	// spot is intentionally only a warning here, not a hard error, even though the risk is the
+	// same in kind (an h2 client can forge X-JA3/X-JA4, not merely go unforwarded) — see
+	// README.md's "Forwarding the fingerprint downstream" section for the tradeoff this leaves
+	// open and why it isn't a hard error like XFF. Name whichever mode actually triggered this so
+	// the message doesn't blame X-Forwarded-For when the route never configured it.
 	if requires_http && spec.http2 {
 		let mode_desc = if source_address_mode == SourceAddressMode::XForwardedFor {
 			"xForwardedFor"
