@@ -272,5 +272,14 @@ describe('SymphonyProxy – route protocol declaration', () => {
 				'resolveConnection must reject xForwardedFor + http2 just like build_route does for the static route table'
 			);
 		});
+
+		it('rejects an unparseable connection id via the "error" event instead of throwing', async () => {
+			const message = await resolveAndCaptureError('not-a-real-id', {
+				upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
+				terminateTls: true,
+				protocol: 'opaque',
+			});
+			assert.match(message, /invalid connection id/i, 'a malformed id must surface via "error", not a thrown exception');
+		});
 	});
 });
