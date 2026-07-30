@@ -236,24 +236,31 @@ impl RouteTable {
 		};
 
 		// A route rejected outright (no last-good to carry forward) must fail closed, not fall
-		// through to a broader wildcard or the default route: it was configured for this SNI, just
-		// rejected, which is not the same as "no route was ever configured here." Checked before
-		// any match below, exact or wildcard, so a poisoned entry always wins over a fallback.
-		if self.dropped_exact.contains(sni) || self.dropped_wildcard.iter().any(|suffix| wildcard_suffix_matches(sni, suffix)) {
-			return None;
-		}
+		// through to a broader fallback: it was configured for this SNI, just rejected, which is
+		// not the same as "no route was ever configured here." But a poison entry must only ever
+		// suppress a fallback *broader* than itself — it must never shadow a route that is more
+		// specific than the poison. So each dropped set is checked immediately after its
+		// same-specificity live counterpart, not before it: a healthy exact route always wins over
+		// a dropped wildcard at the same suffix (checking dropped_wildcard first would incorrectly
+		// black-hole every exact route under a wildcard that happened to fail validation).
 
-		// Exact match first
+		// Exact, live or dropped — most specific, decided first.
 		if let Some(r) = self.exact.get(sni) {
 			return Some(r);
 		}
+		if self.dropped_exact.contains(sni) {
+			return None;
+		}
 
-		// Wildcard: match exactly one left-most label against stored suffixes.
+		// Wildcard, live or dropped — match exactly one left-most label against stored suffixes.
 		// e.g. "foo.example.com" matches "*.example.com" but "a.b.example.com" does not.
 		for (suffix, route) in &self.wildcard {
 			if wildcard_suffix_matches(sni, suffix) {
 				return Some(route);
 			}
+		}
+		if self.dropped_wildcard.iter().any(|suffix| wildcard_suffix_matches(sni, suffix)) {
+			return None;
 		}
 
 		self.default.as_ref()
@@ -359,6 +366,29 @@ pub fn build_route_table(
 	let mut dropped_wildcard: Vec<Arc<str>> = Vec::new();
 
 	for spec in specs {
+		// The protocol/no-carrier declaration checks are validated before any cert/TLS work, and
+		// deliberately never carried forward on a hot-swap even if a last-good route exists: unlike
+		// a cert failure (a transient race between two non-atomic file writes that heals on its own
+		// next reconcile), a missing declaration or a passthrough-with-no-carrier config is a
+		// permanent config error — it never heals without a human editing the config. Applying
+		// cert-style carry-forward to it would silently keep serving the *previous* route
+		// indefinitely, including ignoring any other change (a new upstream, a cert rotation) the
+		// same reconcile made to that route — the operator's `updateConfig` reports success while
+		// their edit quietly never took effect.
+		if let Err(e) = validate_route_protocol_declaration(spec) {
+			let newly_failing = previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
+			failing_snis.insert(Arc::from(spec.sni.as_str()));
+			if newly_failing {
+				eprintln!("symphony: skipping route '{}': {}", spec.sni, e);
+			}
+			if let Some(suffix) = spec.sni.strip_prefix("*.") {
+				dropped_wildcard.push(Arc::from(suffix));
+			} else {
+				dropped_exact.insert(Arc::from(spec.sni.as_str()));
+			}
+			continue;
+		}
+
 		// Isolate per-route failures: a single route whose cert can't be built (e.g. a
 		// rotated key no longer matching an inlined chain → rustls KeyMismatch) must not
 		// abort the whole table and take every other tenant on the port down with it.
@@ -429,19 +459,16 @@ pub fn build_route_table(
 	Ok(RouteTable { exact, wildcard, default: None, monitored_balancers, failing_snis, dropped_exact, dropped_wildcard })
 }
 
-fn build_route(
-	spec: &RouteSpec,
-	listener_tls: &ListenerTlsSpec,
-	cache: &mut TlsConfigCache,
-) -> crate::error::Result<Route> {
+/// The "no carrier" and "declare protocol: 'http'" requirements — checked in `build_route_table`
+/// before `build_route` runs, and deliberately never carried forward on a hot-swap (see the call
+/// site): unlike a cert-build failure, this is a permanent config error, not a transient race.
+fn validate_route_protocol_declaration(spec: &RouteSpec) -> crate::error::Result<()> {
 	let requires_http = requires_http_protocol(spec.source_address_mode, spec.forward_fingerprint);
 
 	// Passthrough (terminateTls=false) never decrypts the stream, so a header-carried mode has no
 	// carrier at all regardless of `protocol` — declaring 'http' wouldn't help. Checked before (and
 	// distinct from) the declaration requirement below: it's not that the route mislabeled its
-	// protocol, it's that no protocol declaration could make this work. Isolated here (rather than
-	// at parse time in proxy.rs) so one route's misconfiguration is dropped/last-good-carried like
-	// a bad cert, instead of aborting construction or updateConfig for every other route.
+	// protocol, it's that no protocol declaration could make this work.
 	if requires_http && !spec.terminate_tls {
 		return Err(crate::error::SymphonyError::Config(format!(
 			"route '{}': sourceAddressHeader 'xForwardedFor', or forwardFingerprint via an HTTP header (any mode other than 'proxyProtocolV2'), has no carrier when terminateTls=false (passthrough never decrypts the stream, so no header can be injected) — use sourceAddressHeader='proxyProtocolV2' (carries both source address and fingerprint), or remove forwardFingerprint",
@@ -456,6 +483,14 @@ fn build_route(
 		)));
 	}
 
+	Ok(())
+}
+
+fn build_route(
+	spec: &RouteSpec,
+	listener_tls: &ListenerTlsSpec,
+	cache: &mut TlsConfigCache,
+) -> crate::error::Result<Route> {
 	let tls_config = if spec.terminate_tls {
 		let cert_pem = spec
 			.cert_pem
@@ -811,6 +846,30 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		);
 	}
 
+	// The inverse and more dangerous case: a dropped wildcard must NOT shadow a healthy, more
+	// specific exact route at the same suffix. A prior version of the fail-closed check tested
+	// `dropped_wildcard` before `exact`, which black-holed every exact route under any wildcard
+	// that happened to fail validation — turning one tenant's wildcard typo into an outage for
+	// every co-tenant sharing that parent domain.
+	#[test]
+	fn healthy_exact_route_survives_a_dropped_sibling_wildcard() {
+		let specs = vec![
+			tls_route("*.acme.com", CERT_A, KEY_B),  // KeyMismatch — dropped
+			tls_route("api.acme.com", CERT_A, KEY_A), // valid, more specific
+		];
+
+		let table = build_route_table(&specs, &ListenerTlsSpec::empty(), None).expect("build");
+
+		assert!(
+			table.resolve(Some("api.acme.com")).is_some(),
+			"a healthy exact route must resolve normally even when a sibling wildcard at the same suffix was dropped"
+		);
+		assert!(
+			table.resolve(Some("other.acme.com")).is_none(),
+			"a subdomain with no exact route of its own must still fail closed against the dropped wildcard"
+		);
+	}
+
 	// On a hot-swap, a route whose cert transiently fails to rebuild (the normal cert+key
 	// non-atomic write window) must retain its last-good route from the live table rather
 	// than dropping the SNI.
@@ -839,6 +898,31 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		assert!(
 			fresh.resolve(Some("tenant.example.com")).is_none(),
 			"with no prior route there is nothing to retain — the SNI is dropped"
+		);
+	}
+
+	// Unlike a cert-build failure (a transient race that heals on the next reconcile), a
+	// protocol-declaration/no-carrier rejection is a permanent config error — it never heals
+	// without a human editing the config. It must therefore never get cert-style last-good
+	// carry-forward: an operator who accidentally drops `protocol: 'http'` in the same edit that
+	// repoints a route to a new upstream must see that route stop serving, not have `updateConfig`
+	// silently keep the old route (old upstream included) running indefinitely.
+	#[test]
+	fn permanent_protocol_rejection_never_carries_forward_on_hot_swap() {
+		let mut good = tls_route("tenant.example.com", CERT_A, KEY_A);
+		good.source_address_mode = SourceAddressMode::XForwardedFor;
+		good.protocol = RouteProtocol::Http;
+		let live = build_route_table(&[good], &ListenerTlsSpec::empty(), None).expect("initial build");
+		assert!(live.resolve(Some("tenant.example.com")).is_some());
+
+		// Hot-swap drops the protocol declaration — a permanent rejection, not a transient one.
+		let mut broken = tls_route("tenant.example.com", CERT_A, KEY_A);
+		broken.source_address_mode = SourceAddressMode::XForwardedFor;
+		// protocol left at its default (Opaque) — undeclared.
+		let swapped = build_route_table(&[broken], &ListenerTlsSpec::empty(), Some(&live)).expect("hot-swap must not fail");
+		assert!(
+			swapped.resolve(Some("tenant.example.com")).is_none(),
+			"a permanent protocol-declaration rejection must drop the route, not silently carry the previous one forward"
 		);
 	}
 
