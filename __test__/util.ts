@@ -442,6 +442,59 @@ export function tlsAlpn(opts: {
 	});
 }
 
+export interface TlsHandshakeResult {
+	/** True when the server accepted the offered session (ticket or session ID). */
+	reused: boolean;
+	protocol: string | null;
+	/** The session to offer on a subsequent connect, or undefined if the server issued none. */
+	session?: Buffer;
+}
+
+/**
+ * Complete one TLS handshake and report whether it resumed, plus the session to reuse next time.
+ * TLS 1.3 tickets arrive *after* the handshake (the 'session' event), so a fresh connection has
+ * to linger briefly for one; a resumed connection is reported as soon as the handshake completes.
+ */
+export function tlsHandshake(opts: {
+	port: number;
+	host?: string;
+	servername: string;
+	caCert?: string;
+	session?: Buffer;
+	maxVersion?: 'TLSv1.2' | 'TLSv1.3';
+	/** How long to wait for a post-handshake session ticket. */
+	ticketWaitMs?: number;
+}): Promise<TlsHandshakeResult> {
+	return new Promise((resolve, reject) => {
+		const { port, host = '127.0.0.1', servername, caCert, session, maxVersion, ticketWaitMs = 1000 } = opts;
+		const socket = tls.connect(
+			{ port, host, servername, ca: caCert, rejectUnauthorized: false, session, minVersion: 'TLSv1.2', maxVersion },
+			() => {
+				const result: TlsHandshakeResult = {
+					reused: socket.isSessionReused(),
+					protocol: socket.getProtocol(),
+					// TLS 1.2 hands the session over at handshake time; 1.3 does not.
+					session: socket.getSession() ?? undefined,
+				};
+				let settled = false;
+				const finish = () => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timer);
+					socket.end();
+					resolve(result);
+				};
+				socket.once('session', (s: Buffer) => {
+					result.session = s;
+					finish();
+				});
+				const timer = setTimeout(finish, result.reused ? 100 : ticketWaitMs);
+			},
+		);
+		socket.on('error', reject);
+	});
+}
+
 /** Send data through a raw TCP connection and return the echoed response. */
 export function tcpRoundTrip(opts: { port: number; host?: string; data: Buffer | string }): Promise<Buffer> {
 	return new Promise((resolve, reject) => {

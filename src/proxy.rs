@@ -10,6 +10,7 @@ use crate::router::{
 	RouteProtocol, RouteSpec, SourceAddressMode, UpstreamSpec,
 };
 use crate::suspended::{build_resolved_route, ResolveSpec, ResolveUpstream, SuspendedRegistry};
+use crate::tls::TlsConfigCache;
 use ipnetwork::IpNetwork;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunction;
@@ -300,6 +301,9 @@ pub struct SymphonyProxyWrap {
 	listener_states: Vec<ListenerState>,
 	// Interior mutability for start/stop
 	shutdown_tx: Mutex<Option<broadcast::Sender<()>>>,
+	// Outlives every route-table build so an unchanged cert keeps the same ServerConfig — and
+	// with it the TLS session cache and ticket keys — across hot-swaps.
+	tls_cache: Mutex<TlsConfigCache>,
 	js_emit: Arc<ThreadsafeFunction<JsEvent>>,
 	// Dedicated multi-thread runtime for all proxy I/O.
 	// napi's tokio_rt runs a single-threaded executor; spawning proxy tasks there
@@ -405,8 +409,10 @@ impl SymphonyProxyWrap {
 			.iter()
 			.map(parse_route_spec)
 			.collect::<Result<Vec<_>>>()?;
-		let table = build_route_table(&specs, &default_listener_tls, None)
+		let mut tls_cache = TlsConfigCache::new();
+		let table = build_route_table(&specs, &default_listener_tls, None, &mut tls_cache)
 			.map_err(|e| napi::Error::from_reason(e.to_string()))?;
+		tls_cache.retain_used();
 
 		// Set up threadsafe event emitter
 		let js_emit: ThreadsafeFunction<JsEvent> = emit_fn
@@ -460,6 +466,7 @@ impl SymphonyProxyWrap {
 			global_metrics: Arc::new(GlobalMetrics::default()),
 			listener_states,
 			shutdown_tx: Mutex::new(None),
+			tls_cache: Mutex::new(tls_cache),
 			js_emit: Arc::new(js_emit),
 			rt: Mutex::new(Some(rt)),
 			rt_handle,
@@ -584,8 +591,17 @@ impl SymphonyProxyWrap {
 			// rebuild (mid-rotation KeyMismatch) retains its last-good cert instead of
 			// dropping the SNI from the live table.
 			let current = self.route_table.0.load();
-			let table = build_route_table(&specs, &self.default_listener_tls, Some(&current))
-				.map_err(|e| napi::Error::from_reason(e.to_string()))?;
+			let mut cache = self
+				.tls_cache
+				.lock()
+				.map_err(|_| napi::Error::from_reason("tls config cache poisoned"))?;
+			let table =
+				build_route_table(&specs, &self.default_listener_tls, Some(&current), &mut cache)
+					.map_err(|e| napi::Error::from_reason(e.to_string()))?;
+			drop(cache);
+			// Not swept here: a later validation failure aborts the whole update, and retiring
+			// configs for a table that never goes live would drop the running table's session
+			// state. The sweep happens at the commit point below.
 			Some(table)
 		} else {
 			None
@@ -630,6 +646,11 @@ impl SymphonyProxyWrap {
 		// All validation passed — apply atomically (routes then protection, neither applied on any error above).
 		if let Some(table) = new_route_table {
 			self.route_table.swap(table);
+			// Committed — now retire the ServerConfigs (and their session state) that no route
+			// in the new table asked for, i.e. rotated-out certs.
+			if let Ok(mut cache) = self.tls_cache.lock() {
+				cache.retain_used();
+			}
 		}
 		if let Some((protection_updates, parsed)) = validated_protection {
 			// Phase 3: store all (infallible — validation above guarantees each port is valid).
