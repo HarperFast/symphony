@@ -1,7 +1,7 @@
 use crate::error::{Result, SymphonyError};
 use crate::mtls::SymphonyClientVerifier;
 use rustls::ServerConfig;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
@@ -19,16 +19,45 @@ pub struct MtlsSpec {
 	pub require_client_cert: bool,
 }
 
+/// key: (cert_sha256, mtls_sha256_or_zeros, http2)
+type CacheKey = ([u8; 32], [u8; 32], bool);
+
 /// Builds and deduplicates Arc<ServerConfig> instances.
 /// Routes sharing identical cert + mTLS config share one allocation.
+///
+/// The cache **outlives a single route-table build** — it is owned by the proxy and threaded
+/// through every `build_route_table`. That is load-bearing for TLS session resumption, not just
+/// an allocation saving: each `ServerConfig` owns its own session store and ticket keys (see
+/// `build_server_config`), so minting a new one for an unchanged cert silently invalidates every
+/// outstanding client ticket. Reloads are frequent — a route add/remove or an on-disk cert
+/// renewal rebuilds the whole table — so a per-build cache means clients almost never get to
+/// resume. Keying on the cert bytes gives exactly the right lifetime: session state survives as
+/// long as the cert it was issued under, and rotating a cert retires it.
 pub struct TlsConfigCache {
-	// key: (cert_sha256, mtls_sha256_or_zeros, http2) -> Arc<ServerConfig>
-	cache: HashMap<([u8; 32], [u8; 32], bool), Arc<ServerConfig>>,
+	cache: HashMap<CacheKey, Arc<ServerConfig>>,
+	/// Keys touched since the last `retain_used()` — the mark half of mark-and-sweep.
+	used: HashSet<CacheKey>,
 }
 
 impl TlsConfigCache {
 	pub fn new() -> Self {
-		Self { cache: HashMap::new() }
+		Self { cache: HashMap::new(), used: HashSet::new() }
+	}
+
+	/// Drop every entry not requested since the previous sweep, retiring rotated-out certs.
+	/// Callers run this once they *commit* the table they just built — see `build_route_table`.
+	pub fn retain_used(&mut self) {
+		let used = std::mem::take(&mut self.used);
+		self.cache.retain(|k, _| used.contains(k));
+	}
+
+	/// Number of live `ServerConfig`s held.
+	pub fn len(&self) -> usize {
+		self.cache.len()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.cache.is_empty()
 	}
 
 	pub fn get_or_build(
@@ -50,11 +79,14 @@ impl TlsConfigCache {
 
 		let cache_key = (cert_key, mtls_key, http2);
 		if let Some(cfg) = self.cache.get(&cache_key) {
+			// Mark before returning: a hit is exactly as much "still in use" as a miss.
+			self.used.insert(cache_key);
 			return Ok(cfg.clone());
 		}
 
 		let cfg = build_server_config(cert, mtls, http2)?;
 		self.cache.insert(cache_key, cfg.clone());
+		self.used.insert(cache_key);
 		Ok(cfg)
 	}
 }
@@ -103,6 +135,13 @@ fn build_server_config(cert: &CertSpec, mtls: Option<&MtlsSpec>, http2: bool) ->
 	// - session_storage: handles TLS 1.2 session ID resumption.
 	// - ticketer: handles TLS 1.3 PSK-based session ticket resumption (primary
 	//   path for modern clients).
+	//
+	// Both live *on this ServerConfig*: the cache entries and the ticketer's random keys die
+	// with it. Rebuilding a config for an unchanged cert therefore looks like a no-op but
+	// invalidates every ticket already handed out — which is why TlsConfigCache is owned by the
+	// proxy and survives route-table rebuilds instead of being created per build. Keep them
+	// per-config rather than process-global: a ticket minted under one tenant's cert should not
+	// be resumable against another tenant's route.
 	if http2 {
 		cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 	}
