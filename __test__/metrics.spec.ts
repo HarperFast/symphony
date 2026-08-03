@@ -273,7 +273,7 @@ describe('route metric identity validation', () => {
 		assert.throws(() => new SymphonyProxy(config('tenant\rbreak')), /metricsGroup must not contain control characters/);
 	});
 
-	it('bounds configured route labels and rejects duplicate route keys', () => {
+	it('bounds configured route labels and isolates duplicate route keys', () => {
 		const oversized = config('tenant');
 		oversized.routes[0].sni = 'x'.repeat(256);
 		assert.throws(() => new SymphonyProxy(oversized), /route SNI exceeds 255 UTF-8 bytes/);
@@ -284,10 +284,16 @@ describe('route metric identity validation', () => {
 
 		const duplicate = config('tenant');
 		duplicate.routes[0].sni = '*.tenant.test';
-		assert.throws(
-			() => new SymphonyProxy({ ...duplicate, routes: [duplicate.routes[0], { ...duplicate.routes[0] }] }),
-			/duplicate route SNI '\*\.tenant\.test'/
+		const sibling = { ...duplicate.routes[0], sni: 'healthy.test' };
+		const proxy = new SymphonyProxy({
+			...duplicate,
+			routes: [duplicate.routes[0], { ...duplicate.routes[0] }, sibling],
+		});
+		assert.deepEqual(
+			proxy.metrics().routeMetrics.map((route) => route.route),
+			['*.tenant.test', 'healthy.test']
 		);
+		assert.equal(proxy.metrics().failingRoutes, 1);
 	});
 });
 

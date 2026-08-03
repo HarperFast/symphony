@@ -205,6 +205,7 @@ impl RouteMetrics {
 
 	pub fn inc_error(&self, kind: ErrorKind) {
 		debug_assert!(kind.is_route_scoped(), "pre-route error attributed to a route");
+		// Fail loud in tests/debug builds, but do not corrupt a route series in release builds.
 		if kind.is_route_scoped() {
 			self.errors_by_kind[kind as usize].fetch_add(1, Ordering::Relaxed);
 		}
@@ -222,6 +223,11 @@ impl RouteMetrics {
 			})
 			.collect()
 	}
+}
+
+pub fn inc_route_error(listener: &ListenerMetrics, route: &RouteMetrics, kind: ErrorKind) {
+	listener.inc_error(kind);
+	route.inc_error(kind);
 }
 
 pub struct RouteActiveGuard {
