@@ -203,6 +203,10 @@ impl RouteMetrics {
 		self.bytes_in.fetch_add(bytes, Ordering::Relaxed);
 	}
 
+	pub fn add_bytes_out(&self, bytes: u64) {
+		self.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+	}
+
 	pub fn inc_error(&self, kind: ErrorKind) {
 		debug_assert!(kind.is_route_scoped(), "pre-route error attributed to a route");
 		// Fail loud in tests/debug builds, but do not corrupt a route series in release builds.
@@ -331,14 +335,14 @@ impl<'a, S> CountingStream<'a, S> {
 	fn publish_in(&self, bytes: u64) {
 		self.listener_metrics.bytes_in.fetch_add(bytes, Ordering::Relaxed);
 		if let Some(metrics) = self.route_metrics {
-			metrics.bytes_in.fetch_add(bytes, Ordering::Relaxed);
+			metrics.add_bytes_in(bytes);
 		}
 	}
 
 	fn publish_out(&self, bytes: u64) {
 		self.listener_metrics.bytes_out.fetch_add(bytes, Ordering::Relaxed);
 		if let Some(metrics) = self.route_metrics {
-			metrics.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+			metrics.add_bytes_out(bytes);
 		}
 	}
 

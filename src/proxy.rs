@@ -219,9 +219,9 @@ pub struct JsProxyMetrics {
 	pub suspended_unresolved: f64,
 	/// Routes currently in the live table, including the default route.
 	pub routes: f64,
-	/// Routes rejected at build time — a cert that failed to build, or a route that failed the
-	/// protocol/carrier validation — either dropped, or (cert failures only) serving a
-	/// carried-forward last-good cert.
+	/// Routes rejected at build time — a cert failure, protocol/carrier validation failure, or
+	/// duplicate wildcard — either dropped, or (cert failures only) serving a carried-forward
+	/// last-good cert.
 	pub failing_routes: f64,
 	pub listeners: Vec<JsListenerMetrics>,
 	/// Per-configured-route metrics, aggregated across this proxy's listeners.

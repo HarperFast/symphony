@@ -384,15 +384,16 @@ pub fn build_route_table(
 	let mut wildcard: Vec<(Arc<str>, Route)> = Vec::new();
 	let mut monitored_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
 	let mut failing_snis: HashSet<Arc<str>> = HashSet::new();
-	let mut configured_snis = HashSet::with_capacity(specs.len());
+	let mut configured_wildcards = HashSet::with_capacity(specs.len());
 	let mut dropped_exact: HashSet<Arc<str>> = HashSet::new();
 	let mut dropped_wildcard: Vec<Arc<str>> = Vec::new();
 
 	for spec in specs {
-		// One configured SNI can resolve to only one live route. Keep the first successfully
-		// built occurrence and isolate later duplicates rather than letting one bad entry abort
-		// every co-tenant on this port-set.
-		if configured_snis.contains(spec.sni.as_str()) {
+		// Exact duplicates already collapse last-wins in `exact`. Wildcards live in a Vec and
+		// resolve first-wins, so isolate later live duplicates to keep that routing behavior while
+		// ensuring the metric table cannot expose two identical configured route labels.
+		let wildcard_suffix = spec.sni.strip_prefix("*.");
+		if wildcard_suffix.is_some_and(|suffix| configured_wildcards.contains(suffix)) {
 			let newly_failing = previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
 			failing_snis.insert(Arc::from(spec.sni.as_str()));
 			if newly_failing {
@@ -480,7 +481,9 @@ pub fn build_route_table(
 				route.metric_identity = previous_route.metric_identity.clone();
 			}
 		}
-		configured_snis.insert(spec.sni.as_str());
+		if let Some(suffix) = wildcard_suffix {
+			configured_wildcards.insert(suffix);
+		}
 
 		// Collect UdsBalancers that have pid/tid slots for the monitor task.
 		for dest in std::iter::once(&route.destination).chain(route.destination_h2.iter()) {
@@ -999,6 +1002,18 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		assert_eq!(table.metric_identities().len(), 1);
 		assert!(table.resolve(Some("app.tenant.example.com")).is_some());
 		assert_eq!(table.failing_route_count(), 1);
+	}
+
+	#[test]
+	fn duplicate_exact_route_preserves_last_wins_behavior() {
+		let mut first = tls_route("tenant.example.com", CERT_A, KEY_A);
+		first.metrics_group = "first".to_string();
+		let mut second = first.clone();
+		second.metrics_group = "second".to_string();
+		let table = build_route_table(&[first, second], &ListenerTlsSpec::empty(), None).expect("build");
+		assert_eq!(table.metric_identities().len(), 1);
+		assert_eq!(table.metric_identities()[0].group.as_ref(), "second");
+		assert_eq!(table.failing_route_count(), 0);
 	}
 
 	// Unlike a cert-build failure (a transient race that heals on the next reconcile), a
