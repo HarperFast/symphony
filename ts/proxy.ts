@@ -294,7 +294,7 @@ export class SymphonyProxy extends EventEmitter {
 				blockedByReason: l.blockedByReason.map((c) => ({ reason: c.reason, count: c.count })),
 				errorsByReason: l.errorsByReason.map((c) => ({ reason: c.reason, count: c.count })),
 			})),
-			routeMetrics: m.routeMetrics.map((r) => ({
+			routeMetrics: (m.routeMetrics ?? []).map((r) => ({
 				route: r.route,
 				metricsGroup: r.metricsGroup,
 				activeConnections: r.activeConnections,

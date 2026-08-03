@@ -89,7 +89,7 @@ console.log('proxy listening on :443');
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `sni` | `string` | required | Hostname for exact match, or `'*.suffix'` for wildcard, or `''` for default (maximum 255 UTF-8 bytes; no control characters; duplicate values are rejected) |
+| `sni` | `string` | required | Hostname for exact match, or `'*.suffix'` for wildcard, or `''` for default (maximum 255 UTF-8 bytes; no control characters; later duplicate values are skipped) |
 | `metricsGroup` | `string` | — | Stable grouping key for aggregating several domain routes as one tenant (maximum 128 UTF-8 bytes; no control characters) |
 | `upstreams` | `Upstream[]` | required | Destination(s); multiple UDS upstreams are load-balanced |
 | `terminateTls` | `boolean` | required | `true` = decrypt TLS; `false` = TCP passthrough |

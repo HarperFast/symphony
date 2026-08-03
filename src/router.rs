@@ -379,25 +379,28 @@ pub fn build_route_table(
 	listener_tls: &ListenerTlsSpec,
 	previous: Option<&RouteTable>,
 ) -> crate::error::Result<RouteTable> {
-	let mut configured_snis = HashSet::with_capacity(specs.len());
-	for spec in specs {
-		if !configured_snis.insert(spec.sni.as_str()) {
-			return Err(crate::error::SymphonyError::Config(format!(
-				"duplicate route SNI '{}'",
-				spec.sni
-			)));
-		}
-	}
-
 	let mut cache = TlsConfigCache::new();
 	let mut exact: HashMap<Arc<str>, Route> = HashMap::new();
 	let mut wildcard: Vec<(Arc<str>, Route)> = Vec::new();
 	let mut monitored_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
 	let mut failing_snis: HashSet<Arc<str>> = HashSet::new();
+	let mut configured_snis = HashSet::with_capacity(specs.len());
 	let mut dropped_exact: HashSet<Arc<str>> = HashSet::new();
 	let mut dropped_wildcard: Vec<Arc<str>> = Vec::new();
 
 	for spec in specs {
+		// One configured SNI can resolve to only one live route. Keep the first successfully
+		// built occurrence and isolate later duplicates rather than letting one bad entry abort
+		// every co-tenant on this port-set.
+		if configured_snis.contains(spec.sni.as_str()) {
+			let newly_failing = previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
+			failing_snis.insert(Arc::from(spec.sni.as_str()));
+			if newly_failing {
+				eprintln!("symphony: skipping duplicate route '{}': duplicate SNI", spec.sni);
+			}
+			continue;
+		}
+
 		// The protocol/no-carrier declaration checks are validated before any cert/TLS work, and
 		// deliberately never carried forward on a hot-swap even if a last-good route exists: unlike
 		// a cert failure (a transient race between two non-atomic file writes that heals on its own
@@ -477,6 +480,7 @@ pub fn build_route_table(
 				route.metric_identity = previous_route.metric_identity.clone();
 			}
 		}
+		configured_snis.insert(spec.sni.as_str());
 
 		// Collect UdsBalancers that have pid/tid slots for the monitor task.
 		for dest in std::iter::once(&route.destination).chain(route.destination_h2.iter()) {
@@ -988,14 +992,13 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	}
 
 	#[test]
-	fn duplicate_route_identity_is_rejected() {
+	fn duplicate_route_identity_is_isolated() {
 		let route = tls_route("*.tenant.example.com", CERT_A, KEY_A);
-		let result = build_route_table(&[route.clone(), route], &ListenerTlsSpec::empty(), None);
-		let error = match result {
-			Ok(_) => panic!("duplicate route must be rejected"),
-			Err(error) => error,
-		};
-		assert!(error.to_string().contains("duplicate route SNI '*.tenant.example.com'"));
+		let table = build_route_table(&[route.clone(), route], &ListenerTlsSpec::empty(), None)
+			.expect("a duplicate must not abort the table");
+		assert_eq!(table.metric_identities().len(), 1);
+		assert!(table.resolve(Some("app.tenant.example.com")).is_some());
+		assert_eq!(table.failing_route_count(), 1);
 	}
 
 	// Unlike a cert-build failure (a transient race that heals on the next reconcile), a

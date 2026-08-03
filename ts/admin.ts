@@ -223,7 +223,7 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 			}
 		}
 
-		for (const route of metrics.routeMetrics) {
+		for (const route of metrics.routeMetrics ?? []) {
 			const tags = { ...proxy, route: route.route, group: route.metricsGroup };
 
 			out.sample(

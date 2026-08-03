@@ -17,7 +17,7 @@ use crate::http_proxy::{
 	host_header, read_http_headers, request_target, strip_body_framing, with_connection_close,
 };
 use crate::listener::{make_reuseport_socket, set_rlimit_nofile};
-use crate::metrics::{BlockKind, CountingStream, ErrorKind, RouteActiveGuard};
+use crate::metrics::{BlockKind, CountingStream, ErrorKind, RouteActiveGuard, inc_route_error};
 use crate::proxy_conn::ConnContext;
 use crate::upstream::{self, UpstreamStream};
 use std::net::SocketAddr;
@@ -202,7 +202,7 @@ async fn proxy_acme(
 	// a flood of /.well-known/acme-challenge/ requests can't bypass the cap.
 	if let Some(rl) = &route.rate_limiter {
 		if !rl.try_acquire() {
-			inc_route_error(ctx, &route.metric_identity.counters, ErrorKind::RouteRateLimited);
+			inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::RouteRateLimited);
 			return;
 		}
 	}
@@ -211,7 +211,7 @@ async fn proxy_acme(
 		Ok(upstream) => upstream,
 		Err(e) => {
 			tracing::debug!("acme upstream connect failed for {host}: {e}");
-			inc_route_error(ctx, &route.metric_identity.counters, ErrorKind::UpstreamConnect);
+			inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::UpstreamConnect);
 			return;
 		}
 	};
@@ -249,13 +249,8 @@ async fn proxy_acme(
 	// the upstream outcome.  The HTTP-mode listener never reuses connections.
 	let _ = client.shutdown().await;
 	if result.is_err() {
-		inc_route_error(ctx, &route.metric_identity.counters, ErrorKind::Stream);
+		inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::Stream);
 	}
-}
-
-fn inc_route_error(ctx: &ConnContext, route_metrics: &crate::metrics::RouteMetrics, kind: ErrorKind) {
-	ctx.listener_metrics.inc_error(kind);
-	route_metrics.inc_error(kind);
 }
 
 /// Send the (sanitized, body-less) request `headers` to `upstream`, then copy

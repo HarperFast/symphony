@@ -1,4 +1,6 @@
-use crate::metrics::{BlockKind, CountingStream, ErrorKind, GlobalMetrics, ListenerMetrics, RouteActiveGuard};
+use crate::metrics::{
+	BlockKind, CountingStream, ErrorKind, GlobalMetrics, ListenerMetrics, RouteActiveGuard, inc_route_error,
+};
 use crate::protection::{IpState, ProtectionState};
 use crate::router::{
 	Destination, ForwardFingerprint, LiveRouteTable, RouteMetricIdentity, RouteProtocol, SourceAddressMode,
@@ -144,7 +146,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	// ── 3b. Per-route rate limit ──────────────────────────────────────────────
 	if let Some(rl) = &route.rate_limiter {
 		if !rl.try_acquire() {
-			inc_route_error(&ctx, &route.metric_identity, ErrorKind::RouteRateLimited);
+			inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::RouteRateLimited);
 			return;
 		}
 	}
@@ -167,7 +169,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 			_ => {
 				ctx.suspended_registry.remove(id);
 				ctx.global_metrics.dec_suspended(false);
-				inc_route_error(&ctx, &route.metric_identity, ErrorKind::SuspendUnresolved);
+				inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::SuspendUnresolved);
 				return; // Timed out or rejected
 			}
 		};
@@ -233,17 +235,17 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 				}
 				Ok(Err(e)) => {
 					tracing::debug!("TLS handshake error from {peer_ip}: {e}");
-					inc_route_error(&ctx, &route.metric_identity, ErrorKind::TlsHandshake);
+					inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::TlsHandshake);
 					return;
 				}
 				Err(_) => {
 					tracing::debug!("TLS handshake timeout from {peer_ip}");
-					inc_route_error(&ctx, &route.metric_identity, ErrorKind::TlsHandshake);
+					inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::TlsHandshake);
 					return;
 				}
 			}
 		} else {
-			inc_route_error(&ctx, &route.metric_identity, ErrorKind::TlsMissingCert);
+			inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::TlsMissingCert);
 			return;
 		}
 	} else {
@@ -252,7 +254,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	};
 
 	if let Err(kind) = upstream_result {
-		inc_route_error(&ctx, &route.metric_identity, kind);
+		inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, kind);
 	}
 }
 
@@ -584,11 +586,6 @@ struct ActiveGuard {
 	/// eviction removed it from the map between admission and connection close.
 	/// None for allowlisted connections (active counter was not incremented).
 	ip_state: Option<Arc<IpState>>,
-}
-
-fn inc_route_error(ctx: &ConnContext, identity: &RouteMetricIdentity, kind: ErrorKind) {
-	ctx.listener_metrics.inc_error(kind);
-	identity.counters.inc_error(kind);
 }
 
 impl Drop for ActiveGuard {
