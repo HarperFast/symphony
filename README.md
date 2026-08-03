@@ -89,7 +89,7 @@ console.log('proxy listening on :443');
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `sni` | `string` | required | Hostname for exact match, or `'*.suffix'` for wildcard, or `''` for default |
+| `sni` | `string` | required | Hostname for exact match, or `'*.suffix'` for wildcard, or `''` for default (maximum 255 UTF-8 bytes; no control characters; duplicate values are rejected) |
 | `metricsGroup` | `string` | — | Stable grouping key for aggregating several domain routes as one tenant (maximum 128 UTF-8 bytes; no control characters) |
 | `upstreams` | `Upstream[]` | required | Destination(s); multiple UDS upstreams are load-balanced |
 | `terminateTls` | `boolean` | required | `true` = decrypt TLS; `false` = TCP passthrough |
@@ -685,6 +685,7 @@ configured wildcard pattern (`*.example.com`) rather than the client-provided ho
 label cardinality bounded by configuration. Counters survive route hot reloads while both `sni`
 and `metricsGroup` are unchanged; changing the group starts a new series rather than moving
 historical counters between tenants.
+Removing or rejecting a route removes its series; adding that route again starts fresh counters.
 
 **Block reasons:** `max_connections`, `cidr_blocked`, `ja3_blocked`, `ja4_blocked`,
 `incomplete_handshake`, `no_sni`, `rate_limited`, `too_many_connections`, `penalty_boxed`.
