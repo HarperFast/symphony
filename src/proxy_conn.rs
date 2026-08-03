@@ -1,6 +1,8 @@
-use crate::metrics::{BlockKind, CountingStream, ErrorKind, GlobalMetrics, ListenerMetrics};
+use crate::metrics::{BlockKind, CountingStream, ErrorKind, GlobalMetrics, ListenerMetrics, RouteActiveGuard};
 use crate::protection::{IpState, ProtectionState};
-use crate::router::{Destination, ForwardFingerprint, LiveRouteTable, RouteProtocol, SourceAddressMode};
+use crate::router::{
+	Destination, ForwardFingerprint, LiveRouteTable, RouteMetricIdentity, RouteProtocol, SourceAddressMode,
+};
 use crate::sni;
 use crate::suspended::SuspendedRegistry;
 use crate::upstream::{self, UpstreamStream};
@@ -137,11 +139,12 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 			return; // No route and no default — drop
 		}
 	};
+	let _route_active_guard = RouteActiveGuard::new(route.metric_identity.counters.clone());
 
 	// ── 3b. Per-route rate limit ──────────────────────────────────────────────
 	if let Some(rl) = &route.rate_limiter {
 		if !rl.try_acquire() {
-			ctx.listener_metrics.inc_error(ErrorKind::RouteRateLimited);
+			inc_route_error(&ctx, &route.metric_identity, ErrorKind::RouteRateLimited);
 			return;
 		}
 	}
@@ -164,7 +167,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 			_ => {
 				ctx.suspended_registry.remove(id);
 				ctx.global_metrics.dec_suspended(false);
-				ctx.listener_metrics.inc_error(ErrorKind::SuspendUnresolved);
+				inc_route_error(&ctx, &route.metric_identity, ErrorKind::SuspendUnresolved);
 				return; // Timed out or rejected
 			}
 		};
@@ -226,30 +229,30 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 					// Header injection (XFF / X-JA3) never touches an h2 stream: forward()
 					// gates it on the route's declared protocol (RouteProtocol::Http) plus
 					// the negotiated ALPN, covering static and suspended-route configs alike.
-					proxy_via_tls(tls_stream, destination, sf, &ctx).await
+					proxy_via_tls(tls_stream, destination, sf, &ctx, &route.metric_identity).await
 				}
 				Ok(Err(e)) => {
 					tracing::debug!("TLS handshake error from {peer_ip}: {e}");
-					ctx.listener_metrics.inc_error(ErrorKind::TlsHandshake);
+					inc_route_error(&ctx, &route.metric_identity, ErrorKind::TlsHandshake);
 					return;
 				}
 				Err(_) => {
 					tracing::debug!("TLS handshake timeout from {peer_ip}");
-					ctx.listener_metrics.inc_error(ErrorKind::TlsHandshake);
+					inc_route_error(&ctx, &route.metric_identity, ErrorKind::TlsHandshake);
 					return;
 				}
 			}
 		} else {
-			ctx.listener_metrics.inc_error(ErrorKind::TlsMissingCert);
+			inc_route_error(&ctx, &route.metric_identity, ErrorKind::TlsMissingCert);
 			return;
 		}
 	} else {
 		// Passthrough — proxy raw TCP
-		proxy_raw(stream, &effective_route.destination, sf, &ctx).await
+		proxy_raw(stream, &effective_route.destination, sf, &ctx, &route.metric_identity).await
 	};
 
 	if let Err(kind) = upstream_result {
-		ctx.listener_metrics.inc_error(kind);
+		inc_route_error(&ctx, &route.metric_identity, kind);
 	}
 }
 
@@ -260,6 +263,7 @@ async fn proxy_via_tls(
 	dest: &Destination,
 	sf: SourceForwarding<'_>,
 	ctx: &ConnContext,
+	route_metrics: &RouteMetricIdentity,
 ) -> std::result::Result<(), ErrorKind> {
 	// TLS facts (incl. the verified mTLS client cert chain) forwarded via PROXY v2
 	// TLVs; only collected on routes that can carry them.
@@ -284,7 +288,7 @@ async fn proxy_via_tls(
 			ErrorKind::UpstreamConnect
 		})?;
 
-	let mut client = CountingStream::new(client, &ctx.listener_metrics);
+	let mut client = CountingStream::new(client, &ctx.listener_metrics, Some(&route_metrics.counters));
 
 	match &mut upstream {
 		UpstreamStream::Tcp(ref mut up) => forward(&mut client, up, &sf, l7_http1, ctx).await,
@@ -299,6 +303,7 @@ async fn proxy_raw(
 	dest: &Destination,
 	sf: SourceForwarding<'_>,
 	ctx: &ConnContext,
+	route_metrics: &RouteMetricIdentity,
 ) -> std::result::Result<(), ErrorKind> {
 	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
 		.await
@@ -307,7 +312,7 @@ async fn proxy_raw(
 			ErrorKind::UpstreamConnect
 		})?;
 
-	let mut client = CountingStream::new(client, &ctx.listener_metrics);
+	let mut client = CountingStream::new(client, &ctx.listener_metrics, Some(&route_metrics.counters));
 
 	// Passthrough forwards raw TLS bytes — never a plaintext HTTP/1 stream, so header injection
 	// is disabled (only PROXY protocol carriers apply here).
@@ -579,6 +584,11 @@ struct ActiveGuard {
 	/// eviction removed it from the map between admission and connection close.
 	/// None for allowlisted connections (active counter was not incremented).
 	ip_state: Option<Arc<IpState>>,
+}
+
+fn inc_route_error(ctx: &ConnContext, identity: &RouteMetricIdentity, kind: ErrorKind) {
+	ctx.listener_metrics.inc_error(kind);
+	identity.counters.inc_error(kind);
 }
 
 impl Drop for ActiveGuard {

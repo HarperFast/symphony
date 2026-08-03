@@ -61,9 +61,9 @@ const MAX_ADMIN_CONNECTIONS = 16;
 
 // ── Prometheus rendering ──────────────────────────────────────────────────────
 
-// Only `\`, `"` and newline are special in a label value (exposition format v0.0.4).
+// Text exposition permits LF line endings only, then escapes `\`, `"`, and LF in label values.
 function escapeLabel(value: string): string {
-	return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+	return value.replace(/\r\n?/g, '\n').replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
 }
 
 function labels(pairs: Record<string, string>): string {
@@ -217,6 +217,45 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 			}
 			for (const { reason, count } of l.errorsByReason) {
 				out.sample('symphony_listener_errors_total', 'counter', 'Connections that failed, by reason.', count, {
+					...tags,
+					reason,
+				});
+			}
+		}
+
+		for (const route of metrics.routeMetrics) {
+			const tags = { ...proxy, route: route.route, group: route.metricsGroup };
+
+			out.sample(
+				'symphony_route_active_connections',
+				'gauge',
+				'Connections currently assigned to a configured route, aggregated across proxy listeners.',
+				route.activeConnections,
+				tags
+			);
+			out.sample(
+				'symphony_route_connections_total',
+				'counter',
+				'Connections assigned to a configured route.',
+				route.connections,
+				tags
+			);
+			out.sample(
+				'symphony_route_bytes_received_total',
+				'counter',
+				'Bytes read from clients after route assignment (client → upstream).',
+				route.bytesReceived,
+				tags
+			);
+			out.sample(
+				'symphony_route_bytes_sent_total',
+				'counter',
+				'Bytes written to clients after route assignment (upstream → client).',
+				route.bytesSent,
+				tags
+			);
+			for (const { reason, count } of route.errorsByReason) {
+				out.sample('symphony_route_errors_total', 'counter', 'Post-route connection failures by reason.', count, {
 					...tags,
 					reason,
 				});

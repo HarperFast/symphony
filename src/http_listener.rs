@@ -17,7 +17,7 @@ use crate::http_proxy::{
 	host_header, read_http_headers, request_target, strip_body_framing, with_connection_close,
 };
 use crate::listener::{make_reuseport_socket, set_rlimit_nofile};
-use crate::metrics::{BlockKind, CountingStream, ErrorKind};
+use crate::metrics::{BlockKind, CountingStream, ErrorKind, RouteActiveGuard};
 use crate::proxy_conn::ConnContext;
 use crate::upstream::{self, UpstreamStream};
 use std::net::SocketAddr;
@@ -146,13 +146,14 @@ async fn handle_http(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<Conn
 	// through CountingStream. `_excess` is read from the client too, even though it is dropped.
 	ctx.listener_metrics
 		.add_bytes_in((headers.len() + _excess.len()) as u64);
+	let received_bytes = (headers.len() + _excess.len()) as u64;
 
 	let target = request_target(&headers);
 	let host = host_header(&headers);
 
 	if target.starts_with(ACME_PATH_PREFIX) {
 		if let Some(host) = host {
-			if let Err(kind) = proxy_acme(&mut stream, &headers, peer_addr, host, &ctx).await {
+			if let Err(kind) = proxy_acme(&mut stream, &headers, received_bytes, peer_addr, host, &ctx).await {
 				ctx.listener_metrics.inc_error(kind);
 			}
 			return;
@@ -184,33 +185,39 @@ async fn handle_http(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<Conn
 async fn proxy_acme(
 	client: &mut TcpStream,
 	headers: &[u8],
+	received_bytes: u64,
 	peer_addr: SocketAddr,
 	host: &str,
 	ctx: &ConnContext,
 ) -> std::result::Result<(), ErrorKind> {
 	let table = ctx.route_table.0.load();
-	let Some(route) = table.resolve(Some(host)) else {
+	let Some(route) = table.resolve(Some(host)).cloned() else {
 		// No matching route — answer 404 so the ACME client gets a definitive answer
 		// rather than a hung connection.
 		let _ = write_simple_response(client, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &ctx.listener_metrics).await;
 		return Err(ErrorKind::NoRoute);
 	};
+	drop(table);
+	let _route_guard = RouteActiveGuard::new(route.metric_identity.counters.clone());
+	route.metric_identity.counters.add_bytes_in(received_bytes);
 
 	// Honour the route's global rate limit the same way the TLS path does, so
 	// a flood of /.well-known/acme-challenge/ requests can't bypass the cap.
 	if let Some(rl) = &route.rate_limiter {
 		if !rl.try_acquire() {
+			route.metric_identity.counters.inc_error(ErrorKind::RouteRateLimited);
 			return Err(ErrorKind::RouteRateLimited);
 		}
 	}
 
-	let upstream =
-		upstream::connect(&route.destination, Some(peer_addr.ip()), UPSTREAM_CONNECT_TIMEOUT)
-			.await
-			.map_err(|e| {
-				tracing::debug!("acme upstream connect failed for {host}: {e}");
-				ErrorKind::UpstreamConnect
-			})?;
+	let upstream = match upstream::connect(&route.destination, Some(peer_addr.ip()), UPSTREAM_CONNECT_TIMEOUT).await {
+		Ok(upstream) => upstream,
+		Err(e) => {
+			tracing::debug!("acme upstream connect failed for {host}: {e}");
+			route.metric_identity.counters.inc_error(ErrorKind::UpstreamConnect);
+			return Err(ErrorKind::UpstreamConnect);
+		}
+	};
 
 	// ACME HTTP-01 challenges are GET requests with no body.  Strip any
 	// Content-Length / Transfer-Encoding headers so a client that lies about a
@@ -225,7 +232,11 @@ async fn proxy_acme(
 
 	// Scoped so the byte counter releases its borrow of `client` before the shutdown below.
 	let result = {
-		let mut counted = CountingStream::new(&mut *client, &ctx.listener_metrics);
+		let mut counted = CountingStream::new(
+			&mut *client,
+			&ctx.listener_metrics,
+			Some(&route.metric_identity.counters),
+		);
 		match upstream {
 			UpstreamStream::Tcp(mut up) => proxy_one_shot(&mut counted, &mut up, &forwarded).await,
 			UpstreamStream::Uds { mut stream, _guard } => {
@@ -239,7 +250,10 @@ async fn proxy_acme(
 	// Always close the client socket after one request/response, regardless of
 	// the upstream outcome.  The HTTP-mode listener never reuses connections.
 	let _ = client.shutdown().await;
-	result.map_err(|_| ErrorKind::Stream)
+	result.map_err(|_| {
+		route.metric_identity.counters.inc_error(ErrorKind::Stream);
+		ErrorKind::Stream
+	})
 }
 
 /// Send the (sanitized, body-less) request `headers` to `upstream`, then copy

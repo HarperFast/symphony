@@ -60,6 +60,8 @@ export interface RouteConfig {
 	 * left-label (e.g. "*.example.com"). Use "" for the default/catch-all route.
 	 */
 	sni: string;
+	/** Stable grouping key for aggregating several domain routes as one tenant. Maximum 128 UTF-8 bytes. */
+	metricsGroup?: string;
 	upstreams: Upstream[];
 	/**
 	 * When true, the proxy terminates TLS and forwards plaintext to the upstream.
@@ -328,6 +330,21 @@ export interface ListenerMetrics {
 	errorsByReason: LabeledCount[];
 }
 
+export interface RouteMetrics {
+	/** Configured exact SNI or wildcard pattern, never the client-provided hostname. */
+	route: string;
+	/** Grouping key from route configuration; empty when not configured. */
+	metricsGroup: string;
+	activeConnections: number;
+	/** Connections that matched this route since process start. */
+	connections: number;
+	errors: number;
+	bytesReceived: number;
+	bytesSent: number;
+	/** Sparse post-route failures; zero-valued reasons are omitted. */
+	errorsByReason: LabeledCount[];
+}
+
 export interface ProxyMetrics {
 	/** Number of connections currently being proxied. */
 	activeConnections: number;
@@ -349,6 +366,8 @@ export interface ProxyMetrics {
 	failingRoutes: number;
 	/** Per-listener breakdown, in configuration order. */
 	listeners: ListenerMetrics[];
+	/** Per-configured-route metrics, aggregated across this proxy's listeners. */
+	routeMetrics: RouteMetrics[];
 }
 
 export interface BlockedIpsInfo {

@@ -1,5 +1,6 @@
 use crate::protection::BlockReason;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -81,6 +82,12 @@ labeled_enum!(ErrorKind {
 	HttpHeader => "http_header",
 });
 
+impl ErrorKind {
+	pub fn is_route_scoped(self) -> bool {
+		!matches!(self, Self::NoRoute | Self::HttpHeader)
+	}
+}
+
 /// Per-listener counters. Every field is `Relaxed` — these are monotonic counters and gauges
 /// read out of band by `metrics()`, never used to make a decision that needs ordering.
 pub struct ListenerMetrics {
@@ -158,6 +165,82 @@ impl ListenerMetrics {
 	}
 }
 
+/// Counters that begin after a configured route is selected. Pre-route blocks and errors remain
+/// listener-scoped because they have no trustworthy route identity.
+pub struct RouteMetrics {
+	pub active_connections: AtomicU64,
+	pub total_connections: AtomicU64,
+	pub bytes_in: AtomicU64,
+	pub bytes_out: AtomicU64,
+	errors_by_kind: [AtomicU64; ErrorKind::COUNT],
+}
+
+impl Default for RouteMetrics {
+	fn default() -> Self {
+		Self {
+			active_connections: AtomicU64::new(0),
+			total_connections: AtomicU64::new(0),
+			bytes_in: AtomicU64::new(0),
+			bytes_out: AtomicU64::new(0),
+			errors_by_kind: std::array::from_fn(|_| AtomicU64::new(0)),
+		}
+	}
+}
+
+impl RouteMetrics {
+	fn inc_active(&self) {
+		self.active_connections.fetch_add(1, Ordering::Relaxed);
+		self.total_connections.fetch_add(1, Ordering::Relaxed);
+	}
+
+	fn dec_active(&self) {
+		let _ = self
+			.active_connections
+			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_sub(1));
+	}
+
+	pub fn add_bytes_in(&self, bytes: u64) {
+		self.bytes_in.fetch_add(bytes, Ordering::Relaxed);
+	}
+
+	pub fn inc_error(&self, kind: ErrorKind) {
+		debug_assert!(kind.is_route_scoped(), "pre-route error attributed to a route");
+		if kind.is_route_scoped() {
+			self.errors_by_kind[kind as usize].fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	/// Route error series are sparse to keep scrape cardinality proportional to failures rather
+	/// than multiplying every zero-valued reason by every configured tenant route.
+	pub fn errors_by_reason(&self) -> Vec<(&'static str, u64)> {
+		ErrorKind::ALL
+			.iter()
+			.filter(|kind| kind.is_route_scoped())
+			.filter_map(|kind| {
+				let count = self.errors_by_kind[*kind as usize].load(Ordering::Relaxed);
+				(count > 0).then_some((kind.as_str(), count))
+			})
+			.collect()
+	}
+}
+
+pub struct RouteActiveGuard {
+	metrics: Arc<RouteMetrics>,
+}
+
+impl RouteActiveGuard {
+	pub fn new(metrics: Arc<RouteMetrics>) -> Self {
+		metrics.inc_active();
+		Self { metrics }
+	}
+}
+
+impl Drop for RouteActiveGuard {
+	fn drop(&mut self) {
+		self.metrics.dec_active();
+	}
+}
+
 /// Sums a per-reason breakdown into its total.
 ///
 /// The exported totals are derived from the same values the breakdown reports rather than kept
@@ -228,20 +311,35 @@ const COUNTER_FLUSH_BYTES: u64 = 256 * 1024;
 /// read here came *from* the client, bytes written here go *to* the client.
 pub struct CountingStream<'a, S> {
 	inner: S,
-	metrics: &'a ListenerMetrics,
+	listener_metrics: &'a ListenerMetrics,
+	route_metrics: Option<&'a RouteMetrics>,
 	pending_in: u64,
 	pending_out: u64,
 }
 
 impl<'a, S> CountingStream<'a, S> {
-	pub fn new(inner: S, metrics: &'a ListenerMetrics) -> Self {
-		Self { inner, metrics, pending_in: 0, pending_out: 0 }
+	pub fn new(inner: S, listener_metrics: &'a ListenerMetrics, route_metrics: Option<&'a RouteMetrics>) -> Self {
+		Self { inner, listener_metrics, route_metrics, pending_in: 0, pending_out: 0 }
+	}
+
+	fn publish_in(&self, bytes: u64) {
+		self.listener_metrics.bytes_in.fetch_add(bytes, Ordering::Relaxed);
+		if let Some(metrics) = self.route_metrics {
+			metrics.bytes_in.fetch_add(bytes, Ordering::Relaxed);
+		}
+	}
+
+	fn publish_out(&self, bytes: u64) {
+		self.listener_metrics.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+		if let Some(metrics) = self.route_metrics {
+			metrics.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+		}
 	}
 
 	fn record_in(&mut self, bytes: u64) {
 		self.pending_in += bytes;
 		if self.pending_in >= COUNTER_FLUSH_BYTES {
-			self.metrics.bytes_in.fetch_add(self.pending_in, Ordering::Relaxed);
+			self.publish_in(self.pending_in);
 			self.pending_in = 0;
 		}
 	}
@@ -249,7 +347,7 @@ impl<'a, S> CountingStream<'a, S> {
 	fn record_out(&mut self, bytes: u64) {
 		self.pending_out += bytes;
 		if self.pending_out >= COUNTER_FLUSH_BYTES {
-			self.metrics.bytes_out.fetch_add(self.pending_out, Ordering::Relaxed);
+			self.publish_out(self.pending_out);
 			self.pending_out = 0;
 		}
 	}
@@ -260,10 +358,10 @@ impl<'a, S> CountingStream<'a, S> {
 impl<S> Drop for CountingStream<'_, S> {
 	fn drop(&mut self) {
 		if self.pending_in > 0 {
-			self.metrics.bytes_in.fetch_add(self.pending_in, Ordering::Relaxed);
+			self.publish_in(self.pending_in);
 		}
 		if self.pending_out > 0 {
-			self.metrics.bytes_out.fetch_add(self.pending_out, Ordering::Relaxed);
+			self.publish_out(self.pending_out);
 		}
 	}
 }
@@ -361,7 +459,7 @@ mod tests {
 		let metrics = ListenerMetrics::default();
 		// duplex gives a paired in-memory stream; write into `peer` to be read through the counter.
 		let (client, mut peer) = tokio::io::duplex(64);
-		let mut counted = CountingStream::new(client, &metrics);
+		let mut counted = CountingStream::new(client, &metrics, None);
 
 		peer.write_all(b"hello").await.unwrap();
 		let mut buf = [0u8; 5];
@@ -384,7 +482,7 @@ mod tests {
 
 		let metrics = ListenerMetrics::default();
 		let (client, mut peer) = tokio::io::duplex(COUNTER_FLUSH_BYTES as usize * 4);
-		let mut counted = CountingStream::new(client, &metrics);
+		let mut counted = CountingStream::new(client, &metrics, None);
 
 		let chunk = vec![0u8; 8 * 1024];
 		let mut written = 0u64;
@@ -403,5 +501,47 @@ mod tests {
 		drop(counted);
 		peer.shutdown().await.ok();
 		assert_eq!(metrics.bytes_out.load(Ordering::Relaxed), written);
+	}
+
+	#[tokio::test]
+	async fn counting_stream_publishes_to_listener_and_route() {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+		let listener = ListenerMetrics::default();
+		let route = RouteMetrics::default();
+		let (client, mut peer) = tokio::io::duplex(64);
+		let mut counted = CountingStream::new(client, &listener, Some(&route));
+
+		peer.write_all(b"hello").await.unwrap();
+		let mut buf = [0u8; 5];
+		counted.read_exact(&mut buf).await.unwrap();
+		counted.write_all(b"world!").await.unwrap();
+		drop(counted);
+
+		assert_eq!(listener.bytes_in.load(Ordering::Relaxed), 5);
+		assert_eq!(listener.bytes_out.load(Ordering::Relaxed), 6);
+		assert_eq!(route.bytes_in.load(Ordering::Relaxed), 5);
+		assert_eq!(route.bytes_out.load(Ordering::Relaxed), 6);
+	}
+
+	#[test]
+	fn route_errors_are_sparse_and_route_scoped() {
+		let metrics = RouteMetrics::default();
+		assert!(metrics.errors_by_reason().is_empty());
+
+		metrics.inc_error(ErrorKind::UpstreamConnect);
+		assert_eq!(metrics.errors_by_reason(), vec![("upstream_connect", 1)]);
+	}
+
+	#[test]
+	fn route_active_gauge_does_not_underflow() {
+		let metrics = Arc::new(RouteMetrics::default());
+		let guard = RouteActiveGuard::new(metrics.clone());
+		assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 1);
+		assert_eq!(metrics.total_connections.load(Ordering::Relaxed), 1);
+		drop(guard);
+		assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 0);
+		metrics.dec_active();
+		assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 0);
 	}
 }

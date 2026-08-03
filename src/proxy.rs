@@ -54,6 +54,8 @@ pub struct JsMtlsConfig {
 #[napi(object)]
 pub struct JsRouteConfig {
 	pub sni: String,
+	/// Optional stable grouping key for aggregating several domain routes as one tenant.
+	pub metrics_group: Option<String>,
 	pub upstreams: Vec<JsUpstream>,
 	pub terminate_tls: bool,
 	pub cert: Option<JsCertConfig>,
@@ -189,6 +191,21 @@ pub struct JsListenerMetrics {
 	pub errors_by_reason: Vec<JsLabeledCount>,
 }
 
+#[napi(object)]
+pub struct JsRouteMetrics {
+	/// Configured exact SNI or wildcard pattern, never the client-provided hostname.
+	pub route: String,
+	/// Optional grouping key from route configuration; empty when not configured.
+	pub metrics_group: String,
+	pub active_connections: f64,
+	pub connections: f64,
+	pub errors: f64,
+	pub bytes_received: f64,
+	pub bytes_sent: f64,
+	/// Sparse post-route errors; zero-valued reasons are omitted.
+	pub errors_by_reason: Vec<JsLabeledCount>,
+}
+
 // Counters are reported as f64 because napi maps u64 to BigInt, which JSON.stringify cannot
 // serialise. f64 is exact to 2^53, so a byte counter stays exact past 9 PB per listener.
 #[napi(object)]
@@ -207,6 +224,8 @@ pub struct JsProxyMetrics {
 	/// carried-forward last-good cert.
 	pub failing_routes: f64,
 	pub listeners: Vec<JsListenerMetrics>,
+	/// Per-configured-route metrics, aggregated across this proxy's listeners.
+	pub route_metrics: Vec<JsRouteMetrics>,
 }
 
 #[napi(object)]
@@ -665,6 +684,23 @@ impl SymphonyProxyWrap {
 		// Likewise derived, so the proxy-wide total always equals the sum of the listener values
 		// in this same snapshot.
 		let blocked_connections = listeners.iter().map(|l| l.blocked).sum();
+		let route_metrics = table
+			.metric_identities()
+			.into_iter()
+			.map(|identity| {
+				let errors_by_reason = identity.counters.errors_by_reason();
+				JsRouteMetrics {
+					route: identity.route.to_string(),
+					metrics_group: identity.group.to_string(),
+					active_connections: identity.counters.active_connections.load(Ordering::Relaxed) as f64,
+					connections: identity.counters.total_connections.load(Ordering::Relaxed) as f64,
+					errors: total_of(&errors_by_reason) as f64,
+					bytes_received: identity.counters.bytes_in.load(Ordering::Relaxed) as f64,
+					bytes_sent: identity.counters.bytes_out.load(Ordering::Relaxed) as f64,
+					errors_by_reason: labeled_counts(errors_by_reason),
+				}
+			})
+			.collect();
 
 		JsProxyMetrics {
 			active_connections: self.global_metrics.active_connections.load(Ordering::Relaxed) as f64,
@@ -675,6 +711,7 @@ impl SymphonyProxyWrap {
 			routes: table.route_count() as f64,
 			failing_routes: table.failing_route_count() as f64,
 			listeners,
+			route_metrics,
 		}
 	}
 
@@ -795,6 +832,7 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 
 	let spec = RouteSpec {
 		sni: r.sni.clone(),
+		metrics_group: parse_metrics_group(r.metrics_group.as_deref(), &r.sni)?,
 		upstreams,
 		terminate_tls: r.terminate_tls,
 		cert_pem: r.cert.as_ref().map(|c| pem_bytes(&c.cert_chain)),
@@ -831,6 +869,23 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 		);
 	}
 	Ok(spec)
+}
+
+const MAX_METRICS_GROUP_BYTES: usize = 128;
+
+fn parse_metrics_group(group: Option<&str>, sni: &str) -> Result<String> {
+	let group = group.unwrap_or("");
+	if group.len() > MAX_METRICS_GROUP_BYTES {
+		return Err(napi::Error::from_reason(format!(
+			"route '{sni}': metricsGroup exceeds {MAX_METRICS_GROUP_BYTES} UTF-8 bytes"
+		)));
+	}
+	if group.chars().any(char::is_control) {
+		return Err(napi::Error::from_reason(format!(
+			"route '{sni}': metricsGroup must not contain control characters"
+		)));
+	}
+	Ok(group.to_string())
 }
 
 fn parse_upstream_spec(u: &JsUpstream, sni: &str) -> Result<UpstreamSpec> {

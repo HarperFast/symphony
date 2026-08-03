@@ -30,6 +30,8 @@ export interface JsMtlsConfig {
 }
 export interface JsRouteConfig {
   sni: string
+  /** Optional stable grouping key for aggregating several domain routes as one tenant. */
+  metricsGroup?: string
   upstreams: Array<JsUpstream>
   terminateTls: boolean
   cert?: JsCertConfig
@@ -158,6 +160,19 @@ export interface JsListenerMetrics {
   blockedByReason: Array<JsLabeledCount>
   errorsByReason: Array<JsLabeledCount>
 }
+export interface JsRouteMetrics {
+  /** Configured exact SNI or wildcard pattern, never the client-provided hostname. */
+  route: string
+  /** Optional grouping key from route configuration; empty when not configured. */
+  metricsGroup: string
+  activeConnections: number
+  connections: number
+  errors: number
+  bytesReceived: number
+  bytesSent: number
+  /** Sparse post-route errors; zero-valued reasons are omitted. */
+  errorsByReason: Array<JsLabeledCount>
+}
 export interface JsProxyMetrics {
   activeConnections: number
   blockedConnections: number
@@ -175,6 +190,8 @@ export interface JsProxyMetrics {
    */
   failingRoutes: number
   listeners: Array<JsListenerMetrics>
+  /** Per-configured-route metrics, aggregated across this proxy's listeners. */
+  routeMetrics: Array<JsRouteMetrics>
 }
 export interface JsBlockedIpsInfo {
   rateLimited: Array<string>
