@@ -290,8 +290,8 @@ impl GlobalMetrics {
 	}
 }
 
-/// Bytes a connection may accumulate locally before publishing to the shared listener counters.
-/// The whole point of the local buffer is to keep the shared cache line off the per-chunk path
+/// Bytes a connection may accumulate locally before publishing to shared counters.
+/// The whole point of the local buffer is to keep shared cache lines off the per-chunk path
 /// (see `CountingStream`), so this wants to be well above the per-direction copy buffer
 /// (`DEFAULT_COPY_BUFFER_SIZE`, 8 KiB) — at 256 KiB a saturated connection publishes ~32× less
 /// often than it would per chunk, while a scrape still sees a busy connection's traffic within a
@@ -302,9 +302,9 @@ const COUNTER_FLUSH_BYTES: u64 = 256 * 1024;
 /// than at completion. Counting `copy_bidirectional`'s return value instead would lose every
 /// byte of any session that ends by idle timeout or reset — i.e. most long-lived ones.
 ///
-/// Counts are accumulated per connection and published to the shared `ListenerMetrics` only
-/// every `COUNTER_FLUSH_BYTES` and on drop. A `fetch_add` per chunk would put a single shared
-/// cache line in the path of every 8 KiB of proxied traffic, ping-ponging it across every core —
+/// Counts are accumulated per connection and published to the listener and optional route only
+/// every `COUNTER_FLUSH_BYTES` and on drop. A `fetch_add` per chunk would put shared cache lines
+/// in the path of every 8 KiB of proxied traffic, ping-ponging them across every core —
 /// exactly the cross-core contention `SO_REUSEPORT` per worker exists to avoid.
 ///
 /// Because it wraps the client, the direction naming is from the proxy's point of view: bytes

@@ -87,11 +87,13 @@ describe('HTTP-mode listener', () => {
 			routes: [
 				{
 					sni: 'example.com',
+					metricsGroup: 'tenant-exact',
 					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
 					terminateTls: false,
 				},
 				{
 					sni: '*.wild.example.com',
+					metricsGroup: 'tenant-wildcard',
 					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
 					terminateTls: false,
 				},
@@ -135,10 +137,10 @@ describe('HTTP-mode listener', () => {
 
 	it('proxies ACME challenge requests to the matched route upstream', async () => {
 		const before = echo.requests.length;
-		const response = await rawHttp(
-			proxyPort,
-			'GET /.well-known/acme-challenge/abc123 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n',
-		);
+		const routeBefore = proxy.metrics().routeMetrics.find((route) => route.route === 'example.com')!;
+		const request =
+			'GET /.well-known/acme-challenge/abc123 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n';
+		const response = await rawHttp(proxyPort, request);
 		assert.match(response, /^HTTP\/1\.1 200 OK\r\n/);
 		assert.match(response, /challenge-token-abc$/);
 
@@ -147,16 +149,28 @@ describe('HTTP-mode listener', () => {
 		const captured_text = captured.toString('utf8');
 		assert.match(captured_text, /^GET \/\.well-known\/acme-challenge\/abc123 HTTP\/1\.1\r\n/);
 		assert.match(captured_text, /\r\nHost: example\.com\r\n/);
+
+		const routeAfter = proxy.metrics().routeMetrics.find((route) => route.route === 'example.com')!;
+		assert.equal(routeAfter.metricsGroup, 'tenant-exact');
+		assert.equal(routeAfter.connections, routeBefore.connections + 1);
+		assert.equal(routeAfter.activeConnections, 0);
+		assert.equal(routeAfter.bytesReceived, routeBefore.bytesReceived + Buffer.byteLength(request));
+		assert.equal(routeAfter.bytesSent, routeBefore.bytesSent + Buffer.byteLength(response));
 	});
 
 	it('proxies ACME requests for wildcard-matched hosts', async () => {
 		const before = echo.requests.length;
+		const routeBefore = proxy.metrics().routeMetrics.find((route) => route.route === '*.wild.example.com')!;
 		const response = await rawHttp(
 			proxyPort,
 			'GET /.well-known/acme-challenge/wild HTTP/1.1\r\nHost: foo.wild.example.com\r\nConnection: close\r\n\r\n',
 		);
 		assert.match(response, /^HTTP\/1\.1 200 OK\r\n/);
 		assert.ok(echo.requests.length > before, 'upstream got the wildcard ACME request');
+		const routeAfter = proxy.metrics().routeMetrics.find((route) => route.route === '*.wild.example.com')!;
+		assert.equal(routeAfter.metricsGroup, 'tenant-wildcard');
+		assert.equal(routeAfter.connections, routeBefore.connections + 1);
+		assert.ok(!proxy.metrics().routeMetrics.some((route) => route.route === 'foo.wild.example.com'));
 	});
 
 	it('returns 404 for ACME requests with no matching route', async () => {

@@ -57,10 +57,14 @@ export interface MtlsConfig {
 export interface RouteConfig {
 	/**
 	 * SNI hostname to match. Exact match (e.g. "api.example.com") or wildcard
-	 * left-label (e.g. "*.example.com"). Use "" for the default/catch-all route.
+	 * left-label (e.g. "*.example.com"). Use "" for the default/catch-all route. Maximum 255
+	 * UTF-8 bytes; control characters are rejected.
 	 */
 	sni: string;
-	/** Stable grouping key for aggregating several domain routes as one tenant. Maximum 128 UTF-8 bytes. */
+	/**
+	 * Stable grouping key for aggregating several domain routes as one tenant. Maximum 128 UTF-8
+	 * bytes; control characters are rejected.
+	 */
 	metricsGroup?: string;
 	upstreams: Upstream[];
 	/**

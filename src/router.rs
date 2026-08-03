@@ -213,6 +213,8 @@ pub struct RouteTable {
 	/// (suffix_without_star_dot, route) — "*.example.com" stored as "example.com"
 	wildcard: Vec<(Arc<str>, Route)>,
 	default: Option<Route>,
+	/// Stable configured-route order, prepared when the table is built rather than on every scrape.
+	metric_identities: Vec<Arc<RouteMetricIdentity>>,
 	/// All UdsBalancers that have at least one pid/tid-configured slot.
 	/// Used by the CPU monitor task spawned in `proxy.rs::start()`.
 	pub monitored_balancers: Vec<Arc<UdsBalancer>>,
@@ -245,16 +247,8 @@ impl RouteTable {
 		self.failing_snis.len()
 	}
 
-	pub fn metric_identities(&self) -> Vec<Arc<RouteMetricIdentity>> {
-		let mut identities: Vec<_> = self
-			.exact
-			.values()
-			.chain(self.wildcard.iter().map(|(_, route)| route))
-			.chain(self.default.iter())
-			.map(|route| route.metric_identity.clone())
-			.collect();
-		identities.sort_unstable_by(|a, b| a.route.cmp(&b.route).then_with(|| a.group.cmp(&b.group)));
-		identities
+	pub fn metric_identities(&self) -> &[Arc<RouteMetricIdentity>] {
+		&self.metric_identities
 	}
 
 	pub fn resolve(&self, sni: Option<&str>) -> Option<&Route> {
@@ -385,6 +379,16 @@ pub fn build_route_table(
 	listener_tls: &ListenerTlsSpec,
 	previous: Option<&RouteTable>,
 ) -> crate::error::Result<RouteTable> {
+	let mut configured_snis = HashSet::with_capacity(specs.len());
+	for spec in specs {
+		if !configured_snis.insert(spec.sni.as_str()) {
+			return Err(crate::error::SymphonyError::Config(format!(
+				"duplicate route SNI '{}'",
+				spec.sni
+			)));
+		}
+	}
+
 	let mut cache = TlsConfigCache::new();
 	let mut exact: HashMap<Arc<str>, Route> = HashMap::new();
 	let mut wildcard: Vec<(Arc<str>, Route)> = Vec::new();
@@ -492,7 +496,25 @@ pub fn build_route_table(
 		}
 	}
 
-	Ok(RouteTable { exact, wildcard, default: None, monitored_balancers, failing_snis, dropped_exact, dropped_wildcard })
+	let default = None;
+	let mut metric_identities: Vec<_> = exact
+		.values()
+		.chain(wildcard.iter().map(|(_, route)| route))
+		.chain(default.iter())
+		.map(|route| route.metric_identity.clone())
+		.collect();
+	metric_identities.sort_unstable_by(|a, b| a.route.cmp(&b.route).then_with(|| a.group.cmp(&b.group)));
+
+	Ok(RouteTable {
+		exact,
+		wildcard,
+		default,
+		metric_identities,
+		monitored_balancers,
+		failing_snis,
+		dropped_exact,
+		dropped_wildcard,
+	})
 }
 
 /// The "no carrier" and "declare protocol: 'http'" requirements — checked in `build_route_table`
@@ -963,6 +985,17 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			&regrouped.resolve(Some("tenant.example.com")).unwrap().metric_identity,
 			&live_identity
 		));
+	}
+
+	#[test]
+	fn duplicate_route_identity_is_rejected() {
+		let route = tls_route("*.tenant.example.com", CERT_A, KEY_A);
+		let result = build_route_table(&[route.clone(), route], &ListenerTlsSpec::empty(), None);
+		let error = match result {
+			Ok(_) => panic!("duplicate route must be rejected"),
+			Err(error) => error,
+		};
+		assert!(error.to_string().contains("duplicate route SNI '*.tenant.example.com'"));
 	}
 
 	// Unlike a cert-build failure (a transient race that heals on the next reconcile), a

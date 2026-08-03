@@ -144,18 +144,15 @@ async fn handle_http(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<Conn
 	// This listener consumes the request head before any stream wrapper could see it, and its
 	// responses are written directly, so bytes are accounted for explicitly here rather than
 	// through CountingStream. `_excess` is read from the client too, even though it is dropped.
-	ctx.listener_metrics
-		.add_bytes_in((headers.len() + _excess.len()) as u64);
 	let received_bytes = (headers.len() + _excess.len()) as u64;
+	ctx.listener_metrics.add_bytes_in(received_bytes);
 
 	let target = request_target(&headers);
 	let host = host_header(&headers);
 
 	if target.starts_with(ACME_PATH_PREFIX) {
 		if let Some(host) = host {
-			if let Err(kind) = proxy_acme(&mut stream, &headers, received_bytes, peer_addr, host, &ctx).await {
-				ctx.listener_metrics.inc_error(kind);
-			}
+			proxy_acme(&mut stream, &headers, received_bytes, peer_addr, host, &ctx).await;
 			return;
 		}
 		// Missing or unsafe Host header on an ACME request — fall through to a 400.
@@ -189,24 +186,24 @@ async fn proxy_acme(
 	peer_addr: SocketAddr,
 	host: &str,
 	ctx: &ConnContext,
-) -> std::result::Result<(), ErrorKind> {
+) {
 	let table = ctx.route_table.0.load();
 	let Some(route) = table.resolve(Some(host)).cloned() else {
 		// No matching route — answer 404 so the ACME client gets a definitive answer
 		// rather than a hung connection.
 		let _ = write_simple_response(client, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &ctx.listener_metrics).await;
-		return Err(ErrorKind::NoRoute);
+		ctx.listener_metrics.inc_error(ErrorKind::NoRoute);
+		return;
 	};
 	drop(table);
 	let _route_guard = RouteActiveGuard::new(route.metric_identity.counters.clone());
-	route.metric_identity.counters.add_bytes_in(received_bytes);
 
 	// Honour the route's global rate limit the same way the TLS path does, so
 	// a flood of /.well-known/acme-challenge/ requests can't bypass the cap.
 	if let Some(rl) = &route.rate_limiter {
 		if !rl.try_acquire() {
-			route.metric_identity.counters.inc_error(ErrorKind::RouteRateLimited);
-			return Err(ErrorKind::RouteRateLimited);
+			inc_route_error(ctx, &route.metric_identity.counters, ErrorKind::RouteRateLimited);
+			return;
 		}
 	}
 
@@ -214,10 +211,11 @@ async fn proxy_acme(
 		Ok(upstream) => upstream,
 		Err(e) => {
 			tracing::debug!("acme upstream connect failed for {host}: {e}");
-			route.metric_identity.counters.inc_error(ErrorKind::UpstreamConnect);
-			return Err(ErrorKind::UpstreamConnect);
+			inc_route_error(ctx, &route.metric_identity.counters, ErrorKind::UpstreamConnect);
+			return;
 		}
 	};
+	route.metric_identity.counters.add_bytes_in(received_bytes);
 
 	// ACME HTTP-01 challenges are GET requests with no body.  Strip any
 	// Content-Length / Transfer-Encoding headers so a client that lies about a
@@ -250,10 +248,14 @@ async fn proxy_acme(
 	// Always close the client socket after one request/response, regardless of
 	// the upstream outcome.  The HTTP-mode listener never reuses connections.
 	let _ = client.shutdown().await;
-	result.map_err(|_| {
-		route.metric_identity.counters.inc_error(ErrorKind::Stream);
-		ErrorKind::Stream
-	})
+	if result.is_err() {
+		inc_route_error(ctx, &route.metric_identity.counters, ErrorKind::Stream);
+	}
+}
+
+fn inc_route_error(ctx: &ConnContext, route_metrics: &crate::metrics::RouteMetrics, kind: ErrorKind) {
+	ctx.listener_metrics.inc_error(kind);
+	route_metrics.inc_error(kind);
 }
 
 /// Send the (sanitized, body-less) request `headers` to `upstream`, then copy

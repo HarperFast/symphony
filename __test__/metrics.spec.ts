@@ -164,6 +164,44 @@ describe('proxy.metrics()', () => {
 		assert.deepEqual(proxy.metrics().routeMetrics[0], before);
 	});
 
+	it('starts a fresh public series when the metrics group changes', () => {
+		proxy.updateConfig({
+			routes: [
+				{
+					sni: 'localhost',
+					metricsGroup: 'tenant-2',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+				},
+			],
+		});
+		assert.deepEqual(proxy.metrics().routeMetrics, [
+			{
+				route: 'localhost',
+				metricsGroup: 'tenant-2',
+				activeConnections: 0,
+				connections: 0,
+				errors: 0,
+				bytesReceived: 0,
+				bytesSent: 0,
+				errorsByReason: [],
+			},
+		]);
+
+		proxy.updateConfig({
+			routes: [
+				{
+					sni: 'localhost',
+					metricsGroup: 'tenant-1',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+				},
+			],
+		});
+	});
+
 	it('classifies an unroutable SNI as no_route rather than a generic error', async () => {
 		const before = proxy.metrics().listeners[0];
 		// No route for this SNI and no default route → symphony drops the connection.
@@ -233,6 +271,23 @@ describe('route metric identity validation', () => {
 	it('rejects oversized or control-character groups before proxy construction', () => {
 		assert.throws(() => new SymphonyProxy(config('x'.repeat(129))), /metricsGroup exceeds 128 UTF-8 bytes/);
 		assert.throws(() => new SymphonyProxy(config('tenant\rbreak')), /metricsGroup must not contain control characters/);
+	});
+
+	it('bounds configured route labels and rejects duplicate route keys', () => {
+		const oversized = config('tenant');
+		oversized.routes[0].sni = 'x'.repeat(256);
+		assert.throws(() => new SymphonyProxy(oversized), /route SNI exceeds 255 UTF-8 bytes/);
+
+		const controlled = config('tenant');
+		controlled.routes[0].sni = 'tenant\ttest';
+		assert.throws(() => new SymphonyProxy(controlled), /route SNI must not contain control characters/);
+
+		const duplicate = config('tenant');
+		duplicate.routes[0].sni = '*.tenant.test';
+		assert.throws(
+			() => new SymphonyProxy({ ...duplicate, routes: [duplicate.routes[0], { ...duplicate.routes[0] }] }),
+			/duplicate route SNI '\*\.tenant\.test'/
+		);
 	});
 });
 

@@ -686,7 +686,7 @@ impl SymphonyProxyWrap {
 		let blocked_connections = listeners.iter().map(|l| l.blocked).sum();
 		let route_metrics = table
 			.metric_identities()
-			.into_iter()
+			.iter()
 			.map(|identity| {
 				let errors_by_reason = identity.counters.errors_by_reason();
 				JsRouteMetrics {
@@ -810,6 +810,7 @@ impl SymphonyProxyWrap {
 // ── Config parsing helpers ────────────────────────────────────────────────────
 
 fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
+	validate_route_metric_label(&r.sni)?;
 	let upstreams: Vec<UpstreamSpec> = r
 		.upstreams
 		.iter()
@@ -872,6 +873,21 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 }
 
 const MAX_METRICS_GROUP_BYTES: usize = 128;
+const MAX_ROUTE_METRIC_LABEL_BYTES: usize = 255;
+
+fn validate_route_metric_label(sni: &str) -> Result<()> {
+	if sni.len() > MAX_ROUTE_METRIC_LABEL_BYTES {
+		return Err(napi::Error::from_reason(format!(
+			"route SNI exceeds {MAX_ROUTE_METRIC_LABEL_BYTES} UTF-8 bytes"
+		)));
+	}
+	if sni.chars().any(char::is_control) {
+		return Err(napi::Error::from_reason(
+			"route SNI must not contain control characters".to_string(),
+		));
+	}
+	Ok(())
+}
 
 fn parse_metrics_group(group: Option<&str>, sni: &str) -> Result<String> {
 	let group = group.unwrap_or("");
