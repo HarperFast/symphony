@@ -75,6 +75,7 @@ describe('proxy.metrics()', () => {
 			routes: [
 				{
 					sni: 'localhost',
+					metricsGroup: 'tenant-1',
 					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
 					terminateTls: true,
 					cert: { certChain: cert.cert, privateKey: cert.key },
@@ -106,6 +107,21 @@ describe('proxy.metrics()', () => {
 		assert.equal(proxy.metrics().failingRoutes, 0);
 	});
 
+	it('reports configured route identity and optional group without client-derived labels', () => {
+		assert.deepEqual(proxy.metrics().routeMetrics, [
+			{
+				route: 'localhost',
+				metricsGroup: 'tenant-1',
+				activeConnections: 0,
+				connections: 0,
+				errors: 0,
+				bytesReceived: 0,
+				bytesSent: 0,
+				errorsByReason: [],
+			},
+		]);
+	});
+
 	it('emits every block and error reason, including the ones still at zero', () => {
 		const listener = proxy.metrics().listeners[0];
 		// A reason that only ever fires under protection config must still have a series.
@@ -126,6 +142,26 @@ describe('proxy.metrics()', () => {
 		// sees exactly the plaintext payload each way — no handshake and no record framing.
 		assert.equal(after.bytesReceived, before.bytesReceived + payload.length);
 		assert.equal(after.bytesSent, before.bytesSent + payload.length);
+		const route = proxy.metrics().routeMetrics[0];
+		assert.equal(route.connections, 1);
+		assert.equal(route.bytesReceived, payload.length);
+		assert.equal(route.bytesSent, payload.length);
+	});
+
+	it('preserves route counters across a hot reload with the same route identity', () => {
+		const before = proxy.metrics().routeMetrics[0];
+		proxy.updateConfig({
+			routes: [
+				{
+					sni: 'localhost',
+					metricsGroup: 'tenant-1',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+				},
+			],
+		});
+		assert.deepEqual(proxy.metrics().routeMetrics[0], before);
 	});
 
 	it('classifies an unroutable SNI as no_route rather than a generic error', async () => {
@@ -143,6 +179,60 @@ describe('proxy.metrics()', () => {
 			after.errorsByReason.reduce((sum, r) => sum + r.count, 0),
 			after.errors
 		);
+	});
+
+	it('does not let an old connection decrement a re-added route identity', async () => {
+		const socket = tls.connect({
+			port: tlsPort,
+			host: '127.0.0.1',
+			servername: 'localhost',
+			rejectUnauthorized: false,
+		});
+		await new Promise<void>((resolve, reject) => {
+			socket.once('secureConnect', resolve);
+			socket.once('error', reject);
+		});
+		await waitFor(() => proxy.metrics().routeMetrics[0]?.activeConnections === 1);
+
+		proxy.updateConfig({ routes: [] });
+		assert.deepEqual(proxy.metrics().routeMetrics, []);
+		socket.destroy();
+
+		proxy.updateConfig({
+			routes: [
+				{
+					sni: 'localhost',
+					metricsGroup: 'tenant-1',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+				},
+			],
+		});
+		await sleep(25);
+		assert.equal(proxy.metrics().routeMetrics[0].activeConnections, 0);
+		assert.equal(proxy.metrics().routeMetrics[0].connections, 0);
+	});
+});
+
+describe('route metric identity validation', () => {
+	function config(metricsGroup: string) {
+		return {
+			listeners: [{ host: '127.0.0.1', port: 0 }],
+			routes: [
+				{
+					sni: 'tenant.test',
+					metricsGroup,
+					upstreams: [{ kind: 'tcp' as const, host: '127.0.0.1', port: 1 }],
+					terminateTls: false,
+				},
+			],
+		};
+	}
+
+	it('rejects oversized or control-character groups before proxy construction', () => {
+		assert.throws(() => new SymphonyProxy(config('x'.repeat(129))), /metricsGroup exceeds 128 UTF-8 bytes/);
+		assert.throws(() => new SymphonyProxy(config('tenant\rbreak')), /metricsGroup must not contain control characters/);
 	});
 });
 
@@ -165,12 +255,14 @@ describe('proxy.metrics() error classification', () => {
 			routes: [
 				{
 					sni: 'idle.test',
+					metricsGroup: 'tenant-idle',
 					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
 					terminateTls: true,
 					cert: { certChain: cert.cert, privateKey: cert.key },
 				},
 				{
 					sni: 'dead.test',
+					metricsGroup: 'tenant-dead',
 					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: deadPort }],
 					terminateTls: true,
 					cert: { certChain: cert.cert, privateKey: cert.key },
@@ -187,10 +279,14 @@ describe('proxy.metrics() error classification', () => {
 
 	it('records an unreachable upstream as upstream_connect', async () => {
 		const before = reasonCount(proxy.metrics().listeners[0].errorsByReason, 'upstream_connect');
+		assert.deepEqual(proxy.metrics().routeMetrics.find((r) => r.route === 'dead.test')?.errorsByReason, []);
 		await tlsRoundTrip({ port: tlsPort, servername: 'dead.test', caCert: cert.cert, data: 'ping' }).catch(
 			() => undefined
 		);
 		await waitFor(() => reasonCount(proxy.metrics().listeners[0].errorsByReason, 'upstream_connect') > before);
+		assert.deepEqual(proxy.metrics().routeMetrics.find((r) => r.route === 'dead.test')?.errorsByReason, [
+			{ reason: 'upstream_connect', count: 1 },
+		]);
 	});
 
 	it('records a session that goes quiet as idle_timeout, not a stream error', async () => {
@@ -221,6 +317,9 @@ describe('proxy.metrics() error classification', () => {
 			beforeStream,
 			'an idle timeout must not also be counted as a stream error'
 		);
+		assert.deepEqual(proxy.metrics().routeMetrics.find((r) => r.route === 'idle.test')?.errorsByReason, [
+			{ reason: 'idle_timeout', count: 1 },
+		]);
 	});
 });
 
@@ -255,6 +354,18 @@ describe('renderPrometheus', () => {
 								{ reason: 'rate_limited', count: 2 },
 								{ reason: 'no_sni', count: 0 },
 							],
+							errorsByReason: [{ reason: 'upstream_connect', count: 1 }],
+						},
+					],
+					routeMetrics: [
+						{
+							route: 'api.example.com',
+							metricsGroup: 'tenant-1',
+							activeConnections: 2,
+							connections: 8,
+							errors: 1,
+							bytesReceived: 768,
+							bytesSent: 1536,
 							errorsByReason: [{ reason: 'upstream_connect', count: 1 }],
 						},
 					],
@@ -308,6 +419,16 @@ describe('renderPrometheus', () => {
 		assert.ok(
 			lines.includes('symphony_listener_bytes_received_total{proxy="80,443",listener="0.0.0.0:443",mode="tls"} 1024')
 		);
+		assert.ok(
+			lines.includes(
+				'symphony_route_connections_total{proxy="80,443",route="api.example.com",group="tenant-1"} 8'
+			)
+		);
+		assert.ok(
+			lines.includes(
+				'symphony_route_errors_total{proxy="80,443",route="api.example.com",group="tenant-1",reason="upstream_connect"} 1'
+			)
+		);
 	});
 
 	it('emits blocked/error counts only under their reason label', () => {
@@ -326,12 +447,12 @@ describe('renderPrometheus', () => {
 		assert.ok(!lines.some((l) => /^symphony_listener_blocked_total\{[^}]*\}\s/.test(l) && !l.includes('reason=')));
 	});
 
-	// Consumers bind this endpoint on loopback, which any local process can reach. That is only
-	// acceptable while the labels stay free of tenant identifiers — a per-SNI or per-route label
-	// would turn aggregate proxy health into a list of which customers a host fronts. This pins
-	// the allowed label set so adding one is a deliberate, visible decision.
-	it('never labels a sample with a tenant identifier', () => {
-		const allowed = new Set(['version', 'proxy', 'listener', 'mode', 'reason', 'outcome']);
+	// Route/group deliberately make the optional admin endpoint tenant-identifying. Host Manager's
+	// default Docker bridge does not expose host loopback to tenant containers, but host-local
+	// processes and downstream collectors can see these labels, so any further identity dimension
+	// remains a deliberate API/security decision.
+	it('restricts tenant identity to the deliberate route and group labels', () => {
+		const allowed = new Set(['version', 'proxy', 'listener', 'mode', 'reason', 'outcome', 'route', 'group']);
 		for (const line of lines) {
 			const labelSet = line.match(/\{(.*)\}/)?.[1];
 			if (!labelSet) continue;
@@ -339,6 +460,9 @@ describe('renderPrometheus', () => {
 			// (proxy="80,443"), so the boundary has to be matched rather than split on.
 			for (const [, , key] of labelSet.matchAll(/(^|,)([a-z_]+)="/g)) {
 				assert.ok(allowed.has(key), `unexpected metric label '${key}' — is it tenant-identifying?`);
+			}
+			if (line.startsWith('symphony_listener_')) {
+				assert.ok(!/(^|,)route=|(^|,)group=/.test(labelSet), 'existing listener series must not gain route labels');
 			}
 		}
 	});
@@ -353,9 +477,49 @@ describe('renderPrometheus', () => {
 		const escaped = renderPrometheus({
 			...snapshot,
 			version: 'a"b\\c',
-			proxies: [],
+			proxies: [
+				{
+					...snapshot.proxies[0],
+					metrics: {
+						...snapshot.proxies[0].metrics,
+						routeMetrics: [
+							{
+								...snapshot.proxies[0].metrics.routeMetrics[0],
+								route: 'a"b\\c\nroute',
+								metricsGroup: 'tenant\rgroup',
+							},
+						],
+					},
+				},
+			],
 		});
 		assert.ok(escaped.includes('symphony_build_info{version="a\\"b\\\\c"} 1'));
+		assert.ok(escaped.includes('route="a\\"b\\\\c\\nroute",group="tenant\\ngroup"'));
+	});
+
+	it('keeps large-route output to four base samples per route plus non-zero errors', () => {
+		const count = 2000;
+		const routeMetrics = Array.from({ length: count }, (_, i) => ({
+			route: `tenant-${i}.example.com`,
+			metricsGroup: `tenant-${i}`,
+			activeConnections: 0,
+			connections: 0,
+			errors: 0,
+			bytesReceived: 0,
+			bytesSent: 0,
+			errorsByReason: [],
+		}));
+		const rendered = renderPrometheus({
+			...snapshot,
+			proxies: [
+				{
+					...snapshot.proxies[0],
+					metrics: { ...snapshot.proxies[0].metrics, routeMetrics },
+				},
+			],
+		});
+		assert.equal(rendered.match(/^symphony_route_connections_total\{/gm)?.length, count);
+		assert.equal(rendered.match(/^symphony_route_errors_total\{/gm)?.length ?? 0, 0);
 	});
 });
 
@@ -392,6 +556,14 @@ describe('symphony-server admin endpoint', () => {
 						routes: [
 							{
 								sni: 'localhost',
+								metricsGroup: 'tenant-exact',
+								upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+								terminateTls: true,
+								cert: { certChain: cert.cert, privateKey: cert.key },
+							},
+							{
+								sni: '*.localhost',
+								metricsGroup: 'tenant-wildcard',
 								upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
 								terminateTls: true,
 								cert: { certChain: cert.cert, privateKey: cert.key },
@@ -433,6 +605,12 @@ describe('symphony-server admin endpoint', () => {
 				`symphony_listener_accepted_total\\{proxy="${proxyPort}",listener="127\\.0\\.0\\.1:${proxyPort}",mode="tls"\\} \\d+`
 			)
 		);
+		assert.match(
+			res.body,
+			new RegExp(
+				`symphony_route_connections_total\\{proxy="${proxyPort}",route="\\*\\.localhost",group="tenant-wildcard"\\} 0`
+			)
+		);
 	});
 
 	it('serves the same snapshot as JSON over the loopback port', async () => {
@@ -448,10 +626,20 @@ describe('symphony-server admin endpoint', () => {
 	it('reflects live traffic on the next scrape', async () => {
 		const before = JSON.parse((await get({ socketPath }, '/metrics.json')).body) as MetricsSnapshot;
 		await tlsRoundTrip({ port: proxyPort, servername: 'localhost', caCert: cert.cert, data: 'hello' });
+		await tlsRoundTrip({ port: proxyPort, servername: 'random.localhost', caCert: cert.cert, data: 'wild' });
 		const after = JSON.parse((await get({ socketPath }, '/metrics.json')).body) as MetricsSnapshot;
 
-		assert.equal(after.proxies[0].metrics.listeners[0].accepted, before.proxies[0].metrics.listeners[0].accepted + 1);
+		assert.equal(after.proxies[0].metrics.listeners[0].accepted, before.proxies[0].metrics.listeners[0].accepted + 2);
 		assert.ok(after.proxies[0].metrics.listeners[0].bytesSent > before.proxies[0].metrics.listeners[0].bytesSent);
+		const exact = after.proxies[0].metrics.routeMetrics.find((route) => route.route === 'localhost');
+		const wildcard = after.proxies[0].metrics.routeMetrics.find((route) => route.route === '*.localhost');
+		assert.equal(exact?.metricsGroup, 'tenant-exact');
+		assert.equal(exact?.connections, 1);
+		assert.equal(wildcard?.metricsGroup, 'tenant-wildcard');
+		assert.equal(wildcard?.connections, 1);
+		const prometheus = (await get({ socketPath }, '/metrics')).body;
+		assert.match(prometheus, /route="\*\.localhost",group="tenant-wildcard"/);
+		assert.ok(!prometheus.includes('random.localhost'), 'wildcard metrics must never use the client-provided hostname');
 	});
 
 	it('restricts the unix socket to owner and group', () => {

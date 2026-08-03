@@ -13,6 +13,7 @@ export type {
 	HotConfig,
 	ProxyMetrics,
 	ListenerMetrics,
+	RouteMetrics,
 	LabeledCount,
 	BlockedIpsInfo,
 	SuspendedConnection,

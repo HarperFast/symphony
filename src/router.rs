@@ -1,4 +1,5 @@
 use crate::balancer::{UdsBalancer, UdsSlotSpec};
+use crate::metrics::RouteMetrics;
 use crate::tls::{CertSpec, MtlsSpec, TlsConfigCache};
 use arc_swap::ArcSwap;
 use rustls::ServerConfig;
@@ -159,6 +160,8 @@ pub enum Destination {
 
 #[derive(Clone)]
 pub struct Route {
+	/// Configured identity only; never derived from the client SNI/Host that selected this route.
+	pub metric_identity: Arc<RouteMetricIdentity>,
 	pub destination: Destination,
 	/// Destination for connections that negotiated `h2` in ALPN, when the route
 	/// has h2-marked upstreams. None = all protocols share `destination`.
@@ -176,6 +179,18 @@ pub struct Route {
 	pub forward_fingerprint: ForwardFingerprint,
 	/// The route's declared application protocol — gates HTTP/1 header rewriting.
 	pub protocol: RouteProtocol,
+}
+
+pub struct RouteMetricIdentity {
+	pub route: Arc<str>,
+	pub group: Arc<str>,
+	pub counters: Arc<RouteMetrics>,
+}
+
+impl RouteMetricIdentity {
+	fn new(route: &str, group: &str) -> Self {
+		Self { route: Arc::from(route), group: Arc::from(group), counters: Arc::new(RouteMetrics::default()) }
+	}
 }
 
 // ── Route table ───────────────────────────────────────────────────────────────
@@ -228,6 +243,18 @@ impl RouteTable {
 	/// carried-forward last-good cert. Non-zero means a rotation needs attention.
 	pub fn failing_route_count(&self) -> usize {
 		self.failing_snis.len()
+	}
+
+	pub fn metric_identities(&self) -> Vec<Arc<RouteMetricIdentity>> {
+		let mut identities: Vec<_> = self
+			.exact
+			.values()
+			.chain(self.wildcard.iter().map(|(_, route)| route))
+			.chain(self.default.iter())
+			.map(|route| route.metric_identity.clone())
+			.collect();
+		identities.sort_unstable_by(|a, b| a.route.cmp(&b.route).then_with(|| a.group.cmp(&b.group)));
+		identities
 	}
 
 	pub fn resolve(&self, sni: Option<&str>) -> Option<&Route> {
@@ -302,6 +329,7 @@ pub enum UpstreamSpec {
 #[derive(Clone, Debug)]
 pub struct RouteSpec {
 	pub sni: String,
+	pub metrics_group: String,
 	pub upstreams: Vec<UpstreamSpec>,
 	pub terminate_tls: bool,
 	pub cert_pem: Option<Vec<u8>>,
@@ -392,7 +420,7 @@ pub fn build_route_table(
 		// Isolate per-route failures: a single route whose cert can't be built (e.g. a
 		// rotated key no longer matching an inlined chain → rustls KeyMismatch) must not
 		// abort the whole table and take every other tenant on the port down with it.
-		let route = match build_route(spec, listener_tls, &mut cache) {
+		let mut route = match build_route(spec, listener_tls, &mut cache) {
 			Ok(route) => route,
 			Err(e) => {
 				// Log only on the good→bad transition: a persistently-broken cert would
@@ -437,6 +465,14 @@ pub fn build_route_table(
 				}
 			}
 		};
+
+		// Reusing by the full metric identity keeps ordinary cert/upstream reloads continuous
+		// without moving historical counters when a route changes tenant groups.
+		if let Some(previous_route) = previous.and_then(|table| table.get_for_spec_sni(&spec.sni)) {
+			if previous_route.metric_identity.group.as_ref() == spec.metrics_group {
+				route.metric_identity = previous_route.metric_identity.clone();
+			}
+		}
 
 		// Collect UdsBalancers that have pid/tid slots for the monitor task.
 		for dest in std::iter::once(&route.destination).chain(route.destination_h2.iter()) {
@@ -575,6 +611,7 @@ fn build_route(
 		.map(|cps| Arc::new(RouteTokenBucket::new(cps, spec.burst)));
 
 	Ok(Route {
+		metric_identity: Arc::new(RouteMetricIdentity::new(&spec.sni, &spec.metrics_group)),
 		destination,
 		destination_h2,
 		tls_config,
@@ -770,6 +807,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	fn tls_route(sni: &str, cert: &[u8], key: &[u8]) -> RouteSpec {
 		RouteSpec {
 			sni: sni.to_string(),
+			metrics_group: String::new(),
 			upstreams: Vec::new(),
 			terminate_tls: true,
 			cert_pem: Some(cert.to_vec()),
@@ -878,7 +916,8 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		// First build with a valid cert → the live table.
 		let good = vec![tls_route("tenant.example.com", CERT_A, KEY_A)];
 		let live = build_route_table(&good, &ListenerTlsSpec::empty(), None).expect("initial build");
-		assert!(live.resolve(Some("tenant.example.com")).is_some());
+		let live_route = live.resolve(Some("tenant.example.com")).expect("live route");
+		let live_identity = live_route.metric_identity.clone();
 
 		// Hot-swap where the same SNI now presents a mismatched pair (mid-rotation).
 		let mismatched = vec![tls_route("tenant.example.com", CERT_A, KEY_B)];
@@ -888,6 +927,10 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			swapped.resolve(Some("tenant.example.com")).is_some(),
 			"the SNI must keep its last-good route across a transient rebuild failure"
 		);
+		assert!(Arc::ptr_eq(
+			&swapped.resolve(Some("tenant.example.com")).unwrap().metric_identity,
+			&live_identity
+		));
 		assert!(
 			swapped.failing_snis.contains("tenant.example.com"),
 			"the transiently-failing SNI must be tracked so it isn't re-logged every reconcile"
@@ -899,6 +942,27 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			fresh.resolve(Some("tenant.example.com")).is_none(),
 			"with no prior route there is nothing to retain — the SNI is dropped"
 		);
+	}
+
+	#[test]
+	fn route_metric_identity_survives_reload_until_group_changes() {
+		let mut initial = tls_route("tenant.example.com", CERT_A, KEY_A);
+		initial.metrics_group = "tenant-1".to_string();
+		let live = build_route_table(&[initial.clone()], &ListenerTlsSpec::empty(), None).expect("initial build");
+		let live_identity = live.resolve(Some("tenant.example.com")).unwrap().metric_identity.clone();
+
+		let reloaded = build_route_table(&[initial.clone()], &ListenerTlsSpec::empty(), Some(&live)).expect("reload");
+		assert!(Arc::ptr_eq(
+			&reloaded.resolve(Some("tenant.example.com")).unwrap().metric_identity,
+			&live_identity
+		));
+
+		initial.metrics_group = "tenant-2".to_string();
+		let regrouped = build_route_table(&[initial], &ListenerTlsSpec::empty(), Some(&reloaded)).expect("regroup");
+		assert!(!Arc::ptr_eq(
+			&regrouped.resolve(Some("tenant.example.com")).unwrap().metric_identity,
+			&live_identity
+		));
 	}
 
 	// Unlike a cert-build failure (a transient race that heals on the next reconcile), a

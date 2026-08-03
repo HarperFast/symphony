@@ -94,6 +94,7 @@ function toJsMtls(m: MtlsConfig): JsMtlsConfig {
 function toJsRoute(r: RouteConfig): JsRouteConfig {
 	return {
 		sni: r.sni,
+		metricsGroup: r.metricsGroup,
 		upstreams: r.upstreams.map(toJsUpstream),
 		terminateTls: r.terminateTls,
 		cert: r.cert ? toJsCert(r.cert) : undefined,
@@ -292,6 +293,16 @@ export class SymphonyProxy extends EventEmitter {
 				bytesSent: l.bytesSent,
 				blockedByReason: l.blockedByReason.map((c) => ({ reason: c.reason, count: c.count })),
 				errorsByReason: l.errorsByReason.map((c) => ({ reason: c.reason, count: c.count })),
+			})),
+			routeMetrics: m.routeMetrics.map((r) => ({
+				route: r.route,
+				metricsGroup: r.metricsGroup,
+				activeConnections: r.activeConnections,
+				connections: r.connections,
+				errors: r.errors,
+				bytesReceived: r.bytesReceived,
+				bytesSent: r.bytesSent,
+				errorsByReason: r.errorsByReason.map((c) => ({ reason: c.reason, count: c.count })),
 			})),
 		};
 	}

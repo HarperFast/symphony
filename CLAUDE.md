@@ -22,6 +22,7 @@ Three properties are load-bearing and easy to regress:
 - **A stale Unix socket is reclaimed, a live one is not.** Three things protect this, and each was a real hole once: the probe counts a path reclaimable only on `ECONNREFUSED` (an `EACCES` from a restrictively-permissioned live socket is not evidence nobody is listening); the inode must actually be a socket (a `socketPath` misconfigured onto a regular file would otherwise be deleted); and the bind happens on a pid-unique temp path that is `rename`d into place, so there is no probe→unlink→bind window for a second process to delete a socket the first has already bound. On shutdown the published path is unlinked only while its inode is still the one we put there. Same family as the `status.json` ownership guard.
 - **Counters are read per request**, not cached at reconcile, so a scrape never serves numbers frozen at the last config reload.
 - **Totals are derived, never maintained alongside their parts.** `blocked`/`errors` are summed from the per-reason values in the same snapshot, and the proxy-wide blocked total from the listener values. A separate `total_blocked` incremented next to its reason counter is two non-atomic writes: a scrape landing between them sees a total that disagrees with its own breakdown, so the invariant would hold only while the proxy is idle — precisely when nobody is reading it.
+- **Route label cardinality is configuration-bounded.** A resolved `Route` owns its configured SNI/wildcard identity and optional metrics group; metric call sites never accept the client SNI/Host as a label. Route errors omit zero-valued reasons so scrape size does not multiply every reason by every tenant.
 
 Prometheus shape: blocked/error counts are emitted **only** under their `reason` label (they sum to the unlabeled total, so a separate total would be a second representation of the same number), and the proxy-wide active gauge is `sum without(listener)`. `renderPrometheus` is exported from the package for embedded consumers.
 
@@ -39,7 +40,7 @@ TCP accept (SO_REUSEPORT per worker thread)
   └─ upstream.rs  connect(Destination, peer_ip) → UpstreamStream
   └─ tokio::io::copy_bidirectional_with_sizes wrapped in idle_timeout
        (per-direction buffers from readBufferSize / client|upstreamReadBufferSize)
-  └─ RAII drop: BalancerGuard, ActiveGuard — all counter decrements happen here
+  └─ RAII drop: BalancerGuard, ActiveGuard, RouteActiveGuard — all counter decrements happen here
 ```
 
 ### Module map
@@ -167,7 +168,7 @@ napi `Buffer` contains raw pointers (`*mut napi_env__`, `*mut napi_ref__`) that 
 
 ### Adding a new metric
 
-1. Add the counter to `ListenerMetrics`/`GlobalMetrics` in `metrics.rs`, or a variant to the
+1. Add the counter to `ListenerMetrics`/`RouteMetrics`/`GlobalMetrics` in `metrics.rs`, or a variant to the
    `labeled_enum!` block for `BlockKind`/`ErrorKind` — the variant list drives the counter array,
    the label, and the export, so there is no second list to update.
 2. Increment it at the call site. A new `protection::BlockReason` variant will fail to compile

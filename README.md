@@ -90,6 +90,7 @@ console.log('proxy listening on :443');
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `sni` | `string` | required | Hostname for exact match, or `'*.suffix'` for wildcard, or `''` for default |
+| `metricsGroup` | `string` | — | Stable grouping key for aggregating several domain routes as one tenant (maximum 128 UTF-8 bytes; no control characters) |
 | `upstreams` | `Upstream[]` | required | Destination(s); multiple UDS upstreams are load-balanced |
 | `terminateTls` | `boolean` | required | `true` = decrypt TLS; `false` = TCP passthrough |
 | `cert` | `CertConfig` | — | Per-route cert, overrides listener `defaultCert` |
@@ -654,6 +655,15 @@ for (const l of m.listeners) {
   // l.errorsByReason  — [{ reason: 'upstream_connect', count: 3 }, ...]
 }
 
+// Per configured route, aggregated across this proxy's listeners
+for (const r of m.routeMetrics) {
+  // r.route        — configured exact SNI or wildcard pattern; never a client-provided hostname
+  // r.metricsGroup — optional RouteConfig.metricsGroup, or ''
+  // r.activeConnections, r.connections
+  // r.bytesReceived, r.bytesSent
+  // r.errorsByReason — sparse post-route failures; zero-valued reasons are omitted
+}
+
 const blocked = proxy.blockedIps();
 // blocked.rateLimited — IPs with a depleted per-second or sustained token bucket
 // blocked.concurrencyLimited — IPs at their maxConcurrentPerIp limit
@@ -661,11 +671,20 @@ const blocked = proxy.blockedIps();
 // blocked.penaltyBoxed — IPs currently in the penalty box
 ```
 
-Every reason is reported on every call, including reasons still at zero, so a dashboard series
+Every listener reason is reported on every call, including reasons still at zero, so a dashboard series
 exists before the first incident rather than appearing mid-outage. `l.blocked` / `l.errors` are
 summed from the very reason values reported alongside them, and `m.blockedConnections` from the
 listener values in the same snapshot — so a reading taken mid-traffic is internally consistent
-rather than only adding up while the proxy is idle.
+rather than only adding up while the proxy is idle. Route errors are sparse to avoid multiplying
+every zero-valued reason by every configured tenant route.
+
+Route counters begin only after resolution succeeds. Listener-level protection blocks,
+`maxConnections`, malformed/no SNI, unmatched routes, and HTTP header failures therefore have no
+route series. Exact routes are labeled with their configured SNI, and wildcard routes with the
+configured wildcard pattern (`*.example.com`) rather than the client-provided hostname, keeping
+label cardinality bounded by configuration. Counters survive route hot reloads while both `sni`
+and `metricsGroup` are unchanged; changing the group starts a new series rather than moving
+historical counters between tenants.
 
 **Block reasons:** `max_connections`, `cidr_blocked`, `ja3_blocked`, `ja4_blocked`,
 `incomplete_handshake`, `no_sni`, `rate_limited`, `too_many_connections`, `penalty_boxed`.
@@ -697,8 +716,10 @@ the same numbers over HTTP. Add an `admin` block to the config file:
 
 Both bindings are optional; give either or both. Omit the `admin` block entirely and nothing is
 exposed. `socketPath` may be relative to the config file's directory, and is chmodded to
-`socketMode` (default `0o660`) after bind. `host` defaults to `127.0.0.1` — metrics carry no
-tenant identifiers, but there is still no reason to publish them off-box.
+`socketMode` (default `0o660`) after bind. `host` defaults to `127.0.0.1`. Route and group labels
+can identify tenants, so keep access scoped to the host collector. Host Manager's standard Docker
+bridge does not expose host loopback to tenant containers, but other host-local processes and
+downstream metric systems remain inside this endpoint's trust boundary.
 
 | Route | Response |
 |---|---|
@@ -715,6 +736,8 @@ symphony_build_info{version="0.5.0"} 1
 symphony_listener_accepted_total{proxy="80,443",listener="0.0.0.0:443",mode="tls"} 148213
 symphony_listener_blocked_total{proxy="80,443",listener="0.0.0.0:443",mode="tls",reason="rate_limited"} 27
 symphony_listener_errors_total{proxy="80,443",listener="0.0.0.0:443",mode="tls",reason="upstream_connect"} 4
+symphony_route_connections_total{proxy="80,443",route="api.example.com",group="tenant-1"} 148000
+symphony_route_errors_total{proxy="80,443",route="api.example.com",group="tenant-1",reason="upstream_connect"} 3
 ```
 
 The `proxy` label is the port-set of the proxy entry the listener belongs to (each config entry
@@ -722,6 +745,12 @@ gets its own route table). Blocked and error counts are only ever emitted with t
 label — the labelled series sum to the total, so use `sum without(reason)` rather than looking
 for a separate unlabelled metric. Likewise the proxy-wide active-connection gauge is
 `sum without(listener) (symphony_listener_active_connections)`.
+
+Route series use `route` (the configured SNI/pattern) and `group` (the configured
+`metricsGroup`, or an empty string). Their active/connection/byte values aggregate across all
+listeners in that proxy; Host Manager uses one proxy per external port, so its existing `proxy`
+label keeps route traffic separated by port. Route error samples appear only after a reason is
+non-zero.
 
 The endpoint is strictly read-only and best-effort: it never blocks proxying, and a bind failure
 is logged and retried every 5s rather than aborting startup. That matters during a version
