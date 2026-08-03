@@ -184,9 +184,9 @@ export interface JsProxyMetrics {
   /** Routes currently in the live table, including the default route. */
   routes: number
   /**
-   * Routes rejected at build time — a cert that failed to build, or a route that failed the
-   * protocol/carrier validation — either dropped, or (cert failures only) serving a
-   * carried-forward last-good cert.
+   * Routes rejected at build time — a cert failure, protocol/carrier validation failure, or
+   * duplicate wildcard — either dropped, or (cert failures only) serving a carried-forward
+   * last-good cert.
    */
   failingRoutes: number
   listeners: Array<JsListenerMetrics>

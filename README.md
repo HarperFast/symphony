@@ -89,7 +89,7 @@ console.log('proxy listening on :443');
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `sni` | `string` | required | Hostname for exact match, or `'*.suffix'` for wildcard, or `''` for default (maximum 255 UTF-8 bytes; no control characters; later duplicate values are skipped) |
+| `sni` | `string` | required | Hostname for exact match, or `'*.suffix'` for wildcard, or `''` for default (maximum 255 UTF-8 bytes; no control characters; exact duplicates remain last-wins, later wildcard duplicates are skipped) |
 | `metricsGroup` | `string` | — | Stable grouping key for aggregating several domain routes as one tenant (maximum 128 UTF-8 bytes; no control characters) |
 | `upstreams` | `Upstream[]` | required | Destination(s); multiple UDS upstreams are load-balanced |
 | `terminateTls` | `boolean` | required | `true` = decrypt TLS; `false` = TCP passthrough |
@@ -639,7 +639,7 @@ const m = proxy.metrics();
 // m.suspendedResolved     — suspended connections that were resolved with a route
 // m.suspendedUnresolved   — suspended connections that timed out or were rejected
 // m.routes                — routes in the live table, including the default route
-// m.failingRoutes         — routes whose cert failed to build (see "Per-route certificates")
+// m.failingRoutes         — rejected cert/protocol/carrier routes or duplicate wildcards
 
 // Per listener, in configuration order
 for (const l of m.listeners) {
@@ -686,6 +686,11 @@ label cardinality bounded by configuration. Counters survive route hot reloads w
 and `metricsGroup` are unchanged; changing the group starts a new series rather than moving
 historical counters between tenants.
 Removing or rejecting a route removes its series; adding that route again starts fresh counters.
+`tls_handshake` and `route_rate_limited` are attributed after SNI selection but before client
+authentication, so they describe traffic aimed at a route rather than confirmed tenant sessions.
+Creating route metric objects and rendering them are linear in configured routes (four base
+samples per route); deployments with thousands of routes should size their scrape interval
+accordingly.
 
 **Block reasons:** `max_connections`, `cidr_blocked`, `ja3_blocked`, `ja4_blocked`,
 `incomplete_handshake`, `no_sni`, `rate_limited`, `too_many_connections`, `penalty_boxed`.
