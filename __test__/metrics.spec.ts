@@ -304,13 +304,15 @@ describe('proxy.metrics() error classification', () => {
 	let echo: Awaited<ReturnType<typeof startEchoServer>>;
 	let proxy: SymphonyProxy;
 	let tlsPort: number;
-	let deadPort: number;
+	let deadSocketPath: string;
 
 	before(async () => {
 		echo = await startEchoServer();
 		tlsPort = await getFreePort();
-		// Reserved and then released, so a connect here is refused rather than hanging.
-		deadPort = await getFreePort();
+		deadSocketPath = path.join(
+			os.tmpdir(),
+			`symphony-missing-${process.pid}-${Math.random().toString(36).slice(2)}.sock`
+		);
 		proxy = new SymphonyProxy({
 			listeners: [{ host: '127.0.0.1', port: tlsPort, idleTimeoutMs: 300 }],
 			routes: [
@@ -324,7 +326,7 @@ describe('proxy.metrics() error classification', () => {
 				{
 					sni: 'dead.test',
 					metricsGroup: 'tenant-dead',
-					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: deadPort }],
+					upstreams: [{ kind: 'uds', path: deadSocketPath }],
 					terminateTls: true,
 					cert: { certChain: cert.cert, privateKey: cert.key },
 				},
