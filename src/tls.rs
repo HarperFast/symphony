@@ -48,7 +48,12 @@ impl TlsConfigCache {
 	/// Callers run this once they *commit* the table they just built — see `build_route_table`.
 	pub fn retain_used(&mut self) {
 		let used = std::mem::take(&mut self.used);
-		self.cache.retain(|k, _| used.contains(k));
+		self.cache.retain(|k, config| used.contains(k) || Arc::strong_count(config) > 1);
+	}
+
+	/// Discard marks from a route table that was never committed.
+	pub(crate) fn clear_used(&mut self) {
+		self.used.clear();
 	}
 
 	/// Number of live `ServerConfig`s held.
