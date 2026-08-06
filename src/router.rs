@@ -386,6 +386,7 @@ pub fn build_route_table(
 	previous: Option<&RouteTable>,
 	cache: &mut TlsConfigCache,
 ) -> crate::error::Result<RouteTable> {
+	cache.clear_used();
 	let mut exact: HashMap<Arc<str>, Route> = HashMap::new();
 	let mut wildcard: Vec<(Arc<str>, Route)> = Vec::new();
 	let mut monitored_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
@@ -911,6 +912,49 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		build_route_table(&[], &ListenerTlsSpec::empty(), None, &mut cache).expect("empty build");
 		cache.retain_used();
 		assert!(cache.is_empty(), "a config no live route references must not be retained");
+	}
+
+	#[test]
+	fn aborted_build_marks_do_not_retain_configs() {
+		let mut cache = TlsConfigCache::new();
+		let old = vec![tls_route("tenant.example.com", CERT_A, KEY_A)];
+		let mut rotated_route = tls_route("tenant.example.com", CERT_A, KEY_A);
+		rotated_route.http2 = true;
+		let rotated = vec![rotated_route];
+
+		let live = build_route_table(&old, &ListenerTlsSpec::empty(), None, &mut cache).expect("initial build");
+		cache.retain_used();
+
+		// Simulate a route table whose later configuration validation aborts the update.
+		drop(build_route_table(&rotated, &ListenerTlsSpec::empty(), Some(&live), &mut cache).expect("aborted build"));
+		let replacement = build_route_table(&old, &ListenerTlsSpec::empty(), Some(&live), &mut cache).expect("replacement build");
+		cache.retain_used();
+
+		assert_eq!(cache.len(), 1, "the aborted build's config must not survive the next committed sweep");
+		drop(replacement);
+	}
+
+	#[test]
+	fn carried_forward_config_survives_sweep() {
+		let mut cache = TlsConfigCache::new();
+		let good = vec![tls_route("tenant.example.com", CERT_A, KEY_A)];
+		let mismatch = vec![tls_route("tenant.example.com", CERT_A, KEY_B)];
+
+		let live = build_route_table(&good, &ListenerTlsSpec::empty(), None, &mut cache).expect("initial build");
+		cache.retain_used();
+		let expected = config_ptr(&live, "tenant.example.com");
+
+		let carried = build_route_table(&mismatch, &ListenerTlsSpec::empty(), Some(&live), &mut cache).expect("carry forward");
+		cache.retain_used();
+		assert_eq!(cache.len(), 1, "the carried-forward config is still serving traffic");
+
+		let healed = build_route_table(&good, &ListenerTlsSpec::empty(), Some(&carried), &mut cache).expect("healed build");
+		cache.retain_used();
+		assert_eq!(
+			expected,
+			config_ptr(&healed, "tenant.example.com"),
+			"healing a transient mismatch must preserve the original ticket keys"
+		);
 	}
 
 	// A single route with a mismatched cert/key must not abort the whole table: the
