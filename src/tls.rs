@@ -51,9 +51,10 @@ impl TlsConfigCache {
 		self.cache.retain(|k, config| used.contains(k) || Arc::strong_count(config) > 1);
 	}
 
-	/// Discard marks from a route table that was never committed.
+	/// Discard marks and cache-only configs from a route table that was never committed.
 	pub(crate) fn clear_used(&mut self) {
 		self.used.clear();
+		self.cache.retain(|_, config| Arc::strong_count(config) > 1);
 	}
 
 	/// Number of live `ServerConfig`s held.
