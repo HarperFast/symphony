@@ -927,6 +927,11 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 
 		// Simulate a route table whose later configuration validation aborts the update.
 		drop(build_route_table(&rotated, &ListenerTlsSpec::empty(), Some(&live), &mut cache).expect("aborted build"));
+		drop(
+			build_route_table(&old, &ListenerTlsSpec::empty(), Some(&live), &mut cache)
+				.expect("second aborted build"),
+		);
+		assert_eq!(cache.len(), 1, "starting another build must discard the first aborted config");
 		let replacement = build_route_table(&old, &ListenerTlsSpec::empty(), Some(&live), &mut cache).expect("replacement build");
 		cache.retain_used();
 
