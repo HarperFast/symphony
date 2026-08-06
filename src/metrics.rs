@@ -230,8 +230,8 @@ impl RouteMetrics {
 }
 
 pub fn inc_route_error(listener: &ListenerMetrics, route: &RouteMetrics, kind: ErrorKind) {
-	listener.inc_error(kind);
 	route.inc_error(kind);
+	listener.inc_error(kind);
 }
 
 pub struct RouteActiveGuard {
