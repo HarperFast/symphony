@@ -65,12 +65,13 @@ impl TlsConfigCache {
 		self.cache.retain(|_, config| Arc::strong_count(config) > 1);
 	}
 
-	/// Number of live `ServerConfig`s held.
-	pub fn len(&self) -> usize {
+	#[cfg(test)]
+	pub(crate) fn len(&self) -> usize {
 		self.cache.len()
 	}
 
-	pub fn is_empty(&self) -> bool {
+	#[cfg(test)]
+	pub(crate) fn is_empty(&self) -> bool {
 		self.cache.is_empty()
 	}
 

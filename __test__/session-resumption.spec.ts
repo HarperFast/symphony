@@ -90,7 +90,9 @@ describe('TLS session resumption', () => {
 	}
 
 	// A rotated cert is a different identity: its predecessor's session state going away is
-	// correct, not a regression. Asserted so the sweep isn't "fixed" into retaining forever.
+	// correct, not a regression. This asserts the client-visible behaviour only — a ticket minted
+	// under the old cert's ticketer cannot decrypt under the new one whether or not the old config
+	// is still cached. Eviction itself is proven in `router.rs::sweep_retires_configs_no_route_references`.
 	it('does not resume a session across a cert rotation', async () => {
 		const first = await tlsHandshake({
 			port: proxyPort,
