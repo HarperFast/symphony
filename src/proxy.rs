@@ -591,10 +591,11 @@ impl SymphonyProxyWrap {
 			// rebuild (mid-rotation KeyMismatch) retains its last-good cert instead of
 			// dropping the SNI from the live table.
 			let current = self.route_table.0.load();
-			let mut cache = self
-				.tls_cache
-				.lock()
-				.map_err(|_| napi::Error::from_reason("tls config cache poisoned"))?;
+			// Recover a poisoned lock instead of propagating: the cache holds no invariant a
+			// panicking build can break — `clear_used` reconciles it at the start of the next
+			// build — and refusing the lock forever would turn one panicked reload into a proxy
+			// that can never pick up a renewed cert again.
+			let mut cache = self.tls_cache.lock().unwrap_or_else(|e| e.into_inner());
 			let table =
 				build_route_table(&specs, &self.default_listener_tls, Some(&current), &mut cache)
 					.map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -648,9 +649,7 @@ impl SymphonyProxyWrap {
 			self.route_table.swap(table);
 			// Committed — now retire the ServerConfigs (and their session state) that no route
 			// in the new table asked for, i.e. rotated-out certs.
-			if let Ok(mut cache) = self.tls_cache.lock() {
-				cache.retain_used();
-			}
+			self.tls_cache.lock().unwrap_or_else(|e| e.into_inner()).retain_used();
 		}
 		if let Some((protection_updates, parsed)) = validated_protection {
 			// Phase 3: store all (infallible — validation above guarantees each port is valid).
