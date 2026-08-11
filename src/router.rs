@@ -380,6 +380,8 @@ impl ListenerTlsSpec {
 /// state survives the reload. Sweeping it (`retain_used`) is the *caller's* job, once it commits
 /// the returned table — this table is only one half of an all-or-nothing `updateConfig`, and
 /// retiring configs for a table that never goes live would strand the running table's sessions.
+/// The `clear_used` below is not that sweep: it drops only configs nothing references yet, i.e.
+/// the previous build's, if that update was abandoned.
 pub fn build_route_table(
 	specs: &[RouteSpec],
 	listener_tls: &ListenerTlsSpec,
