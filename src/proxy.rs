@@ -600,9 +600,11 @@ impl SymphonyProxyWrap {
 				build_route_table(&specs, &self.default_listener_tls, Some(&current), &mut cache)
 					.map_err(|e| napi::Error::from_reason(e.to_string()))?;
 			drop(cache);
-			// Not swept here: a later validation failure aborts the whole update, and retiring
-			// configs for a table that never goes live would drop the running table's session
-			// state. The sweep happens at the commit point below.
+			// Not swept here: a later validation failure aborts the whole update, and a sweep
+			// against marks from a table that never goes live names none of the running table's
+			// configs. The refcount clause in `retain_used` would spare them anyway (the live
+			// table still holds them) — sweeping only at the commit point below means the
+			// placement doesn't depend on that.
 			Some(table)
 		} else {
 			None
