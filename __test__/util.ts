@@ -477,6 +477,7 @@ export function tlsHandshake(opts: {
 					session: socket.getSession() ?? undefined,
 				};
 				let settled = false;
+				let timer: NodeJS.Timeout | undefined;
 				const finish = () => {
 					if (settled) return;
 					settled = true;
@@ -484,11 +485,18 @@ export function tlsHandshake(opts: {
 					socket.end();
 					resolve(result);
 				};
+				// Only 1.3 is worth waiting on: under 1.2 the session is already in hand, and the
+				// 'session' event may have fired before this callback ran, so waiting would just
+				// burn the full ticket timeout on every fresh connection.
+				if (result.protocol !== 'TLSv1.3' && result.session) {
+					finish();
+					return;
+				}
 				socket.once('session', (s: Buffer) => {
 					result.session = s;
 					finish();
 				});
-				const timer = setTimeout(finish, result.reused ? 100 : ticketWaitMs);
+				timer = setTimeout(finish, result.reused ? 100 : ticketWaitMs);
 			},
 		);
 		socket.on('error', reject);
