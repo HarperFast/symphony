@@ -46,12 +46,20 @@ impl TlsConfigCache {
 
 	/// Drop every entry not requested since the previous sweep, retiring rotated-out certs.
 	/// Callers run this once they *commit* the table they just built — see `build_route_table`.
+	///
+	/// `strong_count` is load-bearing, not defensive: the carry-forward branch in
+	/// `build_route_table` reuses the previous table's `Arc` without going through `get_or_build`,
+	/// so a mid-rotation route is live but unmarked. Because `swap()` precedes the sweep, a
+	/// committed table's configs always have `strong_count >= 2` — the refcount, not the mark
+	/// set, is what makes this correct.
 	pub fn retain_used(&mut self) {
 		let used = std::mem::take(&mut self.used);
 		self.cache.retain(|k, config| used.contains(k) || Arc::strong_count(config) > 1);
 	}
 
 	/// Discard marks and cache-only configs from a route table that was never committed.
+	/// `strong_count == 1` means only the cache holds it, so no live table can lose one here;
+	/// without the retain, repeatedly-failing reloads accumulate a config per attempt.
 	pub(crate) fn clear_used(&mut self) {
 		self.used.clear();
 		self.cache.retain(|_, config| Arc::strong_count(config) > 1);
