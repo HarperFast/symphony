@@ -330,8 +330,7 @@ export class SymphonyProxy extends EventEmitter {
 		}
 		// The native method never throws for a route it can decode, but napi decodes the argument
 		// before that method runs, so a mistyped field (e.g. `forwardFingerprint: ['ja3', null]`)
-		// throws here — from an async 'suspended' listener, an unhandled rejection. Handle it the
-		// way the native side handles an invalid route: drop the connection, report via 'error'.
+		// throws here — from an async 'suspended' listener, an unhandled rejection.
 		try {
 			this._inner.resolveConnection(id, {
 				upstream: toJsUpstream(route.upstream),
@@ -345,7 +344,9 @@ export class SymphonyProxy extends EventEmitter {
 			});
 		} catch (err) {
 			this._inner.resolveConnection(id, null);
-			this._emitError(new Error(`resolveConnection(id=${id}): ${(err as Error).message}`, { cause: err }));
+			// Deferred like native-originated errors, so a throwing 'error' listener can't escape this call.
+			const error = new Error(`resolveConnection(id=${id}): ${(err as Error).message}`, { cause: err });
+			process.nextTick(() => this._emitError(error));
 		}
 	}
 }
