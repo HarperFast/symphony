@@ -1,14 +1,9 @@
 /**
  * Dead-peer detection (issue #45): the half-close bound and the keepalive config surface.
  *
- * The half-close tests drive a real `SymphonyProxy` over a real TCP listener, so they exercise
- * the accept loop, the route table and `forward()`'s copy phase rather than a helper in
- * isolation — the retention they assert against only exists on that path.
- *
- * Reaping a genuinely vanished peer is not testable here: it needs a peer whose packets stop
+ * Reaping a genuinely vanished peer is not covered here — that needs a peer whose packets stop
  * without a FIN or RST (an `iptables DROP` or a severed netns), which a single-host Node test
- * cannot produce. `src/liveness.rs` covers the configuration half of that mechanism by reading
- * the keepalive settings back off an accepted socket.
+ * cannot produce. `src/liveness.rs` covers the configuration half of that mechanism instead.
  *
  * Requires the native addon to be built (npm run build:debug).
  */
@@ -126,9 +121,9 @@ describe('dead connection reaping', () => {
 		await waitFor(() => proxy.metrics().listeners[0].halfClosedConnections === 0);
 	});
 
+	// The shape the bound must not touch: the client has shut down its write half and the
+	// response's first byte comes well after the window would have expired.
 	it('does not truncate a slow response after the client half-closes', async () => {
-		// The shape the bound must not touch: the client has sent its request and shut down its
-		// write half, and the response only starts well after the window would have expired.
 		const { proxy, port } = await startProxy((socket) => {
 			socket.resume();
 			setTimeout(() => socket.end('late'), HALF_CLOSE_MS * 4);
@@ -146,8 +141,6 @@ describe('dead connection reaping', () => {
 	});
 
 	it('holds a half-closed connection open while the surviving direction is still carrying bytes', async () => {
-		// The upstream closes its write half immediately but keeps reading; the client keeps
-		// sending. Activity on the surviving direction must defer the bound, not be ignored.
 		let received = 0;
 		const { proxy, port } = await startProxy((socket) => {
 			socket.on('data', (c) => (received += c.length));
@@ -160,7 +153,7 @@ describe('dead connection reaping', () => {
 			client.write('x');
 			await sleep(HALF_CLOSE_MS / 3);
 		}
-		// 8 × 100ms = 800ms, well past a 300ms window that did not reset.
+		// 800ms of dripping bytes, well past a 300ms window that did not reset.
 		assert.equal(proxy.metrics().listeners[0].activeConnections, 1, 'activity must defer the bound');
 		assert.ok(received > 0);
 
@@ -186,13 +179,25 @@ describe('dead connection reaping', () => {
 			routes: [{ sni: SNI, upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: 1 }], terminateTls: false }],
 			tcpKeepalive,
 		});
-		assert.throws(() => new SymphonyProxy(config({ idleMs: 0 })), /idleMs must be a positive number/);
-		assert.throws(() => new SymphonyProxy(config({ intervalMs: -1 })), /intervalMs must be a positive number/);
-		assert.throws(() => new SymphonyProxy(config({ retries: 0 })), /retries must be at least 1/);
+		assert.throws(() => new SymphonyProxy(config({ idleMs: 0 })), /idleMs must be a number of ms/);
+		assert.throws(() => new SymphonyProxy(config({ intervalMs: -1 })), /intervalMs must be a number of ms/);
+		assert.throws(() => new SymphonyProxy(config({ retries: 0 })), /retries must be in \[1, 127\]/);
+		assert.throws(() => new SymphonyProxy(config({ retries: 128 })), /retries must be in \[1, 127\]/);
+		// Sub-second timings reach the kernel as whole seconds, so they would install as 0 and be
+		// rejected by setsockopt long after construction reported success.
+		assert.throws(() => new SymphonyProxy(config({ idleMs: 500 })), /idleMs must be a number of ms/);
+		assert.throws(() => new SymphonyProxy(config({ intervalMs: 999 })), /intervalMs must be a number of ms/);
 		assert.throws(
 			() => new SymphonyProxy({ ...config(undefined), halfCloseTimeoutMs: Number.NaN }),
-			/halfCloseTimeoutMs must be a positive number/
+			/halfCloseTimeoutMs must be a number of ms/
 		);
+		// 0.5 would truncate to Duration::ZERO and silently disable the bound; 0 is the documented
+		// way to do that on purpose.
+		assert.throws(
+			() => new SymphonyProxy({ ...config(undefined), halfCloseTimeoutMs: 0.5 }),
+			/halfCloseTimeoutMs must be a number of ms/
+		);
+		assert.doesNotThrow(() => new SymphonyProxy({ ...config(undefined), halfCloseTimeoutMs: 0 }));
 		// `enabled: false` is the supported way to turn it off, and it is not an error.
 		assert.doesNotThrow(() => new SymphonyProxy(config({ enabled: false })));
 	});

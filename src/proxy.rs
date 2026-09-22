@@ -1198,14 +1198,29 @@ const DEFAULT_KEEPALIVE_INTERVAL_MS: f64 = 30_000.0;
 const DEFAULT_KEEPALIVE_RETRIES: u32 = 5;
 const DEFAULT_HALF_CLOSE_TIMEOUT_MS: f64 = 300_000.0;
 
-/// Rejected rather than clamped: a non-finite or non-positive probe interval would be silently
-/// converted by `as u64` into a schedule nobody asked for, and this is read once at construction.
-fn positive_ms(value: Option<f64>, default: f64, label: &str) -> Result<Duration> {
+/// `TCP_KEEPCNT`'s kernel ceiling on Linux. A larger value is rejected by `setsockopt`, which
+/// would leave the connection on the host defaults after `SO_KEEPALIVE` had already been set.
+const MAX_KEEPALIVE_RETRIES: u32 = 127;
+
+/// Rejected rather than clamped, and rejected against the *granularity the setting reaches*, not
+/// just positivity: everything below goes through `as u64`, `Duration`, and then socket2's
+/// whole-second conversion, so a value that looks positive in JS can arrive at the kernel as
+/// zero. This is read once at construction, so the cost of being strict is a startup error
+/// instead of a silently degraded schedule.
+fn bounded_ms(value: Option<f64>, default: f64, min_ms: f64, max_ms: f64, label: &str) -> Result<Duration> {
 	let ms = value.unwrap_or(default);
-	if !ms.is_finite() || ms <= 0.0 {
-		return Err(napi::Error::from_reason(format!("{label} must be a positive number of ms, got {ms}")));
+	if !ms.is_finite() || ms < min_ms || ms > max_ms {
+		return Err(napi::Error::from_reason(format!(
+			"{label} must be a number of ms in [{min_ms}, {max_ms}], got {ms}"
+		)));
 	}
 	Ok(Duration::from_millis(ms as u64))
+}
+
+/// Keepalive timings reach the kernel as whole seconds (`TCP_KEEPIDLE`/`TCP_KEEPINTVL`, both
+/// `c_int`), so anything under a second would be installed as 0 and rejected.
+fn keepalive_ms(value: Option<f64>, default: f64, label: &str) -> Result<Duration> {
+	bounded_ms(value, default, 1_000.0, i32::MAX as f64 * 1_000.0, label)
 }
 
 fn parse_keepalive_config(cfg: Option<&JsTcpKeepaliveConfig>) -> Result<Option<KeepaliveConfig>> {
@@ -1213,12 +1228,14 @@ fn parse_keepalive_config(cfg: Option<&JsTcpKeepaliveConfig>) -> Result<Option<K
 		return Ok(None);
 	}
 	let retries = cfg.and_then(|c| c.retries).unwrap_or(DEFAULT_KEEPALIVE_RETRIES);
-	if retries == 0 {
-		return Err(napi::Error::from_reason("tcpKeepalive.retries must be at least 1".to_string()));
+	if retries == 0 || retries > MAX_KEEPALIVE_RETRIES {
+		return Err(napi::Error::from_reason(format!(
+			"tcpKeepalive.retries must be in [1, {MAX_KEEPALIVE_RETRIES}], got {retries}"
+		)));
 	}
 	Ok(Some(KeepaliveConfig {
-		idle: positive_ms(cfg.and_then(|c| c.idle_ms), DEFAULT_KEEPALIVE_IDLE_MS, "tcpKeepalive.idleMs")?,
-		interval: positive_ms(
+		idle: keepalive_ms(cfg.and_then(|c| c.idle_ms), DEFAULT_KEEPALIVE_IDLE_MS, "tcpKeepalive.idleMs")?,
+		interval: keepalive_ms(
 			cfg.and_then(|c| c.interval_ms),
 			DEFAULT_KEEPALIVE_INTERVAL_MS,
 			"tcpKeepalive.intervalMs",
@@ -1227,13 +1244,13 @@ fn parse_keepalive_config(cfg: Option<&JsTcpKeepaliveConfig>) -> Result<Option<K
 	}))
 }
 
-/// Zero disables the bound; any other value goes through `positive_ms` so a NaN or negative
-/// cannot become a near-instant deadline that truncates live sessions.
+/// Exactly zero disables the bound. Every other value must land on at least one whole
+/// millisecond, since `0.5` would otherwise truncate to `Duration::ZERO` and disable it silently.
 fn parse_half_close_timeout(value: Option<f64>) -> Result<Duration> {
 	if value == Some(0.0) {
 		return Ok(Duration::ZERO);
 	}
-	positive_ms(value, DEFAULT_HALF_CLOSE_TIMEOUT_MS, "halfCloseTimeoutMs")
+	bounded_ms(value, DEFAULT_HALF_CLOSE_TIMEOUT_MS, 1.0, u32::MAX as f64, "halfCloseTimeoutMs")
 }
 
 fn pem_bytes(v: &Either<String, Buffer>) -> Vec<u8> {
