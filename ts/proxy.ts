@@ -345,7 +345,7 @@ export class SymphonyProxy extends EventEmitter {
 		} catch (err) {
 			this._inner.resolveConnection(id, null);
 			// Deferred like native-originated errors, so a throwing 'error' listener can't escape this call.
-			const message = err instanceof Error ? err.message : String(err);
+			const message = err instanceof Error ? err.message : 'a non-Error value was thrown';
 			const error = new Error(`resolveConnection(id=${id}): ${message}`, { cause: err });
 			process.nextTick(() => this._emitError(error));
 		}
