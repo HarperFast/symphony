@@ -358,7 +358,7 @@ export interface ListenerMetrics {
 	address: string;
 	mode: 'tls' | 'http';
 	activeConnections: number;
-	/** Subset of `activeConnections` whose upstream half has closed. */
+	/** Subset of `activeConnections` in FIN-WAIT-2 — our FIN sent, the client's not yet received. */
 	halfClosedConnections: number;
 	accepted: number;
 	blocked: number;

@@ -72,7 +72,7 @@ console.log('proxy listening on :443');
 | `clientReadBufferSize` | `number` | `readBufferSize` | Overrides `readBufferSize` for the client→upstream direction only |
 | `upstreamReadBufferSize` | `number` | `readBufferSize` | Overrides `readBufferSize` for the upstream→client direction only |
 | `tcpKeepalive` | `TcpKeepaliveConfig` | on, see below | TCP keepalive for accepted sockets. See [Dead-peer detection](#dead-peer-detection) |
-| `halfCloseTimeoutMs` | `number` | `300000` | Reclaim a connection whose upstream has closed once the surviving client→upstream direction has carried nothing for this many ms. Minimum `1`; `0` disables. See [Dead-peer detection](#dead-peer-detection) |
+| `halfCloseTimeoutMs` | `number` | `300000` | Reclaim a connection once its write half to the client is shut down and the surviving client→upstream direction has carried nothing for this many ms. Minimum `1`; `0` disables. See [Dead-peer detection](#dead-peer-detection) |
 
 ### `TcpKeepaliveConfig`
 
@@ -856,19 +856,22 @@ This bounds *idle* sockets. A socket with data outstanding is instead bounded by
 retransmission limit (`net.ipv4.tcp_retries2`, ~15 minutes at its default), because keepalive
 probes are not sent while anything is unacknowledged.
 
-**The half-close bound.** `copy_bidirectional` completes only when *both* directions finish. When
-the upstream closes, symphony shuts down its write half to the client — the socket enters
-FIN-WAIT-2 — and then waits for a FIN the client may never send. Because the fd stays open the
-socket is not orphaned, so `tcp_fin_timeout` does not apply either. `halfCloseTimeoutMs` reclaims
-that connection once the surviving client→upstream direction has carried nothing for the
-configured window.
+**The half-close bound.** `copy_bidirectional` returns only once *both* directions have finished.
+When the upstream closes, symphony drains the response and shuts down its write half to the
+client — the socket enters FIN-WAIT-2 — and then waits for a FIN the client may never send.
+Because the fd stays open the socket is not orphaned, so `tcp_fin_timeout` does not apply either.
+`halfCloseTimeoutMs` reclaims that connection once the surviving client→upstream direction has
+carried nothing for the configured window.
 
 Two properties keep this from cutting live sessions:
 
-- **Only an upstream close arms it.** In that state symphony has already sent its FIN and can
-  never write to the client again, so there is no response a deadline could truncate. A *client*
-  half-close — a client that `shutdown(SHUT_WR)`s after its request — leaves the response in
-  flight and is deliberately not bounded here; a slow upstream is `idleTimeoutMs`'s territory.
+- **The clock starts when our FIN is actually out**, not when the upstream EOFs. Those are not the
+  same instant: on a terminated-TLS route a write is accepted into rustls' buffer long before it
+  reaches a slow client's socket, so the drain happens inside the shutdown. Starting at the EOF
+  would run the deadline against a flush still in progress. Once the FIN is out, nothing further
+  can be sent to that client, so there is no response left for the bound to truncate. A *client*
+  half-close shuts down the write half to the *upstream* instead and arms nothing — there the
+  response is still in flight, and a slow upstream is `idleTimeoutMs`'s territory.
 - **The deadline resets on activity.** A client still uploading to an upstream that closed early
   keeps its connection; only a genuinely quiet one is reclaimed.
 
