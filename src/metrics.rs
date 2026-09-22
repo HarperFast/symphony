@@ -102,9 +102,10 @@ impl ErrorKind {
 /// read out of band by `metrics()`, never used to make a decision that needs ordering.
 pub struct ListenerMetrics {
 	pub active_connections: AtomicU64,
-	/// Subset of `active_connections` sitting in FIN-WAIT-2: symphony's write half to the client
-	/// is shut down and the client's own FIN has not arrived. A rising floor here is the leak in
-	/// issue #45 becoming visible while it is still counted in connections rather than gigabytes.
+	/// Subset of `active_connections` whose write half to the client is shut down and whose
+	/// client has not sent its own FIN (FIN-WAIT-1 until ours is acknowledged, then FIN-WAIT-2).
+	/// A rising floor here is the leak in issue #45 becoming visible while it is still counted
+	/// in connections rather than gigabytes.
 	pub half_closed_connections: AtomicU64,
 	pub total_accepted: AtomicU64,
 	/// Bytes read from clients on this listener (client → upstream), counted where the proxy

@@ -202,7 +202,7 @@ pub struct JsListenerMetrics {
 	/// "tls" or "http".
 	pub mode: String,
 	pub active_connections: f64,
-	/// Subset of `activeConnections` in FIN-WAIT-2 — our FIN sent, the client's not yet received.
+	/// Subset of `activeConnections` whose write half to the client is shut down, awaiting its FIN.
 	pub half_closed_connections: f64,
 	pub accepted: f64,
 	pub blocked: f64,
@@ -1221,11 +1221,13 @@ fn bounded_ms(value: Option<f64>, default: f64, min_ms: f64, max_ms: f64, label:
 /// `c_int`), so a fractional second is not a rounding detail — it is a schedule the listener
 /// reports and does not run. Under a second would install as 0 and be rejected outright.
 fn keepalive_ms(value: Option<f64>, default: f64, label: &str) -> Result<Duration> {
+	let ms = value.unwrap_or(default);
 	let resolved = bounded_ms(value, default, 1_000.0, i32::MAX as f64 * 1_000.0, label)?;
-	if resolved.subsec_millis() != 0 {
+	// Checked against the input, not the `Duration`: `1000.5` truncates to a whole 1000ms and
+	// would pass a check made after the cast.
+	if ms % 1_000.0 != 0.0 {
 		return Err(napi::Error::from_reason(format!(
-			"{label} is installed as whole seconds; use a multiple of 1000, got {}",
-			value.unwrap_or(default)
+			"{label} is installed as whole seconds; use a multiple of 1000, got {ms}"
 		)));
 	}
 	Ok(resolved)
