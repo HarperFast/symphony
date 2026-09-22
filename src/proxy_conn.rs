@@ -562,7 +562,6 @@ fn collect_tls_forward(conn: &rustls::ServerConnection) -> TlsForward {
 	}
 }
 
-/// A fingerprint selected for forwarding, with both of its carriers.
 struct ForwardedFingerprint<'a> {
 	pp2_type: u8,
 	header_name: &'static str,
