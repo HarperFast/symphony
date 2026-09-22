@@ -46,6 +46,9 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets
 
+      - name: cargo fmt
+        run: cargo fmt --check
+
   build-linux:
     name: Build – ${{ matrix.target }}
     runs-on: ubuntu-latest
