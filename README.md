@@ -71,6 +71,17 @@ console.log('proxy listening on :443');
 | `readBufferSize` | `number` | `8192` | Per-direction copy buffer size in bytes, clamped to `[512, 1048576]`. See [Copy buffers and per-connection memory](#copy-buffers-and-per-connection-memory) |
 | `clientReadBufferSize` | `number` | `readBufferSize` | Overrides `readBufferSize` for the client→upstream direction only |
 | `upstreamReadBufferSize` | `number` | `readBufferSize` | Overrides `readBufferSize` for the upstream→client direction only |
+| `tcpKeepalive` | `TcpKeepaliveConfig` | on, see below | TCP keepalive for accepted sockets. See [Dead-peer detection](#dead-peer-detection) |
+| `halfCloseTimeoutMs` | `number` | `300000` | Reclaim a connection whose upstream has closed once the surviving client→upstream direction has carried nothing for this many ms. `0` disables. See [Dead-peer detection](#dead-peer-detection) |
+
+### `TcpKeepaliveConfig`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | `boolean` | `true` | `false` turns dead-peer detection off entirely |
+| `idleMs` | `number` | `300000` | Quiet time before the first probe |
+| `intervalMs` | `number` | `30000` | Gap between probes |
+| `retries` | `number` | `5` | Unanswered probes before the connection is dropped |
 
 ### `ListenerConfig`
 
@@ -696,7 +707,12 @@ accordingly.
 `incomplete_handshake`, `no_sni`, `rate_limited`, `too_many_connections`, `penalty_boxed`.
 
 **Error reasons:** `no_route`, `route_rate_limited`, `suspend_unresolved`, `tls_handshake`,
-`tls_missing_cert`, `upstream_connect`, `idle_timeout`, `stream`, `http_header`.
+`tls_missing_cert`, `upstream_connect`, `idle_timeout`, `half_closed`, `peer_timeout`, `stream`,
+`http_header`.
+
+`symphony_listener_half_closed_connections` is a gauge alongside the active one, counting the
+subset of active connections whose upstream half has closed. A rising floor there is a retention
+leak while it is still measured in connections — see [Dead-peer detection](#dead-peer-detection).
 
 > `idle_timeout` counts terminations by `idleTimeoutMs`, which today is a *total duration* cap
 > rather than an idleness one — see [#34](https://github.com/HarperFast/symphony/issues/34). Busy
@@ -815,6 +831,44 @@ docker run --rm -v $(pwd):/build -w /build \
 ```
 
 ---
+
+## Dead-peer detection
+
+A client that disappears without closing — a mobile network dropping, a host powering off — sends
+no FIN, so nothing in the ordinary proxying path ever learns it is gone. Two independent mechanisms
+bound how long such a connection is retained; both are on by default.
+
+**TCP keepalive.** `SO_KEEPALIVE` is off per socket by default, and the `net.ipv4.tcp_keepalive_*`
+sysctls govern only sockets that opted in — so without this a silent peer is indistinguishable
+from a parked subscriber for the life of the process. symphony sets the option and its timings on
+the *listening* socket, which every accepted socket inherits, so the accept path pays no extra
+syscalls. At the defaults a peer that stops answering is reclaimed `300s + 30s × 5` = 7.5 minutes
+after the connection's last activity. Lower `idleMs` to reclaim sooner, at one probe per
+connection per `idleMs`: across 300k connections the default is roughly 1000 packets/s.
+
+This bounds *idle* sockets. A socket with data outstanding is instead bounded by the kernel's
+retransmission limit (`net.ipv4.tcp_retries2`, ~15 minutes at its default), because keepalive
+probes are not sent while anything is unacknowledged.
+
+**The half-close bound.** `copy_bidirectional` completes only when *both* directions finish. When
+the upstream closes, symphony shuts down its write half to the client — the socket enters
+FIN-WAIT-2 — and then waits for a FIN the client may never send. Because the fd stays open the
+socket is not orphaned, so `tcp_fin_timeout` does not apply either. `halfCloseTimeoutMs` reclaims
+that connection once the surviving client→upstream direction has carried nothing for the
+configured window.
+
+Two properties keep this from cutting live sessions:
+
+- **Only an upstream close arms it.** In that state symphony has already sent its FIN and can
+  never write to the client again, so there is no response a deadline could truncate. A *client*
+  half-close — a client that `shutdown(SHUT_WR)`s after its request — leaves the response in
+  flight and is deliberately not bounded here; a slow upstream is `idleTimeoutMs`'s territory.
+- **The deadline resets on activity.** A client still uploading to an upstream that closed early
+  keeps its connection; only a genuinely quiet one is reclaimed.
+
+Like the buffer sizes, both settings are frozen at construction, so editing either makes
+`symphony-server` recreate the proxy — a reconnect event on a high-connection-count listener, not
+a live tune.
 
 ## Copy buffers and per-connection memory
 

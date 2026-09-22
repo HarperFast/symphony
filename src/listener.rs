@@ -1,3 +1,4 @@
+use crate::liveness::{KeepaliveConfig, arm_accepted, arm_keepalive};
 use crate::metrics::BlockKind;
 use crate::proxy_conn::{ConnContext, handle};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -28,7 +29,7 @@ pub async fn spawn_listeners(
 	let mut handles = Vec::with_capacity(workers);
 
 	for _ in 0..workers {
-		let socket = make_reuseport_socket(addr)?;
+		let socket = make_reuseport_socket(addr, ctx.keepalive.as_ref())?;
 		let listener = TcpListener::from_std(socket)?;
 		let ctx2 = ctx.clone();
 		let max_conn = max_connections;
@@ -73,6 +74,9 @@ async fn accept_loop(
 								continue;
 							}
 						}
+						if let Some(cfg) = &ctx.keepalive {
+							arm_accepted(&stream, cfg);
+						}
 						let ctx2 = ctx.clone();
 						tokio::spawn(async move {
 							handle(stream, peer_addr, ctx2).await;
@@ -89,13 +93,21 @@ async fn accept_loop(
 	}
 }
 
-pub(crate) fn make_reuseport_socket(addr: SocketAddr) -> crate::error::Result<std::net::TcpListener> {
+pub(crate) fn make_reuseport_socket(
+	addr: SocketAddr,
+	keepalive: Option<&KeepaliveConfig>,
+) -> crate::error::Result<std::net::TcpListener> {
 	let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
 	let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
 
 	socket.set_reuse_address(true)?;
 	socket.set_reuse_port(true)?; // SO_REUSEPORT — Linux 3.9+
 	socket.set_nonblocking(true)?;
+	// Before listen(), so no accepted socket can predate it. Accepted sockets inherit the
+	// settings rather than each paying its own setsockopt calls — see `liveness::arm_keepalive`.
+	if let Some(cfg) = keepalive {
+		arm_keepalive(&socket, cfg, &addr);
+	}
 	socket.bind(&addr.into())?;
 	socket.listen(65535)?;
 

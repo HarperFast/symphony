@@ -188,6 +188,13 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 				l.activeConnections,
 				tags
 			);
+			out.sample(
+				'symphony_listener_half_closed_connections',
+				'gauge',
+				'Proxied connections whose upstream half has closed, awaiting the client FIN.',
+				l.halfClosedConnections,
+				tags
+			);
 			out.sample('symphony_listener_accepted_total', 'counter', 'Connections accepted for proxying.', l.accepted, tags);
 			out.sample(
 				'symphony_listener_bytes_received_total',

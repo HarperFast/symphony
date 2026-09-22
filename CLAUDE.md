@@ -40,6 +40,7 @@ TCP accept (SO_REUSEPORT per worker thread)
   └─ upstream.rs  connect(Destination, peer_ip) → UpstreamStream
   └─ tokio::io::copy_bidirectional_with_sizes wrapped in idle_timeout
        (per-direction buffers from readBufferSize / client|upstreamReadBufferSize)
+       (both halves wrapped in liveness::Watched, raced against the half-close bound)
   └─ RAII drop: BalancerGuard, ActiveGuard, RouteActiveGuard — all counter decrements happen here
 ```
 
@@ -50,6 +51,7 @@ TCP accept (SO_REUSEPORT per worker thread)
 | `src/lib.rs` | Crate root; `mod` declarations; `#[macro_use] napi_derive` |
 | `src/proxy.rs` | All `#[napi]`-exposed types and methods; config parsing helpers |
 | `src/listener.rs` | TCP accept loop for TLS listeners; SO_REUSEPORT per worker; RLIMIT_NOFILE |
+| `src/liveness.rs` | Dead-peer detection: TCP keepalive on the listening socket; the half-close bound |
 | `src/http_listener.rs` | Plaintext HTTP/1.1 accept loop (`mode: 'http'`): ACME-proxy or 301 redirect |
 | `src/http_proxy.rs` | HTTP/1.1 header framing and rewrite helpers shared by the HTTP listener |
 | `src/sni.rs` | MSG_PEEK ClientHello parser; SNI extraction; JA3 fingerprint |
@@ -209,6 +211,7 @@ Tests live in `__test__/` and use Node's built-in `node:test` runner.
 - **`suspended.spec.ts`** — hold → resolve → proxy, hold → null → close, hold → timeout → drop
 - **`mtls.spec.ts`** — mTLS termination + PROXY v2 TLV forwarding of the client cert chain (0xE2, SSL TLV 0x20); skips without openssl
 - **`metrics.spec.ts`** — per-listener breakdown and byte counting, `renderPrometheus` output shape, the admin endpoint over UDS + TCP, and stale-socket reclaim after a `SIGKILL`
+- **`liveness.spec.ts`** — the half-close bound over a real passthrough proxy. Its client uses `allowHalfOpen: true` (otherwise Node answers the proxy's FIN with its own and there is no half-close to bound) and a synthetic `clientHello()` from `util.ts` (otherwise `peek()` blocks for its 5s reassembly timeout and a no-SNI connection resolves to no route)
 
 Build and run:
 ```bash
@@ -222,7 +225,9 @@ Tests bind on random high ports (`port: 0`) to avoid conflicts. Suspended-route 
 
 ## Non-obvious gotchas
 
-- **`copy_bidirectional` half-close**: it returns when *either* side closes, including on RST. The `ActiveGuard` drop handles both clean close and error paths.
+- **`copy_bidirectional` half-close**: it returns when *either* side closes, including on RST. The `ActiveGuard` drop handles both clean close and error paths. It completes only when *both* directions finish, which is why `liveness.rs` exists — see below.
+- **Keepalive is set on the listening socket, not on accepted ones**: Linux copies `SOCK_KEEPOPEN` and the keepalive timings into each accepted socket and arms its timer (`tcp_create_openreq_child`), so `make_reuseport_socket` configures it once per worker instead of the accept path paying three `setsockopt` calls per connection. `liveness::tests::keepalive_is_inherited_by_accepted_sockets` is the guard: if a platform stops inheriting them, every connection silently loses dead-peer detection, which no round-trip test would notice.
+- **Only an *upstream* EOF arms the half-close bound**: at that point tokio has already shut down the write half to the client, so nothing can be sent to it and no response exists to truncate. A *client* EOF leaves the upstream's response in flight — bounding that would cut a client that legitimately `shutdown(SHUT_WR)`s after its request and then waits on a slow upstream.
 - **Affinity bounds check**: after `updateConfig` shrinks the socket list, a stale affinity `socket_idx` may be out of bounds. `balancer.rs::pick()` always bounds-checks before using the affinity index and falls back to least-connections if out of range.
 - **`resolveConnection` with unknown ID**: a no-op, not an error. The connection has already timed out and been dropped by the time JS calls this with a stale ID.
 - **`ring` vs `md-5`**: `ring 0.17` removed MD5 support. JA3 fingerprints use `md-5 0.10` (RustCrypto). SHA-256 for cert deduplication still uses `ring::digest::SHA256` (ring is a direct dep for this).

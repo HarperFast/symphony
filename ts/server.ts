@@ -55,6 +55,8 @@ interface FileProxyConfig {
 	readBufferSize?: number;
 	clientReadBufferSize?: number;
 	upstreamReadBufferSize?: number;
+	tcpKeepalive?: ProxyConfig['tcpKeepalive'];
+	halfCloseTimeoutMs?: number;
 }
 
 interface ConfigFile {
@@ -135,6 +137,8 @@ function toProxyConfig(spec: FileProxyConfig, baseDir: string): ProxyConfig {
 		readBufferSize: spec.readBufferSize,
 		clientReadBufferSize: spec.clientReadBufferSize,
 		upstreamReadBufferSize: spec.upstreamReadBufferSize,
+		tcpKeepalive: spec.tcpKeepalive,
+		halfCloseTimeoutMs: spec.halfCloseTimeoutMs,
 	};
 }
 
@@ -329,6 +333,8 @@ class ServerState {
 					readBufferSize: proxyConfig.readBufferSize,
 					clientReadBufferSize: proxyConfig.clientReadBufferSize,
 					upstreamReadBufferSize: proxyConfig.upstreamReadBufferSize,
+					tcpKeepalive: proxyConfig.tcpKeepalive,
+					halfCloseTimeoutMs: proxyConfig.halfCloseTimeoutMs,
 				});
 				if (existing && existing.constructionSig === constructionSig) {
 					// Same listeners (presence-unchanged) → hot-swap routes and protection contents.

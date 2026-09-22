@@ -17,6 +17,7 @@ use crate::http_proxy::{
 	host_header, read_http_headers, request_target, strip_body_framing, with_connection_close,
 };
 use crate::listener::{make_reuseport_socket, set_rlimit_nofile};
+use crate::liveness::arm_accepted;
 use crate::metrics::{BlockKind, CountingStream, ErrorKind, RouteActiveGuard, inc_route_error};
 use crate::proxy_conn::ConnContext;
 use crate::upstream::{self, UpstreamStream};
@@ -55,7 +56,7 @@ pub async fn spawn_http_listeners(
 	let mut handles = Vec::with_capacity(workers);
 
 	for _ in 0..workers {
-		let socket = make_reuseport_socket(addr)?;
+		let socket = make_reuseport_socket(addr, ctx.keepalive.as_ref())?;
 		let listener = TcpListener::from_std(socket)?;
 		let ctx2 = ctx.clone();
 		let max_conn = max_connections;
@@ -95,6 +96,9 @@ async fn accept_loop(
 								ctx.listener_metrics.inc_blocked(BlockKind::MaxConnections);
 								continue;
 							}
+						}
+						if let Some(cfg) = &ctx.keepalive {
+							arm_accepted(&stream, cfg);
 						}
 						let ctx2 = ctx.clone();
 						tokio::spawn(async move {

@@ -1,5 +1,6 @@
 use crate::http_listener::spawn_http_listeners;
 use crate::listener::spawn_listeners;
+use crate::liveness::KeepaliveConfig;
 use crate::metrics::{total_of, GlobalMetrics, ListenerMetrics};
 use crate::protection::ProtectionState;
 use crate::proxy_conn::{
@@ -150,6 +151,26 @@ pub struct JsProxyConfig {
 	pub client_read_buffer_size: Option<u32>,
 	/// Overrides `readBufferSize` for the upstream→client direction only.
 	pub upstream_read_buffer_size: Option<u32>,
+	/// TCP keepalive for accepted sockets. Omit for the defaults; `enabled: false` turns
+	/// dead-peer detection off entirely.
+	pub tcp_keepalive: Option<JsTcpKeepaliveConfig>,
+	/// Reclaim a connection whose upstream has closed once the surviving client→upstream
+	/// direction has carried nothing for this many ms. Default 300000; 0 disables.
+	pub half_close_timeout_ms: Option<f64>,
+}
+
+/// Probe schedule for accepted sockets. A peer that stops answering is declared dead
+/// `idleMs + intervalMs × retries` after the last activity on the connection.
+#[napi(object)]
+pub struct JsTcpKeepaliveConfig {
+	/// Default: true.
+	pub enabled: Option<bool>,
+	/// Quiet time before the first probe, in ms. Default: 300000.
+	pub idle_ms: Option<f64>,
+	/// Gap between probes, in ms. Default: 30000.
+	pub interval_ms: Option<f64>,
+	/// Unanswered probes before the connection is dropped. Default: 5.
+	pub retries: Option<u32>,
 }
 
 #[napi(object)]
@@ -181,6 +202,8 @@ pub struct JsListenerMetrics {
 	/// "tls" or "http".
 	pub mode: String,
 	pub active_connections: f64,
+	/// Subset of `activeConnections` whose upstream half has closed.
+	pub half_closed_connections: f64,
 	pub accepted: f64,
 	pub blocked: f64,
 	pub errors: f64,
@@ -292,6 +315,8 @@ pub struct SymphonyProxyWrap {
 	default_listener_tls: ListenerTlsSpec,
 	worker_threads: usize,
 	idle_timeout: Duration,
+	half_close_timeout: Duration,
+	keepalive: Option<KeepaliveConfig>,
 	client_read_buffer_size: usize,
 	upstream_read_buffer_size: usize,
 	// Shared runtime state
@@ -352,6 +377,8 @@ impl SymphonyProxyWrap {
 		} else {
 			Duration::ZERO
 		};
+		let half_close_timeout = parse_half_close_timeout(config.half_close_timeout_ms)?;
+		let keepalive = parse_keepalive_config(config.tcp_keepalive.as_ref())?;
 		let base_read_buffer_size = resolve_copy_buffer_size(config.read_buffer_size, "readBufferSize");
 		let client_read_buffer_size = match config.client_read_buffer_size {
 			Some(v) => resolve_copy_buffer_size(Some(v), "clientReadBufferSize"),
@@ -459,6 +486,8 @@ impl SymphonyProxyWrap {
 			default_listener_tls,
 			worker_threads,
 			idle_timeout,
+			half_close_timeout,
+			keepalive,
 			client_read_buffer_size,
 			upstream_read_buffer_size,
 			route_table: Arc::new(LiveRouteTable(arc_swap::ArcSwap::new(Arc::new(table)))),
@@ -496,6 +525,8 @@ impl SymphonyProxyWrap {
 				listener_metrics: state.metrics.clone(),
 				listener_addr: state.addr.clone(),
 				idle_timeout: self.idle_timeout,
+				half_close_timeout: self.half_close_timeout,
+				keepalive: self.keepalive,
 				upstream_connect_timeout,
 				client_read_buffer_size: self.client_read_buffer_size,
 				upstream_read_buffer_size: self.upstream_read_buffer_size,
@@ -692,6 +723,8 @@ impl SymphonyProxyWrap {
 						ListenerMode::Http => "http".to_string(),
 					},
 					active_connections: state.metrics.active_connections.load(Ordering::Relaxed) as f64,
+					half_closed_connections: state.metrics.half_closed_connections.load(Ordering::Relaxed)
+						as f64,
 					accepted: state.metrics.total_accepted.load(Ordering::Relaxed) as f64,
 					blocked: total_of(&blocked_by_reason) as f64,
 					errors: total_of(&errors_by_reason) as f64,
@@ -1155,6 +1188,52 @@ fn resolve_copy_buffer_size(configured: Option<u32>, label: &str) -> usize {
 		);
 	}
 	clamped
+}
+
+/// Defaults chosen so a peer that vanishes is reclaimed well inside ten minutes
+/// (300s + 30s × 5 = 7.5 min) while a parked-but-alive subscriber costs one probe per five
+/// minutes — ~1000 packets/s across 300k connections.
+const DEFAULT_KEEPALIVE_IDLE_MS: f64 = 300_000.0;
+const DEFAULT_KEEPALIVE_INTERVAL_MS: f64 = 30_000.0;
+const DEFAULT_KEEPALIVE_RETRIES: u32 = 5;
+const DEFAULT_HALF_CLOSE_TIMEOUT_MS: f64 = 300_000.0;
+
+/// Rejected rather than clamped: a non-finite or non-positive probe interval would be silently
+/// converted by `as u64` into a schedule nobody asked for, and this is read once at construction.
+fn positive_ms(value: Option<f64>, default: f64, label: &str) -> Result<Duration> {
+	let ms = value.unwrap_or(default);
+	if !ms.is_finite() || ms <= 0.0 {
+		return Err(napi::Error::from_reason(format!("{label} must be a positive number of ms, got {ms}")));
+	}
+	Ok(Duration::from_millis(ms as u64))
+}
+
+fn parse_keepalive_config(cfg: Option<&JsTcpKeepaliveConfig>) -> Result<Option<KeepaliveConfig>> {
+	if cfg.is_some_and(|c| c.enabled == Some(false)) {
+		return Ok(None);
+	}
+	let retries = cfg.and_then(|c| c.retries).unwrap_or(DEFAULT_KEEPALIVE_RETRIES);
+	if retries == 0 {
+		return Err(napi::Error::from_reason("tcpKeepalive.retries must be at least 1".to_string()));
+	}
+	Ok(Some(KeepaliveConfig {
+		idle: positive_ms(cfg.and_then(|c| c.idle_ms), DEFAULT_KEEPALIVE_IDLE_MS, "tcpKeepalive.idleMs")?,
+		interval: positive_ms(
+			cfg.and_then(|c| c.interval_ms),
+			DEFAULT_KEEPALIVE_INTERVAL_MS,
+			"tcpKeepalive.intervalMs",
+		)?,
+		retries,
+	}))
+}
+
+/// Zero disables the bound; any other value goes through `positive_ms` so a NaN or negative
+/// cannot become a near-instant deadline that truncates live sessions.
+fn parse_half_close_timeout(value: Option<f64>) -> Result<Duration> {
+	if value == Some(0.0) {
+		return Ok(Duration::ZERO);
+	}
+	positive_ms(value, DEFAULT_HALF_CLOSE_TIMEOUT_MS, "halfCloseTimeoutMs")
 }
 
 fn pem_bytes(v: &Either<String, Buffer>) -> Vec<u8> {

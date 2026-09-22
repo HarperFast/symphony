@@ -1,3 +1,4 @@
+use crate::liveness::{HalfCloseWatch, KeepaliveConfig, Watched};
 use crate::metrics::{
 	BlockKind, CountingStream, ErrorKind, GlobalMetrics, ListenerMetrics, RouteActiveGuard, inc_route_error,
 };
@@ -71,6 +72,10 @@ pub struct ConnContext {
 	pub listener_addr: String,
 	/// Idle timeout for the bidirectional copy phase. Zero means no timeout.
 	pub idle_timeout: Duration,
+	/// How long a half-closed connection may carry nothing before it is reclaimed. Zero disables.
+	pub half_close_timeout: Duration,
+	/// Keepalive schedule armed on this listener's sockets. `None` leaves dead peers undetected.
+	pub keepalive: Option<KeepaliveConfig>,
 	/// Timeout for establishing upstream connections (TCP connect / UDS connect).
 	pub upstream_connect_timeout: Duration,
 	/// Copy buffer for the client→upstream direction. See `DEFAULT_COPY_BUFFER_SIZE`.
@@ -331,6 +336,10 @@ async fn proxy_raw(
 /// is the per-request header rewriter (finding fixes: the header read now lives inside the idle
 /// timeout, and every request — fragmented, pipelined, or keep-alive — is stripped and rewritten,
 /// not just the first read).
+///
+/// Both halves are wrapped in [`Watched`] so the copy — which by contract completes only when
+/// *both* directions finish — cannot outlive an upstream that has closed. See
+/// [`crate::liveness`] for which EOF arms that bound and why the other one does not.
 async fn forward<C, U>(
 	client: &mut C,
 	upstream: &mut U,
@@ -342,25 +351,59 @@ where
 	C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 	U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-	let body = async {
-		write_connection_prefix(upstream, sf).await?;
-		let rewrites = header_rewrites(sf, l7_http1);
-		if rewrites.is_empty() {
-			copy_both_ways(client, upstream, ctx.client_read_buffer_size, ctx.upstream_read_buffer_size)
+	let watch = HalfCloseWatch::new(ctx.listener_metrics.clone());
+	let copy = {
+		let watch = watch.clone();
+		async move {
+			write_connection_prefix(upstream, sf).await?;
+			let mut client = Watched::client(client, watch.clone());
+			let mut upstream = Watched::upstream(upstream, watch);
+			let rewrites = header_rewrites(sf, l7_http1);
+			if rewrites.is_empty() {
+				copy_both_ways(
+					&mut client,
+					&mut upstream,
+					ctx.client_read_buffer_size,
+					ctx.upstream_read_buffer_size,
+				)
 				.await
-		} else {
-			crate::http_proxy::proxy_http1_rewriting(client, upstream, &rewrites).await
+			} else {
+				crate::http_proxy::proxy_http1_rewriting(&mut client, &mut upstream, &rewrites).await
+			}
 		}
 	};
+
+	let body = async {
+		if ctx.half_close_timeout.is_zero() {
+			copy.await.map_err(classify_copy_failure)
+		} else {
+			tokio::pin!(copy);
+			tokio::select! {
+				result = &mut copy => result.map_err(classify_copy_failure),
+				_ = watch.expired(ctx.half_close_timeout) => Err(ErrorKind::HalfClosed),
+			}
+		}
+	};
+
 	// The idle timeout is reported as its own kind rather than inferred from an
 	// `io::ErrorKind::TimedOut`, which a peer's kernel-level ETIMEDOUT would also produce.
 	if ctx.idle_timeout.is_zero() {
-		body.await.map_err(|_| ErrorKind::Stream)
+		body.await
 	} else {
 		match timeout(ctx.idle_timeout, body).await {
-			Ok(result) => result.map_err(|_| ErrorKind::Stream),
+			Ok(result) => result,
 			Err(_) => Err(ErrorKind::IdleTimeout),
 		}
+	}
+}
+
+/// `TimedOut` here is the kernel of either peer abandoning an unreachable host — keepalive probes
+/// or retransmissions exhausted — which is the reap this feature exists to cause, so it gets its
+/// own reason instead of disappearing into the general stream-error bucket.
+fn classify_copy_failure(e: std::io::Error) -> ErrorKind {
+	match e.kind() {
+		std::io::ErrorKind::TimedOut => ErrorKind::PeerTimeout,
+		_ => ErrorKind::Stream,
 	}
 }
 
