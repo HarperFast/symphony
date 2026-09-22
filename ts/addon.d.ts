@@ -131,8 +131,8 @@ export interface JsProxyConfig {
    */
   tcpKeepalive?: JsTcpKeepaliveConfig
   /**
-   * Reclaim a connection whose upstream has closed once the surviving client→upstream
-   * direction has carried nothing for this many ms. Default 300000; 0 disables.
+   * Reclaim a connection once its write half to the client is shut down and the surviving
+   * client→upstream direction has carried nothing for this many ms. Default 300000; 0 disables.
    */
   halfCloseTimeoutMs?: number
 }
@@ -174,7 +174,7 @@ export interface JsListenerMetrics {
   /** "tls" or "http". */
   mode: string
   activeConnections: number
-  /** Subset of `activeConnections` whose upstream half has closed. */
+  /** Subset of `activeConnections` in FIN-WAIT-2 — our FIN sent, the client's not yet received. */
   halfClosedConnections: number
   accepted: number
   blocked: number

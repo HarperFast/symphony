@@ -154,8 +154,8 @@ pub struct JsProxyConfig {
 	/// TCP keepalive for accepted sockets. Omit for the defaults; `enabled: false` turns
 	/// dead-peer detection off entirely.
 	pub tcp_keepalive: Option<JsTcpKeepaliveConfig>,
-	/// Reclaim a connection whose upstream has closed once the surviving client→upstream
-	/// direction has carried nothing for this many ms. Default 300000; 0 disables.
+	/// Reclaim a connection once its write half to the client is shut down and the surviving
+	/// client→upstream direction has carried nothing for this many ms. Default 300000; 0 disables.
 	pub half_close_timeout_ms: Option<f64>,
 }
 
@@ -202,7 +202,7 @@ pub struct JsListenerMetrics {
 	/// "tls" or "http".
 	pub mode: String,
 	pub active_connections: f64,
-	/// Subset of `activeConnections` whose upstream half has closed.
+	/// Subset of `activeConnections` in FIN-WAIT-2 — our FIN sent, the client's not yet received.
 	pub half_closed_connections: f64,
 	pub accepted: f64,
 	pub blocked: f64,
@@ -1218,9 +1218,17 @@ fn bounded_ms(value: Option<f64>, default: f64, min_ms: f64, max_ms: f64, label:
 }
 
 /// Keepalive timings reach the kernel as whole seconds (`TCP_KEEPIDLE`/`TCP_KEEPINTVL`, both
-/// `c_int`), so anything under a second would be installed as 0 and rejected.
+/// `c_int`), so a fractional second is not a rounding detail — it is a schedule the listener
+/// reports and does not run. Under a second would install as 0 and be rejected outright.
 fn keepalive_ms(value: Option<f64>, default: f64, label: &str) -> Result<Duration> {
-	bounded_ms(value, default, 1_000.0, i32::MAX as f64 * 1_000.0, label)
+	let resolved = bounded_ms(value, default, 1_000.0, i32::MAX as f64 * 1_000.0, label)?;
+	if resolved.subsec_millis() != 0 {
+		return Err(napi::Error::from_reason(format!(
+			"{label} is installed as whole seconds; use a multiple of 1000, got {}",
+			value.unwrap_or(default)
+		)));
+	}
+	Ok(resolved)
 }
 
 fn parse_keepalive_config(cfg: Option<&JsTcpKeepaliveConfig>) -> Result<Option<KeepaliveConfig>> {

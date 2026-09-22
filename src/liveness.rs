@@ -4,9 +4,9 @@
 //!   `SO_KEEPALIVE`, which is off by default — so without this a peer that disappears without a
 //!   FIN is indistinguishable from an idle subscriber for the life of the process.
 //! * **A bound on the half-closed state.** `copy_bidirectional` returns only once *both*
-//!   directions have finished. After an upstream EOF the client socket sits in FIN-WAIT-2
-//!   waiting for a FIN that may never come, and because its fd stays open the socket is not
-//!   orphaned, so `tcp_fin_timeout` does not apply either.
+//!   directions have finished. Once the response has drained it shuts down the write half to the
+//!   client, and the socket then sits in FIN-WAIT-2 waiting for a FIN that may never come —
+//!   with its fd still open, so the socket is not orphaned and `tcp_fin_timeout` does not apply.
 
 use crate::metrics::ListenerMetrics;
 use crate::protection::now_ns;
@@ -68,11 +68,15 @@ pub fn arm_accepted(stream: &tokio::net::TcpStream, cfg: &KeepaliveConfig) {
 /// The bounded half-closed state of one proxied connection. Lives on the connection task's stack
 /// and is borrowed by both stream halves, so an ordinary session adds no allocation.
 ///
-/// Armed by the *upstream* half reaching EOF, which is the terminal shape: the copy shuts down
-/// the write half to the client as soon as that EOF is processed, so nothing more can be sent
-/// there and no response exists that a deadline could truncate. A *client*-half EOF is
-/// deliberately not armed — there the surviving direction carries the upstream's response, which
-/// may legitimately be quiet for a long time before its first byte.
+/// Armed when the write half *to the client* finishes shutting down — the moment symphony's FIN
+/// goes out and the socket enters FIN-WAIT-2. Not on the upstream's read EOF, which precedes it:
+/// `copy_bidirectional` may still hold a buffer's worth of response data, and `poll_shutdown`
+/// runs only once that has drained, so a clock started at EOF runs against a flush still in
+/// progress and can truncate the tail for a slow client.
+///
+/// Nothing arms when the *client* half-closes instead. There the surviving direction carries the
+/// upstream's response, which may legitimately be quiet for a long time before its first byte;
+/// what gets shut down in that shape is the write half to the upstream, not to the client.
 ///
 /// Both atomics are `Relaxed`: the two stream halves and the watchdog live in the same connection
 /// task, so they exist to share `&self`, not to order across threads.
@@ -99,6 +103,11 @@ impl<'m> HalfCloseWatch<'m> {
 			self.metrics.inc_half_closed();
 			self.notify.notify_one();
 		}
+	}
+
+	#[cfg(test)]
+	fn is_armed(&self) -> bool {
+		self.armed.load(Ordering::Relaxed)
 	}
 
 	fn record_activity(&self) {
@@ -136,18 +145,20 @@ impl Drop for HalfCloseWatch<'_> {
 pub struct Watched<'w, S> {
 	inner: S,
 	watch: &'w HalfCloseWatch<'w>,
-	arms_on_eof: bool,
+	arms_on_shutdown: bool,
 }
 
 impl<'w, S> Watched<'w, S> {
-	/// The upstream half, whose EOF puts the connection into the bounded half-closed state.
-	pub fn upstream(inner: S, watch: &'w HalfCloseWatch<'w>) -> Self {
-		Self { inner, watch, arms_on_eof: true }
+	/// The client half: shutting down its write side is what puts the connection into the
+	/// bounded state, and its reads are the activity that keeps it out of the reaper.
+	pub fn client(inner: S, watch: &'w HalfCloseWatch<'w>) -> Self {
+		Self { inner, watch, arms_on_shutdown: true }
 	}
 
-	/// The client half, whose reads are the activity that keeps a half-closed connection alive.
-	pub fn client(inner: S, watch: &'w HalfCloseWatch<'w>) -> Self {
-		Self { inner, watch, arms_on_eof: false }
+	/// The upstream half. Its write side is shut down when the *client* half-closes, which is
+	/// the shape deliberately left unbounded.
+	pub fn upstream(inner: S, watch: &'w HalfCloseWatch<'w>) -> Self {
+		Self { inner, watch, arms_on_shutdown: false }
 	}
 }
 
@@ -156,12 +167,8 @@ impl<S: AsyncRead + Unpin> AsyncRead for Watched<'_, S> {
 		let this = self.get_mut();
 		let before = buf.filled().len();
 		let result = Pin::new(&mut this.inner).poll_read(cx, buf);
-		if matches!(result, Poll::Ready(Ok(()))) {
-			if buf.filled().len() > before {
-				this.watch.record_activity();
-			} else if this.arms_on_eof {
-				this.watch.arm();
-			}
+		if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+			this.watch.record_activity();
 		}
 		result
 	}
@@ -189,13 +196,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<'_, S> {
 	}
 
 	fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-		Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+		let this = self.get_mut();
+		let result = Pin::new(&mut this.inner).poll_shutdown(cx);
+		if this.arms_on_shutdown && matches!(result, Poll::Ready(Ok(()))) {
+			this.watch.arm();
+		}
+		result
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::future::Future;
 	use std::io;
 	use tokio::net::{TcpListener, TcpStream};
 
@@ -225,7 +238,8 @@ mod tests {
 		drop(client);
 	}
 
-	/// A stream that yields `chunks` reads of one byte each and then EOFs forever.
+	/// A stream that yields `chunks` reads of one byte each and then EOFs forever. Its
+	/// `poll_shutdown` is what `copy_bidirectional` calls once a direction has fully drained.
 	struct Chunks {
 		remaining: usize,
 	}
@@ -244,27 +258,113 @@ mod tests {
 		}
 	}
 
+	impl AsyncWrite for Chunks {
+		fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+			Poll::Ready(Ok(buf.len()))
+		}
+		fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+		fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+	}
+
 	async fn drain<S: AsyncRead + Unpin>(stream: &mut S) {
 		use tokio::io::AsyncReadExt;
 		let mut buf = [0u8; 8];
 		while stream.read(&mut buf).await.unwrap() > 0 {}
 	}
 
+	async fn shutdown<S: AsyncWrite + Unpin>(stream: &mut S) {
+		use tokio::io::AsyncWriteExt;
+		stream.shutdown().await.unwrap();
+	}
+
+	/// The correction that matters most: an upstream EOF is observed while response data may
+	/// still be buffered, and the client's FIN goes out only when `poll_shutdown` *completes*
+	/// after that drains. A clock started at the EOF runs against a flush still in progress.
+	///
+	/// The gap is invisible on a plain TCP passthrough — tokio's copy loop reads again only once
+	/// its buffer is empty, so it cannot see EOF with bytes still owed. It is real on a
+	/// terminated-TLS route, where `poll_write` on a `TlsStream` accepts into rustls' unbounded
+	/// write buffer and reports success long before anything reaches a slow client's socket.
 	#[tokio::test(start_paused = true)]
-	async fn an_unarmed_connection_never_expires() {
+	async fn an_upstream_eof_alone_does_not_arm_the_bound() {
 		let metrics = ListenerMetrics::default();
 		let watch = HalfCloseWatch::new(&metrics);
-		// The client half reaching EOF is the request/response half-close, not the bounded state.
-		let mut client = Watched::client(Chunks { remaining: 2 }, &watch);
-		drain(&mut client).await;
+		let mut upstream = Watched::upstream(Chunks { remaining: 0 }, &watch);
+		drain(&mut upstream).await;
+
+		assert!(!watch.is_armed());
+		assert_eq!(metrics.half_closed_connections.load(Ordering::Relaxed), 0);
+	}
+
+	/// A client whose write half takes several polls to shut down — the shape of a `TlsStream`
+	/// draining a large buffered response to a slow peer. The bound must not start until that
+	/// finishes, or the reaper races the flush it is waiting on.
+	#[tokio::test(start_paused = true)]
+	async fn a_pending_client_shutdown_does_not_arm_the_bound() {
+		struct SlowShutdown {
+			polls_left: usize,
+		}
+
+		impl AsyncWrite for SlowShutdown {
+			fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+				Poll::Ready(Ok(buf.len()))
+			}
+			fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+				Poll::Ready(Ok(()))
+			}
+			fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+				if self.polls_left == 0 {
+					return Poll::Ready(Ok(()));
+				}
+				self.polls_left -= 1;
+				cx.waker().wake_by_ref();
+				Poll::Pending
+			}
+		}
+
+		let metrics = ListenerMetrics::default();
+		let watch = HalfCloseWatch::new(&metrics);
+		let mut client = Watched::client(SlowShutdown { polls_left: 3 }, &watch);
+
+		let mut shutting_down = std::pin::pin!(shutdown(&mut client));
+		let mut cx = Context::from_waker(futures_noop_waker());
+		assert!(shutting_down.as_mut().poll(&mut cx).is_pending());
+		assert!(!watch.is_armed(), "the FIN is not out yet");
+
+		shutting_down.await;
+		assert!(watch.is_armed());
+		assert_eq!(metrics.half_closed_connections.load(Ordering::Relaxed), 1);
+	}
+
+	/// `std::task::Waker::noop` is unstable, so build the equivalent by hand.
+	fn futures_noop_waker() -> &'static std::task::Waker {
+		use std::task::{RawWaker, RawWakerVTable, Waker};
+		const VTABLE: RawWakerVTable =
+			RawWakerVTable::new(|_| RawWaker::new(std::ptr::null(), &VTABLE), |_| {}, |_| {}, |_| {});
+		static WAKER: std::sync::OnceLock<Waker> = std::sync::OnceLock::new();
+		WAKER.get_or_init(|| unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) })
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_client_half_close_does_not_arm_the_bound() {
+		let metrics = ListenerMetrics::default();
+		let watch = HalfCloseWatch::new(&metrics);
+		// The client half-closing shuts down the write half to the *upstream*, which leaves the
+		// response in flight — the shape deliberately left unbounded.
+		let mut upstream = Watched::upstream(Chunks { remaining: 0 }, &watch);
+		shutdown(&mut upstream).await;
 
 		assert!(
 			tokio::time::timeout(Duration::from_secs(3600), watch.expired(Duration::from_secs(60)))
 				.await
 				.is_err(),
-			"a client-side EOF must not arm the half-close bound"
+			"only the write half to the client arms the bound"
 		);
-		assert_eq!(watch.metrics.half_closed_connections.load(Ordering::Relaxed), 0);
+		assert_eq!(metrics.half_closed_connections.load(Ordering::Relaxed), 0);
 	}
 
 	// The two tests below run on the real clock: the activity stamp comes from `now_ns()`, a
@@ -273,13 +373,13 @@ mod tests {
 	// suite fast, with the assertions a window either side of each boundary.
 
 	#[tokio::test]
-	async fn an_upstream_eof_expires_after_a_quiet_window() {
+	async fn the_clients_fin_arms_the_bound_and_it_expires_when_quiet() {
 		let metrics = ListenerMetrics::default();
 		let watch = HalfCloseWatch::new(&metrics);
-		let mut upstream = Watched::upstream(Chunks { remaining: 0 }, &watch);
-		drain(&mut upstream).await;
+		let mut client = Watched::client(Chunks { remaining: 0 }, &watch);
+		shutdown(&mut client).await;
 
-		assert_eq!(watch.metrics.half_closed_connections.load(Ordering::Relaxed), 1);
+		assert_eq!(metrics.half_closed_connections.load(Ordering::Relaxed), 1);
 		tokio::time::timeout(Duration::from_secs(5), watch.expired(Duration::from_millis(100)))
 			.await
 			.expect("the bound must fire once the surviving direction goes quiet");
@@ -289,14 +389,13 @@ mod tests {
 	async fn activity_on_the_surviving_direction_defers_expiry() {
 		let metrics = ListenerMetrics::default();
 		let watch = HalfCloseWatch::new(&metrics);
-		let mut upstream = Watched::upstream(Chunks { remaining: 0 }, &watch);
-		drain(&mut upstream).await;
+		let mut client = Watched::client(Chunks { remaining: 1 }, &watch);
+		shutdown(&mut client).await;
 
 		let expired = watch.expired(Duration::from_millis(300));
 		tokio::pin!(expired);
 
 		// One byte on the surviving direction 200ms in, restamping the activity clock.
-		let mut client = Watched::client(Chunks { remaining: 1 }, &watch);
 		tokio::time::sleep(Duration::from_millis(200)).await;
 		drain(&mut client).await;
 
@@ -317,8 +416,8 @@ mod tests {
 		let metrics = ListenerMetrics::default();
 		{
 			let watch = HalfCloseWatch::new(&metrics);
-			let mut upstream = Watched::upstream(Chunks { remaining: 0 }, &watch);
-			drain(&mut upstream).await;
+			let mut client = Watched::client(Chunks { remaining: 0 }, &watch);
+			shutdown(&mut client).await;
 			assert_eq!(metrics.half_closed_connections.load(Ordering::Relaxed), 1);
 		}
 		assert_eq!(metrics.half_closed_connections.load(Ordering::Relaxed), 0);

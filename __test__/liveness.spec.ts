@@ -82,23 +82,28 @@ describe('dead connection reaping', () => {
 	 * reassembly timeout waiting for one, and a connection with no SNI resolves to no route at
 	 * all — so without it the connection never reaches the copy phase these tests are about.
 	 */
-	function connect(port: number): Promise<net.Socket> {
-		return new Promise((resolve) => {
+	async function connect(proxy: SymphonyProxy, port: number): Promise<net.Socket> {
+		const socket: net.Socket = await new Promise((resolve) => {
 			// allowHalfOpen is what makes this client the peer from the issue: without it Node
 			// answers the proxy's FIN with its own, and the connection closes on its own.
-			const socket = net.createConnection({ host: '127.0.0.1', port, allowHalfOpen: true });
-			socket.on('error', () => {});
-			sockets.push(socket);
-			socket.on('connect', () => {
-				socket.write(clientHello(SNI));
-				resolve(socket);
+			const s = net.createConnection({ host: '127.0.0.1', port, allowHalfOpen: true });
+			s.on('error', () => {});
+			sockets.push(s);
+			s.on('connect', () => {
+				s.write(clientHello(SNI));
+				resolve(s);
 			});
 		});
+		// The client's connect event can precede the server-side accept, so a test that waits for
+		// activeConnections to fall back to 0 would otherwise be satisfied by the state before it
+		// ever rose.
+		await waitFor(() => proxy.metrics().listeners[0].activeConnections === 1);
+		return socket;
 	}
 
 	it('reclaims a connection whose upstream closed and whose client never sends a FIN', async () => {
 		const { proxy, port } = await startProxy((socket) => socket.end());
-		const client = await connect(port);
+		const client = await connect(proxy, port);
 		client.resume(); // read the upstream's FIN, then hold the socket open and stay silent
 
 		await waitFor(() => proxy.metrics().listeners[0].activeConnections === 0);
@@ -111,7 +116,7 @@ describe('dead connection reaping', () => {
 	it('counts a half-closed connection in the gauge while it is being held', async () => {
 		// A window long enough to observe the gauge before the bound reclaims the connection.
 		const { proxy, port } = await startProxy((socket) => socket.end(), { halfCloseTimeoutMs: 5000 });
-		const client = await connect(port);
+		const client = await connect(proxy, port);
 		client.resume();
 
 		await waitFor(() => proxy.metrics().listeners[0].halfClosedConnections === 1);
@@ -128,7 +133,7 @@ describe('dead connection reaping', () => {
 			socket.resume();
 			setTimeout(() => socket.end('late'), HALF_CLOSE_MS * 4);
 		});
-		const client = await connect(port);
+		const client = await connect(proxy, port);
 		client.end('request');
 
 		const body = await new Promise<Buffer>((resolve) => {
@@ -146,7 +151,7 @@ describe('dead connection reaping', () => {
 			socket.on('data', (c) => (received += c.length));
 			socket.end();
 		});
-		const client = await connect(port);
+		const client = await connect(proxy, port);
 		client.resume();
 
 		for (let i = 0; i < 8; i++) {
@@ -161,9 +166,35 @@ describe('dead connection reaping', () => {
 		await waitFor(() => proxy.metrics().listeners[0].activeConnections === 0);
 	});
 
+	// The bound arms on the client's FIN, not on the upstream's EOF, because the copy can still
+	// be holding a buffer of response data when that EOF lands. Started at the EOF, the clock
+	// would run against a flush in progress and cut the tail for a client this slow.
+	it('does not truncate a buffered response to a client slower than the window', async () => {
+		// Large enough that it cannot all sit in the kernel socket buffers, so the copy is still
+		// flushing — and has not yet shut down the write half — while the window elapses.
+		const payload = Buffer.alloc(32 * 1024 * 1024, 0x61);
+		const { proxy, port } = await startProxy((socket) => {
+			socket.resume();
+			socket.end(payload);
+		});
+		const client = await connect(proxy, port);
+		client.pause();
+		await sleep(HALF_CLOSE_MS * 3);
+		assert.equal(proxy.metrics().listeners[0].activeConnections, 1, 'still flushing, so not yet bounded');
+
+		const body = await new Promise<Buffer>((resolve) => {
+			const chunks: Buffer[] = [];
+			client.on('data', (c) => chunks.push(c));
+			client.on('end', () => resolve(Buffer.concat(chunks)));
+			client.resume();
+		});
+		assert.equal(body.length, payload.length, 'every buffered byte reached the client');
+		assert.equal(reasonCount(proxy.metrics().listeners[0].errorsByReason, 'half_closed'), 0);
+	});
+
 	it('holds the connection indefinitely when the bound is disabled', async () => {
 		const { proxy, port } = await startProxy((socket) => socket.end(), { halfCloseTimeoutMs: 0 });
-		const client = await connect(port);
+		const client = await connect(proxy, port);
 		client.resume();
 
 		await waitFor(() => proxy.metrics().listeners[0].halfClosedConnections === 1);
@@ -187,6 +218,9 @@ describe('dead connection reaping', () => {
 		// rejected by setsockopt long after construction reported success.
 		assert.throws(() => new SymphonyProxy(config({ idleMs: 500 })), /idleMs must be a number of ms/);
 		assert.throws(() => new SymphonyProxy(config({ intervalMs: 999 })), /intervalMs must be a number of ms/);
+		// 1500ms would install as one second, so the config would report a schedule nobody runs.
+		assert.throws(() => new SymphonyProxy(config({ idleMs: 1500 })), /whole seconds/);
+		assert.doesNotThrow(() => new SymphonyProxy(config({ idleMs: 2000, intervalMs: 1000 })));
 		assert.throws(
 			() => new SymphonyProxy({ ...config(undefined), halfCloseTimeoutMs: Number.NaN }),
 			/halfCloseTimeoutMs must be a number of ms/
