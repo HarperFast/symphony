@@ -337,9 +337,9 @@ async fn proxy_raw(
 /// timeout, and every request — fragmented, pipelined, or keep-alive — is stripped and rewritten,
 /// not just the first read).
 ///
-/// Both halves are wrapped in [`Watched`] so the copy — which by contract completes only when
-/// *both* directions finish — cannot outlive an upstream that has closed. See
-/// [`crate::liveness`] for which EOF arms that bound and why the other one does not.
+/// Both halves are wrapped in [`Watched`] so the copy — which returns only once *both* directions
+/// have finished — cannot outlive an upstream that has closed. [`crate::liveness`] has which EOF
+/// arms that bound and why the other one does not.
 async fn forward<C, U>(
 	client: &mut C,
 	upstream: &mut U,
@@ -351,25 +351,17 @@ where
 	C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 	U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-	let watch = HalfCloseWatch::new(ctx.listener_metrics.clone());
-	let copy = {
-		let watch = watch.clone();
-		async move {
-			write_connection_prefix(upstream, sf).await?;
-			let mut client = Watched::client(client, watch.clone());
-			let mut upstream = Watched::upstream(upstream, watch);
-			let rewrites = header_rewrites(sf, l7_http1);
-			if rewrites.is_empty() {
-				copy_both_ways(
-					&mut client,
-					&mut upstream,
-					ctx.client_read_buffer_size,
-					ctx.upstream_read_buffer_size,
-				)
+	let watch = HalfCloseWatch::new(&ctx.listener_metrics);
+	let copy = async {
+		write_connection_prefix(upstream, sf).await?;
+		let mut client = Watched::client(client, &watch);
+		let mut upstream = Watched::upstream(upstream, &watch);
+		let rewrites = header_rewrites(sf, l7_http1);
+		if rewrites.is_empty() {
+			copy_both_ways(&mut client, &mut upstream, ctx.client_read_buffer_size, ctx.upstream_read_buffer_size)
 				.await
-			} else {
-				crate::http_proxy::proxy_http1_rewriting(&mut client, &mut upstream, &rewrites).await
-			}
+		} else {
+			crate::http_proxy::proxy_http1_rewriting(&mut client, &mut upstream, &rewrites).await
 		}
 	};
 

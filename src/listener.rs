@@ -103,8 +103,7 @@ pub(crate) fn make_reuseport_socket(
 	socket.set_reuse_address(true)?;
 	socket.set_reuse_port(true)?; // SO_REUSEPORT — Linux 3.9+
 	socket.set_nonblocking(true)?;
-	// Before listen(), so no accepted socket can predate it. Accepted sockets inherit the
-	// settings rather than each paying its own setsockopt calls — see `liveness::arm_keepalive`.
+	// Before listen(), so no accepted socket can predate the schedule it inherits.
 	if let Some(cfg) = keepalive {
 		arm_keepalive(&socket, cfg, &addr);
 	}

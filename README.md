@@ -72,16 +72,22 @@ console.log('proxy listening on :443');
 | `clientReadBufferSize` | `number` | `readBufferSize` | Overrides `readBufferSize` for the client→upstream direction only |
 | `upstreamReadBufferSize` | `number` | `readBufferSize` | Overrides `readBufferSize` for the upstream→client direction only |
 | `tcpKeepalive` | `TcpKeepaliveConfig` | on, see below | TCP keepalive for accepted sockets. See [Dead-peer detection](#dead-peer-detection) |
-| `halfCloseTimeoutMs` | `number` | `300000` | Reclaim a connection whose upstream has closed once the surviving client→upstream direction has carried nothing for this many ms. `0` disables. See [Dead-peer detection](#dead-peer-detection) |
+| `halfCloseTimeoutMs` | `number` | `300000` | Reclaim a connection whose upstream has closed once the surviving client→upstream direction has carried nothing for this many ms. Minimum `1`; `0` disables. See [Dead-peer detection](#dead-peer-detection) |
 
 ### `TcpKeepaliveConfig`
 
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `enabled` | `boolean` | `true` | `false` turns dead-peer detection off entirely |
-| `idleMs` | `number` | `300000` | Quiet time before the first probe |
-| `intervalMs` | `number` | `30000` | Gap between probes |
-| `retries` | `number` | `5` | Unanswered probes before the connection is dropped |
+| Field | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `enabled` | `boolean` | `true` | — | `false` turns dead-peer detection off entirely |
+| `idleMs` | `number` | `300000` | `≥ 1000` | Quiet time before the first probe |
+| `intervalMs` | `number` | `30000` | `≥ 1000` | Gap between probes |
+| `retries` | `number` | `5` | `1–127` | Unanswered probes before the connection is dropped |
+
+Out-of-range values are rejected by the constructor rather than clamped. The two timings reach
+the kernel as whole seconds (`TCP_KEEPIDLE` / `TCP_KEEPINTVL`), so a sub-second value would be
+installed as `0` and refused by `setsockopt` after `SO_KEEPALIVE` had already been enabled —
+leaving a listener that reports a schedule it is not running. `retries` has the same problem
+above `TCP_KEEPCNT`'s ceiling of 127.
 
 ### `ListenerConfig`
 
@@ -865,6 +871,13 @@ Two properties keep this from cutting live sessions:
   flight and is deliberately not bounded here; a slow upstream is `idleTimeoutMs`'s territory.
 - **The deadline resets on activity.** A client still uploading to an upstream that closed early
   keeps its connection; only a genuinely quiet one is reclaimed.
+
+It is still a policy, not a protocol guarantee: TCP permits an upstream to `shutdown(SHUT_WR)`
+and keep reading indefinitely, so a protocol whose client legitimately pauses longer than
+`halfCloseTimeoutMs` between writes *after* its upstream has stopped replying will be cut. It is
+on by default because the alternative — another knob the fleet has to opt into — is what left
+`idleTimeoutMs` pinned at `0` and produced the sockets above. Set `halfCloseTimeoutMs: 0` on a
+listener carrying such a protocol.
 
 Like the buffer sizes, both settings are frozen at construction, so editing either makes
 `symphony-server` recreate the proxy — a reconnect event on a high-connection-count listener, not
