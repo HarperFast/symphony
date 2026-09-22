@@ -118,7 +118,7 @@ above `TCP_KEEPCNT`'s ceiling of 127.
 | `burst` | `number` | `maxConnectionsPerSecond` | Token bucket burst ceiling for the route rate limit |
 | `http2` | `boolean` | `false` | Advertise `h2` in ALPN so clients negotiate HTTP/2. Raw H2 frames flow through to the upstream unchanged. Requires `terminateTls: true`. |
 | `sourceAddressHeader` | `'proxyProtocol' \| 'proxyProtocolV2' \| 'xForwardedFor' \| 'none'` | `'proxyProtocol'` for UDS, `'none'` for TCP | How the real client IP is forwarded to the upstream. See [Source address forwarding](#source-address-forwarding). |
-| `forwardFingerprint` | `'ja3' \| 'ja4' \| 'none'` | `'none'` | Forward the client TLS fingerprint downstream. See [Forwarding the fingerprint](#forwarding-the-fingerprint-downstream). |
+| `forwardFingerprint` | `'ja3' \| 'ja4' \| 'none' \| ('ja3' \| 'ja4')[]` | `'none'` | Forward the client TLS fingerprint(s) downstream. See [Forwarding the fingerprint](#forwarding-the-fingerprint-downstream). |
 | `protocol` | `'http' \| 'opaque'` | `'opaque'` | The route's application protocol. Required to be `'http'` before `sourceAddressHeader: 'xForwardedFor'` or a header-carried `forwardFingerprint` is accepted — see [Source address forwarding](#source-address-forwarding). |
 
 ### `Upstream`
@@ -449,12 +449,13 @@ symphony computes the client's JA3/JA4 fingerprint from the ClientHello (the sam
 |---|---|
 | `'ja3'` | The JA3 MD5 hex (32 chars) |
 | `'ja4'` | The JA4 fingerprint |
+| `['ja3', 'ja4']` | Both — e.g. while an existing JA3-keyed blocklist or threat-intel feed is migrated to JA4. List order doesn't matter; JA3 is always emitted first. |
 | `'none'` (default) | Nothing forwarded |
 
-The **carrier depends on `sourceAddressHeader`**:
+The **carrier depends on `sourceAddressHeader`**, and every selected fingerprint uses the same one:
 
-- With `'proxyProtocolV2'`, the fingerprint rides a PROXY v2 **TLV** — type `0xE0` for JA3, `0xE1` for JA4 (in HAProxy's `0xE0–0xEF` private range). This works even in passthrough (`terminateTls: false`), since the header prefixes the raw TLS bytes. No `protocol` declaration is needed — the TLV carries it regardless of the route's application protocol.
-- Otherwise, symphony injects an **`X-JA3` / `X-JA4` HTTP header**. This requires `protocol: 'http'` on the route (see [Declaring the route protocol](#declaring-the-route-protocol)) and a plaintext HTTP/1 upstream (`terminateTls: true` and not `http2`); it is skipped for HTTP/2 upstreams (use `'proxyProtocolV2'` there). For that HTTP/1 case, any client-supplied `X-JA3`/`X-JA4` is stripped so the injected value is authoritative and can't be spoofed — **this guarantee does not extend to an h2-negotiated connection on an `http2: true` route**: injection and stripping are both skipped there, so a client-supplied `X-JA3`/`X-JA4` reaches the upstream unmodified. Use `'proxyProtocolV2'` wherever h2 is possible.
+- With `'proxyProtocolV2'`, each fingerprint rides a PROXY v2 **TLV** — type `0xE0` for JA3, `0xE1` for JA4 (in HAProxy's `0xE0–0xEF` private range). This works even in passthrough (`terminateTls: false`), since the header prefixes the raw TLS bytes. No `protocol` declaration is needed — the TLV carries it regardless of the route's application protocol.
+- Otherwise, symphony injects an **`X-JA3` / `X-JA4` HTTP header** per selected fingerprint. This requires `protocol: 'http'` on the route (see [Declaring the route protocol](#declaring-the-route-protocol)) and a plaintext HTTP/1 upstream (`terminateTls: true` and not `http2`); it is skipped for HTTP/2 upstreams (use `'proxyProtocolV2'` there). For that HTTP/1 case, the client-supplied copy of each forwarded header is stripped so the injected value is authoritative and can't be spoofed — **this guarantee does not extend to an h2-negotiated connection on an `http2: true` route**: injection and stripping are both skipped there, so a client-supplied `X-JA3`/`X-JA4` reaches the upstream unmodified. Use `'proxyProtocolV2'` wherever h2 is possible.
 
 A config that requests a header-carried `forwardFingerprint` without declaring `protocol: 'http'` is rejected (and isolated to just that route) — the same fail-loud rule as `sourceAddressHeader: 'xForwardedFor'`. A config that requests `forwardFingerprint` with no viable carrier at all — passthrough (`terminateTls: false`) without `sourceAddressHeader: 'proxyProtocolV2'`, where there's neither an HTTP request to inject a header into nor a v2 TLV — is also rejected, with a distinct "no carrier" error: no `protocol` declaration could fix a passthrough route's inability to inject a header, so it isn't steered toward one. A route that could have carried the header but silently won't for some connections — `http2: true`, where ALPN negotiation is per-connection and some clients may still land on HTTP/1 — logs a startup warning instead, since that outcome isn't guaranteed.
 
@@ -466,7 +467,7 @@ A config that requests a header-carried `forwardFingerprint` without declaring `
   terminateTls: true,
   cert: { certChain, privateKey },
   sourceAddressHeader: 'proxyProtocolV2',
-  forwardFingerprint: 'ja4',
+  forwardFingerprint: ['ja3', 'ja4'], // 0xE0 and 0xE1 TLVs
 }
 
 // HTTP-header carrier — for HTTP/1 backends that read request headers

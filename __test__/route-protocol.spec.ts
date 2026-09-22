@@ -359,6 +359,40 @@ describe('SymphonyProxy – route protocol declaration', () => {
 			);
 		});
 
+		it("rejects a forwardFingerprint list containing 'none'", async () => {
+			const message = await resolveAndCaptureError({
+				upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
+				terminateTls: true,
+				forwardFingerprint: ['ja3', 'none' as 'ja3'],
+				protocol: 'http',
+			});
+			assert.match(message, /forwardFingerprint list entry 'none'/);
+		});
+
+		it('forwards both fingerprints over a resolved route', async () => {
+			const capture = await startCaptureServer();
+			const suspended = new Promise<string>((resolve) => proxy.once('suspended', (conn) => resolve(conn.id)));
+			const socket = tls.connect({ port: proxyPort, host: '127.0.0.1', servername: 'localhost', ca: cert.cert, rejectUnauthorized: false });
+			socket.on('error', () => {});
+			try {
+				proxy.resolveConnection(await suspended, {
+					upstream: { kind: 'tcp', host: '127.0.0.1', port: capture.port },
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+					forwardFingerprint: ['ja3', 'ja4'],
+					protocol: 'http',
+				});
+				await new Promise((resolve) => socket.once('secureConnect', resolve));
+				socket.write('GET / HTTP/1.1\r\nHost: localhost\r\nX-JA3: spoofed\r\n\r\n');
+				const text = (await capture.received).toString('ascii');
+				assert.match(text, /^GET \/ HTTP\/1\.1\r\nX-JA3: [0-9a-f]{32}\r\nX-JA4: t\d{2}[di]\d{4}[0-9a-z]{2}_[0-9a-f]{12}_[0-9a-f]{12}\r\n/);
+				assert.ok(!text.includes('spoofed'), 'client-supplied X-JA3 stripped');
+			} finally {
+				socket.destroy();
+				await capture.close();
+			}
+		});
+
 		it('rejects xForwardedFor combined with http2 (header injection would corrupt h2 frames)', async () => {
 			const message = await resolveAndCaptureError({
 				upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },

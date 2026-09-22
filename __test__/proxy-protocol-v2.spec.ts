@@ -14,6 +14,9 @@ import { generateSelfSignedCert, getFreePort, startCaptureServer, tlsRoundTrip, 
 
 const PROXY_V2_SIGNATURE = Buffer.from([0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a]);
 const PP2_TYPE_JA3 = 0xe0;
+const PP2_TYPE_JA4 = 0xe1;
+const JA3_HEX = /^[0-9a-f]{32}$/;
+const JA4_CORE = /^t\d{2}[di]\d{4}[0-9a-z]{2}_[0-9a-f]{12}_[0-9a-f]{12}$/;
 
 interface ParsedV2 {
 	command: number;
@@ -21,6 +24,8 @@ interface ParsedV2 {
 	srcIp: string;
 	srcPort: number;
 	tlvs: Map<number, Buffer>;
+	/** TLV types in wire order (`tlvs` can't express order). */
+	tlvOrder: number[];
 	rest: Buffer;
 }
 
@@ -36,14 +41,16 @@ function parseProxyV2(buf: Buffer): ParsedV2 {
 	const srcPort = body.readUInt16BE(8);
 	// TLVs begin after the 12-byte IPv4 address block.
 	const tlvs = new Map<number, Buffer>();
+	const tlvOrder: number[] = [];
 	let off = 12;
 	while (off + 3 <= body.length) {
 		const type = body[off];
 		const tlvLen = body.readUInt16BE(off + 1);
 		tlvs.set(type, body.subarray(off + 3, off + 3 + tlvLen));
+		tlvOrder.push(type);
 		off += 3 + tlvLen;
 	}
-	return { command, famProto, srcIp, srcPort, tlvs, rest: buf.subarray(16 + len) };
+	return { command, famProto, srcIp, srcPort, tlvs, tlvOrder, rest: buf.subarray(16 + len) };
 }
 
 /** Open a TLS connection through the proxy, send `data`, and resolve once written. */
@@ -88,7 +95,41 @@ describe('PROXY protocol v2 + fingerprint forwarding', () => {
 		assert.equal(parsed.srcIp, '127.0.0.1', 'source IP is the real client');
 		const ja3 = parsed.tlvs.get(PP2_TYPE_JA3);
 		assert.ok(ja3, 'JA3 TLV present');
-		assert.match(ja3!.toString('ascii'), /^[0-9a-f]{32}$/, 'JA3 is a 32-char md5 hex');
+		assert.match(ja3!.toString('ascii'), JA3_HEX, 'JA3 is a 32-char md5 hex');
+		assert.equal(parsed.rest.toString('ascii'), HTTP_REQUEST, 'application data follows the header');
+
+		socket.destroy();
+		await proxy.stop();
+		await capture.close();
+	});
+
+	it('emits both JA3 and JA4 TLVs, JA3 first, when forwardFingerprint lists both', async () => {
+		const capture = await startCaptureServer();
+		const proxyPort = await getFreePort();
+		const proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: proxyPort }],
+			routes: [
+				{
+					sni: 'localhost',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: capture.port }],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+					sourceAddressHeader: 'proxyProtocolV2',
+					// Listed out of order: the wire order is fixed, not taken from the config.
+					forwardFingerprint: ['ja4', 'ja3'],
+				},
+			],
+		});
+		await proxy.start();
+		await sleep(50);
+
+		const socket = await tlsSend(proxyPort, 'localhost', cert.cert, HTTP_REQUEST);
+		const parsed = parseProxyV2(await capture.received);
+
+		assert.match(parsed.tlvs.get(PP2_TYPE_JA3)?.toString('ascii') ?? '', JA3_HEX, 'JA3 TLV present');
+		assert.match(parsed.tlvs.get(PP2_TYPE_JA4)?.toString('ascii') ?? '', JA4_CORE, 'JA4 TLV present');
+		const fingerprintOrder = parsed.tlvOrder.filter((t) => t === PP2_TYPE_JA3 || t === PP2_TYPE_JA4);
+		assert.deepEqual(fingerprintOrder, [PP2_TYPE_JA3, PP2_TYPE_JA4], 'one TLV each, JA3 before JA4');
 		assert.equal(parsed.rest.toString('ascii'), HTTP_REQUEST, 'application data follows the header');
 
 		socket.destroy();
@@ -313,6 +354,46 @@ describe('PROXY protocol v2 + fingerprint forwarding', () => {
 		assert.ok(text.includes('GET /two HTTP/1.1\r\n'), 'second request forwarded');
 		assert.equal((text.match(/X-JA3: [0-9a-f]{32}\r\n/g) ?? []).length, 2, 'both requests get an authoritative X-JA3');
 		assert.ok(!text.includes('spoofed'), 'spoofed X-JA3 on the second request is stripped');
+
+		socket.destroy();
+		await proxy.stop();
+		await capture.close();
+	});
+
+	it('injects and strips both X-JA3 and X-JA4 on every pipelined request when both are listed', async () => {
+		const capture = await startCaptureServer();
+		const proxyPort = await getFreePort();
+		const proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: proxyPort }],
+			routes: [
+				{
+					sni: 'localhost',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: capture.port }],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+					forwardFingerprint: ['ja3', 'ja4'],
+					protocol: 'http',
+				},
+			],
+		});
+		await proxy.start();
+		await sleep(50);
+
+		const pipelined =
+			'GET /one HTTP/1.1\r\nHost: localhost\r\nx-ja4: spoofed-one\r\n\r\n' +
+			'GET /two HTTP/1.1\r\nHost: localhost\r\nX-Ja3: spoofed-two\r\nX-JA4: spoofed-three\r\n\r\n';
+		const socket = await tlsSend(proxyPort, 'localhost', cert.cert, pipelined);
+		const text = (await capture.received).toString('ascii');
+
+		const requests = text.split(/(?=GET \/)/);
+		assert.equal(requests.length, 2, 'both requests forwarded');
+		for (const request of requests) {
+			const fingerprintHeaders = request.split('\r\n').filter((line) => /^x-ja[34]:/i.test(line));
+			assert.equal(fingerprintHeaders.length, 2, `exactly one X-JA3 and one X-JA4 in: ${request}`);
+			assert.match(fingerprintHeaders[0], /^X-JA3: [0-9a-f]{32}$/, 'authoritative X-JA3 first');
+			assert.match(fingerprintHeaders[1], /^X-JA4: t\d{2}[di]\d{4}[0-9a-z]{2}_[0-9a-f]{12}_[0-9a-f]{12}$/, 'authoritative X-JA4 second');
+		}
+		assert.ok(!text.includes('spoofed'), 'every client-supplied copy stripped, whatever its case');
 
 		socket.destroy();
 		await proxy.stop();

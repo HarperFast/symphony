@@ -112,17 +112,22 @@ pub enum SourceAddressMode {
 	XForwardedFor,
 }
 
-/// Which client TLS fingerprint (if any) symphony forwards to the upstream so the backend
-/// can act on it itself. Carrier depends on `SourceAddressMode`: a PROXY v2 TLV under
-/// `ProxyProtocolV2`, otherwise an injected `X-JA3`/`X-JA4` HTTP header.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ForwardFingerprint {
-	/// Do not forward a fingerprint.
-	None,
-	/// Forward the JA3 fingerprint.
-	Ja3,
-	/// Forward the JA4 fingerprint.
-	Ja4,
+/// Which client TLS fingerprints (none, either, or both) symphony forwards to the upstream so
+/// the backend can act on them itself. Every selected kind rides the same carrier, chosen by
+/// `SourceAddressMode`: a PROXY v2 TLV under `ProxyProtocolV2`, otherwise an injected
+/// `X-JA3`/`X-JA4` HTTP header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForwardFingerprint {
+	pub ja3: bool,
+	pub ja4: bool,
+}
+
+impl ForwardFingerprint {
+	pub const NONE: Self = Self { ja3: false, ja4: false };
+
+	pub fn is_empty(self) -> bool {
+		!self.ja3 && !self.ja4
+	}
 }
 
 // ── Route application protocol ────────────────────────────────────────────────
@@ -150,7 +155,7 @@ pub enum RouteProtocol {
 /// rides a TLV, not a header.
 pub fn requires_http_protocol(mode: SourceAddressMode, fingerprint: ForwardFingerprint) -> bool {
 	mode == SourceAddressMode::XForwardedFor
-		|| (fingerprint != ForwardFingerprint::None && mode != SourceAddressMode::ProxyProtocolV2)
+		|| (!fingerprint.is_empty() && mode != SourceAddressMode::ProxyProtocolV2)
 }
 
 // ── Route destination ─────────────────────────────────────────────────────────
@@ -887,7 +892,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			max_cps: None,
 			burst: None,
 			source_address_mode: SourceAddressMode::None,
-			forward_fingerprint: ForwardFingerprint::None,
+			forward_fingerprint: ForwardFingerprint::NONE,
 			http2: false,
 			protocol: RouteProtocol::Opaque,
 		}
@@ -1321,33 +1326,20 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 
 	#[test]
 	fn header_injection_detection() {
+		const JA3: ForwardFingerprint = ForwardFingerprint { ja3: true, ja4: false };
+		const JA4: ForwardFingerprint = ForwardFingerprint { ja3: false, ja4: true };
+		const BOTH: ForwardFingerprint = ForwardFingerprint { ja3: true, ja4: true };
 		// xForwardedFor always needs protocol: 'http', regardless of fingerprint.
-		assert!(requires_http_protocol(
-			SourceAddressMode::XForwardedFor,
-			ForwardFingerprint::None
-		));
+		assert!(requires_http_protocol(SourceAddressMode::XForwardedFor, ForwardFingerprint::NONE));
 		// A header-carried fingerprint (any mode other than proxyProtocolV2) needs it too.
-		assert!(requires_http_protocol(
-			SourceAddressMode::None,
-			ForwardFingerprint::Ja3
-		));
-		assert!(requires_http_protocol(
-			SourceAddressMode::ProxyProtocol,
-			ForwardFingerprint::Ja4
-		));
+		assert!(requires_http_protocol(SourceAddressMode::None, JA3));
+		assert!(requires_http_protocol(SourceAddressMode::ProxyProtocol, JA4));
+		assert!(requires_http_protocol(SourceAddressMode::None, BOTH));
 		// proxyProtocolV2 carries the fingerprint as a TLV — never needs the declaration.
-		assert!(!requires_http_protocol(
-			SourceAddressMode::ProxyProtocolV2,
-			ForwardFingerprint::Ja3
-		));
+		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocolV2, JA3));
+		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocolV2, BOTH));
 		// No header-injection mode requested at all.
-		assert!(!requires_http_protocol(
-			SourceAddressMode::None,
-			ForwardFingerprint::None
-		));
-		assert!(!requires_http_protocol(
-			SourceAddressMode::ProxyProtocol,
-			ForwardFingerprint::None
-		));
+		assert!(!requires_http_protocol(SourceAddressMode::None, ForwardFingerprint::NONE));
+		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocol, ForwardFingerprint::NONE));
 	}
 }

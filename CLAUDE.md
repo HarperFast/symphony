@@ -78,9 +78,11 @@ Because a single peek returns only whatever bytes are currently buffered, `peek(
 ### Source-address & fingerprint forwarding (`upstream.rs` + `proxy_conn.rs`)
 Per route, `sourceAddressHeader` picks how the client IP reaches the upstream: PROXY v1 (text),
 PROXY **v2** (binary, TLV-capable), `X-Forwarded-For` injection, or none. `forwardFingerprint`
-(`ja3`/`ja4`/`none`) additionally forwards the ClientHello fingerprint symphony already computes
-in `sni.rs`, so backends can make their own bot/abuse decisions on it. Carrier follows the mode:
-a PROXY v2 TLV (custom types `0xE0`=JA3 / `0xE1`=JA4, in HAProxy's `0xE0–0xEF` private range) under
+(`ja3`/`ja4`/`none`, or `['ja3','ja4']` for both) additionally forwards the ClientHello fingerprints
+symphony already computes in `sni.rs`, so backends can make their own bot/abuse decisions on them.
+It parses to a set (`router::ForwardFingerprint`), and every member rides the route's one carrier,
+so the carrier checks (`requires_http_protocol`, "no carrier") depend only on the set being
+non-empty. Carrier follows the mode: a PROXY v2 TLV (custom types `0xE0`=JA3 / `0xE1`=JA4, in HAProxy's `0xE0–0xEF` private range) under
 `proxyProtocolV2` — which works even in passthrough since it prefixes the raw TLS bytes — otherwise
 an injected `X-JA3`/`X-JA4` header. Header injection is gated on `l7_http1` (terminated TLS *and* a
 non-h2 negotiated ALPN); it's a no-op in passthrough or on an h2 upstream, so text is never spliced
