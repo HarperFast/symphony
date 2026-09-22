@@ -96,7 +96,9 @@ fn scan_handshake_records(raw: &[u8]) -> RecordScan {
 				return RecordScan::Invalid; // not a ClientHello handshake message
 			}
 			if hs_buf.len() >= 4 {
-				let hs_len = ((hs_buf[1] as usize) << 16) | ((hs_buf[2] as usize) << 8) | (hs_buf[3] as usize);
+				let hs_len = ((hs_buf[1] as usize) << 16)
+					| ((hs_buf[2] as usize) << 8)
+					| (hs_buf[3] as usize);
 				declared_hs_len = Some(4 + hs_len);
 			}
 		}
@@ -177,15 +179,20 @@ fn parse_client_hello(buf: &[u8]) -> PeekInfo {
 	let ja4 = compute_ja4(hello.legacy_version, hello.cipher_suites, hello.extensions);
 	// `complete` is set by the caller (`peek`) from the reassembly result — a direct parse
 	// here makes no claim about whether the buffer held the whole hello.
-	PeekInfo { sni, ja3, ja4, complete: false }
+	PeekInfo {
+		sni,
+		ja3,
+		ja4,
+		complete: false,
+	}
 }
 
 // ── TLS record / ClientHello structures ──────────────────────────────────────
 
 struct ClientHello<'a> {
 	legacy_version: u16,
-	cipher_suites: &'a [u8],   // raw bytes, 2 bytes per suite
-	extensions: &'a [u8],      // raw extension list bytes
+	cipher_suites: &'a [u8], // raw bytes, 2 bytes per suite
+	extensions: &'a [u8],    // raw extension list bytes
 }
 
 struct Parser<'a> {
@@ -224,7 +231,12 @@ impl<'a> Parser<'a> {
 		if self.remaining() < 3 {
 			return None;
 		}
-		let v = u32::from_be_bytes([0, self.buf[self.pos], self.buf[self.pos + 1], self.buf[self.pos + 2]]);
+		let v = u32::from_be_bytes([
+			0,
+			self.buf[self.pos],
+			self.buf[self.pos + 1],
+			self.buf[self.pos + 2],
+		]);
 		self.pos += 3;
 		Some(v)
 	}
@@ -282,14 +294,22 @@ impl<'a> Parser<'a> {
 
 		// Extensions: 2-byte length + data (may be absent or truncated in short peeks)
 		if self.remaining() < 2 {
-			return Some(ClientHello { legacy_version, cipher_suites, extensions: &[] });
+			return Some(ClientHello {
+				legacy_version,
+				cipher_suites,
+				extensions: &[],
+			});
 		}
 		let ext_len = self.read_u16()? as usize;
 		// Use however many extension bytes are available (peek may be truncated)
 		let available = ext_len.min(self.remaining());
 		let extensions = self.read_bytes(available)?;
 
-		Some(ClientHello { legacy_version, cipher_suites, extensions })
+		Some(ClientHello {
+			legacy_version,
+			cipher_suites,
+			extensions,
+		})
 	}
 }
 
@@ -523,7 +543,11 @@ fn compute_ja4(legacy_version: u16, cipher_suites: &[u8], extensions: &[u8]) -> 
 	}
 
 	// TLS version: max of supported_versions if present, else legacy_version.
-	let tls_version = supported_versions.iter().copied().max().unwrap_or(legacy_version);
+	let tls_version = supported_versions
+		.iter()
+		.copied()
+		.max()
+		.unwrap_or(legacy_version);
 	let ver_str = match tls_version {
 		0x0304 => "13",
 		0x0303 => "12",
@@ -636,7 +660,6 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 	s
 }
 
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -691,11 +714,7 @@ mod tests {
 		make_extension(0x000D, &data)
 	}
 
-	fn make_client_hello(
-		legacy_version: u16,
-		ciphers: &[u16],
-		exts: &[Vec<u8>],
-	) -> Vec<u8> {
+	fn make_client_hello(legacy_version: u16, ciphers: &[u16], exts: &[Vec<u8>]) -> Vec<u8> {
 		let mut body = Vec::new();
 		body.extend_from_slice(&legacy_version.to_be_bytes());
 		body.extend_from_slice(&[0u8; 32]); // random
@@ -755,18 +774,29 @@ mod tests {
 	#[test]
 	fn test_ja4_format() {
 		// Basic format: 3 parts separated by '_', lengths 10/12/12.
-		let hello = make_client_hello(
-			0x0303,
-			&[0x1301],
-			&[make_sni_ext(b"example.com")],
-		);
+		let hello = make_client_hello(0x0303, &[0x1301], &[make_sni_ext(b"example.com")]);
 		let info = parse_client_hello(&hello);
 		assert!(!info.ja4.is_empty(), "JA4 should not be empty");
 		let parts: Vec<&str> = info.ja4.split('_').collect();
-		assert_eq!(parts.len(), 3, "JA4 must have 3 '_'-separated parts: {}", info.ja4);
+		assert_eq!(
+			parts.len(),
+			3,
+			"JA4 must have 3 '_'-separated parts: {}",
+			info.ja4
+		);
 		assert_eq!(parts[0].len(), 10, "Part A must be 10 chars: {}", info.ja4);
-		assert_eq!(parts[1].len(), 12, "Part B must be 12 hex chars: {}", info.ja4);
-		assert_eq!(parts[2].len(), 12, "Part C must be 12 hex chars: {}", info.ja4);
+		assert_eq!(
+			parts[1].len(),
+			12,
+			"Part B must be 12 hex chars: {}",
+			info.ja4
+		);
+		assert_eq!(
+			parts[2].len(),
+			12,
+			"Part C must be 12 hex chars: {}",
+			info.ja4
+		);
 	}
 
 	#[test]
@@ -781,19 +811,23 @@ mod tests {
 			],
 		);
 		let info = parse_client_hello(&hello);
-		assert!(info.ja4.starts_with("t13"), "should use supported_versions: {}", info.ja4);
+		assert!(
+			info.ja4.starts_with("t13"),
+			"should use supported_versions: {}",
+			info.ja4
+		);
 	}
 
 	#[test]
 	fn test_ja4_version_fallback() {
 		// No supported_versions → fall back to legacy_version 0x0303 → "12"
-		let hello = make_client_hello(
-			0x0303,
-			&[0x1301],
-			&[make_sni_ext(b"test")],
-		);
+		let hello = make_client_hello(0x0303, &[0x1301], &[make_sni_ext(b"test")]);
 		let info = parse_client_hello(&hello);
-		assert!(info.ja4.starts_with("t12"), "should fall back to legacy version: {}", info.ja4);
+		assert!(
+			info.ja4.starts_with("t12"),
+			"should fall back to legacy version: {}",
+			info.ja4
+		);
 	}
 
 	#[test]
@@ -803,8 +837,18 @@ mod tests {
 		let without_sni = make_client_hello(0x0303, &[0x1301], &[]);
 		let info_d = parse_client_hello(&with_sni);
 		let info_i = parse_client_hello(&without_sni);
-		assert_eq!(&info_d.ja4[3..4], "d", "SNI present should give 'd': {}", info_d.ja4);
-		assert_eq!(&info_i.ja4[3..4], "i", "SNI absent should give 'i': {}", info_i.ja4);
+		assert_eq!(
+			&info_d.ja4[3..4],
+			"d",
+			"SNI present should give 'd': {}",
+			info_d.ja4
+		);
+		assert_eq!(
+			&info_i.ja4[3..4],
+			"i",
+			"SNI absent should give 'i': {}",
+			info_i.ja4
+		);
 	}
 
 	#[test]
@@ -815,7 +859,12 @@ mod tests {
 		let hello = make_client_hello(0x0303, &[0x1301], &[make_sni_ext(b"::1")]);
 		let info = parse_client_hello(&hello);
 		assert_eq!(info.sni, None, "invalid hostname should be rejected");
-		assert_eq!(&info.ja4[3..4], "d", "SNI extension present should give 'd': {}", info.ja4);
+		assert_eq!(
+			&info.ja4[3..4],
+			"d",
+			"SNI extension present should give 'd': {}",
+			info.ja4
+		);
 	}
 
 	#[test]
@@ -827,7 +876,12 @@ mod tests {
 			&[make_sni_ext(b"test")],
 		);
 		let info = parse_client_hello(&hello);
-		assert_eq!(&info.ja4[4..6], "02", "cipher count should be 02 (GREASE excluded): {}", info.ja4);
+		assert_eq!(
+			&info.ja4[4..6],
+			"02",
+			"cipher count should be 02 (GREASE excluded): {}",
+			info.ja4
+		);
 	}
 
 	#[test]
@@ -845,7 +899,12 @@ mod tests {
 			],
 		);
 		let info = parse_client_hello(&hello);
-		assert_eq!(&info.ja4[6..8], "04", "extension count should be 04 (incl SNI+ALPN): {}", info.ja4);
+		assert_eq!(
+			&info.ja4[6..8],
+			"04",
+			"extension count should be 04 (incl SNI+ALPN): {}",
+			info.ja4
+		);
 	}
 
 	#[test]
@@ -862,7 +921,12 @@ mod tests {
 		let info_no = parse_client_hello(&no_alpn);
 
 		assert_eq!(&info_h2.ja4[8..10], "h2", "h2 ALPN: {}", info_h2.ja4);
-		assert_eq!(&info_http11.ja4[8..10], "h1", "http/1.1 ALPN: {}", info_http11.ja4);
+		assert_eq!(
+			&info_http11.ja4[8..10],
+			"h1",
+			"http/1.1 ALPN: {}",
+			info_http11.ja4
+		);
 		assert_eq!(&info_no.ja4[8..10], "00", "no ALPN: {}", info_no.ja4);
 	}
 
@@ -873,7 +937,12 @@ mod tests {
 		// → hex "0268" → first='0', last='8'.
 		let ch = make_client_hello(0x0303, &[0x1301], &[make_alpn_ext(&[&[0x02, 0x68]])]);
 		let info = parse_client_hello(&ch);
-		assert_eq!(&info.ja4[8..10], "08", "non-alnum ALPN should use hex: {}", info.ja4);
+		assert_eq!(
+			&info.ja4[8..10],
+			"08",
+			"non-alnum ALPN should use hex: {}",
+			info.ja4
+		);
 	}
 
 	#[test]
@@ -883,8 +952,18 @@ mod tests {
 		let ch = make_client_hello(0x0303, &[0x1301], &[make_sig_algs_ext(&[])]);
 		let info = parse_client_hello(&ch);
 		let part_c = &info.ja4[info.ja4.len() - 12..];
-		assert_eq!(part_c, sha256_hex12(b"000d"), "no trailing underscore: {}", info.ja4);
-		assert_ne!(part_c, sha256_hex12(b"000d_"), "must not hash a trailing '_': {}", info.ja4);
+		assert_eq!(
+			part_c,
+			sha256_hex12(b"000d"),
+			"no trailing underscore: {}",
+			info.ja4
+		);
+		assert_ne!(
+			part_c,
+			sha256_hex12(b"000d_"),
+			"must not hash a trailing '_': {}",
+			info.ja4
+		);
 	}
 
 	#[test]
@@ -892,8 +971,11 @@ mod tests {
 		// A GREASE signature algorithm must be excluded from JA4_c, else the fingerprint
 		// diverges from standard JA4 tooling (RFC 8701: ignore GREASE wherever it appears).
 		let real = make_client_hello(0x0303, &[0x1301], &[make_sig_algs_ext(&[0x0403, 0x0804])]);
-		let with_grease =
-			make_client_hello(0x0303, &[0x1301], &[make_sig_algs_ext(&[0x0403, 0x0A0A, 0x0804])]);
+		let with_grease = make_client_hello(
+			0x0303,
+			&[0x1301],
+			&[make_sig_algs_ext(&[0x0403, 0x0A0A, 0x0804])],
+		);
 		assert_eq!(
 			parse_client_hello(&real).ja4,
 			parse_client_hello(&with_grease).ja4,
@@ -928,10 +1010,17 @@ mod tests {
 	fn test_scan_handshake_records_needs_more() {
 		let ch = make_client_hello(0x0303, &[0x1301], &[]);
 		// Fewer than 5 bytes: still waiting on the record header itself.
-		assert!(matches!(scan_handshake_records(&ch[..4]), RecordScan::NeedMoreRaw(5)));
+		assert!(matches!(
+			scan_handshake_records(&ch[..4]),
+			RecordScan::NeedMoreRaw(5)
+		));
 		// Record header known, but the record's declared payload isn't fully buffered yet.
-		assert!(matches!(scan_handshake_records(&ch[..8]), RecordScan::NeedMoreRaw(n) if n == ch.len()));
-		assert!(matches!(scan_handshake_records(&ch[..ch.len() - 1]), RecordScan::NeedMoreRaw(n) if n == ch.len()));
+		assert!(
+			matches!(scan_handshake_records(&ch[..8]), RecordScan::NeedMoreRaw(n) if n == ch.len())
+		);
+		assert!(
+			matches!(scan_handshake_records(&ch[..ch.len() - 1]), RecordScan::NeedMoreRaw(n) if n == ch.len())
+		);
 	}
 
 	#[test]
@@ -950,7 +1039,10 @@ mod tests {
 		// content_type Handshake, but msg_type 0x02 (ServerHello) instead of 0x01 (ClientHello).
 		let mut record = vec![0x16, 0x03, 0x03, 0x00, 0x04];
 		record.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]);
-		assert!(matches!(scan_handshake_records(&record), RecordScan::Invalid));
+		assert!(matches!(
+			scan_handshake_records(&record),
+			RecordScan::Invalid
+		));
 	}
 
 	#[test]
@@ -969,7 +1061,10 @@ mod tests {
 			multi.extend_from_slice(chunk);
 		}
 		let hs = scan_complete(&multi).expect("multi-record hello should reassemble to complete");
-		assert_eq!(hs, hs_layer, "reassembled handshake bytes must match the single-record encoding");
+		assert_eq!(
+			hs, hs_layer,
+			"reassembled handshake bytes must match the single-record encoding"
+		);
 	}
 
 	// ── peek reassembly (fragmented ClientHello) ──────────────────────────────
@@ -1003,7 +1098,10 @@ mod tests {
 		// Pad past the initial peek buffer so reassembly must fetch a second time.
 		exts.push(make_extension(0xABCD, &vec![0u8; 5000]));
 		let hello = make_client_hello(0x0303, &[0x1301, 0x1302, 0x1303], &exts);
-		assert!(hello.len() > INITIAL_PEEK, "test hello must exceed one peek buffer");
+		assert!(
+			hello.len() > INITIAL_PEEK,
+			"test hello must exceed one peek buffer"
+		);
 		let split = 200;
 
 		let info = peek_with_client(Duration::from_secs(5), move |mut sock| async move {
@@ -1016,7 +1114,10 @@ mod tests {
 		})
 		.await;
 
-		assert!(info.complete, "fragmented hello should reassemble to complete");
+		assert!(
+			info.complete,
+			"fragmented hello should reassemble to complete"
+		);
 		assert_eq!(info.sni.as_deref(), Some("example.com"));
 		assert_eq!(info.ja4.len(), 36);
 	}
@@ -1026,7 +1127,11 @@ mod tests {
 		// A client that sends only part of a declared ClientHello and stalls must yield
 		// complete=false (so the caller can fail closed under fingerprint enforcement),
 		// without blocking past the reassembly timeout.
-		let hello = make_client_hello(0x0303, &[0x1301], &[make_extension(0xABCD, &vec![0u8; 3000])]);
+		let hello = make_client_hello(
+			0x0303,
+			&[0x1301],
+			&[make_extension(0xABCD, &vec![0u8; 3000])],
+		);
 		let partial = hello[..100].to_vec();
 
 		// Short injected timeout so the test doesn't wait out the production 5s.
@@ -1038,7 +1143,10 @@ mod tests {
 		})
 		.await;
 
-		assert!(!info.complete, "a stalled partial hello must be marked incomplete");
+		assert!(
+			!info.complete,
+			"a stalled partial hello must be marked incomplete"
+		);
 	}
 
 	#[tokio::test]
@@ -1049,7 +1157,10 @@ mod tests {
 		let hello = make_client_hello(
 			0x0303,
 			&[0x1301, 0x1302],
-			&[make_sni_ext(b"example.com"), make_sig_algs_ext(&[0x0403, 0x0804])],
+			&[
+				make_sni_ext(b"example.com"),
+				make_sig_algs_ext(&[0x0403, 0x0804]),
+			],
 		);
 		let hs_layer = hello[5..].to_vec(); // handshake header + body, no record header
 		let split = hs_layer.len() / 2;
@@ -1070,7 +1181,10 @@ mod tests {
 		})
 		.await;
 
-		assert!(info.complete, "hello split across TLS records should reassemble to complete");
+		assert!(
+			info.complete,
+			"hello split across TLS records should reassemble to complete"
+		);
 		assert_eq!(info.sni.as_deref(), Some("example.com"));
 		assert_eq!(
 			info.ja4, expected.ja4,
@@ -1157,11 +1271,8 @@ mod tests {
 	#[test]
 	fn test_ja4_grease_excluded_from_ext_hash() {
 		// Adding a GREASE extension should not change Part A counts or Part C hash.
-		let without_grease = make_client_hello(
-			0x0303,
-			&[0x1301],
-			&[make_supported_versions_ext(&[0x0303])],
-		);
+		let without_grease =
+			make_client_hello(0x0303, &[0x1301], &[make_supported_versions_ext(&[0x0303])]);
 		let with_grease = make_client_hello(
 			0x0303,
 			&[0x1301],
@@ -1173,12 +1284,20 @@ mod tests {
 		let info_without = parse_client_hello(&without_grease);
 		let info_with = parse_client_hello(&with_grease);
 		// Both should have ext_count=01 (only supported_versions, no GREASE counted)
-		assert_eq!(&info_without.ja4[6..8], "01", "without GREASE: {}", info_without.ja4);
+		assert_eq!(
+			&info_without.ja4[6..8],
+			"01",
+			"without GREASE: {}",
+			info_without.ja4
+		);
 		assert_eq!(&info_with.ja4[6..8], "01", "with GREASE: {}", info_with.ja4);
 		// Part C should be identical
 		let parts_without: Vec<&str> = info_without.ja4.split('_').collect();
 		let parts_with: Vec<&str> = info_with.ja4.split('_').collect();
-		assert_eq!(parts_without[2], parts_with[2], "GREASE ext should not affect Part C");
+		assert_eq!(
+			parts_without[2], parts_with[2],
+			"GREASE ext should not affect Part C"
+		);
 	}
 
 	#[test]
@@ -1190,7 +1309,10 @@ mod tests {
 		let info_b = parse_client_hello(&hello_b);
 		let parts_a: Vec<&str> = info_a.ja4.split('_').collect();
 		let parts_b: Vec<&str> = info_b.ja4.split('_').collect();
-		assert_eq!(parts_a[2], parts_b[2], "Different SNI values should produce same Part C");
+		assert_eq!(
+			parts_a[2], parts_b[2],
+			"Different SNI values should produce same Part C"
+		);
 	}
 
 	// ── SNI parsing (existing test) ──────────────────────────────────────────
@@ -1254,6 +1376,11 @@ mod tests {
 		assert!(!info.ja3.is_empty());
 		assert_eq!(info.ja3.len(), 32);
 		assert!(!info.ja4.is_empty());
-		assert_eq!(info.ja4.len(), 36, "JA4 should be 36 chars (10+1+12+1+12): {}", info.ja4);
+		assert_eq!(
+			info.ja4.len(),
+			36,
+			"JA4 should be 36 chars (10+1+12+1+12): {}",
+			info.ja4
+		);
 	}
 }

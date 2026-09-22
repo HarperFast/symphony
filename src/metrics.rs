@@ -1,7 +1,7 @@
 use crate::protection::BlockReason;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -176,7 +176,12 @@ impl ListenerMetrics {
 	pub fn blocked_by_reason(&self) -> Vec<(&'static str, u64)> {
 		BlockKind::ALL
 			.iter()
-			.map(|k| (k.as_str(), self.blocked_by_kind[*k as usize].load(Ordering::Relaxed)))
+			.map(|k| {
+				(
+					k.as_str(),
+					self.blocked_by_kind[*k as usize].load(Ordering::Relaxed),
+				)
+			})
 			.collect()
 	}
 
@@ -184,7 +189,12 @@ impl ListenerMetrics {
 	pub fn errors_by_reason(&self) -> Vec<(&'static str, u64)> {
 		ErrorKind::ALL
 			.iter()
-			.map(|k| (k.as_str(), self.errors_by_kind[*k as usize].load(Ordering::Relaxed)))
+			.map(|k| {
+				(
+					k.as_str(),
+					self.errors_by_kind[*k as usize].load(Ordering::Relaxed),
+				)
+			})
 			.collect()
 	}
 }
@@ -218,9 +228,11 @@ impl RouteMetrics {
 	}
 
 	fn dec_active(&self) {
-		let _ = self
-			.active_connections
-			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_sub(1));
+		let _ =
+			self.active_connections
+				.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+					value.checked_sub(1)
+				});
 	}
 
 	pub fn add_bytes_in(&self, bytes: u64) {
@@ -232,7 +244,10 @@ impl RouteMetrics {
 	}
 
 	pub fn inc_error(&self, kind: ErrorKind) {
-		debug_assert!(kind.is_route_scoped(), "pre-route error attributed to a route");
+		debug_assert!(
+			kind.is_route_scoped(),
+			"pre-route error attributed to a route"
+		);
 		// Fail loud in tests/debug builds, but do not corrupt a route series in release builds.
 		if kind.is_route_scoped() {
 			self.errors_by_kind[kind as usize].fetch_add(1, Ordering::Relaxed);
@@ -352,19 +367,33 @@ pub struct CountingStream<'a, S> {
 }
 
 impl<'a, S> CountingStream<'a, S> {
-	pub fn new(inner: S, listener_metrics: &'a ListenerMetrics, route_metrics: Option<&'a RouteMetrics>) -> Self {
-		Self { inner, listener_metrics, route_metrics, pending_in: 0, pending_out: 0 }
+	pub fn new(
+		inner: S,
+		listener_metrics: &'a ListenerMetrics,
+		route_metrics: Option<&'a RouteMetrics>,
+	) -> Self {
+		Self {
+			inner,
+			listener_metrics,
+			route_metrics,
+			pending_in: 0,
+			pending_out: 0,
+		}
 	}
 
 	fn publish_in(&self, bytes: u64) {
-		self.listener_metrics.bytes_in.fetch_add(bytes, Ordering::Relaxed);
+		self.listener_metrics
+			.bytes_in
+			.fetch_add(bytes, Ordering::Relaxed);
 		if let Some(metrics) = self.route_metrics {
 			metrics.add_bytes_in(bytes);
 		}
 	}
 
 	fn publish_out(&self, bytes: u64) {
-		self.listener_metrics.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+		self.listener_metrics
+			.bytes_out
+			.fetch_add(bytes, Ordering::Relaxed);
 		if let Some(metrics) = self.route_metrics {
 			metrics.add_bytes_out(bytes);
 		}
@@ -401,7 +430,11 @@ impl<S> Drop for CountingStream<'_, S> {
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<'_, S> {
-	fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+	fn poll_read(
+		self: Pin<&mut Self>,
+		cx: &mut Context<'_>,
+		buf: &mut ReadBuf<'_>,
+	) -> Poll<std::io::Result<()>> {
 		let this = self.get_mut();
 		let before = buf.filled().len();
 		let result = Pin::new(&mut this.inner).poll_read(cx, buf);
@@ -416,7 +449,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<'_, S> {
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<'_, S> {
-	fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+	fn poll_write(
+		self: Pin<&mut Self>,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<std::io::Result<usize>> {
 		let this = self.get_mut();
 		let result = Pin::new(&mut this.inner).poll_write(cx, buf);
 		if let Poll::Ready(Ok(written)) = &result {

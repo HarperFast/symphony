@@ -1,19 +1,21 @@
 use crate::liveness::{HalfCloseWatch, KeepaliveConfig, Watched};
 use crate::metrics::{
-	BlockKind, CountingStream, ErrorKind, GlobalMetrics, ListenerMetrics, RouteActiveGuard, inc_route_error,
+	inc_route_error, BlockKind, CountingStream, ErrorKind, GlobalMetrics, ListenerMetrics,
+	RouteActiveGuard,
 };
 use crate::protection::{IpState, ProtectionState};
 use crate::router::{
-	Destination, ForwardFingerprint, LiveRouteTable, RouteMetricIdentity, RouteProtocol, SourceAddressMode,
+	Destination, ForwardFingerprint, LiveRouteTable, RouteMetricIdentity, RouteProtocol,
+	SourceAddressMode,
 };
 use crate::sni;
 use crate::suspended::SuspendedRegistry;
 use crate::upstream::{self, UpstreamStream};
 use napi::threadsafe_function::ThreadsafeFunction;
+use std::marker::Unpin;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use std::marker::Unpin;
 use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -118,13 +120,16 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		match protection.check(peer_ip, &peek_info) {
 			crate::protection::Decision::Block(reason) => {
 				ctx.listener_metrics.inc_blocked(BlockKind::from(&reason));
-				emit(&ctx.js_emit, JsEvent::Blocked {
-					ip: peer_ip.to_string(),
-					reason: reason.as_str().to_string(),
-					listener: ctx.listener_addr.clone(),
-					ja3: peek_info.ja3.clone(),
-					ja4: peek_info.ja4.clone(),
-				});
+				emit(
+					&ctx.js_emit,
+					JsEvent::Blocked {
+						ip: peer_ip.to_string(),
+						reason: reason.as_str().to_string(),
+						listener: ctx.listener_addr.clone(),
+						ja3: peek_info.ja3.clone(),
+						ja4: peek_info.ja4.clone(),
+					},
+				);
 				return; // active_guard drop decrements the active counters it already bumped
 			}
 			// Allowlisted: active counter was not incremented.
@@ -151,7 +156,11 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	// ── 3b. Per-route rate limit ──────────────────────────────────────────────
 	if let Some(rl) = &route.rate_limiter {
 		if !rl.try_acquire() {
-			inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::RouteRateLimited);
+			inc_route_error(
+				&ctx.listener_metrics,
+				&route.metric_identity.counters,
+				ErrorKind::RouteRateLimited,
+			);
 			return;
 		}
 	}
@@ -161,20 +170,27 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		ctx.global_metrics.inc_suspended();
 		let (id, rx) = ctx.suspended_registry.register();
 
-		emit(&ctx.js_emit, JsEvent::Suspended {
-			id: id.to_string(),
-			sni: sni_str.unwrap_or("").to_string(),
-			peer_ip: peer_ip.to_string(),
-			peer_port: peer_addr.port(),
-			listener: ctx.listener_addr.clone(),
-		});
+		emit(
+			&ctx.js_emit,
+			JsEvent::Suspended {
+				id: id.to_string(),
+				sni: sni_str.unwrap_or("").to_string(),
+				peer_ip: peer_ip.to_string(),
+				peer_port: peer_addr.port(),
+				listener: ctx.listener_addr.clone(),
+			},
+		);
 
 		let resolved = match timeout(route.suspend_timeout, rx).await {
 			Ok(Ok(Some(r))) => r,
 			_ => {
 				ctx.suspended_registry.remove(id);
 				ctx.global_metrics.dec_suspended(false);
-				inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::SuspendUnresolved);
+				inc_route_error(
+					&ctx.listener_metrics,
+					&route.metric_identity.counters,
+					ErrorKind::SuspendUnresolved,
+				);
 				return; // Timed out or rejected
 			}
 		};
@@ -240,22 +256,41 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 				}
 				Ok(Err(e)) => {
 					tracing::debug!("TLS handshake error from {peer_ip}: {e}");
-					inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::TlsHandshake);
+					inc_route_error(
+						&ctx.listener_metrics,
+						&route.metric_identity.counters,
+						ErrorKind::TlsHandshake,
+					);
 					return;
 				}
 				Err(_) => {
 					tracing::debug!("TLS handshake timeout from {peer_ip}");
-					inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::TlsHandshake);
+					inc_route_error(
+						&ctx.listener_metrics,
+						&route.metric_identity.counters,
+						ErrorKind::TlsHandshake,
+					);
 					return;
 				}
 			}
 		} else {
-			inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::TlsMissingCert);
+			inc_route_error(
+				&ctx.listener_metrics,
+				&route.metric_identity.counters,
+				ErrorKind::TlsMissingCert,
+			);
 			return;
 		}
 	} else {
 		// Passthrough — proxy raw TCP
-		proxy_raw(stream, &effective_route.destination, sf, &ctx, &route.metric_identity).await
+		proxy_raw(
+			stream,
+			&effective_route.destination,
+			sf,
+			&ctx,
+			&route.metric_identity,
+		)
+		.await
 	};
 
 	if let Err(kind) = upstream_result {
@@ -276,7 +311,10 @@ async fn proxy_via_tls(
 	// TLVs; only collected on routes that can carry them.
 	let tls_forward = matches!(sf.mode, SourceAddressMode::ProxyProtocolV2)
 		.then(|| collect_tls_forward(client.get_ref().1));
-	let sf = SourceForwarding { tls: tls_forward.as_ref(), ..sf };
+	let sf = SourceForwarding {
+		tls: tls_forward.as_ref(),
+		..sf
+	};
 
 	// HTTP-header injection is only valid for a plaintext HTTP/1 upstream: the route must have
 	// explicitly declared protocol: 'http' (issue #38 — ALPN alone can't tell a native
@@ -288,14 +326,16 @@ async fn proxy_via_tls(
 	let negotiated_h2 = client.get_ref().1.alpn_protocol() == Some(b"h2".as_ref());
 	let l7_http1 = eligible_for_header_rewriting(sf.protocol, negotiated_h2);
 
-	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
-		.await
-		.map_err(|e| {
-			tracing::debug!("upstream connect failed for {}: {e}", sf.peer_addr.ip());
-			ErrorKind::UpstreamConnect
-		})?;
+	let mut upstream =
+		upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
+			.await
+			.map_err(|e| {
+				tracing::debug!("upstream connect failed for {}: {e}", sf.peer_addr.ip());
+				ErrorKind::UpstreamConnect
+			})?;
 
-	let mut client = CountingStream::new(client, &ctx.listener_metrics, Some(&route_metrics.counters));
+	let mut client =
+		CountingStream::new(client, &ctx.listener_metrics, Some(&route_metrics.counters));
 
 	match &mut upstream {
 		UpstreamStream::Tcp(ref mut up) => forward(&mut client, up, &sf, l7_http1, ctx).await,
@@ -312,14 +352,16 @@ async fn proxy_raw(
 	ctx: &ConnContext,
 	route_metrics: &RouteMetricIdentity,
 ) -> std::result::Result<(), ErrorKind> {
-	let mut upstream = upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
-		.await
-		.map_err(|e| {
-			tracing::debug!("upstream connect failed for {}: {e}", sf.peer_addr.ip());
-			ErrorKind::UpstreamConnect
-		})?;
+	let mut upstream =
+		upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
+			.await
+			.map_err(|e| {
+				tracing::debug!("upstream connect failed for {}: {e}", sf.peer_addr.ip());
+				ErrorKind::UpstreamConnect
+			})?;
 
-	let mut client = CountingStream::new(client, &ctx.listener_metrics, Some(&route_metrics.counters));
+	let mut client =
+		CountingStream::new(client, &ctx.listener_metrics, Some(&route_metrics.counters));
 
 	// Passthrough forwards raw TLS bytes — never a plaintext HTTP/1 stream, so header injection
 	// is disabled (only PROXY protocol carriers apply here).
@@ -362,8 +404,13 @@ where
 		let mut upstream = Watched::upstream(upstream, &watch);
 		let rewrites = header_rewrites(sf, l7_http1);
 		if rewrites.is_empty() {
-			copy_both_ways(&mut client, &mut upstream, ctx.client_read_buffer_size, ctx.upstream_read_buffer_size)
-				.await
+			copy_both_ways(
+				&mut client,
+				&mut upstream,
+				ctx.client_read_buffer_size,
+				ctx.upstream_read_buffer_size,
+			)
+			.await
 		} else {
 			crate::http_proxy::proxy_http1_rewriting(&mut client, &mut upstream, &rewrites).await
 		}
@@ -419,9 +466,14 @@ where
 	C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 	U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-	copy_bidirectional_with_sizes(client, upstream, client_read_buffer_size, upstream_read_buffer_size)
-		.await
-		.map(|_| ())
+	copy_bidirectional_with_sizes(
+		client,
+		upstream,
+		client_read_buffer_size,
+		upstream_read_buffer_size,
+	)
+	.await
+	.map(|_| ())
 }
 
 /// Per-connection source-address + fingerprint forwarding parameters. All fields are `Copy`
@@ -460,13 +512,28 @@ struct TlsForward {
 fn build_ssl_tlv(tls: &TlsForward) -> Vec<u8> {
 	let has_cert = !tls.client_cert_chain.is_empty();
 	let mut ssl: Vec<u8> = Vec::with_capacity(32);
-	ssl.push(upstream::PP2_CLIENT_SSL | if has_cert { upstream::PP2_CLIENT_CERT_CONN } else { 0 });
+	ssl.push(
+		upstream::PP2_CLIENT_SSL
+			| if has_cert {
+				upstream::PP2_CLIENT_CERT_CONN
+			} else {
+				0
+			},
+	);
 	ssl.extend_from_slice(&if has_cert { 0u32 } else { 1u32 }.to_be_bytes());
 	if let Some(version) = tls.version {
-		push_sub_tlv(&mut ssl, upstream::PP2_SUBTYPE_SSL_VERSION, version.as_bytes());
+		push_sub_tlv(
+			&mut ssl,
+			upstream::PP2_SUBTYPE_SSL_VERSION,
+			version.as_bytes(),
+		);
 	}
 	if let Some(cipher) = &tls.cipher {
-		push_sub_tlv(&mut ssl, upstream::PP2_SUBTYPE_SSL_CIPHER, cipher.as_bytes());
+		push_sub_tlv(
+			&mut ssl,
+			upstream::PP2_SUBTYPE_SSL_CIPHER,
+			cipher.as_bytes(),
+		);
 	}
 	ssl
 }
@@ -484,7 +551,9 @@ fn collect_tls_forward(conn: &rustls::ServerConnection) -> TlsForward {
 			Some(rustls::ProtocolVersion::TLSv1_2) => Some("TLSv1.2"),
 			_ => None,
 		},
-		cipher: conn.negotiated_cipher_suite().map(|s| format!("{:?}", s.suite())),
+		cipher: conn
+			.negotiated_cipher_suite()
+			.map(|s| format!("{:?}", s.suite())),
 		alpn: conn.alpn_protocol().map(|p| p.to_vec()),
 		client_cert_chain: conn
 			.peer_certificates()
@@ -515,13 +584,18 @@ impl SourceForwarding<'_> {
 
 /// Write the one-shot connection prefix (PROXY v1/v2 header) the mode calls for. HTTP-header
 /// carriers have no prefix — they rewrite the request stream instead (see `header_rewrites`).
-async fn write_connection_prefix<U>(upstream: &mut U, sf: &SourceForwarding<'_>) -> std::io::Result<()>
+async fn write_connection_prefix<U>(
+	upstream: &mut U,
+	sf: &SourceForwarding<'_>,
+) -> std::io::Result<()>
 where
 	U: tokio::io::AsyncWrite + Unpin,
 {
 	match sf.mode {
 		SourceAddressMode::None | SourceAddressMode::XForwardedFor => Ok(()),
-		SourceAddressMode::ProxyProtocol => upstream::write_proxy_v1_header(upstream, sf.peer_addr).await,
+		SourceAddressMode::ProxyProtocol => {
+			upstream::write_proxy_v1_header(upstream, sf.peer_addr).await
+		}
 		SourceAddressMode::ProxyProtocolV2 => {
 			let value = sf.fingerprint_value();
 			let mut tlvs: Vec<(u8, &[u8])> = Vec::new();
@@ -547,7 +621,10 @@ where
 				let chain_len: usize = tls.client_cert_chain.iter().map(|c| 3 + c.len()).sum();
 				let tlv_len: usize = tlvs.iter().map(|(_, v)| 3 + v.len()).sum();
 				if tlv_len + chain_len + 36 <= u16::MAX as usize
-					&& tls.client_cert_chain.iter().all(|c| c.len() <= u16::MAX as usize)
+					&& tls
+						.client_cert_chain
+						.iter()
+						.all(|c| c.len() <= u16::MAX as usize)
 				{
 					for cert in &tls.client_cert_chain {
 						tlvs.push((upstream::PP2_TYPE_CLIENT_CERT, cert));
@@ -580,7 +657,10 @@ fn eligible_for_header_rewriting(protocol: RouteProtocol, negotiated_h2: bool) -
 /// authoritative value to substitute (`value: None`) — a client must never smuggle its own
 /// `X-JA3`/`X-JA4`/`X-Forwarded-For` through precisely when we can't replace it. PROXY v2 carries
 /// the fingerprint in a TLV, so it adds no header rewrite.
-fn header_rewrites(sf: &SourceForwarding<'_>, l7_http1: bool) -> Vec<crate::http_proxy::HeaderRewrite> {
+fn header_rewrites(
+	sf: &SourceForwarding<'_>,
+	l7_http1: bool,
+) -> Vec<crate::http_proxy::HeaderRewrite> {
 	use crate::http_proxy::HeaderRewrite;
 	if !l7_http1 {
 		return Vec::new();
@@ -639,9 +719,11 @@ impl Drop for ActiveGuard {
 
 pub(crate) fn emit(tsf: &ThreadsafeFunction<JsEvent>, event: JsEvent) {
 	// Non-blocking — drop the event if the JS queue is full
-	tsf.call(Ok(event), napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking);
+	tsf.call(
+		Ok(event),
+		napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+	);
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -663,7 +745,10 @@ mod tests {
 
 	impl CapacityRecorder {
 		fn new(bytes: usize, observed: Arc<Mutex<Vec<usize>>>) -> Self {
-			Self { remaining: bytes, observed }
+			Self {
+				remaining: bytes,
+				observed,
+			}
 		}
 	}
 
@@ -685,7 +770,11 @@ mod tests {
 	}
 
 	impl AsyncWrite for CapacityRecorder {
-		fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+		fn poll_write(
+			self: Pin<&mut Self>,
+			_cx: &mut Context<'_>,
+			buf: &[u8],
+		) -> Poll<io::Result<usize>> {
 			Poll::Ready(Ok(buf.len()))
 		}
 		fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -701,7 +790,9 @@ mod tests {
 		let from_upstream = Arc::new(Mutex::new(Vec::new()));
 		let mut client = CapacityRecorder::new(64 * 1024, from_client.clone());
 		let mut upstream = CapacityRecorder::new(64 * 1024, from_upstream.clone());
-		copy_both_ways(&mut client, &mut upstream, client_size, upstream_size).await.unwrap();
+		copy_both_ways(&mut client, &mut upstream, client_size, upstream_size)
+			.await
+			.unwrap();
 		let max_of = |v: &Arc<Mutex<Vec<usize>>>| *v.lock().unwrap().iter().max().unwrap();
 		(max_of(&from_client), max_of(&from_upstream))
 	}
@@ -711,8 +802,14 @@ mod tests {
 		// Deliberately asymmetric, and not the default, so a config that is accepted-then-ignored
 		// (the regression this PR exists to prevent) fails here rather than passing a round-trip.
 		let (from_client, from_upstream) = observed_read_sizes(1024, 4096).await;
-		assert_eq!(from_client, 1024, "client buffer must size reads from the client");
-		assert_eq!(from_upstream, 4096, "upstream buffer must size reads from the upstream");
+		assert_eq!(
+			from_client, 1024,
+			"client buffer must size reads from the client"
+		);
+		assert_eq!(
+			from_upstream, 4096,
+			"upstream buffer must size reads from the upstream"
+		);
 	}
 
 	#[tokio::test]

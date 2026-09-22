@@ -294,7 +294,10 @@ struct InternalListener {
 fn labeled_counts(counts: Vec<(&'static str, u64)>) -> Vec<JsLabeledCount> {
 	counts
 		.into_iter()
-		.map(|(reason, count)| JsLabeledCount { reason: reason.to_string(), count: count as f64 })
+		.map(|(reason, count)| JsLabeledCount {
+			reason: reason.to_string(),
+			count: count as f64,
+		})
 		.collect()
 }
 
@@ -379,7 +382,8 @@ impl SymphonyProxyWrap {
 		};
 		let half_close_timeout = parse_half_close_timeout(config.half_close_timeout_ms)?;
 		let keepalive = parse_keepalive_config(config.tcp_keepalive.as_ref())?;
-		let base_read_buffer_size = resolve_copy_buffer_size(config.read_buffer_size, "readBufferSize");
+		let base_read_buffer_size =
+			resolve_copy_buffer_size(config.read_buffer_size, "readBufferSize");
 		let client_read_buffer_size = match config.client_read_buffer_size {
 			Some(v) => resolve_copy_buffer_size(Some(v), "clientReadBufferSize"),
 			None => base_read_buffer_size,
@@ -395,9 +399,9 @@ impl SymphonyProxyWrap {
 		for l in &config.listeners {
 			let host = l.host.as_deref().unwrap_or("0.0.0.0");
 			let addr_str = format!("{}:{}", host, l.port);
-			let addr: SocketAddr = addr_str
-				.parse()
-				.map_err(|e| napi::Error::from_reason(format!("invalid listener address '{addr_str}': {e}")))?;
+			let addr: SocketAddr = addr_str.parse().map_err(|e| {
+				napi::Error::from_reason(format!("invalid listener address '{addr_str}': {e}"))
+			})?;
 
 			let mode = match l.mode.as_deref() {
 				None | Some("tls") => ListenerMode::Tls,
@@ -442,13 +446,19 @@ impl SymphonyProxyWrap {
 		tls_cache.retain_used();
 
 		// Set up threadsafe event emitter
-		let js_emit: ThreadsafeFunction<JsEvent> = emit_fn
-			.create_threadsafe_function(128, |ctx| {
+		let js_emit: ThreadsafeFunction<JsEvent> =
+			emit_fn.create_threadsafe_function(128, |ctx| {
 				let event: JsEvent = ctx.value;
 				let env = ctx.env;
 				let mut obj = env.create_object()?;
 				match event {
-					JsEvent::Blocked { ip, reason, listener, ja3, ja4 } => {
+					JsEvent::Blocked {
+						ip,
+						reason,
+						listener,
+						ja3,
+						ja4,
+					} => {
 						obj.set("type", "blocked")?;
 						obj.set("ip", ip)?;
 						obj.set("reason", reason)?;
@@ -456,7 +466,13 @@ impl SymphonyProxyWrap {
 						obj.set("ja3", ja3)?;
 						obj.set("ja4", ja4)?;
 					}
-					JsEvent::Suspended { id, sni, peer_ip, peer_port, listener } => {
+					JsEvent::Suspended {
+						id,
+						sni,
+						peer_ip,
+						peer_port,
+						listener,
+					} => {
 						obj.set("type", "suspended")?;
 						obj.set("id", id)?;
 						obj.set("sni", sni)?;
@@ -478,7 +494,9 @@ impl SymphonyProxyWrap {
 			.worker_threads(worker_threads)
 			.enable_all()
 			.build()
-			.map_err(|e| napi::Error::from_reason(format!("failed to create proxy runtime: {e}")))?;
+			.map_err(|e| {
+				napi::Error::from_reason(format!("failed to create proxy runtime: {e}"))
+			})?;
 		let rt_handle = rt.handle().clone();
 
 		Ok(Self {
@@ -542,7 +560,9 @@ impl SymphonyProxyWrap {
 			self.rt_handle.spawn(async move {
 				let result = match mode {
 					ListenerMode::Tls => spawn_listeners(addr, workers, max_conn, ctx, rx).await,
-					ListenerMode::Http => spawn_http_listeners(addr, workers, max_conn, ctx, rx).await,
+					ListenerMode::Http => {
+						spawn_http_listeners(addr, workers, max_conn, ctx, rx).await
+					}
 				};
 				if let Err(e) = result {
 					tracing::error!("listener {addr} failed: {e}");
@@ -627,9 +647,13 @@ impl SymphonyProxyWrap {
 			// build — and refusing the lock forever would turn one panicked reload into a proxy
 			// that can never pick up a renewed cert again.
 			let mut cache = self.tls_cache.lock().unwrap_or_else(|e| e.into_inner());
-			let table =
-				build_route_table(&specs, &self.default_listener_tls, Some(&current), &mut cache)
-					.map_err(|e| napi::Error::from_reason(e.to_string()))?;
+			let table = build_route_table(
+				&specs,
+				&self.default_listener_tls,
+				Some(&current),
+				&mut cache,
+			)
+			.map_err(|e| napi::Error::from_reason(e.to_string()))?;
 			drop(cache);
 			// Not swept here: a later validation failure aborts the whole update, and a sweep
 			// against marks from a table that never goes live names none of the running table's
@@ -647,8 +671,11 @@ impl SymphonyProxyWrap {
 			// Collect all offending ports so the caller gets one actionable error.
 			let mut errors: Vec<String> = Vec::new();
 			for update in &protection_updates {
-				let matches: Vec<_> =
-					self.listener_states.iter().filter(|s| s.port == update.port).collect();
+				let matches: Vec<_> = self
+					.listener_states
+					.iter()
+					.filter(|s| s.port == update.port)
+					.collect();
 				match matches.as_slice() {
 					[] => errors.push(format!("port {} matches no listener", update.port)),
 					[single] if single.protection.is_none() => errors.push(format!(
@@ -682,7 +709,10 @@ impl SymphonyProxyWrap {
 			self.route_table.swap(table);
 			// Committed — now retire the ServerConfigs (and their session state) that no route
 			// in the new table asked for, i.e. rotated-out certs.
-			self.tls_cache.lock().unwrap_or_else(|e| e.into_inner()).retain_used();
+			self.tls_cache
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.retain_used();
 		}
 		if let Some((protection_updates, parsed)) = validated_protection {
 			// Phase 3: store all (infallible — validation above guarantees each port is valid).
@@ -722,9 +752,12 @@ impl SymphonyProxyWrap {
 						ListenerMode::Tls => "tls".to_string(),
 						ListenerMode::Http => "http".to_string(),
 					},
-					active_connections: state.metrics.active_connections.load(Ordering::Relaxed) as f64,
-					half_closed_connections: state.metrics.half_closed_connections.load(Ordering::Relaxed)
+					active_connections: state.metrics.active_connections.load(Ordering::Relaxed)
 						as f64,
+					half_closed_connections: state
+						.metrics
+						.half_closed_connections
+						.load(Ordering::Relaxed) as f64,
 					accepted: state.metrics.total_accepted.load(Ordering::Relaxed) as f64,
 					blocked: total_of(&blocked_by_reason) as f64,
 					errors: total_of(&errors_by_reason) as f64,
@@ -747,7 +780,8 @@ impl SymphonyProxyWrap {
 				JsRouteMetrics {
 					route: identity.route.to_string(),
 					metrics_group: identity.group.to_string(),
-					active_connections: identity.counters.active_connections.load(Ordering::Relaxed) as f64,
+					active_connections: identity.counters.active_connections.load(Ordering::Relaxed)
+						as f64,
 					connections: identity.counters.total_connections.load(Ordering::Relaxed) as f64,
 					errors: total_of(&errors_by_reason) as f64,
 					bytes_received: identity.counters.bytes_in.load(Ordering::Relaxed) as f64,
@@ -758,11 +792,23 @@ impl SymphonyProxyWrap {
 			.collect();
 
 		JsProxyMetrics {
-			active_connections: self.global_metrics.active_connections.load(Ordering::Relaxed) as f64,
+			active_connections: self
+				.global_metrics
+				.active_connections
+				.load(Ordering::Relaxed) as f64,
 			blocked_connections,
-			pending_suspended: self.global_metrics.pending_suspended.load(Ordering::Relaxed) as f64,
-			suspended_resolved: self.global_metrics.suspended_resolved.load(Ordering::Relaxed) as f64,
-			suspended_unresolved: self.global_metrics.suspended_unresolved.load(Ordering::Relaxed) as f64,
+			pending_suspended: self
+				.global_metrics
+				.pending_suspended
+				.load(Ordering::Relaxed) as f64,
+			suspended_resolved: self
+				.global_metrics
+				.suspended_resolved
+				.load(Ordering::Relaxed) as f64,
+			suspended_unresolved: self
+				.global_metrics
+				.suspended_unresolved
+				.load(Ordering::Relaxed) as f64,
 			routes: table.route_count() as f64,
 			failing_routes: table.failing_route_count() as f64,
 			listeners,
@@ -851,7 +897,10 @@ impl SymphonyProxyWrap {
 			Some(Err(message)) => {
 				crate::proxy_conn::emit(
 					&self.js_emit,
-					JsEvent::Error { message: format!("resolveConnection(id={id}): {message}"), listener: String::new() },
+					JsEvent::Error {
+						message: format!("resolveConnection(id={id}): {message}"),
+						listener: String::new(),
+					},
 				);
 				None
 			}
@@ -872,8 +921,11 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 		.map(|u| parse_upstream_spec(u, &r.sni))
 		.collect::<Result<Vec<_>>>()?;
 
-	let has_uds = upstreams.iter().any(|u| matches!(u, UpstreamSpec::Uds { .. }));
-	let source_address_mode = parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
+	let has_uds = upstreams
+		.iter()
+		.any(|u| matches!(u, UpstreamSpec::Uds { .. }));
+	let source_address_mode =
+		parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
 	let forward_fingerprint = parse_forward_fingerprint(r.forward_fingerprint.as_deref())?;
 	let protocol = parse_route_protocol(r.protocol.as_deref())?;
 	let requires_http = requires_http_protocol(source_address_mode, forward_fingerprint);
@@ -894,7 +946,11 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 		cert_pem: r.cert.as_ref().map(|c| pem_bytes(&c.cert_chain)),
 		key_pem: r.cert.as_ref().map(|c| pem_bytes(&c.private_key)),
 		mtls_ca_pem: r.mtls.as_ref().map(|m| pem_bytes(&m.client_ca_cert)),
-		require_client_cert: r.mtls.as_ref().and_then(|m| m.require_client_cert).unwrap_or(false),
+		require_client_cert: r
+			.mtls
+			.as_ref()
+			.and_then(|m| m.require_client_cert)
+			.unwrap_or(false),
 		suspended: r.suspended.unwrap_or(false),
 		suspend_timeout_ms: r.suspend_timeout_ms.unwrap_or(30_000.0) as u64,
 		max_cps: r.max_connections_per_second,
@@ -962,13 +1018,12 @@ fn parse_metrics_group(group: Option<&str>, sni: &str) -> Result<String> {
 fn parse_upstream_spec(u: &JsUpstream, sni: &str) -> Result<UpstreamSpec> {
 	match u.kind.as_str() {
 		"tcp" => {
-			let host = u
-				.host
-				.clone()
-				.ok_or_else(|| napi::Error::from_reason(format!("tcp upstream for '{sni}' missing host")))?;
-			let port = u
-				.port
-				.ok_or_else(|| napi::Error::from_reason(format!("tcp upstream for '{sni}' missing port")))?;
+			let host = u.host.clone().ok_or_else(|| {
+				napi::Error::from_reason(format!("tcp upstream for '{sni}' missing host"))
+			})?;
+			let port = u.port.ok_or_else(|| {
+				napi::Error::from_reason(format!("tcp upstream for '{sni}' missing port"))
+			})?;
 			if u.protocol.is_some() {
 				return Err(napi::Error::from_reason(format!(
 					"tcp upstream for '{sni}': 'protocol' is only supported on uds upstreams"
@@ -977,10 +1032,9 @@ fn parse_upstream_spec(u: &JsUpstream, sni: &str) -> Result<UpstreamSpec> {
 			Ok(UpstreamSpec::Tcp { host, port })
 		}
 		"uds" => {
-			let path = u
-				.path
-				.clone()
-				.ok_or_else(|| napi::Error::from_reason(format!("uds upstream for '{sni}' missing path")))?;
+			let path = u.path.clone().ok_or_else(|| {
+				napi::Error::from_reason(format!("uds upstream for '{sni}' missing path"))
+			})?;
 			if let Some(p) = &u.protocol {
 				if p != "h2" && p != "http/1.1" {
 					return Err(napi::Error::from_reason(format!(
@@ -1011,13 +1065,21 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 				.map_err(|e| napi::Error::from_reason(format!("invalid address: {e}")))?;
 			ResolveUpstream::Tcp(addr)
 		}
-		UpstreamSpec::Uds { paths, ip_affinity, affinity_ttl_ms, .. } => {
-			ResolveUpstream::Uds { paths, ip_affinity, affinity_ttl_ms }
-		}
+		UpstreamSpec::Uds {
+			paths,
+			ip_affinity,
+			affinity_ttl_ms,
+			..
+		} => ResolveUpstream::Uds {
+			paths,
+			ip_affinity,
+			affinity_ttl_ms,
+		},
 	};
 
 	let has_uds = matches!(&upstream, ResolveUpstream::Uds { .. });
-	let source_address_mode = parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
+	let source_address_mode =
+		parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
 	let forward_fingerprint = parse_forward_fingerprint(r.forward_fingerprint.as_deref())?;
 	let protocol = parse_route_protocol(r.protocol.as_deref())?;
 	let requires_http = requires_http_protocol(source_address_mode, forward_fingerprint);
@@ -1056,7 +1118,11 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 		cert_pem: r.cert.as_ref().map(|c| pem_bytes(&c.cert_chain)),
 		key_pem: r.cert.as_ref().map(|c| pem_bytes(&c.private_key)),
 		mtls_ca_pem: r.mtls.as_ref().map(|m| pem_bytes(&m.client_ca_cert)),
-		require_client_cert: r.mtls.as_ref().and_then(|m| m.require_client_cert).unwrap_or(false),
+		require_client_cert: r
+			.mtls
+			.as_ref()
+			.and_then(|m| m.require_client_cert)
+			.unwrap_or(false),
 		source_address_mode,
 		forward_fingerprint,
 		http2,
@@ -1170,7 +1236,11 @@ fn listener_tls_spec(l: &JsListenerConfig) -> ListenerTlsSpec {
 		cert_pem: l.default_cert.as_ref().map(|c| pem_bytes(&c.cert_chain)),
 		key_pem: l.default_cert.as_ref().map(|c| pem_bytes(&c.private_key)),
 		mtls_ca_pem: l.mtls.as_ref().map(|m| pem_bytes(&m.client_ca_cert)),
-		require_client_cert: l.mtls.as_ref().and_then(|m| m.require_client_cert).unwrap_or(true),
+		require_client_cert: l
+			.mtls
+			.as_ref()
+			.and_then(|m| m.require_client_cert)
+			.unwrap_or(true),
 	}
 }
 
@@ -1207,7 +1277,13 @@ const MAX_KEEPALIVE_RETRIES: u32 = 127;
 /// whole-second conversion, so a value that looks positive in JS can arrive at the kernel as
 /// zero. This is read once at construction, so the cost of being strict is a startup error
 /// instead of a silently degraded schedule.
-fn bounded_ms(value: Option<f64>, default: f64, min_ms: f64, max_ms: f64, label: &str) -> Result<Duration> {
+fn bounded_ms(
+	value: Option<f64>,
+	default: f64,
+	min_ms: f64,
+	max_ms: f64,
+	label: &str,
+) -> Result<Duration> {
 	let ms = value.unwrap_or(default);
 	if !ms.is_finite() || ms < min_ms || ms > max_ms {
 		return Err(napi::Error::from_reason(format!(
@@ -1237,14 +1313,20 @@ fn parse_keepalive_config(cfg: Option<&JsTcpKeepaliveConfig>) -> Result<Option<K
 	if cfg.is_some_and(|c| c.enabled == Some(false)) {
 		return Ok(None);
 	}
-	let retries = cfg.and_then(|c| c.retries).unwrap_or(DEFAULT_KEEPALIVE_RETRIES);
+	let retries = cfg
+		.and_then(|c| c.retries)
+		.unwrap_or(DEFAULT_KEEPALIVE_RETRIES);
 	if retries == 0 || retries > MAX_KEEPALIVE_RETRIES {
 		return Err(napi::Error::from_reason(format!(
 			"tcpKeepalive.retries must be in [1, {MAX_KEEPALIVE_RETRIES}], got {retries}"
 		)));
 	}
 	Ok(Some(KeepaliveConfig {
-		idle: keepalive_ms(cfg.and_then(|c| c.idle_ms), DEFAULT_KEEPALIVE_IDLE_MS, "tcpKeepalive.idleMs")?,
+		idle: keepalive_ms(
+			cfg.and_then(|c| c.idle_ms),
+			DEFAULT_KEEPALIVE_IDLE_MS,
+			"tcpKeepalive.idleMs",
+		)?,
 		interval: keepalive_ms(
 			cfg.and_then(|c| c.interval_ms),
 			DEFAULT_KEEPALIVE_INTERVAL_MS,
@@ -1260,7 +1342,13 @@ fn parse_half_close_timeout(value: Option<f64>) -> Result<Duration> {
 	if value == Some(0.0) {
 		return Ok(Duration::ZERO);
 	}
-	bounded_ms(value, DEFAULT_HALF_CLOSE_TIMEOUT_MS, 1.0, u32::MAX as f64, "halfCloseTimeoutMs")
+	bounded_ms(
+		value,
+		DEFAULT_HALF_CLOSE_TIMEOUT_MS,
+		1.0,
+		u32::MAX as f64,
+		"halfCloseTimeoutMs",
+	)
 }
 
 fn pem_bytes(v: &Either<String, Buffer>) -> Vec<u8> {
@@ -1334,8 +1422,10 @@ fn is_valid_ja4(s: &str) -> bool {
 	// sni presence (d=domain/i=ip), cipher count (2 digits), extension count (2 digits),
 	// alpn first/last (2 alphanumeric).
 	a[0] == b't'
-		&& matches!((a[1], a[2]), (b'0', b'0') | (b'1', b'0') | (b'1', b'1') | (b'1', b'2') | (b'1', b'3'))
-		&& matches!(a[3], b'd' | b'i')
+		&& matches!(
+			(a[1], a[2]),
+			(b'0', b'0') | (b'1', b'0') | (b'1', b'1') | (b'1', b'2') | (b'1', b'3')
+		) && matches!(a[3], b'd' | b'i')
 		&& a[4].is_ascii_digit()
 		&& a[5].is_ascii_digit()
 		&& a[6].is_ascii_digit()
@@ -1390,42 +1480,69 @@ mod tests {
 	#[test]
 	fn reject_nan_cps() {
 		let prot = JsProtectionConfig {
-			rate_limit: Some(JsRateLimitConfig { connections_per_second: f64::NAN, burst: None }),
+			rate_limit: Some(JsRateLimitConfig {
+				connections_per_second: f64::NAN,
+				burst: None,
+			}),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_err(), "NaN cps must error");
+		assert!(
+			parse_protection_config(&prot).is_err(),
+			"NaN cps must error"
+		);
 	}
 
 	#[test]
 	fn reject_negative_cps() {
 		let prot = JsProtectionConfig {
-			rate_limit: Some(JsRateLimitConfig { connections_per_second: -1.0, burst: None }),
+			rate_limit: Some(JsRateLimitConfig {
+				connections_per_second: -1.0,
+				burst: None,
+			}),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_err(), "negative cps must error");
+		assert!(
+			parse_protection_config(&prot).is_err(),
+			"negative cps must error"
+		);
 	}
 
 	#[test]
 	fn reject_zero_cps() {
 		let prot = JsProtectionConfig {
-			rate_limit: Some(JsRateLimitConfig { connections_per_second: 0.0, burst: None }),
+			rate_limit: Some(JsRateLimitConfig {
+				connections_per_second: 0.0,
+				burst: None,
+			}),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_err(), "zero cps must error");
+		assert!(
+			parse_protection_config(&prot).is_err(),
+			"zero cps must error"
+		);
 	}
 
 	#[test]
 	fn copy_buffer_default_matches_the_copy_loop() {
 		// The default has to equal what the copy loop used while `readBufferSize` was inert,
 		// or wiring it through would have silently changed every deployment's footprint.
-		assert_eq!(resolve_copy_buffer_size(None, "test"), DEFAULT_COPY_BUFFER_SIZE);
+		assert_eq!(
+			resolve_copy_buffer_size(None, "test"),
+			DEFAULT_COPY_BUFFER_SIZE
+		);
 	}
 
 	#[test]
 	fn copy_buffer_size_is_clamped_not_rejected() {
 		// Zero would make the copy loop read into an empty slice and read the Ok(0) as EOF.
-		assert_eq!(resolve_copy_buffer_size(Some(0), "test"), MIN_COPY_BUFFER_SIZE);
-		assert_eq!(resolve_copy_buffer_size(Some(u32::MAX), "test"), MAX_COPY_BUFFER_SIZE);
+		assert_eq!(
+			resolve_copy_buffer_size(Some(0), "test"),
+			MIN_COPY_BUFFER_SIZE
+		);
+		assert_eq!(
+			resolve_copy_buffer_size(Some(u32::MAX), "test"),
+			MAX_COPY_BUFFER_SIZE
+		);
 		assert_eq!(resolve_copy_buffer_size(Some(1024), "test"), 1024);
 	}
 
@@ -1438,7 +1555,10 @@ mod tests {
 			}),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_err(), "NaN burst must error");
+		assert!(
+			parse_protection_config(&prot).is_err(),
+			"NaN burst must error"
+		);
 	}
 
 	#[test]
@@ -1450,7 +1570,10 @@ mod tests {
 			}),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_err(), "negative burst must error");
+		assert!(
+			parse_protection_config(&prot).is_err(),
+			"negative burst must error"
+		);
 	}
 
 	#[test]
@@ -1462,7 +1585,10 @@ mod tests {
 			}),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_err(), "NaN cpm must error");
+		assert!(
+			parse_protection_config(&prot).is_err(),
+			"NaN cpm must error"
+		);
 	}
 
 	#[test]
@@ -1474,21 +1600,30 @@ mod tests {
 			}),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_err(), "negative cpm must error");
+		assert!(
+			parse_protection_config(&prot).is_err(),
+			"negative cpm must error"
+		);
 	}
 
 	#[test]
 	fn accept_absent_burst() {
 		// burst: None (absent) must not error — only present-but-invalid burst is rejected
 		let prot = JsProtectionConfig {
-			rate_limit: Some(JsRateLimitConfig { connections_per_second: 10.0, burst: None }),
+			rate_limit: Some(JsRateLimitConfig {
+				connections_per_second: 10.0,
+				burst: None,
+			}),
 			sustained: Some(JsSustainedRateLimitConfig {
 				connections_per_minute: 100.0,
 				burst: None,
 			}),
 			..no_rate_limit_prot()
 		};
-		assert!(parse_protection_config(&prot).is_ok(), "absent burst must be accepted");
+		assert!(
+			parse_protection_config(&prot).is_ok(),
+			"absent burst must be accepted"
+		);
 	}
 
 	#[test]
@@ -1505,15 +1640,36 @@ mod tests {
 	fn valid_ja4_rejects_malformed() {
 		assert!(!is_valid_ja4(""), "empty");
 		assert!(!is_valid_ja4("t13d1516h2_8daaf6152771"), "missing part C");
-		assert!(!is_valid_ja4("t13d1516h2_8daaf6152771_02713d6af86"), "part C too short");
-		assert!(!is_valid_ja4("t13d1516h2_8daaf6152771_02713d6af862x"), "too long");
-		assert!(!is_valid_ja4("t13d1516h2-8daaf6152771-02713d6af862"), "wrong separators");
-		assert!(!is_valid_ja4("t13d1516h2_8daaf615277g_02713d6af862"), "non-hex in part B");
-		assert!(!is_valid_ja4("x13d1516h2_8daaf6152771_02713d6af862"), "bad protocol char");
-		assert!(!is_valid_ja4("t1xd1516h2_8daaf6152771_02713d6af862"), "non-digit version");
+		assert!(
+			!is_valid_ja4("t13d1516h2_8daaf6152771_02713d6af86"),
+			"part C too short"
+		);
+		assert!(
+			!is_valid_ja4("t13d1516h2_8daaf6152771_02713d6af862x"),
+			"too long"
+		);
+		assert!(
+			!is_valid_ja4("t13d1516h2-8daaf6152771-02713d6af862"),
+			"wrong separators"
+		);
+		assert!(
+			!is_valid_ja4("t13d1516h2_8daaf615277g_02713d6af862"),
+			"non-hex in part B"
+		);
+		assert!(
+			!is_valid_ja4("x13d1516h2_8daaf6152771_02713d6af862"),
+			"bad protocol char"
+		);
+		assert!(
+			!is_valid_ja4("t1xd1516h2_8daaf6152771_02713d6af862"),
+			"non-digit version"
+		);
 		// Uppercase must be rejected here — call sites are expected to normalize before
 		// validating; is_valid_ja4 itself only matches the lowercase output compute_ja4 emits.
-		assert!(!is_valid_ja4("T13D1516H2_8DAAF6152771_02713D6AF862"), "uppercase");
+		assert!(
+			!is_valid_ja4("T13D1516H2_8DAAF6152771_02713D6AF862"),
+			"uppercase"
+		);
 	}
 
 	// These test the pure `router::requires_http_protocol` / `parse_route_protocol` logic
@@ -1528,60 +1684,94 @@ mod tests {
 
 	#[test]
 	fn xff_requires_http_protocol_declaration() {
-		assert!(requires_http_protocol(SourceAddressMode::XForwardedFor, ForwardFingerprint::None));
+		assert!(requires_http_protocol(
+			SourceAddressMode::XForwardedFor,
+			ForwardFingerprint::None
+		));
 	}
 
 	#[test]
 	fn xff_requires_declaration_regardless_of_fingerprint() {
-		assert!(requires_http_protocol(SourceAddressMode::XForwardedFor, ForwardFingerprint::Ja4));
+		assert!(requires_http_protocol(
+			SourceAddressMode::XForwardedFor,
+			ForwardFingerprint::Ja4
+		));
 	}
 
 	#[test]
 	fn header_carried_fingerprint_requires_http_protocol_declaration() {
 		// source_address_mode is 'none' — not proxyProtocolV2, so the fingerprint would ride
 		// an X-JA3 header and needs the declaration too.
-		assert!(requires_http_protocol(SourceAddressMode::None, ForwardFingerprint::Ja3));
+		assert!(requires_http_protocol(
+			SourceAddressMode::None,
+			ForwardFingerprint::Ja3
+		));
 	}
 
 	#[test]
 	fn fingerprint_under_proxy_protocol_v2_needs_no_declaration() {
 		// TLV carrier, not a header — no protocol declaration required.
-		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocolV2, ForwardFingerprint::Ja4));
+		assert!(!requires_http_protocol(
+			SourceAddressMode::ProxyProtocolV2,
+			ForwardFingerprint::Ja4
+		));
 	}
 
 	#[test]
 	fn proxy_protocol_without_fingerprint_needs_no_declaration() {
-		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocol, ForwardFingerprint::None));
+		assert!(!requires_http_protocol(
+			SourceAddressMode::ProxyProtocol,
+			ForwardFingerprint::None
+		));
 	}
 
 	#[test]
 	fn parse_route_protocol_defaults_to_opaque() {
 		assert_eq!(parse_route_protocol(None).unwrap(), RouteProtocol::Opaque);
-		assert_eq!(parse_route_protocol(Some("opaque")).unwrap(), RouteProtocol::Opaque);
+		assert_eq!(
+			parse_route_protocol(Some("opaque")).unwrap(),
+			RouteProtocol::Opaque
+		);
 	}
 
 	#[test]
 	fn parse_route_protocol_accepts_http() {
-		assert_eq!(parse_route_protocol(Some("http")).unwrap(), RouteProtocol::Http);
+		assert_eq!(
+			parse_route_protocol(Some("http")).unwrap(),
+			RouteProtocol::Http
+		);
 	}
 
 	#[test]
 	fn parse_route_protocol_rejects_unknown_value() {
-		let err = parse_route_protocol(Some("mqtt")).expect_err("an unrecognized protocol value must error");
-		assert!(err.to_string().contains("mqtt"), "error message must mention the offending value: {err}");
+		let err = parse_route_protocol(Some("mqtt"))
+			.expect_err("an unrecognized protocol value must error");
+		assert!(
+			err.to_string().contains("mqtt"),
+			"error message must mention the offending value: {err}"
+		);
 	}
 
 	#[test]
 	fn valid_ja4_rejects_transports_and_versions_symphony_cannot_emit() {
 		// symphony only speaks TLS-over-TCP: 'q' (QUIC) and 'd' (DTLS) transport prefixes can
 		// never match a fingerprint symphony itself computes.
-		assert!(!is_valid_ja4("q13i070500_1234567890ab_abcdef012345"), "QUIC prefix");
-		assert!(!is_valid_ja4("d13i070500_1234567890ab_abcdef012345"), "DTLS prefix");
+		assert!(
+			!is_valid_ja4("q13i070500_1234567890ab_abcdef012345"),
+			"QUIC prefix"
+		);
+		assert!(
+			!is_valid_ja4("d13i070500_1234567890ab_abcdef012345"),
+			"DTLS prefix"
+		);
 		// compute_ja4's ver_str only ever emits 00/10/11/12/13 — any other 2-digit value can
 		// never match either.
 		for ver in ["01", "02", "14", "20", "99"] {
 			let s = format!("t{ver}d1516h2_8daaf6152771_02713d6af862");
-			assert!(!is_valid_ja4(&s), "version {ver} should be rejected (unreachable): {s}");
+			assert!(
+				!is_valid_ja4(&s),
+				"version {ver} should be rejected (unreachable): {s}"
+			);
 		}
 	}
 }
