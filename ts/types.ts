@@ -277,6 +277,40 @@ export interface ProxyConfig {
 	clientReadBufferSize?: number;
 	/** Overrides `readBufferSize` for the upstream -> client direction only. */
 	upstreamReadBufferSize?: number;
+	/**
+	 * TCP keepalive for accepted sockets. Omit for the defaults.
+	 *
+	 * Without it nothing detects a client that disappears without closing: `SO_KEEPALIVE` is off
+	 * per socket by default, and the `net.ipv4.tcp_keepalive_*` sysctls govern only sockets that
+	 * opted in. The settings are applied to the listening socket and inherited by every socket it
+	 * accepts.
+	 */
+	tcpKeepalive?: TcpKeepaliveConfig;
+	/**
+	 * Reclaim a connection whose upstream has closed once the surviving client -> upstream
+	 * direction has carried nothing for this many ms. Default: 300000. 0 disables the bound.
+	 *
+	 * `copy_bidirectional` completes only when both directions finish, so without this a client
+	 * that never sends its own FIN leaves the socket in FIN-WAIT-2 for the life of the process.
+	 * The deadline resets on activity, and only an *upstream* close arms it — a client that
+	 * half-closes after its request is still waiting on a response that may legitimately be slow.
+	 */
+	halfCloseTimeoutMs?: number;
+}
+
+/**
+ * Probe schedule for accepted sockets. A peer that stops answering is declared dead
+ * `idleMs + intervalMs x retries` after the last activity on the connection.
+ */
+export interface TcpKeepaliveConfig {
+	/** Default: true. */
+	enabled?: boolean;
+	/** Quiet time before the first probe, in ms. Default: 300000. */
+	idleMs?: number;
+	/** Gap between probes, in ms. Default: 30000. */
+	intervalMs?: number;
+	/** Unanswered probes before the connection is dropped. Default: 5. */
+	retries?: number;
 }
 
 // ── Hot-swap config ───────────────────────────────────────────────────────────
@@ -295,7 +329,8 @@ export interface ListenerProtectionHotConfig {
  * per-listener protection contents (CIDR lists, JA3 blocklist, rate limits, concurrency
  * caps, handshake timeout, requireSni).
  *
- * Requires restart: bind address, port, idle timeout, worker threads.
+ * Requires restart: bind address, port, idle timeout, half-close timeout, TCP keepalive,
+ * worker threads.
  * Protection presence (None↔Some) cannot change via updateConfig() — a listener must be
  * restarted to gain or lose protection. updateConfig() returns an error for ports that have
  * no protection or that match no listener. symphony-server handles none→some/some→none
@@ -323,6 +358,8 @@ export interface ListenerMetrics {
 	address: string;
 	mode: 'tls' | 'http';
 	activeConnections: number;
+	/** Subset of `activeConnections` whose upstream half has closed. */
+	halfClosedConnections: number;
 	accepted: number;
 	blocked: number;
 	errors: number;

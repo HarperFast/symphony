@@ -8,6 +8,7 @@ mod error;
 mod http_listener;
 mod http_proxy;
 mod listener;
+mod liveness;
 mod metrics;
 mod mtls;
 mod protection;

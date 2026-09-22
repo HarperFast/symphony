@@ -408,6 +408,7 @@ describe('renderPrometheus', () => {
 							address: '0.0.0.0:443',
 							mode: 'tls',
 							activeConnections: 3,
+							halfClosedConnections: 1,
 							accepted: 10,
 							blocked: 2,
 							errors: 1,
@@ -491,6 +492,15 @@ describe('renderPrometheus', () => {
 			lines.includes(
 				'symphony_route_errors_total{proxy="80,443",route="api.example.com",group="tenant-1",reason="upstream_connect"} 1'
 			)
+		);
+	});
+
+	it('emits the half-closed gauge alongside the active gauge', () => {
+		assert.ok(
+			lines.includes(
+				'symphony_listener_half_closed_connections{proxy="80,443",listener="0.0.0.0:443",mode="tls"} 1'
+			),
+			output
 		);
 	});
 

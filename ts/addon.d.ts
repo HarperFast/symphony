@@ -125,6 +125,30 @@ export interface JsProxyConfig {
   clientReadBufferSize?: number
   /** Overrides `readBufferSize` for the upstream→client direction only. */
   upstreamReadBufferSize?: number
+  /**
+   * TCP keepalive for accepted sockets. Omit for the defaults; `enabled: false` turns
+   * dead-peer detection off entirely.
+   */
+  tcpKeepalive?: JsTcpKeepaliveConfig
+  /**
+   * Reclaim a connection whose upstream has closed once the surviving client→upstream
+   * direction has carried nothing for this many ms. Default 300000; 0 disables.
+   */
+  halfCloseTimeoutMs?: number
+}
+/**
+ * Probe schedule for accepted sockets. A peer that stops answering is declared dead
+ * `idleMs + intervalMs × retries` after the last activity on the connection.
+ */
+export interface JsTcpKeepaliveConfig {
+  /** Default: true. */
+  enabled?: boolean
+  /** Quiet time before the first probe, in ms. Default: 300000. */
+  idleMs?: number
+  /** Gap between probes, in ms. Default: 30000. */
+  intervalMs?: number
+  /** Unanswered probes before the connection is dropped. Default: 5. */
+  retries?: number
 }
 export interface JsListenerProtectionHotConfig {
   /** Port of the listener to update. Must match a listener configured at start. */
@@ -150,6 +174,8 @@ export interface JsListenerMetrics {
   /** "tls" or "http". */
   mode: string
   activeConnections: number
+  /** Subset of `activeConnections` whose upstream half has closed. */
+  halfClosedConnections: number
   accepted: number
   blocked: number
   errors: number

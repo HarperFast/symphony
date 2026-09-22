@@ -526,3 +526,43 @@ export function tcpRoundTrip(opts: { port: number; host?: string; data: Buffer |
 
 /** Sleep for `ms` milliseconds. */
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * A minimal, well-formed TLS ClientHello carrying `servername` in the SNI extension.
+ *
+ * For passthrough (`terminateTls: false`) tests: symphony routes on the SNI it peeks out of
+ * these bytes, and everything after them is opaque to the proxy — so the test keeps plain TCP
+ * control over FIN and half-close, which a real `tls.connect` client does not give (Node answers
+ * a close_notify by closing its own side).
+ */
+export function clientHello(servername: string): Buffer {
+	const name = Buffer.from(servername, 'ascii');
+	const sniExtension = Buffer.concat([
+		Buffer.from([0x00, 0x00]), // extension_type: server_name
+		u16(name.length + 5), // extension_data length
+		u16(name.length + 3), // server_name_list length
+		Buffer.from([0x00]), // name_type: host_name
+		u16(name.length),
+		name,
+	]);
+	const body = Buffer.concat([
+		Buffer.from([0x03, 0x03]), // legacy_version: TLS 1.2
+		crypto.randomBytes(32), // random
+		Buffer.from([0x00]), // session_id length
+		u16(2),
+		Buffer.from([0x13, 0x01]), // cipher_suites: TLS_AES_128_GCM_SHA256
+		Buffer.from([0x01, 0x00]), // compression_methods: null
+		u16(sniExtension.length),
+		sniExtension,
+	]);
+	const handshake = Buffer.concat([Buffer.from([0x01]), u24(body.length), body]);
+	return Buffer.concat([Buffer.from([0x16, 0x03, 0x01]), u16(handshake.length), handshake]);
+}
+
+function u16(n: number): Buffer {
+	return Buffer.from([(n >> 8) & 0xff, n & 0xff]);
+}
+
+function u24(n: number): Buffer {
+	return Buffer.from([(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff]);
+}

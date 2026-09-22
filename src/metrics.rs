@@ -76,6 +76,15 @@ labeled_enum!(ErrorKind {
 	/// reset on activity (issue #34, pre-existing). Until that is fixed this counts busy
 	/// connections cut at the deadline, not quiet ones.
 	IdleTimeout => "idle_timeout",
+	/// The upstream half closed and the surviving client→upstream direction then carried nothing
+	/// for `halfCloseTimeoutMs`. Without this bound the socket sits in FIN-WAIT-2 for the life of
+	/// the process, since its fd stays open and `tcp_fin_timeout` applies only to orphans.
+	HalfClosed => "half_closed",
+	/// The copy phase failed with `io::ErrorKind::TimedOut` — either peer's kernel giving up on
+	/// an unreachable host (keepalive probes or retransmissions exhausted). Distinguished from
+	/// `stream` so the connections TCP keepalive reaps are visible rather than pooled with
+	/// ordinary I/O failures.
+	PeerTimeout => "peer_timeout",
 	/// I/O error while proxying an established session.
 	Stream => "stream",
 	/// HTTP-mode listener could not read the request head.
@@ -92,6 +101,10 @@ impl ErrorKind {
 /// read out of band by `metrics()`, never used to make a decision that needs ordering.
 pub struct ListenerMetrics {
 	pub active_connections: AtomicU64,
+	/// Subset of `active_connections` whose upstream half has closed. A rising floor here is the
+	/// leak in issue #45 becoming visible while it is still counted in connections rather than
+	/// gigabytes.
+	pub half_closed_connections: AtomicU64,
 	pub total_accepted: AtomicU64,
 	/// Bytes read from clients on this listener (client → upstream), counted where the proxy
 	/// sees them. On a terminated-TLS route that is the plaintext stream — the handshake happens
@@ -109,6 +122,7 @@ impl Default for ListenerMetrics {
 	fn default() -> Self {
 		Self {
 			active_connections: AtomicU64::new(0),
+			half_closed_connections: AtomicU64::new(0),
 			total_accepted: AtomicU64::new(0),
 			bytes_in: AtomicU64::new(0),
 			bytes_out: AtomicU64::new(0),
@@ -126,6 +140,14 @@ impl ListenerMetrics {
 
 	pub fn dec_active(&self) {
 		self.active_connections.fetch_sub(1, Ordering::Relaxed);
+	}
+
+	pub fn inc_half_closed(&self) {
+		self.half_closed_connections.fetch_add(1, Ordering::Relaxed);
+	}
+
+	pub fn dec_half_closed(&self) {
+		self.half_closed_connections.fetch_sub(1, Ordering::Relaxed);
 	}
 
 	pub fn inc_blocked(&self, kind: BlockKind) {

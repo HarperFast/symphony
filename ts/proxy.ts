@@ -175,6 +175,8 @@ export class SymphonyProxy extends EventEmitter {
 			readBufferSize: config.readBufferSize,
 			clientReadBufferSize: config.clientReadBufferSize,
 			upstreamReadBufferSize: config.upstreamReadBufferSize,
+			tcpKeepalive: config.tcpKeepalive,
+			halfCloseTimeoutMs: config.halfCloseTimeoutMs,
 		};
 
 		this._inner = new Wrap(jsConfig, (err, raw) => {
@@ -286,6 +288,7 @@ export class SymphonyProxy extends EventEmitter {
 				address: l.address,
 				mode: l.mode as 'tls' | 'http',
 				activeConnections: l.activeConnections,
+				halfClosedConnections: l.halfClosedConnections,
 				accepted: l.accepted,
 				blocked: l.blocked,
 				errors: l.errors,

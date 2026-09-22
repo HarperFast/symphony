@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 // longer freeze legitimate bucket refills. Values are only compared internally.
 static START: OnceLock<Instant> = OnceLock::new();
 
-fn now_ns() -> u64 {
+pub(crate) fn now_ns() -> u64 {
 	Instant::now()
 		.duration_since(*START.get_or_init(Instant::now))
 		.as_nanos() as u64
