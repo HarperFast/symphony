@@ -18,7 +18,7 @@ use crate::http_proxy::{
 };
 use crate::listener::{make_reuseport_socket, set_rlimit_nofile};
 use crate::liveness::arm_accepted;
-use crate::metrics::{BlockKind, CountingStream, ErrorKind, RouteActiveGuard, inc_route_error};
+use crate::metrics::{inc_route_error, BlockKind, CountingStream, ErrorKind, RouteActiveGuard};
 use crate::proxy_conn::ConnContext;
 use crate::upstream::{self, UpstreamStream};
 use std::net::SocketAddr;
@@ -126,19 +126,20 @@ async fn handle_http(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<Conn
 
 	// Read just the request line + headers. Capped by HEADER_READ_TIMEOUT so a
 	// stalled client can't hold a worker hostage.
-	let (headers, _excess) = match timeout(HEADER_READ_TIMEOUT, read_http_headers(&mut stream)).await {
-		Ok(Ok(pair)) => pair,
-		Ok(Err(e)) => {
-			tracing::debug!("http :80 header read error from {}: {e}", peer_addr.ip());
-			ctx.listener_metrics.inc_error(ErrorKind::HttpHeader);
-			return;
-		}
-		Err(_) => {
-			tracing::debug!("http :80 header read timeout from {}", peer_addr.ip());
-			ctx.listener_metrics.inc_error(ErrorKind::HttpHeader);
-			return;
-		}
-	};
+	let (headers, _excess) =
+		match timeout(HEADER_READ_TIMEOUT, read_http_headers(&mut stream)).await {
+			Ok(Ok(pair)) => pair,
+			Ok(Err(e)) => {
+				tracing::debug!("http :80 header read error from {}: {e}", peer_addr.ip());
+				ctx.listener_metrics.inc_error(ErrorKind::HttpHeader);
+				return;
+			}
+			Err(_) => {
+				tracing::debug!("http :80 header read timeout from {}", peer_addr.ip());
+				ctx.listener_metrics.inc_error(ErrorKind::HttpHeader);
+				return;
+			}
+		};
 
 	if headers.is_empty() {
 		// EOF before the header block completed.
@@ -160,17 +161,31 @@ async fn handle_http(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<Conn
 			return;
 		}
 		// Missing or unsafe Host header on an ACME request — fall through to a 400.
-		let _ = write_simple_response(&mut stream, b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &ctx.listener_metrics).await;
+		let _ = write_simple_response(
+			&mut stream,
+			b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+			&ctx.listener_metrics,
+		)
+		.await;
 		return;
 	}
 
 	// Default: redirect to https://<host><target>.
 	let Some(host) = host else {
-		let _ = write_simple_response(&mut stream, b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &ctx.listener_metrics).await;
+		let _ = write_simple_response(
+			&mut stream,
+			b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+			&ctx.listener_metrics,
+		)
+		.await;
 		return;
 	};
 	let target_str = std::str::from_utf8(target).unwrap_or("/");
-	let target_str = if target_str.is_empty() { "/" } else { target_str };
+	let target_str = if target_str.is_empty() {
+		"/"
+	} else {
+		target_str
+	};
 	let location = format!("https://{host}{target_str}");
 	let response = format!(
 		"HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -195,7 +210,12 @@ async fn proxy_acme(
 	let Some(route) = table.resolve(Some(host)).cloned() else {
 		// No matching route — answer 404 so the ACME client gets a definitive answer
 		// rather than a hung connection.
-		let _ = write_simple_response(client, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &ctx.listener_metrics).await;
+		let _ = write_simple_response(
+			client,
+			b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+			&ctx.listener_metrics,
+		)
+		.await;
 		ctx.listener_metrics.inc_error(ErrorKind::NoRoute);
 		return;
 	};
@@ -206,16 +226,30 @@ async fn proxy_acme(
 	// a flood of /.well-known/acme-challenge/ requests can't bypass the cap.
 	if let Some(rl) = &route.rate_limiter {
 		if !rl.try_acquire() {
-			inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::RouteRateLimited);
+			inc_route_error(
+				&ctx.listener_metrics,
+				&route.metric_identity.counters,
+				ErrorKind::RouteRateLimited,
+			);
 			return;
 		}
 	}
 
-	let upstream = match upstream::connect(&route.destination, Some(peer_addr.ip()), UPSTREAM_CONNECT_TIMEOUT).await {
+	let upstream = match upstream::connect(
+		&route.destination,
+		Some(peer_addr.ip()),
+		UPSTREAM_CONNECT_TIMEOUT,
+	)
+	.await
+	{
 		Ok(upstream) => upstream,
 		Err(e) => {
 			tracing::debug!("acme upstream connect failed for {host}: {e}");
-			inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::UpstreamConnect);
+			inc_route_error(
+				&ctx.listener_metrics,
+				&route.metric_identity.counters,
+				ErrorKind::UpstreamConnect,
+			);
 			return;
 		}
 	};
@@ -253,7 +287,11 @@ async fn proxy_acme(
 	// the upstream outcome.  The HTTP-mode listener never reuses connections.
 	let _ = client.shutdown().await;
 	if result.is_err() {
-		inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, ErrorKind::Stream);
+		inc_route_error(
+			&ctx.listener_metrics,
+			&route.metric_identity.counters,
+			ErrorKind::Stream,
+		);
 	}
 }
 

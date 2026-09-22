@@ -52,7 +52,10 @@ pub async fn read_header_block<R: AsyncRead + Unpin>(
 			return if carry.is_empty() {
 				Ok(None)
 			} else {
-				Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed mid-header"))
+				Err(io::Error::new(
+					io::ErrorKind::UnexpectedEof,
+					"closed mid-header",
+				))
 			};
 		}
 		carry.extend_from_slice(&tmp[..n]);
@@ -111,8 +114,14 @@ fn header_fields(block: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
 }
 
 fn trim_ascii(bytes: &[u8]) -> &[u8] {
-	let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
-	let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(start, |p| p + 1);
+	let start = bytes
+		.iter()
+		.position(|b| !b.is_ascii_whitespace())
+		.unwrap_or(bytes.len());
+	let end = bytes
+		.iter()
+		.rposition(|b| !b.is_ascii_whitespace())
+		.map_or(start, |p| p + 1);
 	&bytes[start..end]
 }
 
@@ -171,7 +180,9 @@ pub fn status_code(headers: &[u8]) -> u16 {
 /// Status code of a response head, or `None` when the status line is malformed.
 fn parse_status(headers: &[u8]) -> Option<u16> {
 	let line_end = headers.windows(2).position(|w| w == b"\r\n")?;
-	let mut fields = headers[..line_end].split(|&b| b == b' ').filter(|f| !f.is_empty());
+	let mut fields = headers[..line_end]
+		.split(|&b| b == b' ')
+		.filter(|f| !f.is_empty());
 	let code = fields.nth(1)?;
 	std::str::from_utf8(code).ok()?.parse().ok()
 }
@@ -430,7 +441,10 @@ fn rewrite_request_head(block: &[u8], rewrites: &[HeaderRewrite]) -> io::Result<
 		if name.is_empty() || name.iter().any(|b| b.is_ascii_whitespace()) {
 			return Err(bad("malformed header name"));
 		}
-		if !rewrites.iter().any(|r| r.name.as_bytes().eq_ignore_ascii_case(name)) {
+		if !rewrites
+			.iter()
+			.any(|r| r.name.as_bytes().eq_ignore_ascii_case(name))
+		{
 			out.extend_from_slice(&block[i..i + rel + 2]);
 		}
 		i += rel + 2;
@@ -487,7 +501,12 @@ fn request_body(block: &[u8]) -> io::Result<RequestBody> {
 }
 
 /// Copy `n` body bytes through, draining anything already buffered in `carry` before reading more.
-async fn copy_body<R, W>(reader: &mut R, writer: &mut W, carry: &mut Vec<u8>, n: u64) -> io::Result<()>
+async fn copy_body<R, W>(
+	reader: &mut R,
+	writer: &mut W,
+	carry: &mut Vec<u8>,
+	n: u64,
+) -> io::Result<()>
 where
 	R: AsyncRead + Unpin,
 	W: AsyncWrite + Unpin,
@@ -524,7 +543,10 @@ async fn read_control_line<R: AsyncRead + Unpin>(
 		}
 		let n = reader.read(&mut tmp).await?;
 		if n == 0 {
-			return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed mid-chunk"));
+			return Err(io::Error::new(
+				io::ErrorKind::UnexpectedEof,
+				"closed mid-chunk",
+			));
 		}
 		carry.extend_from_slice(&tmp[..n]);
 	}
@@ -533,14 +555,21 @@ async fn read_control_line<R: AsyncRead + Unpin>(
 /// Stream a chunked body through verbatim, following its frame markers only so we know where the
 /// next request begins. Chunk data and trailers are passed through untouched — backends surface
 /// trailers separately from headers, so they aren't a header-spoofing surface.
-async fn copy_chunked_body<R, W>(reader: &mut R, writer: &mut W, carry: &mut Vec<u8>) -> io::Result<()>
+async fn copy_chunked_body<R, W>(
+	reader: &mut R,
+	writer: &mut W,
+	carry: &mut Vec<u8>,
+) -> io::Result<()>
 where
 	R: AsyncRead + Unpin,
 	W: AsyncWrite + Unpin,
 {
 	loop {
 		let line = read_control_line(reader, carry).await?;
-		let size_field = line[..line.len() - 2].split(|&b| b == b';').next().unwrap_or(&[]);
+		let size_field = line[..line.len() - 2]
+			.split(|&b| b == b';')
+			.next()
+			.unwrap_or(&[]);
 		let size_text = std::str::from_utf8(size_field)
 			.map_err(|_| bad("malformed chunk size"))?
 			.trim();
@@ -612,7 +641,11 @@ where
 		let is_tunnel_candidate = is_connect || is_upgrade(&carry[..end]);
 		// CONNECT has no body by definition; an Upgrade request still uses normal framing
 		// until the upstream switches protocols.
-		let body = if is_connect { RequestBody::None } else { request_body(&carry[..end])? };
+		let body = if is_connect {
+			RequestBody::None
+		} else {
+			request_body(&carry[..end])?
+		};
 		let head_only = request_method(&carry[..end]).eq_ignore_ascii_case(b"HEAD");
 
 		let (verdict_tx, verdict_rx) = if is_tunnel_candidate {
@@ -623,7 +656,12 @@ where
 		};
 		// Send meta before the head so the response pump's queue is in request order.
 		if meta_tx
-			.send(RequestMeta { head_only, connect: is_connect, upgrade: is_tunnel_candidate && !is_connect, verdict: verdict_tx })
+			.send(RequestMeta {
+				head_only,
+				connect: is_connect,
+				upgrade: is_tunnel_candidate && !is_connect,
+				verdict: verdict_tx,
+			})
 			.is_err()
 		{
 			return Ok(()); // response pump is gone — the connection is closing
@@ -694,7 +732,8 @@ where
 		let Some(end) = read_header_block(reader, &mut carry).await? else {
 			return Ok(()); // upstream closed between responses
 		};
-		let status = parse_status(&carry[..end]).ok_or_else(|| bad("malformed response status line"))?;
+		let status =
+			parse_status(&carry[..end]).ok_or_else(|| bad("malformed response status line"))?;
 
 		// Interim responses (100 Continue etc.) precede the real one; 101 is the upgrade accept.
 		if (100..200).contains(&status) && status != 101 {
@@ -760,13 +799,15 @@ where
 	let (meta_tx, mut meta_rx) = tokio::sync::mpsc::unbounded_channel();
 
 	let client_to_upstream = async {
-		let result = rewrite_request_stream(&mut client_read, &mut upstream_write, rewrites, &meta_tx).await;
+		let result =
+			rewrite_request_stream(&mut client_read, &mut upstream_write, rewrites, &meta_tx).await;
 		drop(meta_tx); // release the response pump's queue so it can finish
 		let _ = upstream_write.shutdown().await;
 		result
 	};
 	let upstream_to_client = async {
-		let result = forward_response_stream(&mut upstream_read, &mut client_write, &mut meta_rx).await;
+		let result =
+			forward_response_stream(&mut upstream_read, &mut client_write, &mut meta_rx).await;
 		let _ = client_write.shutdown().await;
 		result
 	};
@@ -791,7 +832,9 @@ mod tests {
 
 	impl ChunkReader {
 		fn new(chunks: &[&[u8]]) -> Self {
-			Self { chunks: chunks.iter().map(|c| c.to_vec()).collect() }
+			Self {
+				chunks: chunks.iter().map(|c| c.to_vec()).collect(),
+			}
 		}
 	}
 
@@ -814,7 +857,10 @@ mod tests {
 	}
 
 	fn ja3_rewrite(value: Option<&str>) -> Vec<HeaderRewrite> {
-		vec![HeaderRewrite { name: "X-JA3", value: value.map(str::to_string) }]
+		vec![HeaderRewrite {
+			name: "X-JA3",
+			value: value.map(str::to_string),
+		}]
 	}
 
 	async fn run(chunks: &[&[u8]], rewrites: &[HeaderRewrite]) -> io::Result<String> {
@@ -830,11 +876,16 @@ mod tests {
 	/// Drive the full request/response pump pair over in-memory duplex pipes: the test
 	/// scripts the client's bytes and the upstream's responses, and gets back what each
 	/// side received.
-	async fn run_pair(client_sends: &[u8], upstream_sends: &[u8], rewrites: &[HeaderRewrite]) -> (String, String) {
+	async fn run_pair(
+		client_sends: &[u8],
+		upstream_sends: &[u8],
+		rewrites: &[HeaderRewrite],
+	) -> (String, String) {
 		let (mut client_side, mut proxy_client_side) = tokio::io::duplex(64 * 1024);
 		let (mut proxy_upstream_side, mut upstream_side) = tokio::io::duplex(64 * 1024);
 
-		let proxy = proxy_http1_rewriting(&mut proxy_client_side, &mut proxy_upstream_side, rewrites);
+		let proxy =
+			proxy_http1_rewriting(&mut proxy_client_side, &mut proxy_upstream_side, rewrites);
 
 		let client_data = client_sends.to_vec();
 		let client = async move {
@@ -870,7 +921,10 @@ mod tests {
 		)
 		.await
 		.unwrap();
-		assert_eq!(got, format!("GET / HTTP/1.1\r\nX-JA3: {JA3}\r\nHost: x\r\n\r\n"));
+		assert_eq!(
+			got,
+			format!("GET / HTTP/1.1\r\nX-JA3: {JA3}\r\nHost: x\r\n\r\n")
+		);
 	}
 
 	#[tokio::test]
@@ -892,12 +946,19 @@ mod tests {
 	#[tokio::test]
 	async fn strips_header_fragmented_across_reads() {
 		let got = run(
-			&[b"GET / HTTP/1.1\r\nX-JA", b"3: deadbeef\r\nHost: x\r\n\r", b"\n"],
+			&[
+				b"GET / HTTP/1.1\r\nX-JA",
+				b"3: deadbeef\r\nHost: x\r\n\r",
+				b"\n",
+			],
 			&ja3_rewrite(Some(JA3)),
 		)
 		.await
 		.unwrap();
-		assert_eq!(got, format!("GET / HTTP/1.1\r\nX-JA3: {JA3}\r\nHost: x\r\n\r\n"));
+		assert_eq!(
+			got,
+			format!("GET / HTTP/1.1\r\nX-JA3: {JA3}\r\nHost: x\r\n\r\n")
+		);
 		assert!(!got.contains("deadbeef"));
 	}
 
@@ -1009,8 +1070,14 @@ mod tests {
 		)
 		.await
 		.unwrap();
-		assert!(got.starts_with("GET /longpath HTTP/1.1\r\n"), "request line intact: {got:?}");
-		assert_eq!(got, format!("GET /longpath HTTP/1.1\r\nX-JA3: {JA3}\r\nHost: x\r\n\r\n"));
+		assert!(
+			got.starts_with("GET /longpath HTTP/1.1\r\n"),
+			"request line intact: {got:?}"
+		);
+		assert_eq!(
+			got,
+			format!("GET /longpath HTTP/1.1\r\nX-JA3: {JA3}\r\nHost: x\r\n\r\n")
+		);
 	}
 
 	// An empty stream (client connects, sends nothing, closes) is a clean no-op — no spurious head.
@@ -1045,7 +1112,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn no_rewrites_leaves_stream_verbatim() {
-		let got = run(&[b"GET / HTTP/1.1\r\nX-JA3: keep\r\n\r\n"], &[]).await.unwrap();
+		let got = run(&[b"GET / HTTP/1.1\r\nX-JA3: keep\r\n\r\n"], &[])
+			.await
+			.unwrap();
 		assert_eq!(got, "GET / HTTP/1.1\r\nX-JA3: keep\r\n\r\n");
 	}
 
@@ -1060,7 +1129,10 @@ mod tests {
 		rewrite_request_stream(&mut reader, &mut out, &ja3_rewrite(Some(JA3)), &meta_tx)
 			.await
 			.unwrap();
-		assert!(out.windows(4).any(|w| w == b"caf\xE9"), "obs-text header forwarded intact");
+		assert!(
+			out.windows(4).any(|w| w == b"caf\xE9"),
+			"obs-text header forwarded intact"
+		);
 		assert!(String::from_utf8_lossy(&out).contains(&format!("X-JA3: {JA3}")));
 	}
 
@@ -1070,7 +1142,8 @@ mod tests {
 	fn upgrade_across_multiple_connection_fields() {
 		let head = b"GET /ws HTTP/1.1\r\nConnection: keep-alive\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
 		assert!(is_upgrade(head));
-		let head_tokens = b"GET /ws HTTP/1.1\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\n\r\n";
+		let head_tokens =
+			b"GET /ws HTTP/1.1\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\n\r\n";
 		assert!(is_upgrade(head_tokens));
 		let no_upgrade = b"GET / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n";
 		assert!(!is_upgrade(no_upgrade));
@@ -1087,12 +1160,22 @@ mod tests {
 		let client_sends = [UPGRADE_REQ, b"\x88\x00raw-client-frames"].concat();
 		let upstream_sends: &[u8] =
 			b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n\x82\x01raw-upstream-frames";
-		let (upstream_got, client_got) = run_pair(&client_sends, upstream_sends, &ja3_rewrite(Some(JA3))).await;
-		assert!(upstream_got.contains(&format!("X-JA3: {JA3}")), "upgrade head rewritten");
+		let (upstream_got, client_got) =
+			run_pair(&client_sends, upstream_sends, &ja3_rewrite(Some(JA3))).await;
+		assert!(
+			upstream_got.contains(&format!("X-JA3: {JA3}")),
+			"upgrade head rewritten"
+		);
 		assert!(!upstream_got.contains("spoofed"));
-		assert!(upstream_got.contains("raw-client-frames"), "client tunnel bytes flow");
+		assert!(
+			upstream_got.contains("raw-client-frames"),
+			"client tunnel bytes flow"
+		);
 		assert!(client_got.contains("101 Switching Protocols"));
-		assert!(client_got.contains("raw-upstream-frames"), "upstream tunnel bytes flow");
+		assert!(
+			client_got.contains("raw-upstream-frames"),
+			"upstream tunnel bytes flow"
+		);
 	}
 
 	// The heskew scenario: upstream REJECTS the upgrade but keeps the connection alive. A
@@ -1107,11 +1190,21 @@ mod tests {
 		.concat();
 		let upstream_sends: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n\
 			HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-		let (upstream_got, client_got) = run_pair(&client_sends, upstream_sends, &ja3_rewrite(Some(JA3))).await;
-		assert!(!upstream_got.contains("spoofed"), "upgrade head still stripped");
-		assert!(!upstream_got.contains("smuggled"), "pipelined request must not bypass the rewriter");
+		let (upstream_got, client_got) =
+			run_pair(&client_sends, upstream_sends, &ja3_rewrite(Some(JA3))).await;
+		assert!(
+			!upstream_got.contains("spoofed"),
+			"upgrade head still stripped"
+		);
+		assert!(
+			!upstream_got.contains("smuggled"),
+			"pipelined request must not bypass the rewriter"
+		);
 		let occurrences = upstream_got.matches(&format!("X-JA3: {JA3}")).count();
-		assert_eq!(occurrences, 2, "both requests carry the authoritative header");
+		assert_eq!(
+			occurrences, 2,
+			"both requests carry the authoritative header"
+		);
 		assert!(client_got.contains("400 Bad Request"));
 		assert!(client_got.contains("ok"));
 	}
@@ -1120,12 +1213,19 @@ mod tests {
 	#[tokio::test]
 	async fn connect_verdicts() {
 		let accepted = run_pair(
-			&[b"CONNECT db:5432 HTTP/1.1\r\nHost: db\r\n\r\n" as &[u8], b"opaque-bytes"].concat(),
+			&[
+				b"CONNECT db:5432 HTTP/1.1\r\nHost: db\r\n\r\n" as &[u8],
+				b"opaque-bytes",
+			]
+			.concat(),
 			b"HTTP/1.1 200 Connection Established\r\n\r\ntunnel-back",
 			&ja3_rewrite(Some(JA3)),
 		)
 		.await;
-		assert!(accepted.0.contains("opaque-bytes"), "client bytes tunnel after 2xx");
+		assert!(
+			accepted.0.contains("opaque-bytes"),
+			"client bytes tunnel after 2xx"
+		);
 		assert!(accepted.1.contains("tunnel-back"));
 
 		let rejected = run_pair(
@@ -1138,7 +1238,10 @@ mod tests {
 			&ja3_rewrite(Some(JA3)),
 		)
 		.await;
-		assert!(!rejected.0.contains("smuggled"), "post-CONNECT request stays under the rewriter");
+		assert!(
+			!rejected.0.contains("smuggled"),
+			"post-CONNECT request stays under the rewriter"
+		);
 	}
 
 	// An interim 100 Continue is forwarded without consuming the request's response slot.

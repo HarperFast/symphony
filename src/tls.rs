@@ -41,7 +41,10 @@ pub struct TlsConfigCache {
 
 impl TlsConfigCache {
 	pub fn new() -> Self {
-		Self { cache: HashMap::new(), used: HashSet::new() }
+		Self {
+			cache: HashMap::new(),
+			used: HashSet::new(),
+		}
 	}
 
 	/// Drop every entry not requested since the previous sweep, retiring rotated-out certs.
@@ -54,7 +57,8 @@ impl TlsConfigCache {
 	/// set, is what makes this correct.
 	pub fn retain_used(&mut self) {
 		let used = std::mem::take(&mut self.used);
-		self.cache.retain(|k, config| used.contains(k) || Arc::strong_count(config) > 1);
+		self.cache
+			.retain(|k, config| used.contains(k) || Arc::strong_count(config) > 1);
 	}
 
 	/// Discard marks and cache-only configs from a route table that was never committed.
@@ -83,7 +87,13 @@ impl TlsConfigCache {
 	) -> Result<Arc<ServerConfig>> {
 		// Hash both chain and private key so routes sharing a cert but using different
 		// keys (e.g. mid-rotation) get distinct ServerConfig allocations.
-		let cert_key = sha256(&[cert.cert_chain_pem.as_slice(), cert.private_key_pem.as_slice()].concat());
+		let cert_key = sha256(
+			&[
+				cert.cert_chain_pem.as_slice(),
+				cert.private_key_pem.as_slice(),
+			]
+			.concat(),
+		);
 		let mtls_key = mtls
 			.map(|m| {
 				let mut buf = m.client_ca_pem.clone();
@@ -106,7 +116,11 @@ impl TlsConfigCache {
 	}
 }
 
-fn build_server_config(cert: &CertSpec, mtls: Option<&MtlsSpec>, http2: bool) -> Result<Arc<ServerConfig>> {
+fn build_server_config(
+	cert: &CertSpec,
+	mtls: Option<&MtlsSpec>,
+	http2: bool,
+) -> Result<Arc<ServerConfig>> {
 	// Parse certificate chain
 	let certs: Vec<_> = {
 		let mut reader = std::io::BufReader::new(cert.cert_chain_pem.as_slice());
@@ -115,7 +129,9 @@ fn build_server_config(cert: &CertSpec, mtls: Option<&MtlsSpec>, http2: bool) ->
 			.map_err(|e| SymphonyError::Config(format!("invalid cert chain PEM: {e}")))?
 	};
 	if certs.is_empty() {
-		return Err(SymphonyError::Config("cert chain PEM contains no certificates".into()));
+		return Err(SymphonyError::Config(
+			"cert chain PEM contains no certificates".into(),
+		));
 	}
 
 	// Parse private key
@@ -162,8 +178,7 @@ fn build_server_config(cert: &CertSpec, mtls: Option<&MtlsSpec>, http2: bool) ->
 	}
 
 	cfg.session_storage = rustls::server::ServerSessionMemoryCache::new(1024);
-	cfg.ticketer = rustls::crypto::ring::Ticketer::new()
-		.map_err(SymphonyError::Tls)?;
+	cfg.ticketer = rustls::crypto::ring::Ticketer::new().map_err(SymphonyError::Tls)?;
 
 	Ok(Arc::new(cfg))
 }

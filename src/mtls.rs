@@ -1,7 +1,4 @@
-use rustls::{
-	server::danger::ClientCertVerifier,
-	DistinguishedName,
-};
+use rustls::{server::danger::ClientCertVerifier, DistinguishedName};
 use rustls_pki_types::{CertificateDer, UnixTime};
 use std::sync::Arc;
 
@@ -12,10 +9,7 @@ pub struct SymphonyClientVerifier {
 }
 
 impl SymphonyClientVerifier {
-	pub fn build(
-		ca_pem: &[u8],
-		require_cert: bool,
-	) -> crate::error::Result<Arc<Self>> {
+	pub fn build(ca_pem: &[u8], require_cert: bool) -> crate::error::Result<Arc<Self>> {
 		let mut root_store = rustls::RootCertStore::empty();
 		let mut reader = std::io::BufReader::new(ca_pem);
 		for cert in rustls_pemfile::certs(&mut reader) {
@@ -30,9 +24,14 @@ impl SymphonyClientVerifier {
 
 		let inner = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
 			.build()
-			.map_err(|e| crate::error::SymphonyError::Config(format!("client verifier build failed: {e}")))?;
+			.map_err(|e| {
+				crate::error::SymphonyError::Config(format!("client verifier build failed: {e}"))
+			})?;
 
-		Ok(Arc::new(Self { inner, require_cert }))
+		Ok(Arc::new(Self {
+			inner,
+			require_cert,
+		}))
 	}
 }
 
@@ -59,7 +58,8 @@ impl ClientCertVerifier for SymphonyClientVerifier {
 		intermediates: &[CertificateDer<'_>],
 		now: UnixTime,
 	) -> std::result::Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-		self.inner.verify_client_cert(end_entity, intermediates, now)
+		self.inner
+			.verify_client_cert(end_entity, intermediates, now)
 	}
 
 	fn verify_tls12_signature(
