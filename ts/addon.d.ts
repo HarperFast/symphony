@@ -174,7 +174,7 @@ export interface JsListenerMetrics {
   /** "tls" or "http". */
   mode: string
   activeConnections: number
-  /** Subset of `activeConnections` in FIN-WAIT-2 — our FIN sent, the client's not yet received. */
+  /** Subset of `activeConnections` whose write half to the client is shut down, awaiting its FIN. */
   halfClosedConnections: number
   accepted: number
   blocked: number

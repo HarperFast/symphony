@@ -86,12 +86,12 @@ describe('dead connection reaping', () => {
 		const socket: net.Socket = await new Promise((resolve) => {
 			// allowHalfOpen is what makes this client the peer from the issue: without it Node
 			// answers the proxy's FIN with its own, and the connection closes on its own.
-			const s = net.createConnection({ host: '127.0.0.1', port, allowHalfOpen: true });
-			s.on('error', () => {});
-			sockets.push(s);
-			s.on('connect', () => {
-				s.write(clientHello(SNI));
-				resolve(s);
+			const client = net.createConnection({ host: '127.0.0.1', port, allowHalfOpen: true });
+			client.on('error', () => {});
+			sockets.push(client);
+			client.on('connect', () => {
+				client.write(clientHello(SNI));
+				resolve(client);
 			});
 		});
 		// The client's connect event can precede the server-side accept, so a test that waits for
@@ -126,8 +126,6 @@ describe('dead connection reaping', () => {
 		await waitFor(() => proxy.metrics().listeners[0].halfClosedConnections === 0);
 	});
 
-	// The shape the bound must not touch: the client has shut down its write half and the
-	// response's first byte comes well after the window would have expired.
 	it('does not truncate a slow response after the client half-closes', async () => {
 		const { proxy, port } = await startProxy((socket) => {
 			socket.resume();
@@ -166,9 +164,6 @@ describe('dead connection reaping', () => {
 		await waitFor(() => proxy.metrics().listeners[0].activeConnections === 0);
 	});
 
-	// The bound arms on the client's FIN, not on the upstream's EOF, because the copy can still
-	// be holding a buffer of response data when that EOF lands. Started at the EOF, the clock
-	// would run against a flush in progress and cut the tail for a client this slow.
 	it('does not truncate a buffered response to a client slower than the window', async () => {
 		// Large enough that it cannot all sit in the kernel socket buffers, so the copy is still
 		// flushing — and has not yet shut down the write half — while the window elapses.

@@ -351,6 +351,10 @@ where
 	C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 	U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+	// Wrapped even when the bound is disabled, so the half-closed gauge still reports for an
+	// operator who turned the reaping off but wants to see the pile. The cost is one relaxed load
+	// of a per-connection cache line per read chunk; do not "optimise" it away without also
+	// deciding to lose that metric.
 	let watch = HalfCloseWatch::new(&ctx.listener_metrics);
 	let copy = async {
 		write_connection_prefix(upstream, sf).await?;

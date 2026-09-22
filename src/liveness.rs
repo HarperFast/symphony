@@ -216,10 +216,8 @@ mod tests {
 		KeepaliveConfig { idle: Duration::from_secs(97), interval: Duration::from_secs(13), retries: 4 }
 	}
 
-	/// The invariant the accept path depends on, asserted where it is actually observable. On
-	/// Linux `arm_accepted` is a no-op, so this fails if the kernel ever stops copying the
-	/// listener's schedule into accepted sockets — which would silently cost every proxied
-	/// connection its dead-peer detection without changing anything a round-trip test can see.
+	/// On Linux `arm_accepted` is a no-op, so this fails if the kernel ever stops copying the
+	/// listener's schedule into accepted sockets — which no round-trip test would notice.
 	#[tokio::test]
 	async fn accepted_sockets_carry_the_configured_keepalive() {
 		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -238,8 +236,6 @@ mod tests {
 		drop(client);
 	}
 
-	/// A stream that yields `chunks` reads of one byte each and then EOFs forever. Its
-	/// `poll_shutdown` is what `copy_bidirectional` calls once a direction has fully drained.
 	struct Chunks {
 		remaining: usize,
 	}
@@ -281,14 +277,6 @@ mod tests {
 		stream.shutdown().await.unwrap();
 	}
 
-	/// The correction that matters most: an upstream EOF is observed while response data may
-	/// still be buffered, and the client's FIN goes out only when `poll_shutdown` *completes*
-	/// after that drains. A clock started at the EOF runs against a flush still in progress.
-	///
-	/// The gap is invisible on a plain TCP passthrough — tokio's copy loop reads again only once
-	/// its buffer is empty, so it cannot see EOF with bytes still owed. It is real on a
-	/// terminated-TLS route, where `poll_write` on a `TlsStream` accepts into rustls' unbounded
-	/// write buffer and reports success long before anything reaches a slow client's socket.
 	#[tokio::test(start_paused = true)]
 	async fn an_upstream_eof_alone_does_not_arm_the_bound() {
 		let metrics = ListenerMetrics::default();
@@ -301,8 +289,7 @@ mod tests {
 	}
 
 	/// A client whose write half takes several polls to shut down — the shape of a `TlsStream`
-	/// draining a large buffered response to a slow peer. The bound must not start until that
-	/// finishes, or the reaper races the flush it is waiting on.
+	/// draining a buffered response to a slow peer.
 	#[tokio::test(start_paused = true)]
 	async fn a_pending_client_shutdown_does_not_arm_the_bound() {
 		struct SlowShutdown {
@@ -340,7 +327,7 @@ mod tests {
 		assert_eq!(metrics.half_closed_connections.load(Ordering::Relaxed), 1);
 	}
 
-	/// `std::task::Waker::noop` is unstable, so build the equivalent by hand.
+	/// `std::task::Waker::noop` is unstable on this toolchain.
 	fn futures_noop_waker() -> &'static std::task::Waker {
 		use std::task::{RawWaker, RawWakerVTable, Waker};
 		const VTABLE: RawWakerVTable =
@@ -353,8 +340,7 @@ mod tests {
 	async fn a_client_half_close_does_not_arm_the_bound() {
 		let metrics = ListenerMetrics::default();
 		let watch = HalfCloseWatch::new(&metrics);
-		// The client half-closing shuts down the write half to the *upstream*, which leaves the
-		// response in flight — the shape deliberately left unbounded.
+		// A client half-close shuts down the write half to the *upstream*.
 		let mut upstream = Watched::upstream(Chunks { remaining: 0 }, &watch);
 		shutdown(&mut upstream).await;
 

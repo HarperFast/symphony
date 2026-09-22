@@ -191,7 +191,7 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 			out.sample(
 				'symphony_listener_half_closed_connections',
 				'gauge',
-				'Proxied connections in FIN-WAIT-2: our FIN is sent, the client\'s has not arrived.',
+				'Proxied connections whose write half to the client is shut down, awaiting the client\'s FIN.',
 				l.halfClosedConnections,
 				tags
 			);
