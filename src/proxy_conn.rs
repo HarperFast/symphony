@@ -562,23 +562,31 @@ fn collect_tls_forward(conn: &rustls::ServerConnection) -> TlsForward {
 	}
 }
 
-impl SourceForwarding<'_> {
-	/// The fingerprint string selected for forwarding ("" when none, or unparsed).
-	fn fingerprint_value(&self) -> &str {
-		match self.fingerprint {
-			ForwardFingerprint::None => "",
-			ForwardFingerprint::Ja3 => self.ja3,
-			ForwardFingerprint::Ja4 => self.ja4,
-		}
-	}
+struct ForwardedFingerprint<'a> {
+	pp2_type: u8,
+	header_name: &'static str,
+	/// "" when the ClientHello wasn't parsed.
+	value: &'a str,
+}
 
-	/// The HTTP header name symphony owns for the configured fingerprint mode, if any.
-	fn fingerprint_header_name(&self) -> Option<&'static str> {
-		match self.fingerprint {
-			ForwardFingerprint::Ja3 => Some("X-JA3"),
-			ForwardFingerprint::Ja4 => Some("X-JA4"),
-			ForwardFingerprint::None => None,
-		}
+impl SourceForwarding<'_> {
+	/// The selected fingerprints, JA3 before JA4 regardless of configuration order.
+	fn forwarded_fingerprints(&self) -> impl Iterator<Item = ForwardedFingerprint<'_>> {
+		let ForwardFingerprint { ja3, ja4 } = self.fingerprint;
+		[
+			ja3.then_some(ForwardedFingerprint {
+				pp2_type: upstream::PP2_TYPE_JA3,
+				header_name: "X-JA3",
+				value: self.ja3,
+			}),
+			ja4.then_some(ForwardedFingerprint {
+				pp2_type: upstream::PP2_TYPE_JA4,
+				header_name: "X-JA4",
+				value: self.ja4,
+			}),
+		]
+		.into_iter()
+		.flatten()
 	}
 }
 
@@ -597,13 +605,10 @@ where
 			upstream::write_proxy_v1_header(upstream, sf.peer_addr).await
 		}
 		SourceAddressMode::ProxyProtocolV2 => {
-			let value = sf.fingerprint_value();
-			let mut tlvs: Vec<(u8, &[u8])> = Vec::new();
-			match sf.fingerprint {
-				ForwardFingerprint::Ja3 => tlvs.push((upstream::PP2_TYPE_JA3, value.as_bytes())),
-				ForwardFingerprint::Ja4 => tlvs.push((upstream::PP2_TYPE_JA4, value.as_bytes())),
-				ForwardFingerprint::None => {}
-			}
+			let mut tlvs: Vec<(u8, &[u8])> = sf
+				.forwarded_fingerprints()
+				.map(|fp| (fp.pp2_type, fp.value.as_bytes()))
+				.collect();
 			if let Some(sni) = sf.sni {
 				tlvs.push((upstream::PP2_TYPE_AUTHORITY, sni.as_bytes()));
 			}
@@ -672,15 +677,12 @@ fn header_rewrites(
 			value: Some(sf.peer_addr.ip().to_string()),
 		});
 	}
-	// The fingerprint header rides every HTTP-header mode (None/v1/XFF); v2 uses a TLV instead.
+	// Fingerprint headers ride every HTTP-header mode (None/v1/XFF); v2 uses TLVs instead.
 	if !matches!(sf.mode, SourceAddressMode::ProxyProtocolV2) {
-		if let Some(name) = sf.fingerprint_header_name() {
-			let value = sf.fingerprint_value();
-			rewrites.push(HeaderRewrite {
-				name,
-				value: (!value.is_empty()).then(|| value.to_string()),
-			});
-		}
+		rewrites.extend(sf.forwarded_fingerprints().map(|fp| HeaderRewrite {
+			name: fp.header_name,
+			value: (!fp.value.is_empty()).then(|| fp.value.to_string()),
+		}));
 	}
 	rewrites
 }
@@ -839,5 +841,89 @@ mod tests {
 	fn opaque_protocol_is_never_eligible_regardless_of_alpn() {
 		assert!(!eligible_for_header_rewriting(RouteProtocol::Opaque, false));
 		assert!(!eligible_for_header_rewriting(RouteProtocol::Opaque, true));
+	}
+
+	const JA3: &str = "0123456789abcdef0123456789abcdef";
+	const JA4: &str = "t13d1516h2_8daaf6152771_b186095e22b6";
+	const BOTH: ForwardFingerprint = ForwardFingerprint {
+		ja3: true,
+		ja4: true,
+	};
+
+	fn forwarding(
+		mode: SourceAddressMode,
+		fingerprint: ForwardFingerprint,
+		ja3: &'static str,
+	) -> SourceForwarding<'static> {
+		SourceForwarding {
+			mode,
+			fingerprint,
+			protocol: RouteProtocol::Http,
+			ja3,
+			ja4: JA4,
+			sni: None,
+			tls: None,
+			peer_addr: "192.0.2.1:4000".parse().unwrap(),
+			local_addr: Some("192.0.2.2:443".parse().unwrap()),
+		}
+	}
+
+	fn rewrite_pairs(sf: &SourceForwarding<'_>) -> Vec<(&'static str, Option<String>)> {
+		header_rewrites(sf, true)
+			.into_iter()
+			.map(|r| (r.name, r.value))
+			.collect()
+	}
+
+	#[test]
+	fn both_fingerprints_become_headers_in_fixed_order() {
+		let sf = forwarding(SourceAddressMode::XForwardedFor, BOTH, JA3);
+		assert_eq!(
+			rewrite_pairs(&sf),
+			vec![
+				("X-Forwarded-For", Some("192.0.2.1".to_string())),
+				("X-JA3", Some(JA3.to_string())),
+				("X-JA4", Some(JA4.to_string())),
+			]
+		);
+	}
+
+	#[test]
+	fn an_unparsed_fingerprint_still_strips_its_header() {
+		// value None = strip the client's copy with nothing to substitute; skipping the entry
+		// instead would let a client-supplied X-JA3 through as if symphony had set it.
+		let sf = forwarding(SourceAddressMode::None, BOTH, "");
+		assert_eq!(
+			rewrite_pairs(&sf),
+			vec![("X-JA3", None), ("X-JA4", Some(JA4.to_string()))]
+		);
+	}
+
+	#[test]
+	fn proxy_protocol_v2_carries_fingerprints_as_tlvs_not_headers() {
+		let sf = forwarding(SourceAddressMode::ProxyProtocolV2, BOTH, JA3);
+		assert!(header_rewrites(&sf, true).is_empty());
+	}
+
+	#[tokio::test]
+	async fn proxy_protocol_v2_emits_one_tlv_per_fingerprint_in_fixed_order() {
+		let sf = forwarding(SourceAddressMode::ProxyProtocolV2, BOTH, JA3);
+		let mut out: Vec<u8> = Vec::new();
+		write_connection_prefix(&mut out, &sf).await.unwrap();
+		// 16-byte fixed header + 12-byte IPv4 address block, then TLVs.
+		let mut tlvs = Vec::new();
+		let mut off = 28;
+		while off < out.len() {
+			let len = u16::from_be_bytes([out[off + 1], out[off + 2]]) as usize;
+			tlvs.push((out[off], out[off + 3..off + 3 + len].to_vec()));
+			off += 3 + len;
+		}
+		assert_eq!(
+			tlvs,
+			vec![
+				(upstream::PP2_TYPE_JA3, JA3.as_bytes().to_vec()),
+				(upstream::PP2_TYPE_JA4, JA4.as_bytes().to_vec()),
+			]
+		);
 	}
 }

@@ -116,18 +116,20 @@ export interface RouteConfig {
 	 * upstream can make its own bot/abuse decisions on it.
 	 *
 	 * - `'ja3'` / `'ja4'` — forward that fingerprint.
+	 * - `['ja3', 'ja4']` — forward both (e.g. while migrating a JA3-keyed blocklist to JA4).
+	 *   List order does not matter; JA3 is always emitted before JA4.
 	 * - `'none'` (default) — do not forward.
 	 *
-	 * Carrier: a PROXY v2 TLV when `sourceAddressHeader` is `'proxyProtocolV2'` (works in
-	 * passthrough too, since it prefixes the raw TLS bytes); otherwise an injected
-	 * `X-JA3` / `X-JA4` HTTP header, which requires a plaintext HTTP/1 upstream
-	 * (`terminateTls: true` and not `http2`) — it is skipped otherwise. For that HTTP/1 case,
-	 * any client-supplied `X-JA3` / `X-JA4` is stripped so the injected value is authoritative —
-	 * but this does NOT hold on an h2-negotiated connection on an `http2: true` route: injection
+	 * Every selected fingerprint rides the same carrier: a PROXY v2 TLV when
+	 * `sourceAddressHeader` is `'proxyProtocolV2'` (works in passthrough too, since it
+	 * prefixes the raw TLS bytes); otherwise an injected `X-JA3` / `X-JA4` HTTP header, which
+	 * requires a plaintext HTTP/1 upstream (`terminateTls: true` and not `http2`) — it is
+	 * skipped otherwise. For that HTTP/1 case, the client-supplied copy of each forwarded
+	 * header is stripped so the injected value is authoritative — but this does NOT hold on an h2-negotiated connection on an `http2: true` route: injection
 	 * and stripping are both skipped there, so a client-supplied `X-JA3` / `X-JA4` reaches the
 	 * upstream unmodified. Use `'proxyProtocolV2'` wherever h2 is possible.
 	 */
-	forwardFingerprint?: 'ja3' | 'ja4' | 'none';
+	forwardFingerprint?: 'ja3' | 'ja4' | 'none' | ('ja3' | 'ja4')[];
 	/**
 	 * Advertise HTTP/2 (`h2`) in the TLS ALPN extension so clients can negotiate
 	 * HTTP/2. When true, symphony declares `['h2', 'http/1.1']` in ALPN and the
@@ -443,8 +445,8 @@ export interface ResolveRoute {
 	mtls?: MtlsConfig;
 	/** How the real client IP is forwarded to the upstream. See RouteConfig.sourceAddressHeader. */
 	sourceAddressHeader?: 'proxyProtocol' | 'proxyProtocolV2' | 'xForwardedFor' | 'none';
-	/** Which client TLS fingerprint to forward downstream. See RouteConfig.forwardFingerprint. */
-	forwardFingerprint?: 'ja3' | 'ja4' | 'none';
+	/** Which client TLS fingerprints to forward downstream. See RouteConfig.forwardFingerprint. */
+	forwardFingerprint?: 'ja3' | 'ja4' | 'none' | ('ja3' | 'ja4')[];
 	/** Advertise h2 in ALPN for this resolved connection. See RouteConfig.http2. */
 	http2?: boolean;
 	/** The resolved connection's application protocol. See RouteConfig.protocol. */

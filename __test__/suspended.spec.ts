@@ -446,4 +446,41 @@ describe('Suspended routes – resolveConnection() with an invalid route never t
 
 		socket.destroy();
 	});
+
+	// A route napi can't decode at all fails before the native method's own no-throw handling runs,
+	// so this is the wrapper's guard, not the Rust one above.
+	it('drops the connection and emits "error" — without throwing — for a route napi cannot decode', async () => {
+		const errors: Error[] = [];
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+		process.on('unhandledRejection', onUnhandledRejection);
+
+		let errorsWhenCallReturned = -1;
+		proxy.once('error', (err: Error) => errors.push(err));
+		proxy.once('suspended', async (conn) => {
+			capturedConn = conn;
+			await sleep(10);
+			proxy.resolveConnection(conn.id, {
+				upstream: { kind: 'tcp', host: '127.0.0.1', port: 1 },
+				terminateTls: true,
+				forwardFingerprint: ['ja3', null as unknown as 'ja3'],
+				protocol: 'http',
+			});
+			errorsWhenCallReturned = errors.length;
+		});
+
+		const socket = startTlsSocket(proxyPort, 'localhost', cert.cert);
+		socket.on('error', () => {});
+		await waitForClose(socket, 2000);
+		assert.ok(socket.destroyed || !socket.writable, 'socket must close promptly, not linger until suspendTimeoutMs');
+		process.off('unhandledRejection', onUnhandledRejection);
+
+		assert.ok(capturedConn !== null, 'expected suspended event to have fired');
+		assert.equal(unhandledRejections.length, 0, 'a decode failure must not escape as an unhandledRejection');
+		assert.equal(errors.length, 1, 'the decode failure must surface as exactly one "error" event');
+		assert.equal(errorsWhenCallReturned, 0, 'listeners run after the call returns, so a throwing one cannot escape it');
+		assert.match(errors[0].message, /^resolveConnection\(id=/, 'the surfaced error names the call it came from');
+
+		socket.destroy();
+	});
 });

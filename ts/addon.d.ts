@@ -52,11 +52,11 @@ export interface JsRouteConfig {
    */
   sourceAddressHeader?: string
   /**
-   * Which client TLS fingerprint to forward downstream: "ja3", "ja4", or "none"
-   * (default). Carried as a PROXY v2 TLV under "proxyProtocolV2", otherwise as an
-   * injected X-JA3/X-JA4 HTTP header.
+   * Which client TLS fingerprints to forward downstream: "ja3", "ja4", "none" (default), or
+   * a list of "ja3"/"ja4" to forward both. Carried as PROXY v2 TLVs under
+   * "proxyProtocolV2", otherwise as injected X-JA3/X-JA4 HTTP headers.
    */
-  forwardFingerprint?: string
+  forwardFingerprint?: string | Array<string>
   /** Advertise h2 in ALPN so clients can negotiate HTTP/2. Default: false. */
   http2?: boolean
   /**
@@ -232,7 +232,7 @@ export interface JsResolveRoute {
   cert?: JsCertConfig
   mtls?: JsMtlsConfig
   sourceAddressHeader?: string
-  forwardFingerprint?: string
+  forwardFingerprint?: string | Array<string>
   http2?: boolean
   /**
    * See `JsRouteConfig::protocol` — the same declaration, required under the same
