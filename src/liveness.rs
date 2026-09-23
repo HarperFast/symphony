@@ -35,7 +35,11 @@ pub struct KeepaliveConfig {
 /// A platform that rejects the options gets a warning and no keepalive rather than a failed
 /// `start()`: refusing to serve traffic is the worse failure, and this runs once per listening
 /// socket, so it cannot flood the log.
-pub fn arm_keepalive(socket: &impl std::os::fd::AsFd, cfg: &KeepaliveConfig, addr: &std::net::SocketAddr) {
+pub fn arm_keepalive(
+	socket: &impl std::os::fd::AsFd,
+	cfg: &KeepaliveConfig,
+	addr: &std::net::SocketAddr,
+) {
 	let params = TcpKeepalive::new()
 		.with_time(cfg.idle)
 		.with_interval(cfg.interval)
@@ -122,8 +126,9 @@ impl<'m> HalfCloseWatch<'m> {
 	pub async fn expired(&self, window: Duration) {
 		self.notify.notified().await;
 		loop {
-			let quiet_for =
-				Duration::from_nanos(now_ns().saturating_sub(self.last_activity_ns.load(Ordering::Relaxed)));
+			let quiet_for = Duration::from_nanos(
+				now_ns().saturating_sub(self.last_activity_ns.load(Ordering::Relaxed)),
+			);
 			match window.checked_sub(quiet_for) {
 				Some(remaining) if !remaining.is_zero() => tokio::time::sleep(remaining).await,
 				_ => return,
@@ -152,18 +157,30 @@ impl<'w, S> Watched<'w, S> {
 	/// The client half: shutting down its write side is what puts the connection into the
 	/// bounded state, and its reads are the activity that keeps it out of the reaper.
 	pub fn client(inner: S, watch: &'w HalfCloseWatch<'w>) -> Self {
-		Self { inner, watch, arms_on_shutdown: true }
+		Self {
+			inner,
+			watch,
+			arms_on_shutdown: true,
+		}
 	}
 
 	/// The upstream half. Its write side is shut down when the *client* half-closes, which is
 	/// the shape deliberately left unbounded.
 	pub fn upstream(inner: S, watch: &'w HalfCloseWatch<'w>) -> Self {
-		Self { inner, watch, arms_on_shutdown: false }
+		Self {
+			inner,
+			watch,
+			arms_on_shutdown: false,
+		}
 	}
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Watched<'_, S> {
-	fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+	fn poll_read(
+		self: Pin<&mut Self>,
+		cx: &mut Context<'_>,
+		buf: &mut ReadBuf<'_>,
+	) -> Poll<std::io::Result<()>> {
 		let this = self.get_mut();
 		let before = buf.filled().len();
 		let result = Pin::new(&mut this.inner).poll_read(cx, buf);
@@ -175,7 +192,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for Watched<'_, S> {
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<'_, S> {
-	fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+	fn poll_write(
+		self: Pin<&mut Self>,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<std::io::Result<usize>> {
 		Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
 	}
 
@@ -213,7 +234,11 @@ mod tests {
 	use tokio::net::{TcpListener, TcpStream};
 
 	fn config() -> KeepaliveConfig {
-		KeepaliveConfig { idle: Duration::from_secs(97), interval: Duration::from_secs(13), retries: 4 }
+		KeepaliveConfig {
+			idle: Duration::from_secs(97),
+			interval: Duration::from_secs(13),
+			retries: 4,
+		}
 	}
 
 	/// On Linux `arm_accepted` is a no-op, so this fails if the kernel ever stops copying the
@@ -229,7 +254,10 @@ mod tests {
 		arm_accepted(&accepted, &config());
 
 		let sock = SockRef::from(&accepted);
-		assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE must reach the accepted socket");
+		assert!(
+			sock.keepalive().unwrap(),
+			"SO_KEEPALIVE must reach the accepted socket"
+		);
 		assert_eq!(sock.keepalive_time().unwrap(), Duration::from_secs(97));
 		assert_eq!(sock.keepalive_interval().unwrap(), Duration::from_secs(13));
 		assert_eq!(sock.keepalive_retries().unwrap(), 4);
@@ -255,7 +283,11 @@ mod tests {
 	}
 
 	impl AsyncWrite for Chunks {
-		fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+		fn poll_write(
+			self: Pin<&mut Self>,
+			_cx: &mut Context<'_>,
+			buf: &[u8],
+		) -> Poll<io::Result<usize>> {
 			Poll::Ready(Ok(buf.len()))
 		}
 		fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -297,13 +329,20 @@ mod tests {
 		}
 
 		impl AsyncWrite for SlowShutdown {
-			fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+			fn poll_write(
+				self: Pin<&mut Self>,
+				_cx: &mut Context<'_>,
+				buf: &[u8],
+			) -> Poll<io::Result<usize>> {
 				Poll::Ready(Ok(buf.len()))
 			}
 			fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 				Poll::Ready(Ok(()))
 			}
-			fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			fn poll_shutdown(
+				mut self: Pin<&mut Self>,
+				cx: &mut Context<'_>,
+			) -> Poll<io::Result<()>> {
 				if self.polls_left == 0 {
 					return Poll::Ready(Ok(()));
 				}
@@ -330,8 +369,12 @@ mod tests {
 	/// `std::task::Waker::noop` is unstable on this toolchain.
 	fn futures_noop_waker() -> &'static std::task::Waker {
 		use std::task::{RawWaker, RawWakerVTable, Waker};
-		const VTABLE: RawWakerVTable =
-			RawWakerVTable::new(|_| RawWaker::new(std::ptr::null(), &VTABLE), |_| {}, |_| {}, |_| {});
+		const VTABLE: RawWakerVTable = RawWakerVTable::new(
+			|_| RawWaker::new(std::ptr::null(), &VTABLE),
+			|_| {},
+			|_| {},
+			|_| {},
+		);
 		static WAKER: std::sync::OnceLock<Waker> = std::sync::OnceLock::new();
 		WAKER.get_or_init(|| unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) })
 	}
@@ -345,9 +388,12 @@ mod tests {
 		shutdown(&mut upstream).await;
 
 		assert!(
-			tokio::time::timeout(Duration::from_secs(3600), watch.expired(Duration::from_secs(60)))
-				.await
-				.is_err(),
+			tokio::time::timeout(
+				Duration::from_secs(3600),
+				watch.expired(Duration::from_secs(60))
+			)
+			.await
+			.is_err(),
 			"only the write half to the client arms the bound"
 		);
 		assert_eq!(metrics.half_closed_connections.load(Ordering::Relaxed), 0);
@@ -366,9 +412,12 @@ mod tests {
 		shutdown(&mut client).await;
 
 		assert_eq!(metrics.half_closed_connections.load(Ordering::Relaxed), 1);
-		tokio::time::timeout(Duration::from_secs(5), watch.expired(Duration::from_millis(100)))
-			.await
-			.expect("the bound must fire once the surviving direction goes quiet");
+		tokio::time::timeout(
+			Duration::from_secs(5),
+			watch.expired(Duration::from_millis(100)),
+		)
+		.await
+		.expect("the bound must fire once the surviving direction goes quiet");
 	}
 
 	#[tokio::test]
@@ -387,11 +436,15 @@ mod tests {
 
 		// Without the reset the bound would have fired at t=300ms; the new deadline is t=500ms.
 		assert!(
-			tokio::time::timeout(Duration::from_millis(200), &mut expired).await.is_err(),
+			tokio::time::timeout(Duration::from_millis(200), &mut expired)
+				.await
+				.is_err(),
 			"activity must push the deadline out, not be ignored"
 		);
 		assert!(
-			tokio::time::timeout(Duration::from_secs(5), &mut expired).await.is_ok(),
+			tokio::time::timeout(Duration::from_secs(5), &mut expired)
+				.await
+				.is_ok(),
 			"expiry is deferred, not cancelled"
 		);
 	}

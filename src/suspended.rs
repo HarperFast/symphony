@@ -87,7 +87,11 @@ pub struct ResolveSpec {
 #[derive(Debug)]
 pub enum ResolveUpstream {
 	Tcp(std::net::SocketAddr),
-	Uds { paths: Vec<String>, ip_affinity: bool, affinity_ttl_ms: u64 },
+	Uds {
+		paths: Vec<String>,
+		ip_affinity: bool,
+		affinity_ttl_ms: u64,
+	},
 }
 
 /// Build a `ResolvedRoute` from a `ResolveSpec`.
@@ -95,14 +99,16 @@ pub fn build_resolved_route(spec: &ResolveSpec) -> crate::error::Result<Resolved
 	use crate::tls::{CertSpec, MtlsSpec, TlsConfigCache};
 
 	let tls_config = if spec.terminate_tls {
-		let cert_pem = spec
-			.cert_pem
-			.as_deref()
-			.ok_or_else(|| crate::error::SymphonyError::Config("resolveConnection: terminateTls=true requires cert".into()))?;
-		let key_pem = spec
-			.key_pem
-			.as_deref()
-			.ok_or_else(|| crate::error::SymphonyError::Config("resolveConnection: terminateTls=true requires key".into()))?;
+		let cert_pem = spec.cert_pem.as_deref().ok_or_else(|| {
+			crate::error::SymphonyError::Config(
+				"resolveConnection: terminateTls=true requires cert".into(),
+			)
+		})?;
+		let key_pem = spec.key_pem.as_deref().ok_or_else(|| {
+			crate::error::SymphonyError::Config(
+				"resolveConnection: terminateTls=true requires key".into(),
+			)
+		})?;
 
 		let cert_spec = CertSpec {
 			cert_chain_pem: cert_pem.to_vec(),
@@ -121,12 +127,24 @@ pub fn build_resolved_route(spec: &ResolveSpec) -> crate::error::Result<Resolved
 
 	let destination = match &spec.upstream {
 		ResolveUpstream::Tcp(addr) => Destination::Tcp(*addr),
-		ResolveUpstream::Uds { paths, ip_affinity, affinity_ttl_ms } => {
+		ResolveUpstream::Uds {
+			paths,
+			ip_affinity,
+			affinity_ttl_ms,
+		} => {
 			let slots = paths
 				.iter()
-				.map(|p| UdsSlotSpec { path: p.clone(), pid: None, tid: None })
+				.map(|p| UdsSlotSpec {
+					path: p.clone(),
+					pid: None,
+					tid: None,
+				})
 				.collect();
-			Destination::UdsSet(Arc::new(UdsBalancer::new(slots, *ip_affinity, *affinity_ttl_ms)))
+			Destination::UdsSet(Arc::new(UdsBalancer::new(
+				slots,
+				*ip_affinity,
+				*affinity_ttl_ms,
+			)))
 		}
 	};
 

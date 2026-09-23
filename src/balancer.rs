@@ -16,7 +16,11 @@ fn clk_tck_hz() -> u64 {
 	static CLK_TCK: OnceLock<u64> = OnceLock::new();
 	*CLK_TCK.get_or_init(|| {
 		let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-		if v > 0 { v as u64 } else { 100 }
+		if v > 0 {
+			v as u64
+		} else {
+			100
+		}
 	})
 }
 
@@ -24,8 +28,7 @@ fn clk_tck_hz() -> u64 {
 /// from `/proc/{pid}/task/{tid}/stat`.
 /// Returns `None` on any parse or I/O error (process gone, non-Linux, etc.).
 fn read_thread_cpu_ticks(pid: u32, tid: u32) -> Option<u64> {
-	let content =
-		std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")).ok()?;
+	let content = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")).ok()?;
 	// The comm field (field 2) is wrapped in parentheses and may itself contain
 	// '(' or ')' — find the *last* ')' to locate the end of the comm field.
 	let rparen = content.rfind(')')?;
@@ -207,8 +210,12 @@ impl UdsBalancer {
 		let clk_tck = clk_tck_hz() as f64;
 
 		for slot in &self.sockets {
-			let (Some(pid), Some(tid)) = (slot.pid, slot.tid) else { continue };
-			let Some(ticks) = read_thread_cpu_ticks(pid, tid) else { continue };
+			let (Some(pid), Some(tid)) = (slot.pid, slot.tid) else {
+				continue;
+			};
+			let Some(ticks) = read_thread_cpu_ticks(pid, tid) else {
+				continue;
+			};
 
 			let last_ticks = slot.last_cpu_ticks.load(Ordering::Relaxed);
 			let last_ns = slot.last_sample_ns.load(Ordering::Relaxed);

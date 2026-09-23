@@ -1,6 +1,6 @@
-use crate::liveness::{KeepaliveConfig, arm_accepted, arm_keepalive};
+use crate::liveness::{arm_accepted, arm_keepalive, KeepaliveConfig};
 use crate::metrics::BlockKind;
-use crate::proxy_conn::{ConnContext, handle};
+use crate::proxy_conn::{handle, ConnContext};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -97,7 +97,11 @@ pub(crate) fn make_reuseport_socket(
 	addr: SocketAddr,
 	keepalive: Option<&KeepaliveConfig>,
 ) -> crate::error::Result<std::net::TcpListener> {
-	let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+	let domain = if addr.is_ipv6() {
+		Domain::IPV6
+	} else {
+		Domain::IPV4
+	};
 	let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
 
 	socket.set_reuse_address(true)?;
@@ -116,7 +120,10 @@ pub(crate) fn make_reuseport_socket(
 pub(crate) fn set_rlimit_nofile(desired: u64) -> crate::error::Result<()> {
 	use libc::{getrlimit, rlimit, setrlimit, RLIMIT_NOFILE};
 
-	let mut rlim = rlimit { rlim_cur: 0, rlim_max: 0 };
+	let mut rlim = rlimit {
+		rlim_cur: 0,
+		rlim_max: 0,
+	};
 	let ret = unsafe { getrlimit(RLIMIT_NOFILE, &mut rlim) };
 	if ret != 0 {
 		return Ok(()); // Ignore if we can't query
@@ -124,7 +131,10 @@ pub(crate) fn set_rlimit_nofile(desired: u64) -> crate::error::Result<()> {
 
 	let target = desired.min(rlim.rlim_max);
 	if rlim.rlim_cur < target {
-		let new_rlim = rlimit { rlim_cur: target, rlim_max: rlim.rlim_max };
+		let new_rlim = rlimit {
+			rlim_cur: target,
+			rlim_max: rlim.rlim_max,
+		};
 		let ret = unsafe { setrlimit(RLIMIT_NOFILE, &new_rlim) };
 		if ret != 0 {
 			tracing::warn!(

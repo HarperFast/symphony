@@ -58,12 +58,16 @@ impl RouteTokenBucket {
 			}
 			let old = self.tokens.load(Ordering::Relaxed);
 			let new = old.saturating_add(refill).min(self.burst_fp);
-			if self.tokens
+			if self
+				.tokens
 				.compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed)
 				.is_ok()
 			{
 				let _ = self.last_refill_ns.compare_exchange(
-					last, now, Ordering::Relaxed, Ordering::Relaxed,
+					last,
+					now,
+					Ordering::Relaxed,
+					Ordering::Relaxed,
 				);
 				break;
 			}
@@ -76,7 +80,8 @@ impl RouteTokenBucket {
 			if tokens < ONE_TOKEN {
 				return false;
 			}
-			if self.tokens
+			if self
+				.tokens
 				.compare_exchange(
 					tokens,
 					tokens - ONE_TOKEN,
@@ -189,7 +194,11 @@ pub struct RouteMetricIdentity {
 
 impl RouteMetricIdentity {
 	fn new(route: &str, group: &str) -> Self {
-		Self { route: Arc::from(route), group: Arc::from(group), counters: Arc::new(RouteMetrics::default()) }
+		Self {
+			route: Arc::from(route),
+			group: Arc::from(group),
+			counters: Arc::new(RouteMetrics::default()),
+		}
 	}
 }
 
@@ -280,7 +289,11 @@ impl RouteTable {
 				return Some(route);
 			}
 		}
-		if self.dropped_wildcard.iter().any(|suffix| wildcard_suffix_matches(sni, suffix)) {
+		if self
+			.dropped_wildcard
+			.iter()
+			.any(|suffix| wildcard_suffix_matches(sni, suffix))
+		{
 			return None;
 		}
 
@@ -292,7 +305,10 @@ impl RouteTable {
 	/// last-good route forward across a hot-swap when the new cert transiently fails to build.
 	fn get_for_spec_sni(&self, sni: &str) -> Option<&Route> {
 		if let Some(suffix) = sni.strip_prefix("*.") {
-			self.wildcard.iter().find(|(s, _)| s.as_ref() == suffix).map(|(_, r)| r)
+			self.wildcard
+				.iter()
+				.find(|(s, _)| s.as_ref() == suffix)
+				.map(|(_, r)| r)
 		} else {
 			self.exact.get(sni)
 		}
@@ -304,7 +320,10 @@ impl RouteTable {
 /// Raw JS-provided upstream specification.
 #[derive(Clone, Debug)]
 pub enum UpstreamSpec {
-	Tcp { host: String, port: u16 },
+	Tcp {
+		host: String,
+		port: u16,
+	},
 	Uds {
 		paths: Vec<String>,
 		/// PID per path (parallel vec, same length as `paths`).
@@ -403,10 +422,14 @@ pub fn build_route_table(
 		// ensuring the metric table cannot expose two identical configured route labels.
 		let wildcard_suffix = spec.sni.strip_prefix("*.");
 		if wildcard_suffix.is_some_and(|suffix| configured_wildcards.contains(suffix)) {
-			let newly_failing = previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
+			let newly_failing =
+				previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
 			failing_snis.insert(Arc::from(spec.sni.as_str()));
 			if newly_failing {
-				eprintln!("symphony: skipping duplicate route '{}': duplicate SNI", spec.sni);
+				eprintln!(
+					"symphony: skipping duplicate route '{}': duplicate SNI",
+					spec.sni
+				);
 			}
 			continue;
 		}
@@ -421,7 +444,8 @@ pub fn build_route_table(
 		// same reconcile made to that route — the operator's `updateConfig` reports success while
 		// their edit quietly never took effect.
 		if let Err(e) = validate_route_protocol_declaration(spec) {
-			let newly_failing = previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
+			let newly_failing =
+				previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
 			failing_snis.insert(Arc::from(spec.sni.as_str()));
 			if newly_failing {
 				eprintln!("symphony: skipping route '{}': {}", spec.sni, e);
@@ -443,7 +467,8 @@ pub fn build_route_table(
 				// Log only on the good→bad transition: a persistently-broken cert would
 				// otherwise re-log on every reconcile, since each cert-file event rebuilds
 				// the whole table.
-				let newly_failing = previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
+				let newly_failing =
+					previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
 				failing_snis.insert(Arc::from(spec.sni.as_str()));
 
 				match previous.and_then(|p| p.get_for_spec_sni(&spec.sni)) {
@@ -519,7 +544,8 @@ pub fn build_route_table(
 		.chain(default.iter())
 		.map(|route| route.metric_identity.clone())
 		.collect();
-	metric_identities.sort_unstable_by(|a, b| a.route.cmp(&b.route).then_with(|| a.group.cmp(&b.group)));
+	metric_identities
+		.sort_unstable_by(|a, b| a.route.cmp(&b.route).then_with(|| a.group.cmp(&b.group)));
 
 	Ok(RouteTable {
 		exact,
@@ -666,14 +692,17 @@ fn build_route(
 /// Build the route's destinations: the default (h1) destination plus, when any
 /// upstream is marked `protocol: "h2"`, a separate destination for connections
 /// that negotiated h2 in ALPN.
-fn build_destinations(spec: &RouteSpec) -> crate::error::Result<(Destination, Option<Destination>)> {
+fn build_destinations(
+	spec: &RouteSpec,
+) -> crate::error::Result<(Destination, Option<Destination>)> {
 	// Suspended routes or routes with no upstreams use a placeholder TCP dest
 	// that is replaced by resolveConnection() before any data flows.
 	if spec.suspended || spec.upstreams.is_empty() {
 		return Ok((Destination::Tcp("127.0.0.1:1".parse().unwrap()), None));
 	}
 
-	let is_h2 = |u: &UpstreamSpec| matches!(u, UpstreamSpec::Uds { protocol: Some(p), .. } if p == "h2");
+	let is_h2 =
+		|u: &UpstreamSpec| matches!(u, UpstreamSpec::Uds { protocol: Some(p), .. } if p == "h2");
 	let h1_specs: Vec<&UpstreamSpec> = spec.upstreams.iter().filter(|u| !is_h2(u)).collect();
 	let h2_specs: Vec<&UpstreamSpec> = spec.upstreams.iter().filter(|u| is_h2(u)).collect();
 
@@ -699,8 +728,9 @@ fn build_destination_for(upstreams: &[&UpstreamSpec]) -> crate::error::Result<De
 		.ok_or_else(|| crate::error::SymphonyError::Config("route has no upstreams".to_string()))?;
 	match first {
 		UpstreamSpec::Tcp { host, port } => {
-			let addr: SocketAddr =
-				format!("{host}:{port}").parse().map_err(crate::error::SymphonyError::AddrParse)?;
+			let addr: SocketAddr = format!("{host}:{port}")
+				.parse()
+				.map_err(crate::error::SymphonyError::AddrParse)?;
 			Ok(Destination::Tcp(addr))
 		}
 		UpstreamSpec::Uds { .. } => {
@@ -864,7 +894,14 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	}
 
 	fn config_ptr(table: &RouteTable, sni: &str) -> *const ServerConfig {
-		Arc::as_ptr(table.resolve(Some(sni)).expect("route present").tls_config.as_ref().unwrap())
+		Arc::as_ptr(
+			table
+				.resolve(Some(sni))
+				.expect("route present")
+				.tls_config
+				.as_ref()
+				.unwrap(),
+		)
 	}
 
 	// A rebuild must hand an unchanged cert back the *same* ServerConfig. Identity is the whole
@@ -889,9 +926,13 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		);
 
 		// Control: a cache that does not outlive the build is exactly the bug — a new allocation.
-		let detached =
-			build_route_table(&specs, &ListenerTlsSpec::empty(), None, &mut TlsConfigCache::new())
-				.expect("build with a fresh cache");
+		let detached = build_route_table(
+			&specs,
+			&ListenerTlsSpec::empty(),
+			None,
+			&mut TlsConfigCache::new(),
+		)
+		.expect("build with a fresh cache");
 		assert_ne!(
 			config_ptr(&first, "tenant.example.com"),
 			config_ptr(&detached, "tenant.example.com"),
@@ -913,7 +954,10 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		// The route goes away; nothing asks for its config, so the sweep drops it.
 		build_route_table(&[], &ListenerTlsSpec::empty(), None, &mut cache).expect("empty build");
 		cache.retain_used();
-		assert!(cache.is_empty(), "a config no live route references must not be retained");
+		assert!(
+			cache.is_empty(),
+			"a config no live route references must not be retained"
+		);
 	}
 
 	#[test]
@@ -924,20 +968,34 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		rotated_route.http2 = true;
 		let rotated = vec![rotated_route];
 
-		let live = build_route_table(&old, &ListenerTlsSpec::empty(), None, &mut cache).expect("initial build");
+		let live = build_route_table(&old, &ListenerTlsSpec::empty(), None, &mut cache)
+			.expect("initial build");
 		cache.retain_used();
 
 		// Simulate a route table whose later configuration validation aborts the update.
-		drop(build_route_table(&rotated, &ListenerTlsSpec::empty(), Some(&live), &mut cache).expect("aborted build"));
+		drop(
+			build_route_table(&rotated, &ListenerTlsSpec::empty(), Some(&live), &mut cache)
+				.expect("aborted build"),
+		);
 		drop(
 			build_route_table(&old, &ListenerTlsSpec::empty(), Some(&live), &mut cache)
 				.expect("second aborted build"),
 		);
-		assert_eq!(cache.len(), 1, "starting another build must discard the first aborted config");
-		let replacement = build_route_table(&old, &ListenerTlsSpec::empty(), Some(&live), &mut cache).expect("replacement build");
+		assert_eq!(
+			cache.len(),
+			1,
+			"starting another build must discard the first aborted config"
+		);
+		let replacement =
+			build_route_table(&old, &ListenerTlsSpec::empty(), Some(&live), &mut cache)
+				.expect("replacement build");
 		cache.retain_used();
 
-		assert_eq!(cache.len(), 1, "the aborted build's config must not survive the next committed sweep");
+		assert_eq!(
+			cache.len(),
+			1,
+			"the aborted build's config must not survive the next committed sweep"
+		);
 		drop(replacement);
 	}
 
@@ -947,15 +1005,28 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		let good = vec![tls_route("tenant.example.com", CERT_A, KEY_A)];
 		let mismatch = vec![tls_route("tenant.example.com", CERT_A, KEY_B)];
 
-		let live = build_route_table(&good, &ListenerTlsSpec::empty(), None, &mut cache).expect("initial build");
+		let live = build_route_table(&good, &ListenerTlsSpec::empty(), None, &mut cache)
+			.expect("initial build");
 		cache.retain_used();
 		let expected = config_ptr(&live, "tenant.example.com");
 
-		let carried = build_route_table(&mismatch, &ListenerTlsSpec::empty(), Some(&live), &mut cache).expect("carry forward");
+		let carried = build_route_table(
+			&mismatch,
+			&ListenerTlsSpec::empty(),
+			Some(&live),
+			&mut cache,
+		)
+		.expect("carry forward");
 		cache.retain_used();
-		assert_eq!(cache.len(), 1, "the carried-forward config is still serving traffic");
+		assert_eq!(
+			cache.len(),
+			1,
+			"the carried-forward config is still serving traffic"
+		);
 
-		let healed = build_route_table(&good, &ListenerTlsSpec::empty(), Some(&carried), &mut cache).expect("healed build");
+		let healed =
+			build_route_table(&good, &ListenerTlsSpec::empty(), Some(&carried), &mut cache)
+				.expect("healed build");
 		cache.retain_used();
 		assert_eq!(
 			expected,
@@ -973,8 +1044,13 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			tls_route("bad.example.com", CERT_A, KEY_B), // KeyMismatch
 		];
 
-		let table = build_route_table(&specs, &ListenerTlsSpec::empty(), None, &mut TlsConfigCache::new())
-			.expect("a single bad route must not fail the whole build");
+		let table = build_route_table(
+			&specs,
+			&ListenerTlsSpec::empty(),
+			None,
+			&mut TlsConfigCache::new(),
+		)
+		.expect("a single bad route must not fail the whole build");
 
 		assert!(
 			table.resolve(Some("good.example.com")).is_some(),
@@ -997,7 +1073,13 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			tls_route("*.acme.com", CERT_A, KEY_A),
 		];
 
-		let table = build_route_table(&specs, &ListenerTlsSpec::empty(), None, &mut TlsConfigCache::new()).expect("build");
+		let table = build_route_table(
+			&specs,
+			&ListenerTlsSpec::empty(),
+			None,
+			&mut TlsConfigCache::new(),
+		)
+		.expect("build");
 
 		assert!(
 			table.resolve(Some("api.acme.com")).is_none(),
@@ -1015,7 +1097,13 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	fn dropped_wildcard_route_does_not_fall_through_to_default() {
 		let specs = vec![tls_route("*.acme.com", CERT_A, KEY_B)]; // KeyMismatch — dropped
 
-		let table = build_route_table(&specs, &ListenerTlsSpec::empty(), None, &mut TlsConfigCache::new()).expect("build");
+		let table = build_route_table(
+			&specs,
+			&ListenerTlsSpec::empty(),
+			None,
+			&mut TlsConfigCache::new(),
+		)
+		.expect("build");
 
 		assert!(
 			table.resolve(Some("api.acme.com")).is_none(),
@@ -1031,11 +1119,17 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	#[test]
 	fn healthy_exact_route_survives_a_dropped_sibling_wildcard() {
 		let specs = vec![
-			tls_route("*.acme.com", CERT_A, KEY_B),  // KeyMismatch — dropped
+			tls_route("*.acme.com", CERT_A, KEY_B), // KeyMismatch — dropped
 			tls_route("api.acme.com", CERT_A, KEY_A), // valid, more specific
 		];
 
-		let table = build_route_table(&specs, &ListenerTlsSpec::empty(), None, &mut TlsConfigCache::new()).expect("build");
+		let table = build_route_table(
+			&specs,
+			&ListenerTlsSpec::empty(),
+			None,
+			&mut TlsConfigCache::new(),
+		)
+		.expect("build");
 
 		assert!(
 			table.resolve(Some("api.acme.com")).is_some(),
@@ -1054,21 +1148,36 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	fn transient_failure_retains_last_good_on_hot_swap() {
 		// First build with a valid cert → the live table.
 		let good = vec![tls_route("tenant.example.com", CERT_A, KEY_A)];
-		let live =
-			build_route_table(&good, &ListenerTlsSpec::empty(), None, &mut TlsConfigCache::new()).expect("initial build");
-		let live_route = live.resolve(Some("tenant.example.com")).expect("live route");
+		let live = build_route_table(
+			&good,
+			&ListenerTlsSpec::empty(),
+			None,
+			&mut TlsConfigCache::new(),
+		)
+		.expect("initial build");
+		let live_route = live
+			.resolve(Some("tenant.example.com"))
+			.expect("live route");
 		let live_identity = live_route.metric_identity.clone();
 
 		// Hot-swap where the same SNI now presents a mismatched pair (mid-rotation).
 		let mismatched = vec![tls_route("tenant.example.com", CERT_A, KEY_B)];
-		let swapped = build_route_table(&mismatched, &ListenerTlsSpec::empty(), Some(&live), &mut TlsConfigCache::new())
-			.expect("hot-swap must not fail");
+		let swapped = build_route_table(
+			&mismatched,
+			&ListenerTlsSpec::empty(),
+			Some(&live),
+			&mut TlsConfigCache::new(),
+		)
+		.expect("hot-swap must not fail");
 		assert!(
 			swapped.resolve(Some("tenant.example.com")).is_some(),
 			"the SNI must keep its last-good route across a transient rebuild failure"
 		);
 		assert!(Arc::ptr_eq(
-			&swapped.resolve(Some("tenant.example.com")).unwrap().metric_identity,
+			&swapped
+				.resolve(Some("tenant.example.com"))
+				.unwrap()
+				.metric_identity,
 			&live_identity
 		));
 		assert!(
@@ -1077,7 +1186,13 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		);
 
 		// With no previous table (initial build), the same bad route is dropped.
-		let fresh = build_route_table(&mismatched, &ListenerTlsSpec::empty(), None, &mut TlsConfigCache::new()).expect("build");
+		let fresh = build_route_table(
+			&mismatched,
+			&ListenerTlsSpec::empty(),
+			None,
+			&mut TlsConfigCache::new(),
+		)
+		.expect("build");
 		assert!(
 			fresh.resolve(Some("tenant.example.com")).is_none(),
 			"with no prior route there is nothing to retain — the SNI is dropped"
@@ -1089,21 +1204,47 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		let mut initial = tls_route("tenant.example.com", CERT_A, KEY_A);
 		initial.metrics_group = "tenant-1".to_string();
 		let mut cache = TlsConfigCache::new();
-		let live = build_route_table(&[initial.clone()], &ListenerTlsSpec::empty(), None, &mut cache).expect("initial build");
-		let live_identity = live.resolve(Some("tenant.example.com")).unwrap().metric_identity.clone();
+		let live = build_route_table(
+			&[initial.clone()],
+			&ListenerTlsSpec::empty(),
+			None,
+			&mut cache,
+		)
+		.expect("initial build");
+		let live_identity = live
+			.resolve(Some("tenant.example.com"))
+			.unwrap()
+			.metric_identity
+			.clone();
 
-		let reloaded =
-			build_route_table(&[initial.clone()], &ListenerTlsSpec::empty(), Some(&live), &mut cache).expect("reload");
+		let reloaded = build_route_table(
+			&[initial.clone()],
+			&ListenerTlsSpec::empty(),
+			Some(&live),
+			&mut cache,
+		)
+		.expect("reload");
 		assert!(Arc::ptr_eq(
-			&reloaded.resolve(Some("tenant.example.com")).unwrap().metric_identity,
+			&reloaded
+				.resolve(Some("tenant.example.com"))
+				.unwrap()
+				.metric_identity,
 			&live_identity
 		));
 
 		initial.metrics_group = "tenant-2".to_string();
-		let regrouped =
-			build_route_table(&[initial], &ListenerTlsSpec::empty(), Some(&reloaded), &mut cache).expect("regroup");
+		let regrouped = build_route_table(
+			&[initial],
+			&ListenerTlsSpec::empty(),
+			Some(&reloaded),
+			&mut cache,
+		)
+		.expect("regroup");
 		assert!(!Arc::ptr_eq(
-			&regrouped.resolve(Some("tenant.example.com")).unwrap().metric_identity,
+			&regrouped
+				.resolve(Some("tenant.example.com"))
+				.unwrap()
+				.metric_identity,
 			&live_identity
 		));
 	}
@@ -1111,8 +1252,13 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	#[test]
 	fn duplicate_route_identity_is_isolated() {
 		let route = tls_route("*.tenant.example.com", CERT_A, KEY_A);
-		let table = build_route_table(&[route.clone(), route], &ListenerTlsSpec::empty(), None, &mut TlsConfigCache::new())
-			.expect("a duplicate must not abort the table");
+		let table = build_route_table(
+			&[route.clone(), route],
+			&ListenerTlsSpec::empty(),
+			None,
+			&mut TlsConfigCache::new(),
+		)
+		.expect("a duplicate must not abort the table");
 		assert_eq!(table.metric_identities().len(), 1);
 		assert!(table.resolve(Some("app.tenant.example.com")).is_some());
 		assert_eq!(table.failing_route_count(), 1);
@@ -1124,8 +1270,13 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		first.metrics_group = "first".to_string();
 		let mut second = first.clone();
 		second.metrics_group = "second".to_string();
-		let table =
-			build_route_table(&[first, second], &ListenerTlsSpec::empty(), None, &mut TlsConfigCache::new()).expect("build");
+		let table = build_route_table(
+			&[first, second],
+			&ListenerTlsSpec::empty(),
+			None,
+			&mut TlsConfigCache::new(),
+		)
+		.expect("build");
 		assert_eq!(table.metric_identities().len(), 1);
 		assert_eq!(table.metric_identities()[0].group.as_ref(), "second");
 		assert_eq!(table.failing_route_count(), 0);
@@ -1142,14 +1293,26 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		let mut good = tls_route("tenant.example.com", CERT_A, KEY_A);
 		good.source_address_mode = SourceAddressMode::XForwardedFor;
 		good.protocol = RouteProtocol::Http;
-		let live = build_route_table(&[good], &ListenerTlsSpec::empty(), None, &mut TlsConfigCache::new()).expect("initial build");
+		let live = build_route_table(
+			&[good],
+			&ListenerTlsSpec::empty(),
+			None,
+			&mut TlsConfigCache::new(),
+		)
+		.expect("initial build");
 		assert!(live.resolve(Some("tenant.example.com")).is_some());
 
 		// Hot-swap drops the protocol declaration — a permanent rejection, not a transient one.
 		let mut broken = tls_route("tenant.example.com", CERT_A, KEY_A);
 		broken.source_address_mode = SourceAddressMode::XForwardedFor;
 		// protocol left at its default (Opaque) — undeclared.
-		let swapped = build_route_table(&[broken], &ListenerTlsSpec::empty(), Some(&live), &mut TlsConfigCache::new()).expect("hot-swap must not fail");
+		let swapped = build_route_table(
+			&[broken],
+			&ListenerTlsSpec::empty(),
+			Some(&live),
+			&mut TlsConfigCache::new(),
+		)
+		.expect("hot-swap must not fail");
 		assert!(
 			swapped.resolve(Some("tenant.example.com")).is_none(),
 			"a permanent protocol-declaration rejection must drop the route, not silently carry the previous one forward"
@@ -1159,14 +1322,32 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	#[test]
 	fn header_injection_detection() {
 		// xForwardedFor always needs protocol: 'http', regardless of fingerprint.
-		assert!(requires_http_protocol(SourceAddressMode::XForwardedFor, ForwardFingerprint::None));
+		assert!(requires_http_protocol(
+			SourceAddressMode::XForwardedFor,
+			ForwardFingerprint::None
+		));
 		// A header-carried fingerprint (any mode other than proxyProtocolV2) needs it too.
-		assert!(requires_http_protocol(SourceAddressMode::None, ForwardFingerprint::Ja3));
-		assert!(requires_http_protocol(SourceAddressMode::ProxyProtocol, ForwardFingerprint::Ja4));
+		assert!(requires_http_protocol(
+			SourceAddressMode::None,
+			ForwardFingerprint::Ja3
+		));
+		assert!(requires_http_protocol(
+			SourceAddressMode::ProxyProtocol,
+			ForwardFingerprint::Ja4
+		));
 		// proxyProtocolV2 carries the fingerprint as a TLV — never needs the declaration.
-		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocolV2, ForwardFingerprint::Ja3));
+		assert!(!requires_http_protocol(
+			SourceAddressMode::ProxyProtocolV2,
+			ForwardFingerprint::Ja3
+		));
 		// No header-injection mode requested at all.
-		assert!(!requires_http_protocol(SourceAddressMode::None, ForwardFingerprint::None));
-		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocol, ForwardFingerprint::None));
+		assert!(!requires_http_protocol(
+			SourceAddressMode::None,
+			ForwardFingerprint::None
+		));
+		assert!(!requires_http_protocol(
+			SourceAddressMode::ProxyProtocol,
+			ForwardFingerprint::None
+		));
 	}
 }

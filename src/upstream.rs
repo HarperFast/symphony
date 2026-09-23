@@ -47,9 +47,9 @@ async fn connect_uds(
 	peer_ip: Option<IpAddr>,
 	connect_timeout: Duration,
 ) -> crate::error::Result<UpstreamStream> {
-	let path = balancer
-		.pick(peer_ip)
-		.ok_or_else(|| crate::error::SymphonyError::Config("UDS balancer has no sockets configured".into()))?;
+	let path = balancer.pick(peer_ip).ok_or_else(|| {
+		crate::error::SymphonyError::Config("UDS balancer has no sockets configured".into())
+	})?;
 
 	let stream = timeout(connect_timeout, UnixStream::connect(path.as_ref()))
 		.await
@@ -63,7 +63,10 @@ async fn connect_uds(
 	// The guard increments the counter on construction and decrements on drop.
 	let guard = BalancerGuard::new(balancer.clone(), path.to_string());
 
-	Ok(UpstreamStream::Uds { stream, _guard: guard })
+	Ok(UpstreamStream::Uds {
+		stream,
+		_guard: guard,
+	})
 }
 
 /// Write a PROXY protocol v1 header so the backend can recover the real client
@@ -89,8 +92,9 @@ pub async fn write_proxy_v1_header<W: tokio::io::AsyncWrite + Unpin>(
 }
 
 /// The 12-byte PROXY protocol v2 signature (`\r\n\r\n\0\r\nQUIT\n`).
-const PROXY_V2_SIGNATURE: [u8; 12] =
-	[0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A];
+const PROXY_V2_SIGNATURE: [u8; 12] = [
+	0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+];
 
 /// PP2 TLV type carrying the JA3 fingerprint. HAProxy reserves the 0xE0–0xEF range for
 /// private/experimental TLVs (`PP2_TYPE_MIN_CUSTOM`); there is no registered type for JA3/JA4.
@@ -188,7 +192,10 @@ pub async fn write_proxy_v2_header<W: tokio::io::AsyncWrite + Unpin>(
 		}
 		// TLV and header length fields are u16; refuse to silently truncate an oversized value.
 		let tlv_len: u16 = bytes.len().try_into().map_err(|_| {
-			std::io::Error::new(std::io::ErrorKind::InvalidInput, "PROXY v2 TLV value exceeds 65535 bytes")
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"PROXY v2 TLV value exceeds 65535 bytes",
+			)
 		})?;
 		tlv_block.push(*ty);
 		tlv_block.extend_from_slice(&tlv_len.to_be_bytes());
@@ -196,9 +203,14 @@ pub async fn write_proxy_v2_header<W: tokio::io::AsyncWrite + Unpin>(
 	}
 
 	// 16-bit length of everything after the 16-byte fixed header (address block + TLVs).
-	let len: u16 = (addr_block.len() + tlv_block.len()).try_into().map_err(|_| {
-		std::io::Error::new(std::io::ErrorKind::InvalidInput, "PROXY v2 header exceeds 65535 bytes")
-	})?;
+	let len: u16 = (addr_block.len() + tlv_block.len())
+		.try_into()
+		.map_err(|_| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"PROXY v2 header exceeds 65535 bytes",
+			)
+		})?;
 	out.extend_from_slice(&len.to_be_bytes());
 	out.extend_from_slice(&addr_block);
 	out.extend_from_slice(&tlv_block);
@@ -227,16 +239,25 @@ mod tests {
 		let peer: SocketAddr = "192.168.1.5:51000".parse().unwrap();
 		let local: SocketAddr = "10.0.0.1:443".parse().unwrap();
 		let mut out: Vec<u8> = Vec::new();
-		write_proxy_v2_header(&mut out, peer, Some(local), &[(PP2_TYPE_JA3, JA3.as_bytes())])
-			.await
-			.unwrap();
+		write_proxy_v2_header(
+			&mut out,
+			peer,
+			Some(local),
+			&[(PP2_TYPE_JA3, JA3.as_bytes())],
+		)
+		.await
+		.unwrap();
 
 		// Fixed 16-byte header.
 		assert_eq!(&out[0..12], &PROXY_V2_SIGNATURE);
 		assert_eq!(out[12], 0x21, "version 2 | PROXY command");
 		assert_eq!(out[13], 0x11, "AF_INET | STREAM");
 		let declared_len = u16::from_be_bytes([out[14], out[15]]) as usize;
-		assert_eq!(out.len(), 16 + declared_len, "declared length covers the rest");
+		assert_eq!(
+			out.len(),
+			16 + declared_len,
+			"declared length covers the rest"
+		);
 
 		// IPv4 address block: src(4) dst(4) sport(2) dport(2).
 		assert_eq!(&out[16..20], &[192, 168, 1, 5]);
@@ -264,7 +285,11 @@ mod tests {
 		assert_eq!(declared_len, 12, "address block only, empty TLV skipped");
 		assert_eq!(out.len(), 28);
 		assert_eq!(&out[20..24], &[127, 0, 0, 1], "dst defaults to loopback");
-		assert_eq!(u16::from_be_bytes([out[26], out[27]]), 0, "dst port defaults to 0");
+		assert_eq!(
+			u16::from_be_bytes([out[26], out[27]]),
+			0,
+			"dst port defaults to 0"
+		);
 	}
 
 	#[tokio::test]
@@ -272,7 +297,9 @@ mod tests {
 		// ::ffff:1.2.3.4 must emit as AF_INET, matching the v1 path.
 		let peer: SocketAddr = "[::ffff:1.2.3.4]:9000".parse().unwrap();
 		let mut out: Vec<u8> = Vec::new();
-		write_proxy_v2_header(&mut out, peer, None, &[]).await.unwrap();
+		write_proxy_v2_header(&mut out, peer, None, &[])
+			.await
+			.unwrap();
 		assert_eq!(out[13], 0x11, "IPv4-mapped IPv6 collapses to AF_INET");
 		assert_eq!(&out[16..20], &[1, 2, 3, 4]);
 	}
@@ -281,11 +308,15 @@ mod tests {
 	async fn v2_header_ipv6() {
 		let peer: SocketAddr = "[2001:db8::1]:8443".parse().unwrap();
 		let mut out: Vec<u8> = Vec::new();
-		write_proxy_v2_header(&mut out, peer, None, &[]).await.unwrap();
+		write_proxy_v2_header(&mut out, peer, None, &[])
+			.await
+			.unwrap();
 		assert_eq!(out[13], 0x21, "AF_INET6 | STREAM");
 		let declared_len = u16::from_be_bytes([out[14], out[15]]) as usize;
 		assert_eq!(declared_len, 36, "IPv6 address block is 36 bytes");
-		assert_eq!(&out[16..32], &std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets());
+		assert_eq!(
+			&out[16..32],
+			&std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets()
+		);
 	}
-
 }
