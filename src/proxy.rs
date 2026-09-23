@@ -921,8 +921,11 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 		.map(|u| parse_upstream_spec(u, &r.sni))
 		.collect::<Result<Vec<_>>>()?;
 
-	let has_uds = upstreams.iter().any(|u| matches!(u, UpstreamSpec::Uds { .. }));
-	let source_address_mode = parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
+	let has_uds = upstreams
+		.iter()
+		.any(|u| matches!(u, UpstreamSpec::Uds { .. }));
+	let source_address_mode =
+		parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
 	let forward_fingerprint = parse_forward_fingerprint(r.forward_fingerprint.as_ref())?;
 	let protocol = parse_route_protocol(r.protocol.as_deref())?;
 	let requires_http = requires_http_protocol(source_address_mode, forward_fingerprint);
@@ -1075,7 +1078,8 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 	};
 
 	let has_uds = matches!(&upstream, ResolveUpstream::Uds { .. });
-	let source_address_mode = parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
+	let source_address_mode =
+		parse_source_address_mode(r.source_address_header.as_deref(), has_uds)?;
 	let forward_fingerprint = parse_forward_fingerprint(r.forward_fingerprint.as_ref())?;
 	let protocol = parse_route_protocol(r.protocol.as_deref())?;
 	let requires_http = requires_http_protocol(source_address_mode, forward_fingerprint);
@@ -1375,7 +1379,9 @@ fn parse_source_address_mode(
 	}
 }
 
-fn parse_forward_fingerprint(value: Option<&Either<String, Vec<String>>>) -> Result<ForwardFingerprint> {
+fn parse_forward_fingerprint(
+	value: Option<&Either<String, Vec<String>>>,
+) -> Result<ForwardFingerprint> {
 	let mut fingerprint = ForwardFingerprint::NONE;
 	match value {
 		None => {}
@@ -1698,18 +1704,33 @@ mod tests {
 	// `JsRouteConfig` parse path (including this error message) lives in
 	// `__test__/route-protocol.spec.ts`, which runs against the built native addon.
 
-	const JA3_ONLY: ForwardFingerprint = ForwardFingerprint { ja3: true, ja4: false };
-	const JA4_ONLY: ForwardFingerprint = ForwardFingerprint { ja3: false, ja4: true };
-	const BOTH: ForwardFingerprint = ForwardFingerprint { ja3: true, ja4: true };
+	const JA3_ONLY: ForwardFingerprint = ForwardFingerprint {
+		ja3: true,
+		ja4: false,
+	};
+	const JA4_ONLY: ForwardFingerprint = ForwardFingerprint {
+		ja3: false,
+		ja4: true,
+	};
+	const BOTH: ForwardFingerprint = ForwardFingerprint {
+		ja3: true,
+		ja4: true,
+	};
 
 	#[test]
 	fn xff_requires_http_protocol_declaration() {
-		assert!(requires_http_protocol(SourceAddressMode::XForwardedFor, ForwardFingerprint::NONE));
+		assert!(requires_http_protocol(
+			SourceAddressMode::XForwardedFor,
+			ForwardFingerprint::NONE
+		));
 	}
 
 	#[test]
 	fn xff_requires_declaration_regardless_of_fingerprint() {
-		assert!(requires_http_protocol(SourceAddressMode::XForwardedFor, JA4_ONLY));
+		assert!(requires_http_protocol(
+			SourceAddressMode::XForwardedFor,
+			JA4_ONLY
+		));
 	}
 
 	#[test]
@@ -1723,13 +1744,22 @@ mod tests {
 	#[test]
 	fn fingerprint_under_proxy_protocol_v2_needs_no_declaration() {
 		// TLV carrier, not a header — no protocol declaration required.
-		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocolV2, JA4_ONLY));
-		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocolV2, BOTH));
+		assert!(!requires_http_protocol(
+			SourceAddressMode::ProxyProtocolV2,
+			JA4_ONLY
+		));
+		assert!(!requires_http_protocol(
+			SourceAddressMode::ProxyProtocolV2,
+			BOTH
+		));
 	}
 
 	#[test]
 	fn proxy_protocol_without_fingerprint_needs_no_declaration() {
-		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocol, ForwardFingerprint::NONE));
+		assert!(!requires_http_protocol(
+			SourceAddressMode::ProxyProtocol,
+			ForwardFingerprint::NONE
+		));
 	}
 
 	fn scalar(kind: &str) -> Either<String, Vec<String>> {
@@ -1742,29 +1772,59 @@ mod tests {
 
 	#[test]
 	fn parse_forward_fingerprint_scalar_forms() {
-		assert_eq!(parse_forward_fingerprint(None).unwrap(), ForwardFingerprint::NONE);
-		assert_eq!(parse_forward_fingerprint(Some(&scalar("none"))).unwrap(), ForwardFingerprint::NONE);
-		assert_eq!(parse_forward_fingerprint(Some(&scalar("ja3"))).unwrap(), JA3_ONLY);
-		assert_eq!(parse_forward_fingerprint(Some(&scalar("ja4"))).unwrap(), JA4_ONLY);
-		let err = parse_forward_fingerprint(Some(&scalar("ja5"))).expect_err("unknown scalar must error");
+		assert_eq!(
+			parse_forward_fingerprint(None).unwrap(),
+			ForwardFingerprint::NONE
+		);
+		assert_eq!(
+			parse_forward_fingerprint(Some(&scalar("none"))).unwrap(),
+			ForwardFingerprint::NONE
+		);
+		assert_eq!(
+			parse_forward_fingerprint(Some(&scalar("ja3"))).unwrap(),
+			JA3_ONLY
+		);
+		assert_eq!(
+			parse_forward_fingerprint(Some(&scalar("ja4"))).unwrap(),
+			JA4_ONLY
+		);
+		let err =
+			parse_forward_fingerprint(Some(&scalar("ja5"))).expect_err("unknown scalar must error");
 		assert!(err.to_string().contains("'ja5'"), "{err}");
 	}
 
 	#[test]
 	fn parse_forward_fingerprint_list_forms() {
-		assert_eq!(parse_forward_fingerprint(Some(&list(&["ja3", "ja4"]))).unwrap(), BOTH);
-		assert_eq!(parse_forward_fingerprint(Some(&list(&["ja4", "ja3"]))).unwrap(), BOTH);
-		assert_eq!(parse_forward_fingerprint(Some(&list(&["ja4"]))).unwrap(), JA4_ONLY);
-		assert_eq!(parse_forward_fingerprint(Some(&list(&["ja3", "ja3"]))).unwrap(), JA3_ONLY);
-		assert_eq!(parse_forward_fingerprint(Some(&list(&[]))).unwrap(), ForwardFingerprint::NONE);
+		assert_eq!(
+			parse_forward_fingerprint(Some(&list(&["ja3", "ja4"]))).unwrap(),
+			BOTH
+		);
+		assert_eq!(
+			parse_forward_fingerprint(Some(&list(&["ja4", "ja3"]))).unwrap(),
+			BOTH
+		);
+		assert_eq!(
+			parse_forward_fingerprint(Some(&list(&["ja4"]))).unwrap(),
+			JA4_ONLY
+		);
+		assert_eq!(
+			parse_forward_fingerprint(Some(&list(&["ja3", "ja3"]))).unwrap(),
+			JA3_ONLY
+		);
+		assert_eq!(
+			parse_forward_fingerprint(Some(&list(&[]))).unwrap(),
+			ForwardFingerprint::NONE
+		);
 	}
 
 	#[test]
 	fn parse_forward_fingerprint_rejects_none_and_unknown_list_entries() {
 		// 'none' alongside a kind is contradictory; it is only meaningful as the scalar.
-		let err = parse_forward_fingerprint(Some(&list(&["ja3", "none"]))).expect_err("'none' in a list must error");
+		let err = parse_forward_fingerprint(Some(&list(&["ja3", "none"])))
+			.expect_err("'none' in a list must error");
 		assert!(err.to_string().contains("'none'"), "{err}");
-		let err = parse_forward_fingerprint(Some(&list(&["ja3", "JA4"]))).expect_err("unknown list entry must error");
+		let err = parse_forward_fingerprint(Some(&list(&["ja3", "JA4"])))
+			.expect_err("unknown list entry must error");
 		assert!(err.to_string().contains("'JA4'"), "{err}");
 	}
 

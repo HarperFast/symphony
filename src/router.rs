@@ -123,7 +123,10 @@ pub struct ForwardFingerprint {
 }
 
 impl ForwardFingerprint {
-	pub const NONE: Self = Self { ja3: false, ja4: false };
+	pub const NONE: Self = Self {
+		ja3: false,
+		ja4: false,
+	};
 
 	pub fn is_empty(self) -> bool {
 		!self.ja3 && !self.ja4
@@ -1326,20 +1329,47 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 
 	#[test]
 	fn header_injection_detection() {
-		const JA3: ForwardFingerprint = ForwardFingerprint { ja3: true, ja4: false };
-		const JA4: ForwardFingerprint = ForwardFingerprint { ja3: false, ja4: true };
-		const BOTH: ForwardFingerprint = ForwardFingerprint { ja3: true, ja4: true };
+		const JA3: ForwardFingerprint = ForwardFingerprint {
+			ja3: true,
+			ja4: false,
+		};
+		const JA4: ForwardFingerprint = ForwardFingerprint {
+			ja3: false,
+			ja4: true,
+		};
+		const BOTH: ForwardFingerprint = ForwardFingerprint {
+			ja3: true,
+			ja4: true,
+		};
 		// xForwardedFor always needs protocol: 'http', regardless of fingerprint.
-		assert!(requires_http_protocol(SourceAddressMode::XForwardedFor, ForwardFingerprint::NONE));
+		assert!(requires_http_protocol(
+			SourceAddressMode::XForwardedFor,
+			ForwardFingerprint::NONE
+		));
 		// A header-carried fingerprint (any mode other than proxyProtocolV2) needs it too.
 		assert!(requires_http_protocol(SourceAddressMode::None, JA3));
-		assert!(requires_http_protocol(SourceAddressMode::ProxyProtocol, JA4));
+		assert!(requires_http_protocol(
+			SourceAddressMode::ProxyProtocol,
+			JA4
+		));
 		assert!(requires_http_protocol(SourceAddressMode::None, BOTH));
 		// proxyProtocolV2 carries the fingerprint as a TLV — never needs the declaration.
-		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocolV2, JA3));
-		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocolV2, BOTH));
+		assert!(!requires_http_protocol(
+			SourceAddressMode::ProxyProtocolV2,
+			JA3
+		));
+		assert!(!requires_http_protocol(
+			SourceAddressMode::ProxyProtocolV2,
+			BOTH
+		));
 		// No header-injection mode requested at all.
-		assert!(!requires_http_protocol(SourceAddressMode::None, ForwardFingerprint::NONE));
-		assert!(!requires_http_protocol(SourceAddressMode::ProxyProtocol, ForwardFingerprint::NONE));
+		assert!(!requires_http_protocol(
+			SourceAddressMode::None,
+			ForwardFingerprint::NONE
+		));
+		assert!(!requires_http_protocol(
+			SourceAddressMode::ProxyProtocol,
+			ForwardFingerprint::NONE
+		));
 	}
 }

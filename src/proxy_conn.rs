@@ -605,8 +605,10 @@ where
 			upstream::write_proxy_v1_header(upstream, sf.peer_addr).await
 		}
 		SourceAddressMode::ProxyProtocolV2 => {
-			let mut tlvs: Vec<(u8, &[u8])> =
-				sf.forwarded_fingerprints().map(|fp| (fp.pp2_type, fp.value.as_bytes())).collect();
+			let mut tlvs: Vec<(u8, &[u8])> = sf
+				.forwarded_fingerprints()
+				.map(|fp| (fp.pp2_type, fp.value.as_bytes()))
+				.collect();
 			if let Some(sni) = sf.sni {
 				tlvs.push((upstream::PP2_TYPE_AUTHORITY, sni.as_bytes()));
 			}
@@ -843,7 +845,10 @@ mod tests {
 
 	const JA3: &str = "0123456789abcdef0123456789abcdef";
 	const JA4: &str = "t13d1516h2_8daaf6152771_b186095e22b6";
-	const BOTH: ForwardFingerprint = ForwardFingerprint { ja3: true, ja4: true };
+	const BOTH: ForwardFingerprint = ForwardFingerprint {
+		ja3: true,
+		ja4: true,
+	};
 
 	fn forwarding(
 		mode: SourceAddressMode,
@@ -864,7 +869,10 @@ mod tests {
 	}
 
 	fn rewrite_pairs(sf: &SourceForwarding<'_>) -> Vec<(&'static str, Option<String>)> {
-		header_rewrites(sf, true).into_iter().map(|r| (r.name, r.value)).collect()
+		header_rewrites(sf, true)
+			.into_iter()
+			.map(|r| (r.name, r.value))
+			.collect()
 	}
 
 	#[test]
@@ -885,7 +893,10 @@ mod tests {
 		// value None = strip the client's copy with nothing to substitute; skipping the entry
 		// instead would let a client-supplied X-JA3 through as if symphony had set it.
 		let sf = forwarding(SourceAddressMode::None, BOTH, "");
-		assert_eq!(rewrite_pairs(&sf), vec![("X-JA3", None), ("X-JA4", Some(JA4.to_string()))]);
+		assert_eq!(
+			rewrite_pairs(&sf),
+			vec![("X-JA3", None), ("X-JA4", Some(JA4.to_string()))]
+		);
 	}
 
 	#[test]
