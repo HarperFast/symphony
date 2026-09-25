@@ -151,6 +151,21 @@ function portKey(listeners: { port: number }[]): string {
 		.join(',');
 }
 
+// On Linux the cmdline check keeps a status.json whose pid the kernel has since recycled from
+// counting as a live symphony-server on this config.
+function servesConfig(pid: number, configPath: string): boolean {
+	try {
+		process.kill(pid, 0);
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== 'EPERM') return false;
+	}
+	try {
+		return readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').includes(configPath);
+	} catch {
+		return process.platform !== 'linux';
+	}
+}
+
 interface ActiveProxy {
 	proxy: SymphonyProxy;
 	constructionSig: string;
@@ -391,7 +406,30 @@ class ServerState {
 		this.writeStatus();
 	}
 
+	// A live symphony-server on this config that started after this one and has claimed status.json:
+	// this process is the outgoing side of an overlapped upgrade.
+	private newerStatusOwner(): number | null {
+		let current: { pid?: unknown; startedAt?: unknown };
+		try {
+			current = JSON.parse(readFileSync(this.statusPath, 'utf8'));
+		} catch {
+			return null;
+		}
+		const { pid, startedAt } = current;
+		if (typeof pid !== 'number' || pid === process.pid || typeof startedAt !== 'string') return null;
+		if (!(Date.parse(startedAt) > Date.parse(this.startedAt))) return null;
+		return servesConfig(pid, this.configPath) ? pid : null;
+	}
+
 	private writeStatus(): void {
+		// Both sides of an overlapped upgrade reload on the same config write. Pointing status.json back
+		// at the outgoing process hides the successor from a supervisor waiting for its pid, and lets
+		// this process's stop() delete the file as its owner.
+		const successor = this.newerStatusOwner();
+		if (successor !== null) {
+			log(`status.json belongs to newer pid ${successor}; not overwriting it`);
+			return;
+		}
 		const ports = [...this.active.keys()].flatMap((k) => k.split(',').map(Number));
 		const status = {
 			pid: process.pid,
@@ -401,14 +439,20 @@ class ServerState {
 			configPath: this.configPath,
 			ports,
 		};
+		// Atomic write (temp + rename): the status file is rewritten on every reload, and a
+		// supervisor polling it concurrently must never read a half-written document. The temp name
+		// is per-pid because an overlapping peer writes the same status file.
+		const tmp = `${this.statusPath}.${process.pid}.tmp`;
 		try {
-			// Atomic write (temp + rename): the status file is rewritten on every reload, and a
-			// supervisor polling it concurrently must never read a half-written document.
-			const tmp = `${this.statusPath}.tmp`;
 			writeFileSync(tmp, JSON.stringify(status, null, 2));
 			renameSync(tmp, this.statusPath);
 		} catch (err) {
 			logErr(`could not write status ${this.statusPath}:`, (err as Error).message);
+			try {
+				unlinkSync(tmp);
+			} catch {
+				// never created, or already renamed into place
+			}
 		}
 	}
 

@@ -40,21 +40,24 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
 
 interface RunningServer {
 	child: ChildProcess;
+	getStdout: () => string;
 	getStderr: () => string;
 	markShutdown: () => void;
 }
 
 function spawnServer(configPath: string, statusPath?: string): RunningServer {
+	let stdout = '';
 	let stderr = '';
 	let shuttingDown = false;
 	const args = [SERVER_JS, '--config', configPath];
 	if (statusPath) args.push('--status', statusPath);
 	const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+	child.stdout?.on('data', (d) => (stdout += d.toString()));
 	child.stderr?.on('data', (d) => (stderr += d.toString()));
 	child.on('exit', (code, sig) => {
 		if (!shuttingDown) stderr += `\n[child exited early code=${code} sig=${sig}]`;
 	});
-	return { child, getStderr: () => stderr, markShutdown: () => (shuttingDown = true) };
+	return { child, getStdout: () => stdout, getStderr: () => stderr, markShutdown: () => (shuttingDown = true) };
 }
 
 async function killServer(server: RunningServer): Promise<void> {
@@ -646,6 +649,7 @@ describe('symphony-server (status.json ownership guard)', () => {
 	const cert = generateSelfSignedCert('localhost');
 	let dir: string;
 	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	const peers: ChildProcess[] = [];
 
 	before(async () => {
 		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-status-'));
@@ -653,13 +657,14 @@ describe('symphony-server (status.json ownership guard)', () => {
 	});
 
 	after(async () => {
+		for (const peer of peers) peer.kill('SIGKILL');
 		await echo.close().catch(() => {});
 		fs.rmSync(dir, { recursive: true, force: true });
 	});
 
 	// Inline cert (no cert files) so overwriting the status file can't trip a cert watcher
 	// and cause a reconcile that rewrites status.json out from under the test.
-	async function boot(name: string): Promise<{ server: RunningServer; statusPath: string }> {
+	async function boot(name: string): Promise<{ server: RunningServer; configPath: string; statusPath: string }> {
 		const configPath = path.join(dir, `${name}.json`);
 		const statusPath = path.join(dir, `${name}-status.json`);
 		const port = await getFreePort();
@@ -681,8 +686,67 @@ describe('symphony-server (status.json ownership guard)', () => {
 		});
 		const server = spawnServer(configPath, statusPath);
 		await waitFor(() => fs.existsSync(statusPath));
-		return { server, statusPath };
+		// SIGHUP is only handled once start() has returned, which is after this line is logged.
+		await waitFor(() => server.getStdout().includes('watching'));
+		return { server, configPath, statusPath };
 	}
+
+	// Stands in for another symphony-server: a live process whose argv names `configPath`.
+	function startPeer(configPath: string): number {
+		const peer = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1 << 30)', configPath], { stdio: 'ignore' });
+		peers.push(peer);
+		return peer.pid!;
+	}
+
+	const statusPid = (statusPath: string): number => JSON.parse(fs.readFileSync(statusPath, 'utf8')).pid;
+
+	it('does not repoint status.json at itself on reload while a newer live peer owns it', async () => {
+		const { server, configPath, statusPath } = await boot('newer-peer');
+		const peerPid = startPeer(configPath);
+		writeConfigAtomic(statusPath, { pid: peerPid, startedAt: new Date().toISOString() });
+
+		server.child.kill('SIGHUP');
+		await waitFor(() => server.getStdout().includes(`status.json belongs to newer pid ${peerPid}`));
+
+		assert.equal(statusPid(statusPath), peerPid);
+		await killServer(server);
+		assert.equal(statusPid(statusPath), peerPid, "stop() leaves the successor's status.json in place");
+	});
+
+	for (const [name, owner, makeOwner] of [
+		[
+			'dead-newer',
+			'a newer pid that is no longer running',
+			() => ({ pid: 2147483646, startedAt: new Date().toISOString() }),
+		],
+		[
+			'older-peer',
+			'an older live peer',
+			(configPath: string) => ({ pid: startPeer(configPath), startedAt: new Date(0).toISOString() }),
+		],
+	] as const) {
+		it(`reclaims status.json on reload from ${owner}`, async () => {
+			const { server, configPath, statusPath } = await boot(name);
+			writeConfigAtomic(statusPath, makeOwner(configPath));
+
+			server.child.kill('SIGHUP');
+			await waitFor(() => statusPid(statusPath) === server.child.pid);
+			await killServer(server);
+		});
+	}
+
+	it(
+		'reclaims status.json from a newer live pid that is not serving this config',
+		{ skip: process.platform !== 'linux' && '/proc cmdline check is Linux-only' },
+		async () => {
+			const { server, configPath, statusPath } = await boot('recycled-pid');
+			writeConfigAtomic(statusPath, { pid: startPeer(`${configPath}.other`), startedAt: new Date().toISOString() });
+
+			server.child.kill('SIGHUP');
+			await waitFor(() => statusPid(statusPath) === server.child.pid);
+			await killServer(server);
+		}
+	);
 
 	it('removes status.json on stop when this process owns it', async () => {
 		const { server, statusPath } = await boot('owned');
