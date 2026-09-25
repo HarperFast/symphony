@@ -151,6 +151,39 @@ function portKey(listeners: { port: number }[]): string {
 		.join(',');
 }
 
+// A peer started as this user with `--config <configPath>`. On Linux the cmdline check keeps a pid the
+// kernel has recycled from counting.
+function servesConfig(pid: number, configPath: string): boolean {
+	try {
+		process.kill(pid, 0);
+	} catch {
+		return false;
+	}
+	let argv: string[];
+	try {
+		argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
+	} catch {
+		return process.platform !== 'linux';
+	}
+	return argv.some((arg, i) => (arg === '--config' || arg === '-c') && argv[i + 1] === configPath);
+}
+
+interface StatusOwner {
+	pid: number;
+	startedAt: string;
+}
+
+// The newest process owns status.json; pid breaks a same-millisecond tie.
+function startedAfter(a: StatusOwner, b: StatusOwner): boolean {
+	const aStart = Date.parse(a.startedAt);
+	const bStart = Date.parse(b.startedAt);
+	return aStart > bStart || (aStart === bStart && a.pid > b.pid);
+}
+
+// A peer without the writeStatus guard, or one that read status.json just before this process renamed
+// over it, can overwrite the file after this write. These look again and take it back.
+const STATUS_RECHECK_MS = [1_000, 2_000, 4_000, 8_000];
+
 interface ActiveProxy {
 	proxy: SymphonyProxy;
 	constructionSig: string;
@@ -172,6 +205,8 @@ class ServerState {
 	private readonly certWatchers = new Map<string, ReturnType<typeof watch>>();
 	private certFilesByDir = new Map<string, Set<string>>();
 	private debounceTimer: NodeJS.Timeout | null = null;
+	private statusRecheck: NodeJS.Timeout | null = null;
+	private stopping = false;
 
 	constructor(configPath: string, statusPath: string) {
 		this.configPath = configPath;
@@ -391,7 +426,30 @@ class ServerState {
 		this.writeStatus();
 	}
 
+	private readStatusOwner(): StatusOwner | null {
+		try {
+			const { pid, startedAt } = JSON.parse(readFileSync(this.statusPath, 'utf8')) ?? {};
+			return typeof pid === 'number' && typeof startedAt === 'string' ? { pid, startedAt } : null;
+		} catch {
+			return null;
+		}
+	}
+
+	// During an overlapped upgrade both processes reload on the same config write. The outgoing one
+	// must not point status.json back at itself: a supervisor waiting for the successor's pid would never
+	// see it, and this process's stop() would then delete the file as its owner.
 	private writeStatus(): void {
+		if (this.stopping) return;
+		const owner = this.readStatusOwner();
+		if (
+			owner &&
+			owner.pid !== process.pid &&
+			startedAfter(owner, { pid: process.pid, startedAt: this.startedAt }) &&
+			servesConfig(owner.pid, this.configPath)
+		) {
+			log(`status.json belongs to newer pid ${owner.pid}; not overwriting it`);
+			return;
+		}
 		const ports = [...this.active.keys()].flatMap((k) => k.split(',').map(Number));
 		const status = {
 			pid: process.pid,
@@ -401,15 +459,37 @@ class ServerState {
 			configPath: this.configPath,
 			ports,
 		};
+		// Atomic write (temp + rename): the status file is rewritten on every reload, and a
+		// supervisor polling it concurrently must never read a half-written document. An overlapping
+		// peer writes the same file, hence the per-pid temp name.
+		const tmp = `${this.statusPath}.${process.pid}.tmp`;
 		try {
-			// Atomic write (temp + rename): the status file is rewritten on every reload, and a
-			// supervisor polling it concurrently must never read a half-written document.
-			const tmp = `${this.statusPath}.tmp`;
 			writeFileSync(tmp, JSON.stringify(status, null, 2));
 			renameSync(tmp, this.statusPath);
+			this.recheckStatus(0);
 		} catch (err) {
 			logErr(`could not write status ${this.statusPath}:`, (err as Error).message);
+			try {
+				unlinkSync(tmp);
+			} catch {
+				// never created, or already renamed into place
+			}
 		}
+	}
+
+	private recheckStatus(attempt: number): void {
+		if (this.statusRecheck) clearTimeout(this.statusRecheck);
+		this.statusRecheck = null;
+		if (this.stopping || attempt >= STATUS_RECHECK_MS.length) return;
+		this.statusRecheck = setTimeout(() => {
+			this.statusRecheck = null;
+			// Queued behind any reconcile, so a rewrite never publishes a half-applied port set.
+			void this.reloading.then(() => {
+				if (this.readStatusOwner()?.pid === process.pid) this.recheckStatus(attempt + 1);
+				else this.writeStatus();
+			});
+		}, STATUS_RECHECK_MS[attempt]);
+		this.statusRecheck.unref();
 	}
 
 	async start(): Promise<void> {
@@ -427,6 +507,11 @@ class ServerState {
 	}
 
 	async stop(): Promise<void> {
+		this.stopping = true;
+		if (this.statusRecheck) {
+			clearTimeout(this.statusRecheck);
+			this.statusRecheck = null;
+		}
 		if (this.debounceTimer) {
 			clearTimeout(this.debounceTimer);
 			this.debounceTimer = null;
