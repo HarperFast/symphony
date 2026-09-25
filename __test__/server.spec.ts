@@ -691,14 +691,15 @@ describe('symphony-server (status.json ownership guard)', () => {
 		return { server, configPath, statusPath };
 	}
 
-	// Stands in for another symphony-server: a live process whose argv names `configPath`.
+	// Stands in for another symphony-server: a live process started with `--config <configPath>`.
 	function startPeer(configPath: string): number {
-		const peer = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1 << 30)', configPath], { stdio: 'ignore' });
+		const script = 'setInterval(() => {}, 1 << 30)';
+		const peer = spawn(process.execPath, ['-e', script, 'symphony-peer', '--config', configPath], { stdio: 'ignore' });
 		peers.push(peer);
 		return peer.pid!;
 	}
 
-	const statusPid = (statusPath: string): number => JSON.parse(fs.readFileSync(statusPath, 'utf8')).pid;
+	const statusPid = (statusPath: string): number | undefined => JSON.parse(fs.readFileSync(statusPath, 'utf8'))?.pid;
 
 	it('does not repoint status.json at itself on reload while a newer live peer owns it', async () => {
 		const { server, configPath, statusPath } = await boot('newer-peer');
@@ -708,9 +709,20 @@ describe('symphony-server (status.json ownership guard)', () => {
 		server.child.kill('SIGHUP');
 		await waitFor(() => server.getStdout().includes(`status.json belongs to newer pid ${peerPid}`));
 
+		await sleep(1500); // past the first post-write recheck
 		assert.equal(statusPid(statusPath), peerPid);
 		await killServer(server);
 		assert.equal(statusPid(statusPath), peerPid, "stop() leaves the successor's status.json in place");
+	});
+
+	// A 1.3.0 incumbent has no writeStatus guard, and its reload of the config write that preceded this
+	// process's start lands ~300ms after it.
+	it('takes status.json back from an older process that overwrites it after this one wrote it', async () => {
+		const { server, configPath, statusPath } = await boot('overwritten');
+		writeConfigAtomic(statusPath, { pid: startPeer(configPath), startedAt: new Date(0).toISOString() });
+
+		await waitFor(() => statusPid(statusPath) === server.child.pid, 5000);
+		await killServer(server);
 	});
 
 	for (const [name, owner, makeOwner] of [
@@ -724,6 +736,7 @@ describe('symphony-server (status.json ownership guard)', () => {
 			'an older live peer',
 			(configPath: string) => ({ pid: startPeer(configPath), startedAt: new Date(0).toISOString() }),
 		],
+		['null-status', 'a status.json holding JSON null', () => null],
 	] as const) {
 		it(`reclaims status.json on reload from ${owner}`, async () => {
 			const { server, configPath, statusPath } = await boot(name);
