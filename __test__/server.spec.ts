@@ -644,8 +644,8 @@ describe('symphony-server (protection hot-swap via config file)', () => {
 
 describe('symphony-server (status.json ownership guard)', () => {
 	// During a version upgrade the replacement starts first (SO_REUSEPORT overlap) and
-	// rewrites status.json with its own pid before the incumbent retires. stop() must only
-	// delete status.json if this process still owns it, or it clobbers the successor's file.
+	// rewrites status.json with its own pid before the incumbent retires. The file must name the
+	// newest live process throughout, and stop() never deletes it.
 	const cert = generateSelfSignedCert('localhost');
 	let dir: string;
 	let echo: Awaited<ReturnType<typeof startEchoServer>>;
@@ -715,6 +715,20 @@ describe('symphony-server (status.json ownership guard)', () => {
 		assert.equal(statusPid(statusPath), peerPid, "stop() leaves the successor's status.json in place");
 	});
 
+	it('takes status.json back when the newer peer it yielded to exits', async () => {
+		const { server, configPath, statusPath } = await boot('successor-exits');
+		const peerPid = startPeer(configPath);
+		writeConfigAtomic(statusPath, { pid: peerPid, startedAt: new Date().toISOString() });
+		server.child.kill('SIGHUP');
+		await waitFor(() => server.getStdout().includes(`status.json belongs to newer pid ${peerPid}`));
+		await sleep(1500); // past the startup write's first recheck, which would otherwise reclaim it
+
+		process.kill(peerPid, 'SIGKILL');
+
+		await waitFor(() => statusPid(statusPath) === server.child.pid, 12_000);
+		await killServer(server);
+	});
+
 	// A 1.3.0 incumbent has no writeStatus guard, and its reload of the config write that preceded this
 	// process's start lands ~300ms after it.
 	it('takes status.json back from an older process that overwrites it after this one wrote it', async () => {
@@ -761,11 +775,12 @@ describe('symphony-server (status.json ownership guard)', () => {
 		}
 	);
 
-	it('removes status.json on stop when this process owns it', async () => {
+	it('leaves status.json in place on stop, naming the exited pid', async () => {
 		const { server, statusPath } = await boot('owned');
-		assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).pid, server.child.pid);
+		const pid = server.child.pid;
+		assert.equal(statusPid(statusPath), pid);
 		await killServer(server);
-		assert.equal(fs.existsSync(statusPath), false, 'owned status.json should be removed on stop');
+		assert.equal(statusPid(statusPath), pid, 'a supervisor reads the dead pid as not running');
 	});
 
 	it('leaves status.json alone on stop when another process owns it', async () => {

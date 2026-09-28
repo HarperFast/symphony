@@ -206,6 +206,7 @@ class ServerState {
 	private certFilesByDir = new Map<string, Set<string>>();
 	private debounceTimer: NodeJS.Timeout | null = null;
 	private statusRecheck: NodeJS.Timeout | null = null;
+	private yieldedTo: number | null = null;
 	private stopping = false;
 
 	constructor(configPath: string, statusPath: string) {
@@ -436,8 +437,8 @@ class ServerState {
 	}
 
 	// During an overlapped upgrade both processes reload on the same config write. The outgoing one
-	// must not point status.json back at itself: a supervisor waiting for the successor's pid would never
-	// see it, and this process's stop() would then delete the file as its owner.
+	// must not point status.json back at itself, or a supervisor waiting for the successor's pid never
+	// sees it.
 	private writeStatus(): void {
 		if (this.stopping) return;
 		const owner = this.readStatusOwner();
@@ -447,9 +448,13 @@ class ServerState {
 			startedAfter(owner, { pid: process.pid, startedAt: this.startedAt }) &&
 			servesConfig(owner.pid, this.configPath)
 		) {
-			log(`status.json belongs to newer pid ${owner.pid}; not overwriting it`);
+			if (this.yieldedTo !== owner.pid) log(`status.json belongs to newer pid ${owner.pid}; not overwriting it`);
+			this.yieldedTo = owner.pid;
+			// Keep looking: if the successor exits while this process still serves, take the file back.
+			this.recheckStatus(STATUS_RECHECK_MS.length - 1);
 			return;
 		}
+		this.yieldedTo = null;
 		const ports = [...this.active.keys()].flatMap((k) => k.split(',').map(Number));
 		const status = {
 			pid: process.pid,
@@ -528,17 +533,8 @@ class ServerState {
 			await entry.proxy.stop().catch((err) => logErr(`stopping proxy [${key}]:`, err));
 		}
 		this.active.clear();
-		// Only remove status.json if this process still owns it. During a version upgrade the
-		// replacement starts first (SO_REUSEPORT overlap) and rewrites status.json with its own
-		// pid before this incumbent is retired; an unconditional unlink here would delete the
-		// successor's file and make host-manager's health check read null → respawn a duplicate.
-		// Best-effort: a missing or garbage status file must not throw out of stop().
-		try {
-			const current = JSON.parse(readFileSync(this.statusPath, 'utf8')) as { pid?: number };
-			if (current.pid === process.pid) unlinkSync(this.statusPath);
-		} catch {
-			// status file missing, unreadable, or not ours — leave it alone
-		}
+		// status.json stays in place: a supervisor reads a dead pid as not running, and a successor can
+		// rename its own status over the path between any ownership check here and an unlink.
 	}
 }
 
