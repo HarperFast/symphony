@@ -207,6 +207,13 @@ napi `Buffer` contains raw pointers (`*mut napi_env__`, `*mut napi_ref__`) that 
 
 Tests live in `__test__/` and use Node's built-in `node:test` runner.
 
+**No `cargo test`**: the crate is cdylib-only, and its `#[napi(object)]` config structs hold
+`napi::bindgen_prelude::Buffer` fields. `Buffer` only links against a running Node host, so a
+`cargo test` binary fails to link if any `#[cfg(test)]` code constructs one of those structs —
+even with the `Buffer` field set to `None`. Test pure/router-layer logic with plain Rust
+`#[test]`s that never touch the napi structs, or exercise napi-object construction through the
+JS integration suite below.
+
 - **`util.ts`** — self-signed cert generation via `openssl` (or a fallback baked-in cert if openssl is unavailable), free-port helper, echo servers, TLS/TCP round-trip helpers
 - **`proxy.spec.ts`** — TLS termination, wildcard SNI routing, `updateConfig` hot-swap
 - **`protection.spec.ts`** — rate limit token bucket exhaustion, CIDR blocklist in `blockedIps()`
