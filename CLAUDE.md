@@ -239,7 +239,7 @@ cargo fmt --check
 ```
 
 CI runs these Rust checks on Linux (`ubuntu-latest`), and its result is authoritative. On macOS,
-macOS does not compile the Linux-only `#[cfg(target_os = "linux")]` branches. Run `cargo test`
+the Linux-only `#[cfg(target_os = "linux")]` branches are not compiled. Run `cargo test`
 and `cargo clippy --all-targets` in a Linux environment before pushing from macOS. The [README Cross-compilation section](README.md#cross-compilation) documents the Linux Docker images.
 `cargo fmt --check` can run on either platform.
 
