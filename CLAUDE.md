@@ -239,9 +239,10 @@ cargo fmt --check
 ```
 
 CI runs these Rust checks on Linux (`ubuntu-latest`), and its result is authoritative. On macOS,
-`cargo test` and Clippy compile different `#[cfg(target_os = "linux")]` branches, so run those two
-checks in a Linux environment before pushing; a macOS pass alone does not validate Linux-only code.
-`cargo fmt --check` can run on either platform.
+run `cargo test` and `cargo clippy --all-targets` in a Linux environment before pushing; the
+[README Cross-compilation section](README.md#cross-compilation) documents the Linux Docker images.
+macOS compiles different `#[cfg(target_os = "linux")]` branches, so local test/lint passes are
+insufficient; `cargo fmt --check` can run on either platform.
 
 Tests bind on random high ports (`port: 0`) to avoid conflicts. Suspended-route tests use short `suspendTimeoutMs` (200ms) to keep the suite fast.
 
