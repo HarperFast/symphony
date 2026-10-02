@@ -159,7 +159,7 @@ napi `Buffer` contains raw pointers (`*mut napi_env__`, `*mut napi_ref__`) that 
 - All counter decrements use RAII guards (`BalancerGuard`, `ActiveGuard`). Never decrement in a finally-style chain.
 - `Relaxed` ordering for per-connection counters (active, accepted, errors). `AcqRel` only where cross-thread ordering is required — each such site has a comment explaining why.
 - Error type: `SymphonyError` → `napi::Error` via `From`. No `unwrap()` on paths reachable from JS.
-- `#![deny(clippy::all)]` is set in `lib.rs`. Fix clippy warnings before committing.
+- `#![deny(clippy::all)]` is set in `lib.rs`. Fix clippy warnings before committing; run `cargo clippy --all-targets` as listed in Testing.
 
 ---
 
@@ -215,11 +215,27 @@ Tests live in `__test__/` and use Node's built-in `node:test` runner.
 - **`metrics.spec.ts`** — per-listener breakdown and byte counting, `renderPrometheus` output shape, the admin endpoint over UDS + TCP, and stale-socket reclaim after a `SIGKILL`
 - **`liveness.spec.ts`** — the half-close bound over a real passthrough proxy. Its client uses `allowHalfOpen: true` (otherwise Node answers the proxy's FIN with its own and there is no half-close to bound) and a synthetic `clientHello()` from `util.ts` (otherwise `peek()` blocks for its 5s reassembly timeout and a no-SNI connection resolves to no route)
 
-Build and run:
+The Rust toolchain is pinned to `1.94.1` in `rust-toolchain.toml`. Ensure rustup's
+`~/.cargo/bin` is on `PATH` ahead of any system-installed `cargo`, including in non-interactive
+shells; `cargo --version` should report `1.94.1`. This also applies to `npm run build:debug`, which
+invokes Cargo.
+
+Build the addon before running the Node tests, and repeat the build after Rust changes so the tests
+load the current native addon:
 ```bash
 npm run build:debug
 npm test
 ```
+
+`npm test` does not run the Rust checks below. For changes to Rust source, Cargo manifests or
+lockfiles, or Rust toolchain configuration, run these Rust CI checks before pushing:
+```bash
+cargo test
+cargo clippy --all-targets
+cargo fmt --check
+```
+
+CI runs these Rust checks on Linux.
 
 Tests bind on random high ports (`port: 0`) to avoid conflicts. Suspended-route tests use short `suspendTimeoutMs` (200ms) to keep the suite fast.
 
