@@ -216,9 +216,11 @@ Tests live in `__test__/` and use Node's built-in `node:test` runner.
 - **`liveness.spec.ts`** — the half-close bound over a real passthrough proxy. Its client uses `allowHalfOpen: true` (otherwise Node answers the proxy's FIN with its own and there is no half-close to bound) and a synthetic `clientHello()` from `util.ts` (otherwise `peek()` blocks for its 5s reassembly timeout and a no-SNI connection resolves to no route)
 
 The Rust toolchain is pinned to `1.94.1` in `rust-toolchain.toml`. Ensure rustup's
-`~/.cargo/bin` is on `PATH` ahead of any system-installed `cargo`, including in non-interactive
-shells; `cargo --version` should report `1.94.1`. This also applies to `npm run build:debug`, which
-invokes Cargo.
+`~/.cargo/bin` (or `$CARGO_HOME/bin` with a custom Cargo home) is on `PATH` ahead of any
+system-installed `cargo`, including in non-interactive shells. From the repository root,
+`cargo --version` should report `1.94.1`; if the pinned toolchain is missing, run
+`rustup toolchain install` from the repository root. This also applies to `npm run build:debug`,
+which invokes Cargo.
 
 Build the addon before running the Node tests, and repeat the build after Rust changes so the tests
 load the current native addon:
@@ -227,15 +229,18 @@ npm run build:debug
 npm test
 ```
 
-`npm test` does not run the Rust checks below. For changes to Rust source, Cargo manifests or
-lockfiles, or Rust toolchain configuration, run these Rust CI checks before pushing:
+`npm test` does not run the Rust checks below. For changes to Rust sources (`src/**`, `build.rs`),
+Cargo manifests or lockfiles, or Rust toolchain/formatter configuration (`rust-toolchain.toml`,
+`rustfmt.toml`), run these Rust CI checks before pushing:
 ```bash
 cargo test
 cargo clippy --all-targets
 cargo fmt --check
 ```
 
-CI runs these Rust checks on Linux.
+CI runs these Rust checks on Linux (`ubuntu-latest`), and its result is authoritative. On macOS,
+`cargo test` and Clippy compile different `#[cfg(target_os = "linux")]` branches from Linux CI,
+so a clean local run cannot guarantee that CI will pass.
 
 Tests bind on random high ports (`port: 0`) to avoid conflicts. Suspended-route tests use short `suspendTimeoutMs` (200ms) to keep the suite fast.
 
