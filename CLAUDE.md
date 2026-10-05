@@ -207,6 +207,16 @@ napi `Buffer` contains raw pointers (`*mut napi_env__`, `*mut napi_ref__`) that 
 
 Tests live in `__test__/` and use Node's built-in `node:test` runner.
 
+`cargo test` runs in CI and works for most of the crate, but `#[cfg(test)]` code must not
+construct a struct that holds a `napi::bindgen_prelude::Buffer` field — directly (`JsCertConfig`,
+`JsMtlsConfig`) or transitively (`JsRouteConfig`, `JsListenerConfig`, `JsResolveRoute`, and
+anything that embeds one of those, e.g. `JsProxyConfig`, `JsHotConfig`) — even with that field
+set to `None`. `Buffer`'s drop glue only links against a running Node host, which a standalone
+`cargo test` binary doesn't have, so the link fails. Test pure/router-layer logic (structs
+without `Buffer`, like `JsProtectionConfig`, already have `#[test]` coverage) with plain Rust
+`#[test]`s, and exercise the `Buffer`-holding structs through the JS integration suite below
+instead.
+
 - **`util.ts`** — self-signed cert generation via `openssl` (or a fallback baked-in cert if openssl is unavailable), free-port helper, echo servers, TLS/TCP round-trip helpers
 - **`proxy.spec.ts`** — TLS termination, wildcard SNI routing, `updateConfig` hot-swap
 - **`protection.spec.ts`** — rate limit token bucket exhaustion, CIDR blocklist in `blockedIps()`
