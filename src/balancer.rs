@@ -186,8 +186,12 @@ impl UdsBalancer {
 			.collect()
 	}
 
-	/// Evict affinity entries older than TTL with no active connections.
-	/// Called by the background eviction task.
+	pub fn has_affinity(&self) -> bool {
+		self.affinity.is_some()
+	}
+
+	/// Evict affinity entries older than TTL — the ones `pick()` would no longer honour.
+	/// Called by `router::evict_affinity_periodically`.
 	pub fn evict_affinity(&self) {
 		let Some(aff) = &self.affinity else { return };
 		let now = now_ns();
@@ -195,6 +199,11 @@ impl UdsBalancer {
 			let last_seen = entry.last_seen_ns.load(Ordering::Relaxed);
 			now.saturating_sub(last_seen) < aff.ttl_ns
 		});
+	}
+
+	#[cfg(test)]
+	pub(crate) fn affinity_len(&self) -> usize {
+		self.affinity.as_ref().map_or(0, |aff| aff.entries.len())
 	}
 
 	/// Returns true if any slot has a pid/tid configured for CPU monitoring.
@@ -264,5 +273,38 @@ impl BalancerGuard {
 impl Drop for BalancerGuard {
 	fn drop(&mut self) {
 		self.balancer.decrement(&self.path);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn evict_affinity_drops_only_entries_past_their_ttl() {
+		let balancer = UdsBalancer::new(
+			vec![UdsSlotSpec {
+				path: "/tmp/symphony-test.sock".to_string(),
+				pid: None,
+				tid: None,
+			}],
+			true,
+			60_000,
+		);
+		let stale: IpAddr = "192.0.2.1".parse().unwrap();
+		let fresh: IpAddr = "192.0.2.2".parse().unwrap();
+		balancer.pick(Some(stale));
+		balancer.pick(Some(fresh));
+		let aff = balancer.affinity.as_ref().unwrap();
+		aff.entries
+			.get(&stale)
+			.unwrap()
+			.last_seen_ns
+			.store(0, Ordering::Relaxed);
+
+		balancer.evict_affinity();
+
+		assert!(!aff.entries.contains_key(&stale));
+		assert!(aff.entries.contains_key(&fresh));
 	}
 }

@@ -7,8 +7,8 @@ use crate::proxy_conn::{
 	ConnContext, JsEvent, DEFAULT_COPY_BUFFER_SIZE, MAX_COPY_BUFFER_SIZE, MIN_COPY_BUFFER_SIZE,
 };
 use crate::router::{
-	build_route_table, requires_http_protocol, ForwardFingerprint, ListenerTlsSpec, LiveRouteTable,
-	RouteProtocol, RouteSpec, SourceAddressMode, UpstreamSpec,
+	build_route_table, evict_affinity_periodically, requires_http_protocol, ForwardFingerprint,
+	ListenerTlsSpec, LiveRouteTable, RouteProtocol, RouteSpec, SourceAddressMode, UpstreamSpec,
 };
 use crate::suspended::{build_resolved_route, ResolveSpec, ResolveUpstream, SuspendedRegistry};
 use crate::tls::TlsConfigCache;
@@ -589,6 +589,12 @@ impl SymphonyProxyWrap {
 				}
 			}
 		});
+
+		self.rt_handle.spawn(evict_affinity_periodically(
+			self.route_table.clone(),
+			Duration::from_secs(60),
+			tx.subscribe(),
+		));
 
 		// Spawn a periodic IP state eviction task per listener that has protection.
 		// Eviction bounds ip_table memory growth under diverse-IP traffic / attack.
