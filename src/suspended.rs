@@ -118,9 +118,8 @@ pub fn build_resolved_route(
 			require_client_cert: spec.require_client_cert,
 		});
 
-		// Poison recovery as in `update_config`.
 		let mut cache = tls_cache.lock().unwrap_or_else(|e| e.into_inner());
-		Some(cache.get_or_build(&cert_spec, mtls_spec.as_ref(), spec.http2)?)
+		Some(cache.get_or_build_unmarked(&cert_spec, mtls_spec.as_ref(), spec.http2)?)
 	} else {
 		None
 	};

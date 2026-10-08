@@ -101,12 +101,36 @@ impl TlsConfigCache {
 		self.cache.is_empty()
 	}
 
+	/// For a route-table build: also marks the key as requested by the table being built.
 	pub fn get_or_build(
 		&mut self,
 		cert: &CertSpec,
 		mtls: Option<&MtlsSpec>,
 		http2: bool,
 	) -> Result<Arc<ServerConfig>> {
+		let (cache_key, cfg) = self.lookup_or_build(cert, mtls, http2)?;
+		// A hit is exactly as much "still in use" as a miss.
+		self.used.insert(cache_key);
+		Ok(cfg)
+	}
+
+	/// For `resolveConnection`: no table will hold the result, so marking it would only add a key
+	/// nothing reads before the next build clears it.
+	pub fn get_or_build_unmarked(
+		&mut self,
+		cert: &CertSpec,
+		mtls: Option<&MtlsSpec>,
+		http2: bool,
+	) -> Result<Arc<ServerConfig>> {
+		self.lookup_or_build(cert, mtls, http2).map(|(_, cfg)| cfg)
+	}
+
+	fn lookup_or_build(
+		&mut self,
+		cert: &CertSpec,
+		mtls: Option<&MtlsSpec>,
+		http2: bool,
+	) -> Result<(CacheKey, Arc<ServerConfig>)> {
 		// Hash both chain and private key so routes sharing a cert but using different
 		// keys (e.g. mid-rotation) get distinct ServerConfig allocations.
 		let cert_key = sha256(
@@ -126,18 +150,15 @@ impl TlsConfigCache {
 
 		let cache_key = (cert_key, mtls_key, http2);
 		if let Some(cfg) = self.cache.get(&cache_key) {
-			// Mark before returning: a hit is exactly as much "still in use" as a miss.
-			self.used.insert(cache_key);
-			return Ok(cfg.clone());
+			return Ok((cache_key, cfg.clone()));
 		}
 
 		let cfg = build_server_config(cert, mtls, http2)?;
 		self.cache.insert(cache_key, cfg.clone());
-		self.used.insert(cache_key);
 		if self.cache.len() > self.evict_at {
 			self.evict_unreferenced();
 		}
-		Ok(cfg)
+		Ok((cache_key, cfg))
 	}
 }
 
@@ -235,19 +256,33 @@ mod tests {
 	fn unreferenced_configs_are_bounded_without_a_reload() {
 		let mut cache = TlsConfigCache::new();
 		let held: Vec<_> = (0..4)
-			.map(|n| cache.get_or_build(&distinct_cert(n), None, false).unwrap())
+			.map(|n| {
+				cache
+					.get_or_build_unmarked(&distinct_cert(n), None, false)
+					.unwrap()
+			})
 			.collect();
 
 		for n in 4..MIN_EVICT_AT * 3 {
-			drop(cache.get_or_build(&distinct_cert(n), None, false).unwrap());
+			drop(
+				cache
+					.get_or_build_unmarked(&distinct_cert(n), None, false)
+					.unwrap(),
+			);
 			assert!(cache.len() <= MIN_EVICT_AT + 1);
 		}
+		assert!(
+			cache.used.is_empty(),
+			"resolutions must not leave marks behind"
+		);
 
 		for (n, config) in held.iter().enumerate() {
 			assert!(
 				Arc::ptr_eq(
 					config,
-					&cache.get_or_build(&distinct_cert(n), None, false).unwrap()
+					&cache
+						.get_or_build_unmarked(&distinct_cert(n), None, false)
+						.unwrap()
 				),
 				"a referenced config must survive pressure eviction"
 			);

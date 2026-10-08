@@ -42,8 +42,8 @@ describe('TLS session resumption', () => {
 	});
 
 	after(async () => {
-		await proxy.stop();
-		await echo.close();
+		await proxy?.stop();
+		await echo?.close();
 	});
 
 	for (const maxVersion of ['TLSv1.3', 'TLSv1.2'] as const) {
@@ -153,8 +153,8 @@ describe('TLS session resumption – suspended routes resolved with a cert', () 
 	});
 
 	after(async () => {
-		await proxy.stop();
-		await echo.close();
+		await proxy?.stop();
+		await echo?.close();
 	});
 
 	for (const maxVersion of ['TLSv1.3', 'TLSv1.2'] as const) {
