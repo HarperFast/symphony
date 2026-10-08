@@ -888,7 +888,9 @@ impl SymphonyProxyWrap {
 		let route_result = route.map(|r| {
 			parse_resolve_spec(&r)
 				.map_err(|e| e.reason)
-				.and_then(|spec| build_resolved_route(&spec).map_err(|e| e.to_string()))
+				.and_then(|spec| {
+					build_resolved_route(&spec, &self.tls_cache).map_err(|e| e.to_string())
+				})
 		});
 
 		let resolved = match route_result {

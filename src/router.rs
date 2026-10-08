@@ -792,13 +792,13 @@ impl LiveRouteTable {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use super::*;
 
 	// A self-signed cert (CERT_A) and its matching key (KEY_A), plus an unrelated key
 	// (KEY_B). Pairing CERT_A with KEY_B reproduces the production rustls KeyMismatch a
 	// cert rotation causes (leaf pubkey ≠ private key).
-	const CERT_A: &[u8] = b"-----BEGIN CERTIFICATE-----
+	pub(crate) const CERT_A: &[u8] = b"-----BEGIN CERTIFICATE-----
 MIIDNDCCAhygAwIBAgIUM+1LAIojftQSkEIBoBR0AV87XfowDQYJKoZIhvcNAQEL
 BQAwGzEZMBcGA1UEAwwQZ29vZC5leGFtcGxlLmNvbTAeFw0yNjA3MDYxNTQ4MzBa
 Fw0zNjA3MDMxNTQ4MzBaMBsxGTAXBgNVBAMMEGdvb2QuZXhhbXBsZS5jb20wggEi
@@ -820,7 +820,7 @@ ZlgCEToIkYUjQVGSygmQqFBbRC5EJAPb+Wpx8N5Y2+g/Q2qy2aPKXhIcOwFSrtbB
 -----END CERTIFICATE-----
 ";
 
-	const KEY_A: &[u8] = b"-----BEGIN PRIVATE KEY-----
+	pub(crate) const KEY_A: &[u8] = b"-----BEGIN PRIVATE KEY-----
 MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCua7KJUHPYvO/P
 aqLDMrHGlEddpxkFGMifO87nj9QRnIpHcz+nWrdvH57QpBRdojBC/j9L2/ybaRVG
 M52OO5fJm1DH4veD9axofkOGWBp1yPqDlxe0g/wlreWtAAMRVqGODw/OOvcDwnok
@@ -850,7 +850,7 @@ UKlOCXtHXb1XskMBV7W29w==
 -----END PRIVATE KEY-----
 ";
 
-	const KEY_B: &[u8] = b"-----BEGIN PRIVATE KEY-----
+	pub(crate) const KEY_B: &[u8] = b"-----BEGIN PRIVATE KEY-----
 MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCWxNE5Z315MdlX
 Za+MKSJrdcJlm5zHfsBZ642On9Cc+oMe+U5+91RMUhiNt524CNvQyDMTntiD9wn7
 zUaeQGZjP+wtUDcIG1S1EIXhoAWLWd+Jww/3WAYNxnauIW3QawlqH/aiJVxTgWB2
@@ -880,7 +880,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 -----END PRIVATE KEY-----
 ";
 
-	fn tls_route(sni: &str, cert: &[u8], key: &[u8]) -> RouteSpec {
+	pub(crate) fn tls_route(sni: &str, cert: &[u8], key: &[u8]) -> RouteSpec {
 		RouteSpec {
 			sni: sni.to_string(),
 			metrics_group: String::new(),
