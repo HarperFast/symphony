@@ -799,9 +799,8 @@ impl LiveRouteTable {
 	}
 }
 
-/// Reclaim expired IP-affinity entries from the live table's balancers every `interval` until
-/// `shutdown` fires. `pick()` already ignores an expired entry but only overwrites it when that
-/// same IP returns, so without this the maps grow with every distinct client IP until a reload.
+/// `pick()` ignores an expired affinity entry but only overwrites it when that same IP returns, so
+/// without this the maps grow with every distinct client IP until a reload.
 ///
 /// `DashMap::retain` is O(N) and write-locks each shard while scanning it, so it runs on the
 /// blocking pool, as IP-state eviction does; a `pick()` hashing to the shard under scan still

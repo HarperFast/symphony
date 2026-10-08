@@ -41,7 +41,6 @@ pub struct TlsConfigCache {
 	cache: HashMap<CacheKey, Arc<ServerConfig>>,
 	/// Keys touched since the last `retain_used()` — the mark half of mark-and-sweep.
 	used: HashSet<CacheKey>,
-	/// Cache size past which an insert runs `evict_unreferenced`.
 	evict_at: usize,
 }
 
@@ -87,8 +86,10 @@ impl TlsConfigCache {
 	fn evict_unreferenced(&mut self) {
 		self.cache.retain(|_, config| Arc::strong_count(config) > 1);
 		// Doubling keeps the scan amortised O(1) per insert even when referenced configs alone
-		// exceed the floor.
+		// exceed the floor; shrinking keeps it so after a large referenced set drains, since
+		// `retain` walks the allocation, not just the live entries.
 		self.evict_at = MIN_EVICT_AT.max(self.cache.len() * 2);
+		self.cache.shrink_to(self.evict_at);
 	}
 
 	#[cfg(test)]
