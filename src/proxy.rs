@@ -338,8 +338,8 @@ pub struct SymphonyProxyWrap {
 	// would serialise all connections onto one OS thread.  By creating our own
 	// multi-thread runtime and using its Handle to spawn, every accept loop and
 	// connection handler gets distributed across the full CPU count.
-	// Handle is Send+Sync; Runtime is Send-only, so it lives in a Mutex.
-	rt: Mutex<Option<Runtime>>,
+	// Never read: owning it is what keeps the runtime alive until the proxy is dropped.
+	_rt: Runtime,
 	rt_handle: RtHandle,
 }
 
@@ -508,14 +508,14 @@ impl SymphonyProxyWrap {
 			keepalive,
 			client_read_buffer_size,
 			upstream_read_buffer_size,
-			route_table: Arc::new(LiveRouteTable(arc_swap::ArcSwap::new(Arc::new(table)))),
+			route_table: LiveRouteTable::new(table),
 			suspended_registry: SuspendedRegistry::new(),
 			global_metrics: Arc::new(GlobalMetrics::default()),
 			listener_states,
 			shutdown_tx: Mutex::new(None),
 			tls_cache: Mutex::new(tls_cache),
 			js_emit: Arc::new(js_emit),
-			rt: Mutex::new(Some(rt)),
+			_rt: rt,
 			rt_handle,
 		})
 	}

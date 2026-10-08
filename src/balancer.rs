@@ -178,14 +178,6 @@ impl UdsBalancer {
 		}
 	}
 
-	/// Current active connection count per socket path, for metrics.
-	pub fn connection_counts(&self) -> Vec<(String, u32)> {
-		self.sockets
-			.iter()
-			.map(|s| (s.path.to_string(), s.active.load(Ordering::Relaxed)))
-			.collect()
-	}
-
 	pub fn has_affinity(&self) -> bool {
 		self.affinity.is_some()
 	}

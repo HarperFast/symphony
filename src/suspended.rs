@@ -61,11 +61,6 @@ impl SuspendedRegistry {
 	pub fn contains(&self, id: u64) -> bool {
 		self.pending.contains_key(&id)
 	}
-
-	/// Number of currently pending suspended connections.
-	pub fn pending_count(&self) -> u64 {
-		self.pending.len() as u64
-	}
 }
 
 // ── JS-side resolver spec ─────────────────────────────────────────────────────
