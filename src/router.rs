@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
 
 fn now_ns() -> u64 {
 	SystemTime::now()
@@ -235,6 +236,8 @@ pub struct RouteTable {
 	/// All UdsBalancers that have at least one pid/tid-configured slot.
 	/// Used by the CPU monitor task spawned in `proxy.rs::start()`.
 	pub monitored_balancers: Vec<Arc<UdsBalancer>>,
+	/// All UdsBalancers with IP affinity, for `evict_affinity_periodically`.
+	affinity_balancers: Vec<Arc<UdsBalancer>>,
 	/// SNIs whose cert failed to build in this table. Carried across a hot-swap so a
 	/// persistently-broken route is logged only on the good→bad transition, not every reconcile.
 	failing_snis: HashSet<Arc<str>>,
@@ -419,6 +422,7 @@ pub fn build_route_table(
 	let mut exact: HashMap<Arc<str>, Route> = HashMap::new();
 	let mut wildcard: Vec<(Arc<str>, Route)> = Vec::new();
 	let mut monitored_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
+	let mut affinity_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
 	let mut failing_snis: HashSet<Arc<str>> = HashSet::new();
 	let mut configured_wildcards = HashSet::with_capacity(specs.len());
 	let mut dropped_exact: HashSet<Arc<str>> = HashSet::new();
@@ -527,11 +531,14 @@ pub fn build_route_table(
 			configured_wildcards.insert(suffix);
 		}
 
-		// Collect UdsBalancers that have pid/tid slots for the monitor task.
+		// Collected from the route actually installed, which may be a carried-forward one.
 		for dest in std::iter::once(&route.destination).chain(route.destination_h2.iter()) {
 			if let Destination::UdsSet(ref bal) = dest {
 				if bal.has_monitored_slots() {
 					monitored_balancers.push(bal.clone());
+				}
+				if bal.has_affinity() {
+					affinity_balancers.push(bal.clone());
 				}
 			}
 		}
@@ -561,6 +568,7 @@ pub fn build_route_table(
 		default,
 		metric_identities,
 		monitored_balancers,
+		affinity_balancers,
 		failing_snis,
 		dropped_exact,
 		dropped_wildcard,
@@ -791,14 +799,44 @@ impl LiveRouteTable {
 	}
 }
 
+/// `pick()` ignores an expired affinity entry but only overwrites it when that same IP returns, so
+/// without this the maps grow with every distinct client IP until a reload.
+///
+/// `DashMap::retain` is O(N) and write-locks each shard while scanning it, so it runs on the
+/// blocking pool, as IP-state eviction does; a `pick()` hashing to the shard under scan still
+/// waits for that one shard.
+pub async fn evict_affinity_periodically(
+	live: Arc<LiveRouteTable>,
+	interval: Duration,
+	mut shutdown: broadcast::Receiver<()>,
+) {
+	loop {
+		tokio::select! {
+			_ = shutdown.recv() => break,
+			_ = tokio::time::sleep(interval) => {
+				let table = live.0.load_full();
+				if table.affinity_balancers.is_empty() {
+					continue;
+				}
+				let _ = tokio::task::spawn_blocking(move || {
+					for balancer in &table.affinity_balancers {
+						balancer.evict_affinity();
+					}
+				})
+				.await;
+			}
+		}
+	}
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use super::*;
 
 	// A self-signed cert (CERT_A) and its matching key (KEY_A), plus an unrelated key
 	// (KEY_B). Pairing CERT_A with KEY_B reproduces the production rustls KeyMismatch a
 	// cert rotation causes (leaf pubkey ≠ private key).
-	const CERT_A: &[u8] = b"-----BEGIN CERTIFICATE-----
+	pub(crate) const CERT_A: &[u8] = b"-----BEGIN CERTIFICATE-----
 MIIDNDCCAhygAwIBAgIUM+1LAIojftQSkEIBoBR0AV87XfowDQYJKoZIhvcNAQEL
 BQAwGzEZMBcGA1UEAwwQZ29vZC5leGFtcGxlLmNvbTAeFw0yNjA3MDYxNTQ4MzBa
 Fw0zNjA3MDMxNTQ4MzBaMBsxGTAXBgNVBAMMEGdvb2QuZXhhbXBsZS5jb20wggEi
@@ -820,7 +858,7 @@ ZlgCEToIkYUjQVGSygmQqFBbRC5EJAPb+Wpx8N5Y2+g/Q2qy2aPKXhIcOwFSrtbB
 -----END CERTIFICATE-----
 ";
 
-	const KEY_A: &[u8] = b"-----BEGIN PRIVATE KEY-----
+	pub(crate) const KEY_A: &[u8] = b"-----BEGIN PRIVATE KEY-----
 MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCua7KJUHPYvO/P
 aqLDMrHGlEddpxkFGMifO87nj9QRnIpHcz+nWrdvH57QpBRdojBC/j9L2/ybaRVG
 M52OO5fJm1DH4veD9axofkOGWBp1yPqDlxe0g/wlreWtAAMRVqGODw/OOvcDwnok
@@ -850,7 +888,7 @@ UKlOCXtHXb1XskMBV7W29w==
 -----END PRIVATE KEY-----
 ";
 
-	const KEY_B: &[u8] = b"-----BEGIN PRIVATE KEY-----
+	pub(crate) const KEY_B: &[u8] = b"-----BEGIN PRIVATE KEY-----
 MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCWxNE5Z315MdlX
 Za+MKSJrdcJlm5zHfsBZ642On9Cc+oMe+U5+91RMUhiNt524CNvQyDMTntiD9wn7
 zUaeQGZjP+wtUDcIG1S1EIXhoAWLWd+Jww/3WAYNxnauIW3QawlqH/aiJVxTgWB2
@@ -880,7 +918,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 -----END PRIVATE KEY-----
 ";
 
-	fn tls_route(sni: &str, cert: &[u8], key: &[u8]) -> RouteSpec {
+	pub(crate) fn tls_route(sni: &str, cert: &[u8], key: &[u8]) -> RouteSpec {
 		RouteSpec {
 			sni: sni.to_string(),
 			metrics_group: String::new(),
@@ -1371,5 +1409,114 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			SourceAddressMode::ProxyProtocol,
 			ForwardFingerprint::NONE
 		));
+	}
+
+	fn uds_upstream(path: &str, protocol: Option<&str>, ip_affinity: bool) -> UpstreamSpec {
+		UpstreamSpec::Uds {
+			paths: vec![path.to_string()],
+			pids: vec![None],
+			tids: vec![None],
+			ip_affinity,
+			affinity_ttl_ms: 0,
+			protocol: protocol.map(str::to_string),
+		}
+	}
+
+	/// A terminating route whose UDS upstreams include an h2 mirror, so it gets two balancers.
+	fn affinity_route(key: &[u8], ip_affinity: bool) -> RouteSpec {
+		let mut spec = tls_route("tenant.example.com", CERT_A, key);
+		spec.http2 = true;
+		spec.upstreams = vec![
+			uds_upstream("/tmp/symphony-test.sock", None, ip_affinity),
+			uds_upstream("/tmp/symphony-test-h2.sock", Some("h2"), ip_affinity),
+		];
+		spec
+	}
+
+	#[test]
+	fn affinity_balancers_come_from_the_installed_route() {
+		let mut cache = TlsConfigCache::new();
+		let no_affinity = build_route_table(
+			&[affinity_route(KEY_A, false)],
+			&ListenerTlsSpec::empty(),
+			None,
+			&mut cache,
+		)
+		.expect("build");
+		assert!(no_affinity.affinity_balancers.is_empty());
+
+		let live = build_route_table(
+			&[affinity_route(KEY_A, true)],
+			&ListenerTlsSpec::empty(),
+			Some(&no_affinity),
+			&mut cache,
+		)
+		.expect("build");
+		assert_eq!(
+			live.affinity_balancers.len(),
+			2,
+			"the h2 mirror's balancer carries its own affinity map"
+		);
+
+		// A cert mismatch carries the live route forward — affinity and all — even though the
+		// rejected spec turned affinity off. Its maps keep growing, so they must stay collected.
+		let carried = build_route_table(
+			&[affinity_route(KEY_B, false)],
+			&ListenerTlsSpec::empty(),
+			Some(&live),
+			&mut cache,
+		)
+		.expect("carry forward");
+		assert_eq!(carried.affinity_balancers.len(), 2);
+		assert!(carried
+			.affinity_balancers
+			.iter()
+			.zip(&live.affinity_balancers)
+			.all(|(a, b)| Arc::ptr_eq(a, b)));
+	}
+
+	#[tokio::test]
+	async fn affinity_eviction_follows_the_live_table_and_stops_on_shutdown() {
+		let mut cache = TlsConfigCache::new();
+		let live = LiveRouteTable::new(
+			build_route_table(&[], &ListenerTlsSpec::empty(), None, &mut cache).expect("build"),
+		);
+		let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+		let task = tokio::spawn(evict_affinity_periodically(
+			live.clone(),
+			Duration::from_millis(5),
+			shutdown_rx,
+		));
+
+		// Affinity arrives with a reload after the task started, so it has to re-read the table.
+		live.swap(
+			build_route_table(
+				&[affinity_route(KEY_A, true)],
+				&ListenerTlsSpec::empty(),
+				None,
+				&mut cache,
+			)
+			.expect("build"),
+		);
+		let balancers = live.0.load().affinity_balancers.clone();
+		for balancer in &balancers {
+			balancer.pick(Some("192.0.2.7".parse().unwrap()));
+			assert_eq!(balancer.affinity_len(), 1);
+		}
+
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+		while balancers.iter().any(|b| b.affinity_len() > 0) {
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"expired affinity entries were never reclaimed"
+			);
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+
+		shutdown_tx.send(()).unwrap();
+		tokio::time::timeout(Duration::from_secs(5), task)
+			.await
+			.expect("the task must exit on shutdown")
+			.unwrap();
 	}
 }

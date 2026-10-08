@@ -1,9 +1,10 @@
 use crate::balancer::{UdsBalancer, UdsSlotSpec};
 use crate::router::{Destination, ForwardFingerprint, RouteProtocol, SourceAddressMode};
+use crate::tls::{CertSpec, MtlsSpec, TlsConfigCache};
 use dashmap::DashMap;
 use rustls::ServerConfig;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
 /// The resolved route sent back from JS via `resolveConnection()`.
@@ -60,11 +61,6 @@ impl SuspendedRegistry {
 	pub fn contains(&self, id: u64) -> bool {
 		self.pending.contains_key(&id)
 	}
-
-	/// Number of currently pending suspended connections.
-	pub fn pending_count(&self) -> u64 {
-		self.pending.len() as u64
-	}
 }
 
 // ── JS-side resolver spec ─────────────────────────────────────────────────────
@@ -94,10 +90,13 @@ pub enum ResolveUpstream {
 	},
 }
 
-/// Build a `ResolvedRoute` from a `ResolveSpec`.
-pub fn build_resolved_route(spec: &ResolveSpec) -> crate::error::Result<ResolvedRoute> {
-	use crate::tls::{CertSpec, MtlsSpec, TlsConfigCache};
-
+/// Build a `ResolvedRoute` from a `ResolveSpec`. `tls_cache` is the proxy's own, so every
+/// resolution of one cert gets the same `ServerConfig` — and with it the session store and ticket
+/// keys a returning client needs to resume.
+pub fn build_resolved_route(
+	spec: &ResolveSpec,
+	tls_cache: &Mutex<TlsConfigCache>,
+) -> crate::error::Result<ResolvedRoute> {
 	let tls_config = if spec.terminate_tls {
 		let cert_pem = spec.cert_pem.as_deref().ok_or_else(|| {
 			crate::error::SymphonyError::Config(
@@ -119,8 +118,8 @@ pub fn build_resolved_route(spec: &ResolveSpec) -> crate::error::Result<Resolved
 			require_client_cert: spec.require_client_cert,
 		});
 
-		let mut cache = TlsConfigCache::new();
-		Some(cache.get_or_build(&cert_spec, mtls_spec.as_ref(), spec.http2)?)
+		let mut cache = tls_cache.lock().unwrap_or_else(|e| e.into_inner());
+		Some(cache.get_or_build_unmarked(&cert_spec, mtls_spec.as_ref(), spec.http2)?)
 	} else {
 		None
 	};
@@ -156,4 +155,124 @@ pub fn build_resolved_route(spec: &ResolveSpec) -> crate::error::Result<Resolved
 		forward_fingerprint: spec.forward_fingerprint,
 		protocol: spec.protocol,
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::router::tests::{CERT_A, KEY_A, KEY_B};
+	use crate::router::{build_route_table, ListenerTlsSpec, RouteSpec};
+
+	fn resolve_spec(key: &[u8]) -> ResolveSpec {
+		ResolveSpec {
+			upstream: ResolveUpstream::Tcp("127.0.0.1:9".parse().unwrap()),
+			terminate_tls: true,
+			cert_pem: Some(CERT_A.to_vec()),
+			key_pem: Some(key.to_vec()),
+			mtls_ca_pem: None,
+			require_client_cert: false,
+			source_address_mode: SourceAddressMode::None,
+			forward_fingerprint: ForwardFingerprint::NONE,
+			http2: false,
+			protocol: RouteProtocol::Opaque,
+		}
+	}
+
+	fn tls_config(spec: &ResolveSpec, cache: &Mutex<TlsConfigCache>) -> Arc<ServerConfig> {
+		build_resolved_route(spec, cache)
+			.expect("resolve")
+			.tls_config
+			.expect("terminating route")
+	}
+
+	/// A committed route-table reload, as `update_config` runs it.
+	fn reload(cache: &Mutex<TlsConfigCache>, specs: &[RouteSpec]) -> crate::router::RouteTable {
+		let mut cache = cache.lock().unwrap();
+		let table =
+			build_route_table(specs, &ListenerTlsSpec::empty(), None, &mut cache).expect("build");
+		cache.retain_used();
+		table
+	}
+
+	#[test]
+	fn resolutions_of_one_cert_share_a_server_config() {
+		let cache = Mutex::new(TlsConfigCache::new());
+		let spec = resolve_spec(KEY_A);
+		assert!(Arc::ptr_eq(
+			&tls_config(&spec, &cache),
+			&tls_config(&spec, &cache)
+		));
+	}
+
+	// One config means one ticketer, so anything that changes what a resumed session may skip
+	// (client auth, ALPN) must key a different one.
+	#[test]
+	fn tls_policy_keys_a_separate_server_config() {
+		let cache = Mutex::new(TlsConfigCache::new());
+		let plain = resolve_spec(KEY_A);
+		let mut mtls_required = resolve_spec(KEY_A);
+		mtls_required.mtls_ca_pem = Some(CERT_A.to_vec());
+		mtls_required.require_client_cert = true;
+		let mut mtls_optional = resolve_spec(KEY_A);
+		mtls_optional.mtls_ca_pem = Some(CERT_A.to_vec());
+		let mut h2 = resolve_spec(KEY_A);
+		h2.http2 = true;
+
+		let configs: Vec<_> = [&plain, &mtls_required, &mtls_optional, &h2]
+			.into_iter()
+			.map(|spec| tls_config(spec, &cache))
+			.collect();
+		for (i, a) in configs.iter().enumerate() {
+			for b in &configs[i + 1..] {
+				assert!(!Arc::ptr_eq(a, b));
+			}
+		}
+	}
+
+	#[test]
+	fn a_resolution_shares_a_table_route_config_for_the_same_cert() {
+		let cache = Mutex::new(TlsConfigCache::new());
+		let route = crate::router::tests::tls_route("tenant.example.com", CERT_A, KEY_A);
+		let table = reload(&cache, &[route]);
+		let table_config = table
+			.resolve(Some("tenant.example.com"))
+			.and_then(|r| r.tls_config.clone())
+			.expect("route config");
+		assert!(Arc::ptr_eq(
+			&table_config,
+			&tls_config(&resolve_spec(KEY_A), &cache)
+		));
+	}
+
+	#[test]
+	fn a_held_resolved_config_survives_a_reload_and_an_idle_one_does_not() {
+		let cache = Mutex::new(TlsConfigCache::new());
+		let spec = resolve_spec(KEY_A);
+
+		let held = tls_config(&spec, &cache);
+		reload(&cache, &[]);
+		assert!(
+			Arc::ptr_eq(&held, &tls_config(&spec, &cache)),
+			"a config a live connection holds must outlive the sweep"
+		);
+
+		drop(held);
+		reload(&cache, &[]);
+		assert!(
+			cache.lock().unwrap().is_empty(),
+			"no table or connection references it any more"
+		);
+	}
+
+	#[test]
+	fn a_failed_resolution_leaves_the_cache_usable() {
+		let cache = Mutex::new(TlsConfigCache::new());
+		assert!(build_resolved_route(&resolve_spec(KEY_B), &cache).is_err());
+		let first = tls_config(&resolve_spec(KEY_A), &cache);
+		assert!(Arc::ptr_eq(
+			&first,
+			&tls_config(&resolve_spec(KEY_A), &cache)
+		));
+		assert_eq!(cache.lock().unwrap().len(), 1);
+	}
 }

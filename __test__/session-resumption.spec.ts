@@ -42,8 +42,8 @@ describe('TLS session resumption', () => {
 	});
 
 	after(async () => {
-		await proxy.stop();
-		await echo.close();
+		await proxy?.stop();
+		await echo?.close();
 	});
 
 	for (const maxVersion of ['TLSv1.3', 'TLSv1.2'] as const) {
@@ -121,4 +121,59 @@ describe('TLS session resumption', () => {
 		await proxy.updateConfig({ routes: routes() });
 		await sleep(50);
 	});
+});
+
+// A resolved route's TLS config comes from resolveConnection(), not the route table. The suspended
+// route below carries no cert of its own, so a resumed second connection can only mean that both
+// resolutions were handed the same ServerConfig — and with it the same ticketer and session store.
+describe('TLS session resumption – suspended routes resolved with a cert', () => {
+	const cert = generateSelfSignedCert('localhost');
+	let proxyPort: number;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	let proxy: SymphonyProxy;
+	let resolutions = 0;
+
+	before(async () => {
+		echo = await startEchoServer();
+		proxyPort = await getFreePort();
+		proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: proxyPort }],
+			routes: [{ sni: 'localhost', upstreams: [], terminateTls: false, suspended: true, suspendTimeoutMs: 5000 }],
+		});
+		proxy.on('suspended', (conn) => {
+			resolutions++;
+			proxy.resolveConnection(conn.id, {
+				upstream: { kind: 'tcp', host: '127.0.0.1', port: echo.port },
+				terminateTls: true,
+				cert: { certChain: cert.cert, privateKey: cert.key },
+			});
+		});
+		await proxy.start();
+		await sleep(50);
+	});
+
+	after(async () => {
+		await proxy?.stop();
+		await echo?.close();
+	});
+
+	for (const maxVersion of ['TLSv1.3', 'TLSv1.2'] as const) {
+		it(`resumes a ${maxVersion} session issued to an earlier resolution of the same cert`, async () => {
+			const resolutionsBefore = resolutions;
+			const first = await tlsHandshake({ port: proxyPort, servername: 'localhost', caCert: cert.cert, maxVersion });
+			assert.equal(first.protocol, maxVersion);
+			assert.equal(first.reused, false);
+			assert.ok(first.session, 'the server must issue a session to resume against');
+
+			const second = await tlsHandshake({
+				port: proxyPort,
+				servername: 'localhost',
+				caCert: cert.cert,
+				maxVersion,
+				session: first.session,
+			});
+			assert.equal(second.reused, true, 'each resolution must not mint its own ServerConfig for an unchanged cert');
+			assert.equal(resolutions - resolutionsBefore, 2, 'both connections must have gone through resolveConnection');
+		});
+	}
 });

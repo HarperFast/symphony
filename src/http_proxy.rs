@@ -159,22 +159,12 @@ pub fn is_transfer_encoding_chunked(headers: &[u8]) -> bool {
 		.unwrap_or(false)
 }
 
-/// Return `true` if the `Connection: close` header is present.
-pub fn is_connection_close(headers: &[u8]) -> bool {
-	connection_has_token(headers, "close")
-}
-
 /// Return `true` if a protocol upgrade is requested (e.g. WebSocket).
 /// `Connection` may be split across several fields (`Connection: keep-alive` +
 /// `Connection: Upgrade`) — every field's token list counts.
 pub fn is_upgrade(headers: &[u8]) -> bool {
 	header_fields(headers).any(|(n, _)| n.eq_ignore_ascii_case(b"upgrade"))
 		&& connection_has_token(headers, "upgrade")
-}
-
-/// Parse the HTTP response status code (first line: `HTTP/1.x NNN ...`).
-pub fn status_code(headers: &[u8]) -> u16 {
-	parse_status(headers).unwrap_or(200)
 }
 
 /// Status code of a response head, or `None` when the status line is malformed.
@@ -254,14 +244,6 @@ pub fn with_connection_close(headers: &[u8]) -> Vec<u8> {
 	rewrite_connection_header(headers, b"Connection: close\r\n")
 }
 
-/// Return a copy of `headers` with the `Connection` field replaced by (or
-/// inserted as) `Connection: keep-alive`.
-///
-/// `headers` must include the trailing `\r\n\r\n`.
-pub fn with_connection_keep_alive(headers: &[u8]) -> Vec<u8> {
-	rewrite_connection_header(headers, b"Connection: keep-alive\r\n")
-}
-
 /// Return a copy of `headers` with any `Content-Length` and `Transfer-Encoding`
 /// fields removed.  Intended for ACME proxy requests which we treat as
 /// body-less GETs — stripping these headers avoids deadlocking the upstream if
@@ -331,22 +313,6 @@ fn rewrite_connection_header(headers: &[u8], replacement: &[u8]) -> Vec<u8> {
 		out.extend_from_slice(replacement);
 	}
 	out.extend_from_slice(b"\r\n"); // end-of-headers blank line
-	out
-}
-
-/// Insert `X-Forwarded-For: <ip>` after the first request line.
-pub fn insert_x_forwarded_for(headers: &[u8], peer_ip: std::net::IpAddr) -> Vec<u8> {
-	let xff = format!("X-Forwarded-For: {}\r\n", peer_ip);
-	// End of first line (method SP path SP version \r\n)
-	let insert_at = headers
-		.windows(2)
-		.position(|w| w == b"\r\n")
-		.map(|p| p + 2)
-		.unwrap_or(0);
-	let mut out = Vec::with_capacity(headers.len() + xff.len());
-	out.extend_from_slice(&headers[..insert_at]);
-	out.extend_from_slice(xff.as_bytes());
-	out.extend_from_slice(&headers[insert_at..]);
 	out
 }
 
