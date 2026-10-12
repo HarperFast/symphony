@@ -7,8 +7,8 @@ use crate::proxy_conn::{
 	ConnContext, JsEvent, DEFAULT_COPY_BUFFER_SIZE, MAX_COPY_BUFFER_SIZE, MIN_COPY_BUFFER_SIZE,
 };
 use crate::router::{
-	build_route_table, requires_http_protocol, ForwardFingerprint, ListenerTlsSpec, LiveRouteTable,
-	RouteProtocol, RouteSpec, SourceAddressMode, UpstreamSpec,
+	build_route_table, evict_affinity_periodically, requires_http_protocol, ForwardFingerprint,
+	ListenerTlsSpec, LiveRouteTable, RouteProtocol, RouteSpec, SourceAddressMode, UpstreamSpec,
 };
 use crate::suspended::{build_resolved_route, ResolveSpec, ResolveUpstream, SuspendedRegistry};
 use crate::tls::TlsConfigCache;
@@ -338,8 +338,8 @@ pub struct SymphonyProxyWrap {
 	// would serialise all connections onto one OS thread.  By creating our own
 	// multi-thread runtime and using its Handle to spawn, every accept loop and
 	// connection handler gets distributed across the full CPU count.
-	// Handle is Send+Sync; Runtime is Send-only, so it lives in a Mutex.
-	rt: Mutex<Option<Runtime>>,
+	// Never read: owning it is what keeps the runtime alive until the proxy is dropped.
+	_rt: Runtime,
 	rt_handle: RtHandle,
 }
 
@@ -508,14 +508,14 @@ impl SymphonyProxyWrap {
 			keepalive,
 			client_read_buffer_size,
 			upstream_read_buffer_size,
-			route_table: Arc::new(LiveRouteTable(arc_swap::ArcSwap::new(Arc::new(table)))),
+			route_table: LiveRouteTable::new(table),
 			suspended_registry: SuspendedRegistry::new(),
 			global_metrics: Arc::new(GlobalMetrics::default()),
 			listener_states,
 			shutdown_tx: Mutex::new(None),
 			tls_cache: Mutex::new(tls_cache),
 			js_emit: Arc::new(js_emit),
-			rt: Mutex::new(Some(rt)),
+			_rt: rt,
 			rt_handle,
 		})
 	}
@@ -589,6 +589,12 @@ impl SymphonyProxyWrap {
 				}
 			}
 		});
+
+		self.rt_handle.spawn(evict_affinity_periodically(
+			self.route_table.clone(),
+			Duration::from_secs(60),
+			tx.subscribe(),
+		));
 
 		// Spawn a periodic IP state eviction task per listener that has protection.
 		// Eviction bounds ip_table memory growth under diverse-IP traffic / attack.
@@ -888,7 +894,9 @@ impl SymphonyProxyWrap {
 		let route_result = route.map(|r| {
 			parse_resolve_spec(&r)
 				.map_err(|e| e.reason)
-				.and_then(|spec| build_resolved_route(&spec).map_err(|e| e.to_string()))
+				.and_then(|spec| {
+					build_resolved_route(&spec, &self.tls_cache).map_err(|e| e.to_string())
+				})
 		});
 
 		let resolved = match route_result {

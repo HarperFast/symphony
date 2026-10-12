@@ -106,9 +106,9 @@ describe('Suspended routes – hold then resolve', () => {
 
 		// 3. Resolve the connection — this triggers the TLS handshake + proxying.
 		//    terminateTls: true = proxy terminates TLS from the client, then forwards
-		//    plaintext to the upstream. The cert must be provided here because the
-		//    resolved route builds its own TLS config (the original route's config
-		//    is not reused for resolved connections).
+		//    plaintext to the upstream. The cert must be provided here: a resolved
+		//    route takes its TLS config from the resolution, not from the suspended
+		//    route's own cert.
 		proxy.resolveConnection(capturedConn!.id, {
 			upstream: { kind: 'tcp', host: '127.0.0.1', port: echo.port },
 			terminateTls: true,

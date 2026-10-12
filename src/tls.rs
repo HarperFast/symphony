@@ -33,17 +33,29 @@ type CacheKey = ([u8; 32], [u8; 32], bool);
 /// renewal rebuilds the whole table — so a per-build cache means clients almost never get to
 /// resume. Keying on the cert bytes gives exactly the right lifetime: session state survives as
 /// long as the cert it was issued under, and rotating a cert retires it.
+///
+/// `resolveConnection` draws from the same cache. No route table holds those configs, so they
+/// live by refcount alone: kept while a connection holds one, dropped by the next build's
+/// `clear_used` or by an insert past `evict_at` — whichever comes first.
 pub struct TlsConfigCache {
 	cache: HashMap<CacheKey, Arc<ServerConfig>>,
 	/// Keys touched since the last `retain_used()` — the mark half of mark-and-sweep.
 	used: HashSet<CacheKey>,
+	evict_at: usize,
 }
+
+/// Floor for `evict_at`: how many configs nothing references (idle resolved-route certs) a proxy
+/// that never reloads its route table keeps for resumption. Each one carries a session store
+/// preallocated for 1024 entries, so without a bound they accumulate with every distinct cert
+/// ever resolved.
+const MIN_EVICT_AT: usize = 256;
 
 impl TlsConfigCache {
 	pub fn new() -> Self {
 		Self {
 			cache: HashMap::new(),
 			used: HashSet::new(),
+			evict_at: MIN_EVICT_AT,
 		}
 	}
 
@@ -66,7 +78,18 @@ impl TlsConfigCache {
 	/// without the retain, repeatedly-failing reloads accumulate a config per attempt.
 	pub(crate) fn clear_used(&mut self) {
 		self.used.clear();
+		self.evict_unreferenced();
+	}
+
+	/// Drop every config only the cache holds. A route table or a live connection holding one
+	/// keeps it, so the cost is one full handshake per returning client of an idle resolved route.
+	fn evict_unreferenced(&mut self) {
 		self.cache.retain(|_, config| Arc::strong_count(config) > 1);
+		// Doubling keeps the scan amortised O(1) per insert even when referenced configs alone
+		// exceed the floor; shrinking keeps it so after a large referenced set drains, since
+		// `retain` walks the allocation, not just the live entries.
+		self.evict_at = MIN_EVICT_AT.max(self.cache.len() * 2);
+		self.cache.shrink_to(self.evict_at);
 	}
 
 	#[cfg(test)]
@@ -79,12 +102,36 @@ impl TlsConfigCache {
 		self.cache.is_empty()
 	}
 
+	/// For a route-table build: also marks the key as requested by the table being built.
 	pub fn get_or_build(
 		&mut self,
 		cert: &CertSpec,
 		mtls: Option<&MtlsSpec>,
 		http2: bool,
 	) -> Result<Arc<ServerConfig>> {
+		let (cache_key, cfg) = self.lookup_or_build(cert, mtls, http2)?;
+		// A hit is exactly as much "still in use" as a miss.
+		self.used.insert(cache_key);
+		Ok(cfg)
+	}
+
+	/// For `resolveConnection`: no table will hold the result, so marking it would only add a key
+	/// nothing reads before the next build clears it.
+	pub fn get_or_build_unmarked(
+		&mut self,
+		cert: &CertSpec,
+		mtls: Option<&MtlsSpec>,
+		http2: bool,
+	) -> Result<Arc<ServerConfig>> {
+		self.lookup_or_build(cert, mtls, http2).map(|(_, cfg)| cfg)
+	}
+
+	fn lookup_or_build(
+		&mut self,
+		cert: &CertSpec,
+		mtls: Option<&MtlsSpec>,
+		http2: bool,
+	) -> Result<(CacheKey, Arc<ServerConfig>)> {
 		// Hash both chain and private key so routes sharing a cert but using different
 		// keys (e.g. mid-rotation) get distinct ServerConfig allocations.
 		let cert_key = sha256(
@@ -104,15 +151,15 @@ impl TlsConfigCache {
 
 		let cache_key = (cert_key, mtls_key, http2);
 		if let Some(cfg) = self.cache.get(&cache_key) {
-			// Mark before returning: a hit is exactly as much "still in use" as a miss.
-			self.used.insert(cache_key);
-			return Ok(cfg.clone());
+			return Ok((cache_key, cfg.clone()));
 		}
 
 		let cfg = build_server_config(cert, mtls, http2)?;
 		self.cache.insert(cache_key, cfg.clone());
-		self.used.insert(cache_key);
-		Ok(cfg)
+		if self.cache.len() > self.evict_at {
+			self.evict_unreferenced();
+		}
+		Ok((cache_key, cfg))
 	}
 }
 
@@ -188,4 +235,58 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 	let mut out = [0u8; 32];
 	out.copy_from_slice(digest.as_ref());
 	out
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::router::tests::{CERT_A, KEY_A};
+
+	/// The same cert with a distinct comment line: PEM parsing ignores it, the cache key doesn't.
+	fn distinct_cert(n: usize) -> CertSpec {
+		let mut chain = CERT_A.to_vec();
+		chain.extend_from_slice(format!("# {n}\n").as_bytes());
+		CertSpec {
+			cert_chain_pem: chain,
+			private_key_pem: KEY_A.to_vec().into(),
+		}
+	}
+
+	// Without a reload nothing else evicts, so every distinct cert ever resolved would stay.
+	#[test]
+	fn unreferenced_configs_are_bounded_without_a_reload() {
+		let mut cache = TlsConfigCache::new();
+		let held: Vec<_> = (0..4)
+			.map(|n| {
+				cache
+					.get_or_build_unmarked(&distinct_cert(n), None, false)
+					.unwrap()
+			})
+			.collect();
+
+		for n in 4..MIN_EVICT_AT * 3 {
+			drop(
+				cache
+					.get_or_build_unmarked(&distinct_cert(n), None, false)
+					.unwrap(),
+			);
+			assert!(cache.len() <= MIN_EVICT_AT + 1);
+		}
+		assert!(
+			cache.used.is_empty(),
+			"resolutions must not leave marks behind"
+		);
+
+		for (n, config) in held.iter().enumerate() {
+			assert!(
+				Arc::ptr_eq(
+					config,
+					&cache
+						.get_or_build_unmarked(&distinct_cert(n), None, false)
+						.unwrap()
+				),
+				"a referenced config must survive pressure eviction"
+			);
+		}
+	}
 }
