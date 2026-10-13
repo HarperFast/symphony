@@ -1034,25 +1034,27 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 class RunAborted extends Error {}
 
 class Child {
+	readonly name: string;
+	readonly proc: ChildProcess;
 	private seq = 0;
-	private readonly waiting = new Map<number, (stats: any) => void>();
+	private readonly waiting = new Map<number, { resolve: (stats: any) => void; reject: (err: Error) => void }>();
 	readonly ready: Promise<void>;
 	exited?: string;
 
-	constructor(
-		readonly name: string,
-		readonly proc: ChildProcess
-	) {
+	constructor(name: string, proc: ChildProcess) {
+		this.name = name;
+		this.proc = proc;
 		this.ready = new Promise((resolveReady, reject) => {
 			const fail = (reason: string): void => {
 				this.exited ??= reason;
 				reject(new Error(this.exited));
+				for (const waiter of [...this.waiting.values()]) waiter.reject(new RunAborted(this.exited));
 			};
 			proc.on('error', (err) => fail(`${name} failed: ${err.message}`));
 			proc.once('exit', (code, signal) => fail(`${name} exited (${signal ?? code})`));
 			const onMessage = (msg: any): void => {
 				if (msg.type === 'ready') resolveReady();
-				else if (msg.type === 'stats') this.waiting.get(msg.seq)?.(msg.stats);
+				else if (msg.type === 'stats') this.waiting.get(msg.seq)?.resolve(msg.stats);
 			};
 			// A forked Node child talks over IPC; the python slow reader over stdin/stdout JSON lines.
 			if (proc.stdout) {
@@ -1080,16 +1082,30 @@ class Child {
 	stats<T>(): Promise<T> {
 		const seq = ++this.seq;
 		return new Promise((resolveStats, reject) => {
-			const timer = setTimeout(() => {
-				this.waiting.delete(seq);
-				reject(new RunAborted(this.exited ?? `${this.name} did not answer within ${IPC_TIMEOUT_MS} ms`));
-			}, IPC_TIMEOUT_MS);
-			this.waiting.set(seq, (stats) => {
+			const settle = (): void => {
 				clearTimeout(timer);
 				this.waiting.delete(seq);
-				resolveStats(stats);
-			});
-			this.send({ type: 'stats', seq });
+			};
+			const waiter = {
+				resolve: (stats: T): void => {
+					settle();
+					resolveStats(stats);
+				},
+				reject: (err: Error): void => {
+					settle();
+					reject(err);
+				},
+			};
+			const timer = setTimeout(
+				() => waiter.reject(new RunAborted(`${this.name} did not answer within ${IPC_TIMEOUT_MS} ms`)),
+				IPC_TIMEOUT_MS
+			);
+			this.waiting.set(seq, waiter);
+			try {
+				this.send({ type: 'stats', seq });
+			} catch (err) {
+				waiter.reject(err as Error);
+			}
 		});
 	}
 }
@@ -1102,17 +1118,35 @@ class Run {
 	private timer?: NodeJS.Timeout;
 	private fault?: string;
 
+	private readonly opts: Options;
+	readonly pid: number;
+	readonly port: number;
+	readonly adminSocket: string;
+	readonly cgroupDir: string | undefined;
+	readonly clients: Child[];
+	/** python3 clients that can stall with a small receive window; part of every target total. */
+	readonly slowClients: Child[];
+	readonly upstreams: Child[];
+
 	constructor(
-		private readonly opts: Options,
-		readonly pid: number,
-		readonly port: number,
-		readonly adminSocket: string,
-		readonly cgroupDir: string | undefined,
-		readonly clients: Child[],
-		/** python3 clients that can stall with a small receive window; part of every target total. */
-		readonly slowClients: Child[],
-		readonly upstreams: Child[]
-	) {}
+		opts: Options,
+		pid: number,
+		port: number,
+		adminSocket: string,
+		cgroupDir: string | undefined,
+		clients: Child[],
+		slowClients: Child[],
+		upstreams: Child[]
+	) {
+		this.opts = opts;
+		this.pid = pid;
+		this.port = port;
+		this.adminSocket = adminSocket;
+		this.cgroupDir = cgroupDir;
+		this.clients = clients;
+		this.slowClients = slowClients;
+		this.upstreams = upstreams;
+	}
 
 	startTimeline(): void {
 		const ownCgroup = cgroupDirOf(process.pid);
@@ -1401,6 +1435,12 @@ const sha256 = (file: string): string => createHash('sha256').update(readFileSyn
 
 /** Everything a run started, so a signal or crash can stop it. */
 const live = new Set<ChildProcess>();
+const socketDirs = new Set<string>();
+
+function removeSocketDir(dir: string): void {
+	rmSync(dir, { recursive: true, force: true });
+	socketDirs.delete(dir);
+}
 /** Set by a signal: a run still starting up must not leave a process the stop snapshot missed. */
 let stopping = false;
 
@@ -1437,6 +1477,7 @@ async function runProcess(
 	const port = await freePort();
 	// Sockets live apart from the results, whose path can be too deep for a socket address.
 	const socketDir = mkdtempSync(join(socketRoot(), 'smo-'));
+	socketDirs.add(socketDir);
 	const adminSocket = join(socketDir, 'admin.sock');
 	const result: RunResult = { arm: arm.name, kind, repeat, samples: [], timeline: [], trimMicros: [] };
 
@@ -1461,13 +1502,6 @@ async function runProcess(
 		...arm.config,
 	};
 	const configPath = join(runDir, 'config.json');
-	writeFileSync(
-		configPath,
-		JSON.stringify({ version: 1, admin: { socketPath: adminSocket }, proxies: [proxy] }, null, 2),
-		{
-			mode: 0o600,
-		}
-	);
 
 	const started: ChildProcess[] = [];
 	const track = (child: ChildProcess): ChildProcess => {
@@ -1477,6 +1511,11 @@ async function runProcess(
 		return child;
 	};
 	try {
+		writeFileSync(
+			configPath,
+			JSON.stringify({ version: 1, admin: { socketPath: adminSocket }, proxies: [proxy] }, null, 2),
+			{ mode: 0o600 }
+		);
 		const upstreams = upstreamPaths.map(
 			(path, i) =>
 				new Child(
@@ -1725,7 +1764,7 @@ async function runProcess(
 		console.warn(`    run failed: ${result.error}`);
 	} finally {
 		await stopAll(started);
-		rmSync(socketDir, { recursive: true, force: true });
+		removeSocketDir(socketDir);
 	}
 
 	const logFile = join(runDir, 'symphony.log');
@@ -1990,6 +2029,9 @@ function summarizeDirs(dirs: string[]): void {
 			rustJemallocAddon: undefined,
 			jemalloc: undefined,
 			mimalloc: undefined,
+			phases: undefined,
+			cgroup: undefined,
+			minAvailableMb: undefined,
 		});
 	for (const run of runs.slice(1)) {
 		if (workload(run.options) !== workload(runs[0].options)) {
@@ -2042,7 +2084,10 @@ async function orchestrate(argv: string[]): Promise<void> {
 	const stopOnSignal = (signal: NodeJS.Signals): void => {
 		stopping = true;
 		console.warn(`${signal}: stopping ${live.size} child processes`);
-		stopAll([...live]).finally(() => process.exit(130));
+		stopAll([...live]).finally(() => {
+			for (const dir of [...socketDirs]) removeSocketDir(dir);
+			process.exit(130);
+		});
 	};
 	process.once('SIGINT', stopOnSignal);
 	process.once('SIGTERM', stopOnSignal);
