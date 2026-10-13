@@ -83,7 +83,7 @@ describe('memory benchmark hooks', () => {
 	});
 
 	it(
-		'the trim loop runs alongside traffic and ends with each proxy',
+		'the trim loop runs alongside traffic, on two proxies in turn',
 		{ skip: !hasGlibc && 'malloc_trim is glibc-only' },
 		async () => {
 			for (let i = 0; i < 2; i++) {

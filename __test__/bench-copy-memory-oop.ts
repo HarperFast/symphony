@@ -5,12 +5,12 @@
  * symphony-server runs in its own process — in its own cgroup with swap disabled when
  * `systemd-run --user` works — while the TLS clients and the UDS upstreams run in separate processes.
  * Only symphony's process is sampled. The in-process benchmarks measured their own load generator's
- * memory and reached three wrong conclusions (PR #41); do not fold this back into one process.
+ * memory, not the proxy's (PR #41); do not fold this back into one process.
  *
  *   npm run build                      # release build; never benchmark a debug addon
  *   npm run benchmark:memory-oop -- --conns 100000 --repeats 3
  *
- * Run it under ~/dev/scripts/bench-run on a shared host. `--help` lists the options.
+ * On a shared host, run it under whatever serialises benchmarks there. `--help` lists the options.
  *
  * Roles: the orchestrator (default) forks `--role client` and `--role upstream` copies of this file,
  * plus, for the slow-reader phase, a small python3 client (SLOW_CLIENT_PY) that can set SO_RCVBUF.
@@ -18,7 +18,16 @@
 
 import { fork, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFileSync, cpSync, createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+	copyFileSync,
+	cpSync,
+	createWriteStream,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	realpathSync,
+	writeFileSync,
+} from 'node:fs';
 import { get as httpGet } from 'node:http';
 import { connect as netConnect, createServer as createNetServer, type Socket } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
@@ -650,7 +659,7 @@ function runUpstream(argv: string[]): void {
 
 /**
  * A client that can stall with a small receive window, so the backlog reaches symphony instead of
- * its own kernel. Node cannot set SO_RCVBUF on a TCP socket, and on this kernel an unlocked receive
+ * its own kernel. Node cannot set SO_RCVBUF on a TCP socket, and on recent kernels (7.0) an unlocked receive
  * buffer keeps growing while data arrives even if nothing reads it, so a paused Node socket absorbs
  * megabytes before symphony sees a closed window. A remote stalled reader closes it far sooner.
  * Speaks the client protocol over Node's IPC channel (line-delimited JSON on NODE_CHANNEL_FD).
@@ -980,7 +989,7 @@ class Child {
 		readonly proc: ChildProcess
 	) {
 		this.ready = new Promise((resolveReady, reject) => {
-			proc.once('error', (err) => {
+			proc.on('error', (err) => {
 				this.exited = `${name} failed to start: ${err.message}`;
 				reject(new Error(this.exited));
 			});
@@ -1186,7 +1195,11 @@ class Run {
 			stableFor = clients.bytesIn === last ? stableFor + 1 : 0;
 			last = clients.bytesIn;
 			if (stableFor >= 10 || Date.now() > deadline) {
-				return `payload mismatch: upstream wrote ${upstreams.bytesOut} B, clients read ${clients.bytesIn} B; clients wrote ${clients.bytesOut} B, upstream read ${upstreams.bytesIn} B`;
+				return (
+					`payload mismatch: upstream wrote ${upstreams.bytesOut} B, clients read ${clients.bytesIn} B; ` +
+					`clients wrote ${clients.bytesOut} B, upstream read ${upstreams.bytesIn} B ` +
+					`(${clients.lost} connections lost, ${clients.failed} failed)`
+				);
 			}
 			await this.hold(1000);
 		}
@@ -1216,6 +1229,8 @@ class Run {
 			upstreams,
 		};
 		this.samples.push(sample);
+		// A fault raised while sampling (memory, TCP pressure, a dead child) invalidates even the last sample.
+		this.checkAlive();
 		const mb = (b: number): string => (b / 1048576).toFixed(0);
 		const kernel = sample.sockets ? sample.sockets.rmem + sample.sockets.wqueued + sample.sockets.fwd : undefined;
 		console.log(
@@ -1466,8 +1481,11 @@ async function runProcess(
 					.filter((p) => p && /\.so|\.node/.test(p))
 			),
 		];
-		if (!maps.includes(expectedAddon)) throw new Error(`symphony did not load ${expectedAddon}`);
-		if (arm.mustMap && !maps.includes(arm.mustMap)) throw new Error(`${arm.mustMap} is not mapped into symphony`);
+		// maps records real paths; a symlinked library or output directory must still match.
+		if (!maps.includes(realpathSync(expectedAddon))) throw new Error(`symphony did not load ${expectedAddon}`);
+		if (arm.mustMap && !maps.includes(realpathSync(arm.mustMap))) {
+			throw new Error(`${arm.mustMap} is not mapped into symphony`);
+		}
 		const cgroupDir = useScope ? cgroupDirOf(pid) : undefined;
 		if (cgroupDir && !cgroupDir.endsWith(`/${unit}.scope`))
 			throw new Error(`symphony landed in ${cgroupDir}, not its own scope`);
