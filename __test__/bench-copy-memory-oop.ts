@@ -1979,8 +1979,18 @@ function summarizeDirs(dirs: string[]): void {
 		options: (JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')) as { options: Options }).options,
 		results: JSON.parse(readFileSync(join(dir, 'results.json'), 'utf8')) as RunResult[],
 	}));
+	// Build paths are not workload: the per-arm addon hash below is what identifies a build.
 	const workload = (o: Options): string =>
-		JSON.stringify({ ...o, arms: undefined, repeats: undefined, out: undefined, addonArms: undefined });
+		JSON.stringify({
+			...o,
+			arms: undefined,
+			repeats: undefined,
+			out: undefined,
+			addonArms: undefined,
+			rustJemallocAddon: undefined,
+			jemalloc: undefined,
+			mimalloc: undefined,
+		});
 	for (const run of runs.slice(1)) {
 		if (workload(run.options) !== workload(runs[0].options)) {
 			throw new Error('--summarize: the directories were run with different workload options');
