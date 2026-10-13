@@ -945,6 +945,9 @@ Two caveats when sizing a node from this:
   rustls session state per connection, plus kernel socket memory (bounded in aggregate by
   `net.ipv4.tcp_mem`). Measure the actual slope — `activeConnections` from the admin endpoint
   against process RSS — before deciding a connection target is reachable.
+  `npm run benchmark:memory-oop` (`__test__/bench-copy-memory-oop.ts`) does this with symphony in
+  its own process under parked, active, slow-reader and churn load; the other `benchmark*` scripts
+  host the proxy inside their own load generator, so their RSS is mostly the client's.
 - Buffer memory is not what caps connection count. File descriptors (2 per proxied connection,
   against `RLIMIT_NOFILE`) and `nf_conntrack_max` bind first; see
   [Linux kernel tuning](#linux-kernel-tuning).

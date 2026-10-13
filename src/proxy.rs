@@ -322,6 +322,8 @@ pub struct SymphonyProxyWrap {
 	keepalive: Option<KeepaliveConfig>,
 	client_read_buffer_size: usize,
 	upstream_read_buffer_size: usize,
+	tls_buffer_limit: Option<usize>,
+	malloc_trim_interval: Option<Duration>,
 	// Shared runtime state
 	route_table: Arc<LiveRouteTable>,
 	suspended_registry: Arc<SuspendedRegistry>,
@@ -382,6 +384,10 @@ impl SymphonyProxyWrap {
 		};
 		let half_close_timeout = parse_half_close_timeout(config.half_close_timeout_ms)?;
 		let keepalive = parse_keepalive_config(config.tcp_keepalive.as_ref())?;
+		let tls_buffer_limit =
+			crate::bench_hooks::tls_buffer_limit().map_err(napi::Error::from_reason)?;
+		let malloc_trim_interval =
+			crate::bench_hooks::malloc_trim_interval().map_err(napi::Error::from_reason)?;
 		let base_read_buffer_size =
 			resolve_copy_buffer_size(config.read_buffer_size, "readBufferSize");
 		let client_read_buffer_size = match config.client_read_buffer_size {
@@ -508,6 +514,8 @@ impl SymphonyProxyWrap {
 			keepalive,
 			client_read_buffer_size,
 			upstream_read_buffer_size,
+			tls_buffer_limit,
+			malloc_trim_interval,
 			route_table: LiveRouteTable::new(table),
 			suspended_registry: SuspendedRegistry::new(),
 			global_metrics: Arc::new(GlobalMetrics::default()),
@@ -548,6 +556,7 @@ impl SymphonyProxyWrap {
 				upstream_connect_timeout,
 				client_read_buffer_size: self.client_read_buffer_size,
 				upstream_read_buffer_size: self.upstream_read_buffer_size,
+				tls_buffer_limit: self.tls_buffer_limit,
 				js_emit: self.js_emit.clone(),
 			});
 
@@ -595,6 +604,13 @@ impl SymphonyProxyWrap {
 			Duration::from_secs(60),
 			tx.subscribe(),
 		));
+
+		if let Some(interval) = self.malloc_trim_interval {
+			self.rt_handle.spawn(crate::bench_hooks::trim_periodically(
+				interval,
+				tx.subscribe(),
+			));
+		}
 
 		// Spawn a periodic IP state eviction task per listener that has protection.
 		// Eviction bounds ip_table memory growth under diverse-IP traffic / attack.
