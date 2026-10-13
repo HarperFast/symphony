@@ -134,7 +134,8 @@ const HELP = `Options (defaults in brackets):
   --rust-jemalloc-addon P   .node built with \`--features jemalloc\` (npm run build:bench-jemalloc)
                             [target/bench-jemalloc/symphony.linux-<arch>-gnu.node if present]
   --addon-arm NAME=PATH     an extra arm running another .node build on the default allocator, for
-                            comparing a code change; repeatable, and included in the default arm list
+                            comparing a native change; only the .node is swapped, the JS is this
+                            checkout's dist/; repeatable, and included in the default arm list
   --out DIR                 results root; each invocation writes a timestamped directory under it
                             [$TMPDIR/symphony-memory-oop, else ./bench-results]
   --no-cgroup               run symphony without its own systemd scope
@@ -214,8 +215,13 @@ function parseOptions(argv: string[]): Options {
 				.flatMap((arg, i) => (arg === '--addon-arm' ? [argv[i + 1] ?? ''] : []))
 				.map((spec) => {
 					const eq = spec.indexOf('=');
+					const name = spec.slice(0, eq);
 					if (eq <= 0) throw new Error(`--addon-arm takes NAME=PATH, got '${spec}'`);
-					return [spec.slice(0, eq), resolve(spec.slice(eq + 1))];
+					// Names become directory and systemd unit names, and must not shadow a built-in arm.
+					if (!/^[a-z0-9-]+$/.test(name) || ALL_ARMS.includes(name)) {
+						throw new Error(`--addon-arm name '${name}' must be new and use only a-z, 0-9 and -`);
+					}
+					return [name, resolve(spec.slice(eq + 1))];
 				})
 		),
 		out: resolve(
@@ -842,8 +848,9 @@ let pageSize: number | undefined;
 /** sockstat and tcp_mem count kernel pages, which are 64 KiB on some arm64 kernels. */
 function pagesToBytes(pages: number): number {
 	if (pageSize === undefined) {
-		pageSize = Number(spawnSync('getconf', ['PAGESIZE'], { encoding: 'utf8' }).stdout);
-		if (!(pageSize > 0)) throw new Error('getconf PAGESIZE failed');
+		const size = Number(spawnSync('getconf', ['PAGESIZE'], { encoding: 'utf8' }).stdout);
+		if (!(size > 0)) throw new Error('getconf PAGESIZE failed');
+		pageSize = size;
 	}
 	return pages * pageSize;
 }
@@ -1047,7 +1054,13 @@ class Child {
 			// A forked Node child talks over IPC; the python slow reader over stdin/stdout JSON lines.
 			if (proc.stdout) {
 				proc.stdin!.on('error', (err) => fail(`${name} stdin: ${err.message}`));
-				createInterface({ input: proc.stdout }).on('line', (line) => onMessage(JSON.parse(line)));
+				createInterface({ input: proc.stdout }).on('line', (line) => {
+					try {
+						onMessage(JSON.parse(line));
+					} catch {
+						fail(`${name} wrote a malformed line: ${line.slice(0, 80)}`); // e.g. cut off as it died
+					}
+				});
 			} else {
 				proc.on('message', onMessage);
 			}
@@ -1247,6 +1260,7 @@ class Run {
 		const deadline = performance.now() + 120_000;
 		for (;;) {
 			const [clients, upstreams] = await Promise.all([this.clientTotals(), this.upstreamTotals()]);
+			if (clients.lost > 0) return `${clients.lost} connections closed without the client closing them`;
 			if (clients.bytesIn === upstreams.bytesOut && upstreams.bytesIn === clients.bytesOut) return undefined;
 			stableFor = clients.bytesIn === last ? stableFor + 1 : 0;
 			last = clients.bytesIn;
@@ -1395,7 +1409,7 @@ async function stopAll(children: ChildProcess[]): Promise<void> {
 			try {
 				child.send({ type: 'exit' });
 			} catch {
-				child.kill('SIGTERM'); // no IPC channel (symphony), or it closed under us
+				child.kill('SIGTERM'); // no IPC channel (symphony, the python reader), or it closed under us
 			}
 			const term = setTimeout(() => child.kill('SIGTERM'), 5_000);
 			const kill = setTimeout(() => child.kill('SIGKILL'), 15_000);
@@ -1419,10 +1433,6 @@ async function runProcess(
 	mkdirSync(runDir, { recursive: true, mode: 0o700 });
 	const port = await freePort();
 	const adminSocket = join(runDir, 'admin.sock');
-	// sun_path holds 108 bytes, and the admin server binds a `.<pid>` sibling before renaming it.
-	if (Buffer.byteLength(adminSocket) + 12 > 107) {
-		throw new Error(`${runDir} is too long for Unix socket paths; pass a shorter --out`);
-	}
 	const result: RunResult = { arm: arm.name, kind, repeat, samples: [], timeline: [], trimMicros: [] };
 
 	const upstreamPaths = Array.from({ length: opts.upstreams }, (_, i) => join(runDir, `up${i}.sock`));
@@ -1954,6 +1964,7 @@ function shuffle<T>(items: T[]): T[] {
 
 /** Repeats run as separate invocations (so a shared benchmark lock is not held for hours) pool here. */
 function summarizeDirs(dirs: string[]): void {
+	if (dirs.length === 0) throw new Error('--summarize needs at least one output directory');
 	const runs = dirs.map((dir) => ({
 		options: (JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')) as { options: Options }).options,
 		results: JSON.parse(readFileSync(join(dir, 'results.json'), 'utf8')) as RunResult[],
@@ -1966,6 +1977,15 @@ function summarizeDirs(dirs: string[]): void {
 		}
 	}
 	const results = runs.flatMap((run) => run.results);
+	// An arm name pools runs only when they ran the same native build.
+	const builds = new Map<string, string | undefined>();
+	for (const r of results) {
+		if (r.error) continue;
+		if (builds.has(r.arm) && builds.get(r.arm) !== r.addonSha256) {
+			throw new Error(`--summarize: arm '${r.arm}' ran different addon builds across the directories`);
+		}
+		builds.set(r.arm, r.addonSha256);
+	}
 	console.log(summarize({ ...runs[0].options, repeats: runs.reduce((n, run) => n + run.options.repeats, 0) }, results));
 }
 
@@ -1979,6 +1999,13 @@ async function orchestrate(argv: string[]): Promise<void> {
 	if (opts.cgroup && !useScope)
 		console.warn('systemd-run --user --scope unavailable: no cgroup stats, and symphony may swap');
 	const arms = opts.arms.map((name) => resolveArm(name, opts));
+	// sun_path holds 108 bytes, and the admin server first binds a `.<pid>` sibling (≤ 8 more).
+	for (const arm of arms) {
+		const longest = join(opts.out, `${arm.name}-abc-r${opts.repeats}`, 'admin.sock');
+		if (Buffer.byteLength(longest) + 8 > 107) {
+			throw new Error(`${longest} is too long for a Unix socket path; pass a shorter --out`);
+		}
+	}
 	const meta = { options: opts, environment: environment(), cgroup: useScope };
 	writeFileSync(join(opts.out, 'meta.json'), JSON.stringify(meta, null, 2));
 	console.log(`symphony memory-oop → ${opts.out}\n${JSON.stringify(meta)}`);
@@ -1996,6 +2023,7 @@ async function orchestrate(argv: string[]): Promise<void> {
 		// Shuffled per repeat, so drift on a shared host spreads across arms instead of biasing one.
 		for (const arm of shuffle(arms)) {
 			for (const kind of arm.phases) {
+				if (stopping) return;
 				console.log(`[${new Date().toISOString()}] ${arm.name} ${kind} repeat ${repeat}`);
 				results.push(await runProcess(opts, arm, kind, repeat, useScope, cert));
 				writeFileSync(join(opts.out, 'results.json'), JSON.stringify(results, null, 2));
