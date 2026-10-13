@@ -40,6 +40,7 @@ describe('memory benchmark hooks', () => {
 	/** The hooks are read in the constructor, so the variables only need to exist around it. */
 	async function proxyWith(env: Record<string, string>): Promise<{ proxy: SymphonyProxy; port: number }> {
 		const port = await getFreePort();
+		const saved = Object.keys(env).map((name) => [name, process.env[name]] as const);
 		Object.assign(process.env, env);
 		try {
 			const proxy = new SymphonyProxy({
@@ -55,7 +56,10 @@ describe('memory benchmark hooks', () => {
 			});
 			return { proxy, port };
 		} finally {
-			for (const name of Object.keys(env)) delete process.env[name];
+			for (const [name, value] of saved) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
 		}
 	}
 

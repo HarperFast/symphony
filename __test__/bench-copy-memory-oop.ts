@@ -5,7 +5,7 @@
  * symphony-server runs in its own process — in its own cgroup with swap disabled when
  * `systemd-run --user` works — while the TLS clients and the UDS upstreams run in separate processes.
  * Only symphony's process is sampled. The in-process benchmarks measured their own load generator's
- * memory, not the proxy's (PR #41); do not fold this back into one process.
+ * memory, not the proxy's; do not fold this back into one process.
  *
  *   npm run build                      # release build; never benchmark a debug addon
  *   npm run benchmark:memory-oop -- --conns 100000 --repeats 3
@@ -233,6 +233,8 @@ function parseOptions(argv: string[]): Options {
 	if (opts.slowFraction > 0 && spawnSync('python3', ['--version']).status !== 0) {
 		throw new Error('the slow-reader phase needs python3 (or pass --slow-fraction 0)');
 	}
+	if (opts.clients >= SLOW_NET - 1)
+		throw new Error(`--clients must be below ${SLOW_NET - 1}: their source nets would overlap the slow readers'`);
 	const requested = argValue(argv, '--arms');
 	opts.arms = requested
 		? requested.split(',')
@@ -276,9 +278,13 @@ function armUnavailable(name: string, opts: Options): string | undefined {
 		case 'mimalloc-preload':
 			return opts.mimalloc && existsSync(opts.mimalloc) ? undefined : 'no --mimalloc library given';
 		case 'rust-jemalloc':
-			return opts.rustJemallocAddon && existsSync(opts.rustJemallocAddon)
+			if (!opts.rustJemallocAddon || !existsSync(opts.rustJemallocAddon)) {
+				return 'no --rust-jemalloc-addon (npm run build:bench-jemalloc)';
+			}
+			// Statically linked, so it never shows up in /proc/<pid>/maps; its message prefix does in the file.
+			return readFileSync(opts.rustJemallocAddon).includes('<jemalloc>')
 				? undefined
-				: 'no --rust-jemalloc-addon (npm run build:bench-jemalloc)';
+				: `${opts.rustJemallocAddon} was not built with --features jemalloc`;
 		default:
 			return 'unknown arm';
 	}
@@ -430,8 +436,9 @@ function runClient(argv: string[]): void {
 	};
 
 	const write = (conn: ClientConn, data: Buffer): void => {
-		stats.bytesOut += data.length;
-		conn.socket.write(data);
+		conn.socket.write(data, (err) => {
+			if (!err) stats.bytesOut += data.length;
+		});
 	};
 
 	const open = (): void => {
@@ -475,9 +482,9 @@ function runClient(argv: string[]): void {
 		conn.socket.end(); // graceful: symphony sees EOF and tears down both halves
 	};
 
-	let last = Date.now();
+	let last = performance.now();
 	setInterval(() => {
-		const now = Date.now();
+		const now = performance.now();
 		const dt = (now - last) / 1000;
 		last = now;
 
@@ -575,9 +582,11 @@ function runUpstream(argv: string[]): void {
 			stats.dropped++;
 			return false;
 		}
-		conn.socket.write(msg);
+		const sent = msg;
+		conn.socket.write(sent, (err) => {
+			if (!err) stats.bytesOut += sent.length;
+		});
 		stats.sent++;
-		stats.bytesOut += msg.length;
 		return true;
 	};
 
@@ -608,8 +617,11 @@ function runUpstream(argv: string[]): void {
 				if (chunk.length === 0) return;
 			}
 			stats.bytesIn += chunk.length;
-			stats.bytesOut += chunk.length;
-			socket.write(chunk); // echo: the burst and pings come back like a broker's acks
+			const echoed = chunk;
+			// Echoed: the burst and pings come back like a broker's acks.
+			socket.write(echoed, (err) => {
+				if (!err) stats.bytesOut += echoed.length;
+			});
 		});
 		socket.on('error', () => {});
 		socket.on('close', () => {
@@ -627,9 +639,9 @@ function runUpstream(argv: string[]): void {
 	});
 	server.listen(path, () => process.send!({ type: 'ready' }));
 
-	let last = Date.now();
+	let last = performance.now();
 	setInterval(() => {
-		const now = Date.now();
+		const now = performance.now();
 		const dt = (now - last) / 1000;
 		last = now;
 		if (conns.length === 0) return;
@@ -786,7 +798,9 @@ last = time.monotonic()
 while True:
     for key, _ in sel.select(0.05):
         if key.data != 'ipc':
-            drain(key.fileobj)
+            # A pause handled earlier in this same batch must stop the reads it returned too.
+            if not state['paused'] and key.fileobj in live:
+                drain(key.fileobj)
             continue
         try:
             chunk = os.read(chan, 65536)
@@ -822,10 +836,20 @@ function readKb(file: string): Record<string, number> {
 	return out;
 }
 
+let pageSize: number | undefined;
+/** sockstat and tcp_mem count kernel pages, which are 64 KiB on some arm64 kernels. */
+function pagesToBytes(pages: number): number {
+	if (pageSize === undefined) {
+		pageSize = Number(spawnSync('getconf', ['PAGESIZE'], { encoding: 'utf8' }).stdout);
+		if (!(pageSize > 0)) throw new Error('getconf PAGESIZE failed');
+	}
+	return pages * pageSize;
+}
+
 function tcpMemBytes(): number {
 	const m = /^TCP: .* mem (\d+)$/m.exec(readFileSync('/proc/net/sockstat', 'utf8'));
 	if (!m) throw new Error('no TCP mem line in /proc/net/sockstat');
-	return Number(m[1]) * 4096;
+	return pagesToBytes(Number(m[1]));
 }
 
 interface SocketMem {
@@ -948,6 +972,7 @@ function adminGet(socketPath: string, path: string): Promise<any> {
 		const req = httpGet({ socketPath, path, timeout: 5000 }, (res) => {
 			let body = '';
 			res.setEncoding('utf8');
+			res.on('error', reject);
 			res.on('data', (chunk) => (body += chunk));
 			res.on('end', () => {
 				try {
@@ -1049,7 +1074,7 @@ class Run {
 	readonly samples: Sample[] = [];
 	readonly timeline: TimelinePoint[] = [];
 	phase = 'start';
-	private readonly started = Date.now();
+	private readonly started = performance.now();
 	private timer?: NodeJS.Timeout;
 	private fault?: string;
 
@@ -1069,7 +1094,7 @@ class Run {
 		const ownCgroup = cgroupDirOf(process.pid);
 		// TCP memory is host-wide: past tcp_mem[1] the kernel squeezes every socket on the box, not just
 		// this benchmark's, so stop well short of it.
-		const tcpPressure = Number(readFileSync('/proc/sys/net/ipv4/tcp_mem', 'utf8').trim().split(/\s+/)[1]) * 4096;
+		const tcpPressure = pagesToBytes(Number(readFileSync('/proc/sys/net/ipv4/tcp_mem', 'utf8').trim().split(/\s+/)[1]));
 		this.timer = setInterval(() => {
 			const tcp = tcpMemBytes();
 			if (tcp > tcpPressure * 0.8) {
@@ -1089,7 +1114,7 @@ class Run {
 				.then(({ conns }) => {
 					const mem = procMem(this.pid);
 					this.timeline.push({
-						t: Date.now() - this.started,
+						t: performance.now() - this.started,
 						phase: this.phase,
 						conns,
 						vmRss: mem.vmRss,
@@ -1120,16 +1145,18 @@ class Run {
 
 	/** Polls in 1 s steps so a fault aborts the run within a second. */
 	async hold(ms: number): Promise<void> {
-		const until = Date.now() + ms;
-		while (Date.now() < until) {
+		const until = performance.now() + ms;
+		while (performance.now() < until) {
 			this.checkAlive();
-			await sleep(Math.min(1000, until - Date.now()));
+			await sleep(Math.min(1000, until - performance.now()));
 		}
 		this.checkAlive();
 	}
 
 	private checkAlive(): void {
 		if (this.fault) throw new RunAborted(this.fault);
+		const dead = [...this.clients, ...this.slowClients, ...this.upstreams].find((c) => c.exited);
+		if (dead) throw new RunAborted(dead.exited);
 		if (!existsSync(`/proc/${this.pid}`)) throw new RunAborted('symphony exited');
 	}
 
@@ -1181,7 +1208,8 @@ class Run {
 	async reach(total: number): Promise<void> {
 		const tolerance = Math.max(5, total * 0.005);
 		const rate = Math.min(this.opts.openRate, this.opts.closeRate) || 1;
-		const deadline = Date.now() + 60_000 + (3 * Math.abs(total - (await this.clientTotals()).live) * 1000) / rate;
+		const deadline =
+			performance.now() + 60_000 + (3 * Math.abs(total - (await this.clientTotals()).live) * 1000) / rate;
 		for (;;) {
 			const [clients, upstreams, { conns }] = await Promise.all([
 				this.clientTotals(),
@@ -1189,7 +1217,7 @@ class Run {
 				this.symphonyConns(),
 			]);
 			if ([clients.live, upstreams.conns, conns].every((n) => Math.abs(n - total) <= tolerance)) return;
-			if (Date.now() > deadline) {
+			if (performance.now() > deadline) {
 				throw new RunAborted(
 					`stuck short of ${total}: clients ${clients.live} (${clients.failed} failed), symphony ${conns}, upstream ${upstreams.conns}`
 				);
@@ -1206,13 +1234,13 @@ class Run {
 		this.slow({ type: 'resume' });
 		let last = -1;
 		let stableFor = 0;
-		const deadline = Date.now() + 120_000;
+		const deadline = performance.now() + 120_000;
 		for (;;) {
 			const [clients, upstreams] = await Promise.all([this.clientTotals(), this.upstreamTotals()]);
 			if (clients.bytesIn === upstreams.bytesOut && upstreams.bytesIn === clients.bytesOut) return undefined;
 			stableFor = clients.bytesIn === last ? stableFor + 1 : 0;
 			last = clients.bytesIn;
-			if (stableFor >= 10 || Date.now() > deadline) {
+			if (stableFor >= 10 || performance.now() > deadline) {
 				return (
 					`payload mismatch: upstream wrote ${upstreams.bytesOut} B, clients read ${clients.bytesIn} B; ` +
 					`clients wrote ${clients.bytesOut} B, upstream read ${upstreams.bytesIn} B ` +
@@ -1230,7 +1258,7 @@ class Run {
 			this.upstreamTotals(),
 		]);
 		const proc = procMem(this.pid);
-		const t = Date.now() - this.started;
+		const t = performance.now() - this.started;
 		const before = this.timeline.find((p) => p.t >= t - 30_000);
 		const sample: Sample = {
 			label,
@@ -1330,14 +1358,14 @@ function canUseScope(): boolean {
 }
 
 async function waitFor(check: () => Promise<boolean>, timeoutMs: number, what: string): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
+	const deadline = performance.now() + timeoutMs;
 	for (;;) {
 		try {
 			if (await check()) return;
 		} catch (err) {
 			if (err instanceof RunAborted) throw err; // anything else means not up yet
 		}
-		if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+		if (performance.now() > deadline) throw new Error(`timed out waiting for ${what}`);
 		await sleep(200);
 	}
 }
@@ -1346,6 +1374,8 @@ const sha256 = (file: string): string => createHash('sha256').update(readFileSyn
 
 /** Everything a run started, so a signal or crash can stop it. */
 const live = new Set<ChildProcess>();
+/** Set by a signal: a run still starting up must not leave a process the stop snapshot missed. */
+let stopping = false;
 
 async function stopAll(children: ChildProcess[]): Promise<void> {
 	await Promise.all(
@@ -1379,6 +1409,10 @@ async function runProcess(
 	mkdirSync(runDir, { recursive: true, mode: 0o700 });
 	const port = await freePort();
 	const adminSocket = join(runDir, 'admin.sock');
+	// sun_path holds 108 bytes, and the admin server binds a `.<pid>` sibling before renaming it.
+	if (Buffer.byteLength(adminSocket) + 12 > 107) {
+		throw new Error(`${runDir} is too long for Unix socket paths; pass a shorter --out`);
+	}
 	const result: RunResult = { arm: arm.name, kind, repeat, samples: [], timeline: [], trimMicros: [] };
 
 	const upstreamPaths = Array.from({ length: opts.upstreams }, (_, i) => join(runDir, `up${i}.sock`));
@@ -1414,6 +1448,7 @@ async function runProcess(
 	const track = (child: ChildProcess): ChildProcess => {
 		started.push(child);
 		live.add(child);
+		if (stopping) child.kill('SIGKILL');
 		return child;
 	};
 	try {
@@ -1939,6 +1974,7 @@ async function orchestrate(argv: string[]): Promise<void> {
 	console.log(`symphony memory-oop → ${opts.out}\n${JSON.stringify(meta)}`);
 
 	const stopOnSignal = (signal: NodeJS.Signals): void => {
+		stopping = true;
 		console.warn(`${signal}: stopping ${live.size} child processes`);
 		stopAll([...live]).finally(() => process.exit(130));
 	};

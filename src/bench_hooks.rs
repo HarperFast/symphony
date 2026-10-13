@@ -47,7 +47,12 @@ fn read_env(name: &str, min: u64) -> Result<Option<u64>, String> {
 }
 
 pub fn tls_buffer_limit() -> Result<Option<usize>, String> {
-	Ok(read_env(TLS_BUFFER_LIMIT_ENV, MIN_TLS_BUFFER_LIMIT)?.map(|v| v as usize))
+	read_env(TLS_BUFFER_LIMIT_ENV, MIN_TLS_BUFFER_LIMIT)?
+		.map(|v| {
+			usize::try_from(v)
+				.map_err(|_| format!("{TLS_BUFFER_LIMIT_ENV}={v} does not fit a usize"))
+		})
+		.transpose()
 }
 
 pub fn malloc_trim_interval() -> Result<Option<Duration>, String> {
