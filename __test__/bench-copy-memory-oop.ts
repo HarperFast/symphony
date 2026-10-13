@@ -79,6 +79,8 @@ interface Options {
 	jemalloc: string;
 	mimalloc?: string;
 	rustJemallocAddon?: string;
+	/** Extra arms that differ only by addon build, `--addon-arm name=path`. */
+	addonArms: Record<string, string>;
 	out: string;
 	cgroup: boolean;
 	minAvailableMb: number;
@@ -130,10 +132,13 @@ const HELP = `Options (defaults in brackets):
   --mimalloc PATH           LD_PRELOAD library for mimalloc-preload [none]
   --rust-jemalloc-addon P   .node built with \`--features jemalloc\` (npm run build:bench-jemalloc)
                             [target/bench-jemalloc/symphony.linux-<arch>-gnu.node if present]
+  --addon-arm NAME=PATH     an extra arm running another .node build on the default allocator, for
+                            comparing a code change; repeatable, and included in the default arm list
   --out DIR                 results root; each invocation writes a timestamped directory under it
                             [$TMPDIR/symphony-memory-oop, else ./bench-results]
   --no-cgroup               run symphony without its own systemd scope
   --min-available-mb M      abort a run when host or cgroup headroom drops below this [1536]
+  --summarize DIR...        print the summary of earlier invocations' output directories together
 `;
 
 function argValue(argv: string[], name: string): string | undefined {
@@ -203,6 +208,15 @@ function parseOptions(argv: string[]): Options {
 		jemalloc: argValue(argv, '--jemalloc') ?? `/usr/lib/${libArch}-linux-gnu/libjemalloc.so.2`,
 		mimalloc: argValue(argv, '--mimalloc'),
 		rustJemallocAddon: argValue(argv, '--rust-jemalloc-addon') ?? (existsSync(defaultAddon) ? defaultAddon : undefined),
+		addonArms: Object.fromEntries(
+			argv
+				.flatMap((arg, i) => (arg === '--addon-arm' ? [argv[i + 1] ?? ''] : []))
+				.map((spec) => {
+					const eq = spec.indexOf('=');
+					if (eq <= 0) throw new Error(`--addon-arm takes NAME=PATH, got '${spec}'`);
+					return [spec.slice(0, eq), resolve(spec.slice(eq + 1))];
+				})
+		),
 		out: resolve(
 			argValue(argv, '--out') ??
 				(process.env.TMPDIR ? join(process.env.TMPDIR, 'symphony-memory-oop') : join(ROOT, 'bench-results'))
@@ -220,7 +234,9 @@ function parseOptions(argv: string[]): Options {
 		throw new Error('the slow-reader phase needs python3 (or pass --slow-fraction 0)');
 	}
 	const requested = argValue(argv, '--arms');
-	opts.arms = requested ? requested.split(',') : ALL_ARMS.filter((arm) => armUnavailable(arm, opts) === undefined);
+	opts.arms = requested
+		? requested.split(',')
+		: [...ALL_ARMS, ...Object.keys(opts.addonArms)].filter((arm) => armUnavailable(arm, opts) === undefined);
 	for (const arm of opts.arms) {
 		const reason = armUnavailable(arm, opts);
 		if (reason) throw new Error(`arm '${arm}' unavailable: ${reason}`);
@@ -243,6 +259,8 @@ interface Arm {
 }
 
 function armUnavailable(name: string, opts: Options): string | undefined {
+	if (Object.hasOwn(opts.addonArms, name))
+		return existsSync(opts.addonArms[name]) ? undefined : `${opts.addonArms[name]} not found`;
 	switch (name) {
 		case 'glibc':
 		case 'arena2':
@@ -267,7 +285,7 @@ function armUnavailable(name: string, opts: Options): string | undefined {
 }
 
 function resolveArm(name: string, opts: Options): Arm {
-	const arm: Arm = { name, env: {}, config: {}, phases: opts.phases };
+	const arm: Arm = { name, env: {}, config: {}, phases: opts.phases, addon: opts.addonArms[name] };
 	switch (name) {
 		case 'arena2':
 			arm.env.MALLOC_ARENA_MAX = '2';
@@ -1889,6 +1907,23 @@ function shuffle<T>(items: T[]): T[] {
 	return out;
 }
 
+/** Repeats run as separate invocations (so a shared benchmark lock is not held for hours) pool here. */
+function summarizeDirs(dirs: string[]): void {
+	const runs = dirs.map((dir) => ({
+		options: (JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')) as { options: Options }).options,
+		results: JSON.parse(readFileSync(join(dir, 'results.json'), 'utf8')) as RunResult[],
+	}));
+	const workload = (o: Options): string =>
+		JSON.stringify({ ...o, arms: undefined, repeats: undefined, out: undefined, addonArms: undefined });
+	for (const run of runs.slice(1)) {
+		if (workload(run.options) !== workload(runs[0].options)) {
+			throw new Error('--summarize: the directories were run with different workload options');
+		}
+	}
+	const results = runs.flatMap((run) => run.results);
+	console.log(summarize({ ...runs[0].options, repeats: runs.reduce((n, run) => n + run.options.repeats, 0) }, results));
+}
+
 async function orchestrate(argv: string[]): Promise<void> {
 	const opts = parseOptions(argv);
 	checkReleaseAddon();
@@ -1937,6 +1972,10 @@ switch (argValue(argv, '--role')) {
 		runUpstream(argv);
 		break;
 	default:
+		if (argv.includes('--summarize')) {
+			summarizeDirs(argv.slice(argv.indexOf('--summarize') + 1));
+			break;
+		}
 		orchestrate(argv).catch((err) => {
 			console.error(err);
 			stopAll([...live]).finally(() => process.exit(1));
