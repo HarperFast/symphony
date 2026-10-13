@@ -24,12 +24,15 @@ import {
 	createWriteStream,
 	existsSync,
 	mkdirSync,
+	mkdtempSync,
 	readFileSync,
 	realpathSync,
+	rmSync,
 	writeFileSync,
 } from 'node:fs';
 import { get as httpGet } from 'node:http';
 import { connect as netConnect, createServer as createNetServer, type Socket } from 'node:net';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { connect as tlsConnect, type TLSSocket } from 'node:tls';
@@ -1432,10 +1435,12 @@ async function runProcess(
 	const runDir = join(opts.out, `${arm.name}-${kind}-r${repeat}`);
 	mkdirSync(runDir, { recursive: true, mode: 0o700 });
 	const port = await freePort();
-	const adminSocket = join(runDir, 'admin.sock');
+	// Sockets live apart from the results, whose path can be too deep for a socket address.
+	const socketDir = mkdtempSync(join(socketRoot(), 'smo-'));
+	const adminSocket = join(socketDir, 'admin.sock');
 	const result: RunResult = { arm: arm.name, kind, repeat, samples: [], timeline: [], trimMicros: [] };
 
-	const upstreamPaths = Array.from({ length: opts.upstreams }, (_, i) => join(runDir, `up${i}.sock`));
+	const upstreamPaths = Array.from({ length: opts.upstreams }, (_, i) => join(socketDir, `up${i}.sock`));
 	const proxy: Record<string, unknown> = {
 		// Production shape (host-manager): no idle timeout, TLS termination, UDS upstreams with IP
 		// affinity, PROXY v1, symphony's default buffer sizes unless overridden.
@@ -1703,7 +1708,10 @@ async function runProcess(
 				run.push(0);
 				run.broadcast({ type: 'ping', intervalMs: 0, size: 0 });
 				await run.hold(opts.settleMs);
-				await run.sample('quiesced');
+				const quiesced = await run.sample('quiesced');
+				if (quiesced.clients.lost > 0) {
+					throw new RunAborted(`${quiesced.clients.lost} connections closed without the client closing them`);
+				}
 			}
 		} catch (err) {
 			if (!(err instanceof RunAborted)) throw err;
@@ -1717,6 +1725,7 @@ async function runProcess(
 		console.warn(`    run failed: ${result.error}`);
 	} finally {
 		await stopAll(started);
+		rmSync(socketDir, { recursive: true, force: true });
 	}
 
 	const logFile = join(runDir, 'symphony.log');
@@ -1933,6 +1942,7 @@ function environment(): Record<string, string> {
 		kernel: run('uname', ['-r']),
 		glibc: (process.report.getReport() as any).header.glibcVersionRuntime ?? 'none',
 		commit: run('git', ['-C', ROOT, 'rev-parse', 'HEAD']),
+		harness: sha256(__filename),
 		dirty: run('git', ['-C', ROOT, 'status', '--porcelain']) ? 'yes' : 'no',
 		cpus: run('nproc', []),
 		tcpMem: readFileSync('/proc/sys/net/ipv4/tcp_mem', 'utf8').trim(),
@@ -1977,6 +1987,12 @@ function summarizeDirs(dirs: string[]): void {
 		}
 	}
 	const results = runs.flatMap((run) => run.results);
+	const harnesses = new Set(
+		dirs.map((dir) => JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')).environment?.harness)
+	);
+	if (harnesses.size > 1) {
+		console.warn(`--summarize: pooling ${harnesses.size} harness versions; check they measure the same way`);
+	}
 	// An arm name pools runs only when they ran the same native build.
 	const builds = new Map<string, string | undefined>();
 	for (const r of results) {
@@ -1987,6 +2003,11 @@ function summarizeDirs(dirs: string[]): void {
 		builds.set(r.arm, r.addonSha256);
 	}
 	console.log(summarize({ ...runs[0].options, repeats: runs.reduce((n, run) => n + run.options.repeats, 0) }, results));
+}
+
+/** Short and private: $XDG_RUNTIME_DIR is per-user tmpfs, unlike a benchmark runner's long TMPDIR. */
+function socketRoot(): string {
+	return process.env.XDG_RUNTIME_DIR || tmpdir();
 }
 
 async function orchestrate(argv: string[]): Promise<void> {
@@ -2000,11 +2021,9 @@ async function orchestrate(argv: string[]): Promise<void> {
 		console.warn('systemd-run --user --scope unavailable: no cgroup stats, and symphony may swap');
 	const arms = opts.arms.map((name) => resolveArm(name, opts));
 	// sun_path holds 108 bytes, and the admin server first binds a `.<pid>` sibling (≤ 8 more).
-	for (const arm of arms) {
-		const longest = join(opts.out, `${arm.name}-abc-r${opts.repeats}`, 'admin.sock');
-		if (Buffer.byteLength(longest) + 8 > 107) {
-			throw new Error(`${longest} is too long for a Unix socket path; pass a shorter --out`);
-		}
+	const longest = join(socketRoot(), 'smo-XXXXXX', 'admin.sock');
+	if (Buffer.byteLength(longest) + 8 > 107) {
+		throw new Error(`${longest} is too long for a Unix socket path; set XDG_RUNTIME_DIR or TMPDIR shorter`);
 	}
 	const meta = { options: opts, environment: environment(), cgroup: useScope };
 	writeFileSync(join(opts.out, 'meta.json'), JSON.stringify(meta, null, 2));
