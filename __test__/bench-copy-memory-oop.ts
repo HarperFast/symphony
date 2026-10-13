@@ -1609,7 +1609,9 @@ async function runProcess(
 		const cgroupDir = useScope ? cgroupDirOf(pid) : undefined;
 		if (cgroupDir && !cgroupDir.endsWith(`/${unit}.scope`))
 			throw new Error(`symphony landed in ${cgroupDir}, not its own scope`);
-		if (cgroupDir && readFileSync(join(cgroupDir, 'memory.swap.max'), 'utf8').trim() !== '0') {
+		// No memory.swap.max means the kernel does not account swap per cgroup; VmSwap still reports it.
+		const swapMax = cgroupDir && join(cgroupDir, 'memory.swap.max');
+		if (swapMax && existsSync(swapMax) && readFileSync(swapMax, 'utf8').trim() !== '0') {
 			throw new Error(`${cgroupDir} still allows swap`);
 		}
 
