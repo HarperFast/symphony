@@ -980,6 +980,10 @@ class Child {
 		readonly proc: ChildProcess
 	) {
 		this.ready = new Promise((resolveReady, reject) => {
+			proc.once('error', (err) => {
+				this.exited = `${name} failed to start: ${err.message}`;
+				reject(new Error(this.exited));
+			});
 			proc.once('exit', (code, signal) => {
 				this.exited = `${name} exited (${signal ?? code})`;
 				reject(new Error(this.exited));
@@ -1297,8 +1301,8 @@ async function waitFor(check: () => Promise<boolean>, timeoutMs: number, what: s
 	for (;;) {
 		try {
 			if (await check()) return;
-		} catch {
-			// not up yet
+		} catch (err) {
+			if (err instanceof RunAborted) throw err; // anything else means not up yet
 		}
 		if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
 		await sleep(200);
@@ -1315,8 +1319,11 @@ async function stopAll(children: ChildProcess[]): Promise<void> {
 		children.map(async (child) => {
 			if (child.exitCode !== null || child.signalCode !== null) return;
 			const exited = new Promise((r) => child.once('exit', r));
-			if (child.connected) child.send({ type: 'exit' });
-			else child.kill('SIGTERM');
+			try {
+				child.send({ type: 'exit' });
+			} catch {
+				child.kill('SIGTERM'); // no IPC channel (symphony), or it closed under us
+			}
 			const term = setTimeout(() => child.kill('SIGTERM'), 5_000);
 			const kill = setTimeout(() => child.kill('SIGKILL'), 15_000);
 			await exited;
@@ -1433,12 +1440,20 @@ async function runProcess(
 				]
 			: nodeCmd;
 		const log = createWriteStream(join(runDir, 'symphony.log'));
-		await new Promise((r) => log.once('open', r));
+		await new Promise((resolveOpen, reject) => {
+			log.once('open', resolveOpen);
+			log.once('error', reject);
+		});
 		const symphony = track(spawn(command[0], command.slice(1), { env, stdio: ['ignore', log, log] }));
+		let spawnError: Error | undefined;
+		symphony.once('error', (err) => (spawnError = err));
 		const pid = symphony.pid!;
 		// systemd-run --scope and env both exec in place, so the spawned pid must be the server itself.
 		await waitFor(
-			async () => (await adminGet(adminSocket, '/health')).pid === pid,
+			async () => {
+				if (spawnError) throw new RunAborted(`${command[0]}: ${spawnError.message}`);
+				return (await adminGet(adminSocket, '/health')).pid === pid;
+			},
 			20_000,
 			`symphony (pid ${pid}) on its admin socket`
 		);

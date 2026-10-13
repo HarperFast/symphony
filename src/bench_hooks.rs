@@ -29,21 +29,29 @@ fn parse_at_least(name: &str, raw: Option<&str>, min: u64) -> Result<Option<u64>
 	}
 }
 
+/// Set-but-unreadable is an error, not "unset": a hook that silently stays off would make its
+/// benchmark arm measure the default instead.
+fn read_env(name: &str, min: u64) -> Result<Option<u64>, String> {
+	let raw = match std::env::var(name) {
+		Ok(raw) => Some(raw),
+		Err(std::env::VarError::NotPresent) => None,
+		Err(std::env::VarError::NotUnicode(raw)) => {
+			return Err(format!("{name} must be an integer >= {min}, got {raw:?}"))
+		}
+	};
+	let value = parse_at_least(name, raw.as_deref(), min)?;
+	if let Some(value) = value {
+		eprintln!("symphony: benchmark hook {name}={value} is active");
+	}
+	Ok(value)
+}
+
 pub fn tls_buffer_limit() -> Result<Option<usize>, String> {
-	let raw = std::env::var(TLS_BUFFER_LIMIT_ENV).ok();
-	Ok(
-		parse_at_least(TLS_BUFFER_LIMIT_ENV, raw.as_deref(), MIN_TLS_BUFFER_LIMIT)?
-			.map(|v| v as usize),
-	)
+	Ok(read_env(TLS_BUFFER_LIMIT_ENV, MIN_TLS_BUFFER_LIMIT)?.map(|v| v as usize))
 }
 
 pub fn malloc_trim_interval() -> Result<Option<Duration>, String> {
-	let raw = std::env::var(MALLOC_TRIM_INTERVAL_ENV).ok();
-	let ms = parse_at_least(
-		MALLOC_TRIM_INTERVAL_ENV,
-		raw.as_deref(),
-		MIN_MALLOC_TRIM_INTERVAL_MS,
-	)?;
+	let ms = read_env(MALLOC_TRIM_INTERVAL_ENV, MIN_MALLOC_TRIM_INTERVAL_MS)?;
 	if ms.is_some() && !MALLOC_TRIM_SUPPORTED {
 		return Err(format!(
 			"{MALLOC_TRIM_INTERVAL_ENV} needs glibc's malloc_trim, which this build does not link"
@@ -73,7 +81,7 @@ fn trim_once() {
 	let start = std::time::Instant::now();
 	// SAFETY: no preconditions; glibc serialises it against malloc/free per arena.
 	let released = unsafe { libc::malloc_trim(0) } == 1;
-	// The duration is the cost a production lever would pay, so the benchmark collects it.
+	// The benchmark collects the duration: it is what a production trim would stall for.
 	tracing::info!(
 		"malloc_trim elapsed_us={} released={released}",
 		start.elapsed().as_micros()
