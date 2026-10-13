@@ -179,7 +179,7 @@ function parseOptions(argv: string[]): Options {
 	const opts: Options = {
 		conns,
 		clients: Math.max(1, num('--clients', Math.ceil(conns / 12500))),
-		upstreams: Math.max(1, num('--upstreams', 4)),
+		upstreams: Math.min(64, Math.max(1, Math.floor(num('--upstreams', 4)))),
 		openRate: num('--open-rate', 2000),
 		closeRate: num('--close-rate', 4000),
 		maxInflight: num('--max-inflight', 200),
@@ -1359,6 +1359,8 @@ interface RunResult {
 	timeline: TimelinePoint[];
 	trimMicros: number[];
 	addonSha256?: string;
+	/** The LD_PRELOAD allocator library, for the preload arms. */
+	preloadSha256?: string;
 	maps?: string[];
 }
 
@@ -1533,6 +1535,7 @@ async function runProcess(
 		const serverJs = staged?.serverJs ?? join(ROOT, 'dist', 'server.js');
 		const expectedAddon = staged?.addon ?? join(ROOT, `symphony.linux-${process.arch}-gnu.node`);
 		result.addonSha256 = sha256(expectedAddon);
+		if (arm.mustMap) result.preloadSha256 = sha256(arm.mustMap);
 		// Only this arm's allocator variables reach symphony, whatever the orchestrator was started with.
 		const env: Record<string, string> = { ...(process.env as Record<string, string>) };
 		for (const name of [
@@ -2030,7 +2033,6 @@ function summarizeDirs(dirs: string[]): void {
 			jemalloc: undefined,
 			mimalloc: undefined,
 			phases: undefined,
-			cgroup: undefined,
 			minAvailableMb: undefined,
 		});
 	for (const run of runs.slice(1)) {
@@ -2045,14 +2047,15 @@ function summarizeDirs(dirs: string[]): void {
 	if (harnesses.size > 1) {
 		console.warn(`--summarize: pooling ${harnesses.size} harness versions; check they measure the same way`);
 	}
-	// An arm name pools runs only when they ran the same native build.
-	const builds = new Map<string, string | undefined>();
+	// An arm name pools runs only when they ran the same native build and preloaded allocator.
+	const builds = new Map<string, string>();
 	for (const r of results) {
 		if (r.error) continue;
-		if (builds.has(r.arm) && builds.get(r.arm) !== r.addonSha256) {
-			throw new Error(`--summarize: arm '${r.arm}' ran different addon builds across the directories`);
+		const build = `${r.addonSha256}+${r.preloadSha256 ?? ''}`;
+		if (builds.has(r.arm) && builds.get(r.arm) !== build) {
+			throw new Error(`--summarize: arm '${r.arm}' ran different builds across the directories`);
 		}
-		builds.set(r.arm, r.addonSha256);
+		builds.set(r.arm, build);
 	}
 	console.log(summarize({ ...runs[0].options, repeats: runs.reduce((n, run) => n + run.options.repeats, 0) }, results));
 }
