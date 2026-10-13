@@ -31,6 +31,7 @@ import {
 import { get as httpGet } from 'node:http';
 import { connect as netConnect, createServer as createNetServer, type Socket } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
+import { createInterface } from 'node:readline';
 import { connect as tlsConnect, type TLSSocket } from 'node:tls';
 
 const ROOT = resolve(__dirname, '..', '..');
@@ -489,7 +490,7 @@ function runClient(argv: string[]): void {
 		last = now;
 
 		if (churnTurnoverS > 0) {
-			churnBudget += (live.length / churnTurnoverS) * dt;
+			churnBudget = Math.min(churnBudget + (live.length / churnTurnoverS) * dt, live.length);
 			while (churnBudget >= 1 && live.length > 0) {
 				churnBudget--;
 				closeRandom(); // the deficit is reopened below, at the open rate
@@ -692,7 +693,8 @@ function runUpstream(argv: string[]): void {
  * its own kernel. Node cannot set SO_RCVBUF on a TCP socket, and on recent kernels (7.0) an unlocked receive
  * buffer keeps growing while data arrives even if nothing reads it, so a paused Node socket absorbs
  * megabytes before symphony sees a closed window. A remote stalled reader closes it far sooner.
- * Speaks the client protocol over Node's IPC channel (line-delimited JSON on NODE_CHANNEL_FD).
+ * Speaks the client protocol as JSON lines on stdin/stdout: Node's IPC channel is unsupported with a
+ * child that is not Node.
  */
 const SLOW_CLIENT_PY = String.raw`
 import json, os, selectors, socket, ssl, sys, time
@@ -701,7 +703,7 @@ args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
 port, net = int(args['--port']), int(args['--net'])
 rcvbuf, mss = int(args['--rcvbuf']), int(args['--mss'])
 burst = b'a' * int(args['--burst'])
-chan = int(os.environ['NODE_CHANNEL_FD'])
+cmd_in, cmd_out = 0, 1
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
@@ -714,7 +716,7 @@ def send(msg):
     data = (json.dumps(msg) + '\n').encode()
     while data:
         try:
-            data = data[os.write(chan, data):]
+            data = data[os.write(cmd_out, data):]
         except BlockingIOError:
             time.sleep(0.001)
 
@@ -790,8 +792,8 @@ def handle(msg):
     elif kind == 'exit':
         sys.exit(0)
 
-os.set_blocking(chan, False)
-sel.register(chan, selectors.EVENT_READ, 'ipc')
+os.set_blocking(cmd_in, False)
+sel.register(cmd_in, selectors.EVENT_READ, 'ipc')
 pending = b''
 send(dict(type='ready'))
 last = time.monotonic()
@@ -803,7 +805,7 @@ while True:
                 drain(key.fileobj)
             continue
         try:
-            chunk = os.read(chan, 65536)
+            chunk = os.read(cmd_in, 65536)
         except BlockingIOError:
             continue
         if not chunk:
@@ -1032,25 +1034,31 @@ class Child {
 		readonly proc: ChildProcess
 	) {
 		this.ready = new Promise((resolveReady, reject) => {
-			proc.on('error', (err) => {
-				this.exited = `${name} failed to start: ${err.message}`;
+			const fail = (reason: string): void => {
+				this.exited ??= reason;
 				reject(new Error(this.exited));
-			});
-			proc.once('exit', (code, signal) => {
-				this.exited = `${name} exited (${signal ?? code})`;
-				reject(new Error(this.exited));
-			});
-			proc.on('message', (msg: any) => {
+			};
+			proc.on('error', (err) => fail(`${name} failed: ${err.message}`));
+			proc.once('exit', (code, signal) => fail(`${name} exited (${signal ?? code})`));
+			const onMessage = (msg: any): void => {
 				if (msg.type === 'ready') resolveReady();
 				else if (msg.type === 'stats') this.waiting.get(msg.seq)?.(msg.stats);
-			});
+			};
+			// A forked Node child talks over IPC; the python slow reader over stdin/stdout JSON lines.
+			if (proc.stdout) {
+				proc.stdin!.on('error', (err) => fail(`${name} stdin: ${err.message}`));
+				createInterface({ input: proc.stdout }).on('line', (line) => onMessage(JSON.parse(line)));
+			} else {
+				proc.on('message', onMessage);
+			}
 		});
 		this.ready.catch(() => {});
 	}
 
 	send(cmd: ClientCommand | UpstreamCommand): void {
 		if (this.exited) throw new RunAborted(this.exited);
-		this.proc.send(cmd);
+		if (this.proc.stdin) this.proc.stdin.write(JSON.stringify(cmd) + '\n');
+		else this.proc.send(cmd);
 	}
 
 	stats<T>(): Promise<T> {
@@ -1112,6 +1120,7 @@ class Run {
 			if (dead) this.fault = dead.exited;
 			this.symphonyConns()
 				.then(({ conns }) => {
+					if (this.timer === undefined) return; // answered after the run ended
 					const mem = procMem(this.pid);
 					this.timeline.push({
 						t: performance.now() - this.started,
@@ -1130,6 +1139,7 @@ class Run {
 
 	stopTimeline(): void {
 		clearInterval(this.timer);
+		this.timer = undefined;
 	}
 
 	async symphonyConns(): Promise<{ conns: number; halfClosed: number }> {
@@ -1596,7 +1606,7 @@ async function runProcess(
 								'--burst',
 								String(opts.burstSize),
 							],
-							{ stdio: ['ignore', 'inherit', 'inherit', 'ipc'] }
+							{ stdio: ['pipe', 'pipe', 'inherit'] }
 						)
 					)
 				)
