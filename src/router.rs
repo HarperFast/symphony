@@ -1,6 +1,6 @@
 use crate::balancer::{UdsBalancer, UdsSlotSpec};
 use crate::metrics::RouteMetrics;
-use crate::tls::{CertSpec, MtlsSpec, TlsConfigCache};
+use crate::tls::{sha256, CertSpec, MtlsSpec, TlsConfigCache};
 use arc_swap::ArcSwap;
 use rustls::ServerConfig;
 use std::collections::{HashMap, HashSet};
@@ -253,6 +253,10 @@ pub struct RouteTable {
 	/// fail-closed reasoning as `dropped_exact`, checked against incoming SNIs with the same
 	/// suffix-matching rule as `wildcard` itself.
 	dropped_wildcard: Vec<Arc<str>>,
+	/// The client-certificate policy each installed route enforces, keyed by configured SNI
+	/// (`*.`-prefixed for a wildcard). Kept here rather than on `Route`, which every connection
+	/// clones into its task.
+	client_auth: HashMap<Arc<str>, ClientAuth>,
 }
 
 impl RouteTable {
@@ -398,12 +402,68 @@ impl ListenerTlsSpec {
 	}
 }
 
+fn effective_mtls<'a>(
+	spec: &'a RouteSpec,
+	listener_tls: &'a ListenerTlsSpec,
+) -> Option<(&'a [u8], bool)> {
+	match spec.mtls_ca_pem.as_deref() {
+		Some(ca) => Some((ca, spec.require_client_cert)),
+		None => listener_tls
+			.mtls_ca_pem
+			.as_deref()
+			.map(|ca| (ca, listener_tls.require_client_cert)),
+	}
+}
+
+/// The client-certificate policy a route spec asks for, as `build_route` would enforce it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientAuth {
+	/// symphony never terminates, so any client authentication is the upstream's own. Distinct
+	/// from `NoClientCert`: a terminating route must not stand in for a passthrough whose upstream
+	/// requires client certificates.
+	Passthrough,
+	NoClientCert,
+	ClientCert {
+		ca_sha256: [u8; 32],
+		required: bool,
+	},
+}
+
+impl ClientAuth {
+	fn of(spec: &RouteSpec, listener_tls: &ListenerTlsSpec) -> Self {
+		if !spec.terminate_tls {
+			return Self::Passthrough;
+		}
+		match effective_mtls(spec, listener_tls) {
+			None => Self::NoClientCert,
+			Some((ca, required)) => Self::ClientCert {
+				ca_sha256: sha256(ca),
+				required,
+			},
+		}
+	}
+}
+
+fn tombstone(
+	sni: &str,
+	dropped_exact: &mut HashSet<Arc<str>>,
+	dropped_wildcard: &mut Vec<Arc<str>>,
+) {
+	if let Some(suffix) = sni.strip_prefix("*.") {
+		dropped_wildcard.push(Arc::from(suffix));
+	} else {
+		dropped_exact.insert(Arc::from(sni));
+	}
+}
+
 /// Build a RouteTable from a list of route specs and a listener-level fallback.
 ///
 /// `previous` is the currently-live table on a hot-swap (None on initial construction). When
 /// a route's cert fails to build, its last-good route is carried forward from `previous` if
-/// present, so a transient rotation mismatch keeps serving the old (still-valid) cert instead
-/// of dropping the SNI.
+/// present and it enforces the client-certificate policy the new spec asks for, so a transient
+/// rotation mismatch keeps serving the old (still-valid) cert instead of dropping the SNI. A
+/// route whose requested policy changed is dropped instead: its old verifier would otherwise
+/// outlive the edit that replaced it.
 ///
 /// `cache` is the proxy's long-lived `TlsConfigCache`, deliberately *not* created here: an
 /// unchanged cert must map to the same `Arc<ServerConfig>` across rebuilds so its TLS session
@@ -427,13 +487,27 @@ pub fn build_route_table(
 	let mut configured_wildcards = HashSet::with_capacity(specs.len());
 	let mut dropped_exact: HashSet<Arc<str>> = HashSet::new();
 	let mut dropped_wildcard: Vec<Arc<str>> = Vec::new();
+	let mut client_auth: HashMap<Arc<str>, ClientAuth> = HashMap::new();
+	let last_exact: HashMap<&str, usize> = specs
+		.iter()
+		.enumerate()
+		.filter(|(_, spec)| !spec.sni.starts_with("*."))
+		.map(|(i, spec)| (spec.sni.as_str(), i))
+		.collect();
 
-	for spec in specs {
-		// Exact duplicates already collapse last-wins in `exact`. Wildcards live in a Vec and
-		// resolve first-wins, so isolate later live duplicates to keep that routing behavior while
-		// ensuring the metric table cannot expose two identical configured route labels.
+	for (i, spec) in specs.iter().enumerate() {
+		// One spec decides each configured SNI, even when it is rejected: otherwise a duplicate could
+		// serve the SNI under a policy the deciding spec didn't ask for. Exact duplicates collapse
+		// last-wins. Wildcards live in a Vec and resolve first-wins, so later duplicates are isolated,
+		// which also keeps the metric table from exposing two identical configured route labels.
+		if last_exact
+			.get(spec.sni.as_str())
+			.is_some_and(|&last| last != i)
+		{
+			continue;
+		}
 		let wildcard_suffix = spec.sni.strip_prefix("*.");
-		if wildcard_suffix.is_some_and(|suffix| configured_wildcards.contains(suffix)) {
+		if wildcard_suffix.is_some_and(|suffix| !configured_wildcards.insert(suffix)) {
 			let newly_failing =
 				previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
 			failing_snis.insert(Arc::from(spec.sni.as_str()));
@@ -462,13 +536,11 @@ pub fn build_route_table(
 			if newly_failing {
 				eprintln!("symphony: skipping route '{}': {}", spec.sni, e);
 			}
-			if let Some(suffix) = spec.sni.strip_prefix("*.") {
-				dropped_wildcard.push(Arc::from(suffix));
-			} else {
-				dropped_exact.insert(Arc::from(spec.sni.as_str()));
-			}
+			tombstone(&spec.sni, &mut dropped_exact, &mut dropped_wildcard);
 			continue;
 		}
+
+		let requested_auth = ClientAuth::of(spec, listener_tls);
 
 		// Isolate per-route failures: a single route whose cert can't be built (e.g. a
 		// rotated key no longer matching an inlined chain → rustls KeyMismatch) must not
@@ -483,14 +555,21 @@ pub fn build_route_table(
 					previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
 				failing_snis.insert(Arc::from(spec.sni.as_str()));
 
-				match previous.and_then(|p| p.get_for_spec_sni(&spec.sni)) {
+				let last_good = previous.and_then(|p| {
+					let route = p.get_for_spec_sni(&spec.sni)?;
+					Some((
+						route,
+						p.client_auth.get(spec.sni.as_str()) == Some(&requested_auth),
+					))
+				});
+				match last_good {
 					// On a hot-swap, a cert and key rotate as two non-atomic files, so a
 					// transient mismatch mid-rotation is normal. Carry the previous route
 					// forward *whole* (cert and upstreams) — intentional: its cert is still
 					// valid, and the route heals on the next reconcile when the pair is
 					// consistent. If the route's upstreams also changed in the same reconcile,
 					// they too persist until then; that's the accepted cost of last-good.
-					Some(prev) => {
+					Some((prev, true)) => {
 						if newly_failing {
 							eprintln!(
 								"symphony: route '{}' failed to rebuild ({}); retaining last-good route",
@@ -498,6 +577,17 @@ pub fn build_route_table(
 							);
 						}
 						prev.clone()
+					}
+					// The previous route's `tls_config` holds its client verifier, so retaining it
+					// would keep enforcing the old policy. Always logged: the previous table was
+					// serving this SNI, so this is a transition even if it was already failing.
+					Some((_, false)) => {
+						eprintln!(
+							"symphony: skipping route '{}': {}; its last-good route enforces a different client-certificate policy, so it is not retained",
+							spec.sni, e
+						);
+						tombstone(&spec.sni, &mut dropped_exact, &mut dropped_wildcard);
+						continue;
 					}
 					// No prior route (initial build, or a newly-added route): drop this SNI. It must
 					// resolve to nothing, not silently fall through to a broader wildcard or the
@@ -509,11 +599,7 @@ pub fn build_route_table(
 						if newly_failing {
 							eprintln!("symphony: skipping route '{}': {}", spec.sni, e);
 						}
-						if let Some(suffix) = spec.sni.strip_prefix("*.") {
-							dropped_wildcard.push(Arc::from(suffix));
-						} else {
-							dropped_exact.insert(Arc::from(spec.sni.as_str()));
-						}
+						tombstone(&spec.sni, &mut dropped_exact, &mut dropped_wildcard);
 						continue;
 					}
 				}
@@ -527,10 +613,6 @@ pub fn build_route_table(
 				route.metric_identity = previous_route.metric_identity.clone();
 			}
 		}
-		if let Some(suffix) = wildcard_suffix {
-			configured_wildcards.insert(suffix);
-		}
-
 		// Collected from the route actually installed, which may be a carried-forward one.
 		for dest in std::iter::once(&route.destination).chain(route.destination_h2.iter()) {
 			if let Destination::UdsSet(ref bal) = dest {
@@ -543,6 +625,7 @@ pub fn build_route_table(
 			}
 		}
 
+		client_auth.insert(Arc::from(spec.sni.as_str()), requested_auth);
 		if spec.sni.starts_with("*.") {
 			let suffix: Arc<str> = Arc::from(&spec.sni[2..]);
 			wildcard.push((suffix, route));
@@ -572,6 +655,7 @@ pub fn build_route_table(
 		failing_snis,
 		dropped_exact,
 		dropped_wildcard,
+		client_auth,
 	})
 }
 
@@ -633,18 +717,11 @@ fn build_route(
 			private_key_pem: key_pem.to_vec().into(),
 		};
 
-		let mtls_ca = spec
-			.mtls_ca_pem
-			.as_deref()
-			.or(listener_tls.mtls_ca_pem.as_deref());
-		let mtls_spec = mtls_ca.map(|ca| MtlsSpec {
-			client_ca_pem: ca.to_vec(),
-			require_client_cert: if spec.mtls_ca_pem.is_some() {
-				spec.require_client_cert
-			} else {
-				listener_tls.require_client_cert
-			},
-		});
+		let mtls_spec =
+			effective_mtls(spec, listener_tls).map(|(ca, require_client_cert)| MtlsSpec {
+				client_ca_pem: ca.to_vec(),
+				require_client_cert,
+			});
 
 		Some(cache.get_or_build(&cert_spec, mtls_spec.as_ref(), spec.http2)?)
 	} else {
@@ -1243,6 +1320,200 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			fresh.resolve(Some("tenant.example.com")).is_none(),
 			"with no prior route there is nothing to retain — the SNI is dropped"
 		);
+	}
+
+	fn with_client_ca(mut spec: RouteSpec, ca: &[u8], required: bool) -> RouteSpec {
+		spec.mtls_ca_pem = Some(ca.to_vec());
+		spec.require_client_cert = required;
+		spec
+	}
+
+	fn build(
+		specs: &[RouteSpec],
+		listener: &ListenerTlsSpec,
+		live: Option<&RouteTable>,
+	) -> RouteTable {
+		build_route_table(specs, listener, live, &mut TlsConfigCache::new()).expect("build")
+	}
+
+	/// A passthrough spec whose build fails: every upstream is h2-marked, so it has no default one.
+	fn failing_passthrough(sni: &str) -> RouteSpec {
+		let mut spec = tls_route(sni, CERT_A, KEY_A);
+		spec.terminate_tls = false;
+		spec.upstreams = vec![UpstreamSpec::Uds {
+			paths: vec!["/nonexistent/h2.sock".into()],
+			pids: vec![None],
+			tids: vec![None],
+			ip_affinity: false,
+			affinity_ttl_ms: 0,
+			protocol: Some("h2".into()),
+		}];
+		spec
+	}
+
+	// symphony#62
+	#[test]
+	fn failed_rebuild_under_a_new_client_cert_policy_is_dropped() {
+		let listener = ListenerTlsSpec::empty();
+		let wildcard = tls_route("*.example.com", CERT_A, KEY_A);
+		let live = build(
+			&[
+				tls_route("tenant.example.com", CERT_A, KEY_A),
+				wildcard.clone(),
+			],
+			&listener,
+			None,
+		);
+		assert!(live.resolve(Some("tenant.example.com")).is_some());
+
+		let required_with_no_trust_anchors =
+			with_client_ca(tls_route("tenant.example.com", CERT_A, KEY_A), b"", true);
+		let failing = [required_with_no_trust_anchors, wildcard.clone()];
+		let swapped = build(&failing, &listener, Some(&live));
+		assert!(
+			swapped.resolve(Some("tenant.example.com")).is_none(),
+			"the old route admits certless clients the new policy refuses, so it must not be retained, and the SNI must not fall through to the wildcard"
+		);
+		assert!(swapped.failing_snis.contains("tenant.example.com"));
+		assert!(
+			swapped.resolve(Some("other.example.com")).is_some(),
+			"the healthy wildcard keeps serving its own subdomains"
+		);
+
+		let again = build(&failing, &listener, Some(&swapped));
+		assert!(again.resolve(Some("tenant.example.com")).is_none());
+
+		let buildable =
+			with_client_ca(tls_route("tenant.example.com", CERT_A, KEY_A), CERT_A, true);
+		let healed = build(&[buildable, wildcard], &listener, Some(&again));
+		assert!(healed.resolve(Some("tenant.example.com")).is_some());
+		assert_eq!(healed.failing_route_count(), 0);
+	}
+
+	#[test]
+	fn a_rejected_duplicate_is_not_replaced_by_its_sibling() {
+		let listener = ListenerTlsSpec::empty();
+		for (sni, probe) in [
+			("tenant.example.com", "tenant.example.com"),
+			("*.example.com", "app.example.com"),
+		] {
+			let certless = tls_route(sni, CERT_A, KEY_A);
+			let rejected = with_client_ca(certless.clone(), b"", true);
+			let live = build(std::slice::from_ref(&certless), &listener, None);
+			let deciding_rejected = if sni.starts_with("*.") {
+				[rejected.clone(), certless.clone()]
+			} else {
+				[certless.clone(), rejected.clone()]
+			};
+			for previous in [None, Some(&live)] {
+				let table = build(&deciding_rejected, &listener, previous);
+				assert!(
+					table.resolve(Some(probe)).is_none(),
+					"{sni}: a certless duplicate must not serve the SNI its deciding spec requires certs for"
+				);
+			}
+
+			let mut deciding_buildable = deciding_rejected;
+			deciding_buildable.reverse();
+			let table = build(&deciding_buildable, &listener, Some(&live));
+			assert!(
+				table.resolve(Some(probe)).is_some(),
+				"{sni}: a buildable deciding duplicate serves"
+			);
+		}
+	}
+
+	#[test]
+	fn cert_only_failure_keeps_last_good_while_the_client_cert_policy_is_unchanged() {
+		let listener = ListenerTlsSpec::empty();
+		let specs = |key: &[u8], required: bool| {
+			["tenant.example.com", "*.example.com"]
+				.map(|sni| with_client_ca(tls_route(sni, CERT_A, key), CERT_A, required))
+		};
+		let live = build(&specs(KEY_A, true), &listener, None);
+
+		let carried = build(&specs(KEY_B, true), &listener, Some(&live));
+		for sni in ["tenant.example.com", "other.example.com"] {
+			assert_eq!(
+				config_ptr(&carried, sni),
+				config_ptr(&live, sni),
+				"{sni}: a mismatched key under an unchanged policy keeps the last-good route"
+			);
+		}
+
+		let dropped = build(&specs(KEY_B, false), &listener, Some(&carried));
+		for sni in ["tenant.example.com", "other.example.com"] {
+			assert!(
+				dropped.resolve(Some(sni)).is_none(),
+				"{sni}: a carried-forward route must not outlive a client-cert policy change"
+			);
+		}
+	}
+
+	#[test]
+	fn every_client_auth_change_drops_a_failing_route() {
+		let listener = ListenerTlsSpec::empty();
+		let sni = "tenant.example.com";
+		let terminated = tls_route(sni, CERT_A, KEY_A);
+		let required = with_client_ca(terminated.clone(), CERT_A, true);
+		let mut other_bundle = CERT_A.to_vec();
+		other_bundle.extend_from_slice(b"# a different bundle\n");
+		let mismatched = |spec: &RouteSpec| RouteSpec {
+			key_pem: Some(KEY_B.to_vec()),
+			..spec.clone()
+		};
+
+		let cases = [
+			("client CA removed", &required, mismatched(&terminated)),
+			(
+				"client cert made optional",
+				&required,
+				mismatched(&with_client_ca(terminated.clone(), CERT_A, false)),
+			),
+			(
+				"client CA bundle changed",
+				&required,
+				mismatched(&with_client_ca(terminated.clone(), &other_bundle, true)),
+			),
+			(
+				"client CA added",
+				&terminated,
+				mismatched(&with_client_ca(terminated.clone(), CERT_A, true)),
+			),
+			(
+				"terminating route switched to passthrough",
+				&terminated,
+				failing_passthrough(sni),
+			),
+		];
+		for (change, previous, failing) in cases {
+			let live = build(std::slice::from_ref(previous), &listener, None);
+			assert!(live.resolve(Some(sni)).is_some(), "{change}: live route");
+			let swapped = build(&[failing], &listener, Some(&live));
+			assert!(
+				swapped.resolve(Some(sni)).is_none(),
+				"{change}: the last-good route must not be retained"
+			);
+		}
+	}
+
+	#[test]
+	fn client_auth_inherited_from_the_listener_compares_by_effect() {
+		let listener = ListenerTlsSpec {
+			mtls_ca_pem: Some(CERT_A.to_vec()),
+			require_client_cert: true,
+			..ListenerTlsSpec::empty()
+		};
+		let sni = "tenant.example.com";
+		let live = build(&[tls_route(sni, CERT_A, KEY_A)], &listener, None);
+
+		let same_effect = with_client_ca(tls_route(sni, CERT_A, KEY_B), CERT_A, true);
+		let carried = build(&[same_effect], &listener, Some(&live));
+		assert_eq!(config_ptr(&carried, sni), config_ptr(&live, sni));
+
+		let optional = with_client_ca(tls_route(sni, CERT_A, KEY_B), CERT_A, false);
+		let dropped = build(&[optional], &listener, Some(&live));
+		assert!(dropped.resolve(Some(sni)).is_none());
 	}
 
 	#[test]

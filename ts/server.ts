@@ -100,22 +100,30 @@ function resolveMtls(m: FileMtlsConfig, baseDir: string): MtlsConfig {
 // A cert the Rust layer is guaranteed to reject at build time (empty PEM → "no
 // certificates"). Substituted for a route whose cert/key file can't be read, so the failure
 // is isolated inside build_route_table (which carries the route's last-good forward on a
-// hot-swap, or drops just that SNI on an initial build) instead of throwing out of
+// hot-swap while its client-cert policy is unchanged, or drops just that SNI) instead of throwing out of
 // toProxyConfig and aborting the update for every route on the port-set.
 const UNRESOLVABLE_CERT: CertConfig = { certChain: '', privateKey: Buffer.alloc(0) };
+
+// Stands in for a client CA that can't be read: the requested policy is unknown. No verifier builds
+// from an empty bundle, so on a terminating route it never matches a serving route's policy and the
+// route is dropped rather than kept under its old one. A passthrough route ignores mtls.
+const UNRESOLVABLE_MTLS: MtlsConfig = { clientCaCert: '', requireClientCert: true };
 
 // Resolve one route's cert/mTLS from disk, isolating a file-read failure (e.g. ENOENT while a
 // cert rotates) to this route rather than letting it abort the whole port-set's reconcile.
 function resolveRoute(r: FileRouteConfig, baseDir: string): RouteConfig {
+	let mtls: MtlsConfig | undefined;
 	try {
-		return {
-			...r,
-			cert: r.cert ? resolveCert(r.cert, baseDir) : undefined,
-			mtls: r.mtls ? resolveMtls(r.mtls, baseDir) : undefined,
-		};
+		mtls = r.mtls ? resolveMtls(r.mtls, baseDir) : undefined;
+	} catch (err) {
+		logErr(`failed to resolve the client CA for route '${r.sni}' — isolating route:`, (err as Error).message);
+		return { ...r, cert: UNRESOLVABLE_CERT, mtls: UNRESOLVABLE_MTLS };
+	}
+	try {
+		return { ...r, cert: r.cert ? resolveCert(r.cert, baseDir) : undefined, mtls };
 	} catch (err) {
 		logErr(`failed to resolve cert material for route '${r.sni}' — isolating route:`, (err as Error).message);
-		return { ...r, cert: UNRESOLVABLE_CERT, mtls: undefined };
+		return { ...r, cert: UNRESOLVABLE_CERT, mtls };
 	}
 }
 

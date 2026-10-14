@@ -106,7 +106,7 @@ above `TCP_KEEPCNT`'s ceiling of 127.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `sni` | `string` | required | Hostname for exact match, or `'*.suffix'` for wildcard, or `''` for default (maximum 255 UTF-8 bytes; no control characters; exact duplicates remain last-wins, later wildcard duplicates are skipped) |
+| `sni` | `string` | required | Hostname for exact match, or `'*.suffix'` for wildcard, or `''` for default (maximum 255 UTF-8 bytes; no control characters; exact duplicates remain last-wins, later wildcard duplicates are skipped, even when the winning entry is rejected) |
 | `metricsGroup` | `string` | — | Stable grouping key for aggregating several domain routes as one tenant (maximum 128 UTF-8 bytes; no control characters) |
 | `upstreams` | `Upstream[]` | required | Destination(s); multiple UDS upstreams are load-balanced |
 | `terminateTls` | `boolean` | required | `true` = decrypt TLS; `false` = TCP passthrough |
@@ -396,7 +396,7 @@ Use `sourceAddressHeader` on a route to control how the real client IP is commun
 
 This declaration only helps when a header could actually be injected in the first place. A **passthrough** route (`terminateTls: false`) never decrypts the stream, so a header-carried mode has no carrier at all regardless of `protocol` — declaring `'http'` on a passthrough route wouldn't make it work, and is rejected with a distinct "no carrier" error instead of steering you toward a declaration that can't help. Use `sourceAddressHeader: 'proxyProtocolV2'` there instead (it works on any byte stream, passthrough included).
 
-Like a cert that fails to build, a route rejected for either reason is isolated to just that route: it's dropped (its SNI resolves to nothing) rather than failing `new SymphonyProxy()` or `updateConfig()` for every other route on the same port-set — one tenant's config mistake doesn't take the rest down with it. The rejection is still loud: it's logged (`symphony: skipping route '<sni>': ...`), and on a hot-swap the route's last-good version (if any) keeps serving until the config is fixed.
+Like a cert that fails to build, a route rejected for either reason is isolated to just that route: it's dropped (its SNI resolves to nothing) rather than failing `new SymphonyProxy()` or `updateConfig()` for every other route on the same port-set — one tenant's config mistake doesn't take the rest down with it. The rejection is still loud: it's logged (`symphony: skipping route '<sni>': ...`) and counted in `failingRoutes`. A rejected declaration is dropped on a hot-swap too, since it won't heal until the config is edited. A cert that fails to build on a hot-swap (typically a cert and key rotating as two separate files) instead keeps the route's last-good version serving until the pair is consistent again, but only while the route still asks for the client-certificate policy that version enforces (passthrough, no `mtls`, or the same `clientCaCert` bundle and `requireClientCert`). A route whose policy changed is dropped, so an old verifier never outlives the edit that replaced it.
 
 This is a breaking change for a hand-written route that already uses `sourceAddressHeader: 'xForwardedFor'` (or a header-carried `forwardFingerprint`) without `protocol: 'http'` — add the declaration when upgrading, or that route will stop serving traffic (silently, aside from the log line) rather than failing loudly at startup.
 

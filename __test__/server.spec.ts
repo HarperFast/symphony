@@ -14,7 +14,7 @@ import { spawn, ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { generateSelfSignedCert, getFreePort, startEchoServer, tlsRoundTrip, sleep } from './util.js';
+import { generateClientCa, generateSelfSignedCert, getFreePort, startEchoServer, tlsRoundTrip, sleep } from './util.js';
 
 // server.js sits next to this compiled spec's sibling ts/ dir: dist-test/ts/server.js
 const SERVER_JS = path.join(__dirname, '..', 'ts', 'server.js');
@@ -531,6 +531,130 @@ describe('symphony-server (route cert-file read failure is isolated)', () => {
 			`co-tenant b.local was dropped when its cert file went missing. stderr:\n${server.getStderr()}`
 		);
 		assert.match(server.getStderr(), /route 'b\.local'/);
+	});
+});
+
+describe('symphony-server (a route that fails to rebuild never keeps an old client-cert policy)', () => {
+	// symphony#62
+	const serverCert = generateSelfSignedCert('tenant.local');
+	const clientCa = generateClientCa();
+	const client = { clientCert: clientCa.clientCert, clientKey: clientCa.clientKey };
+	let dir: string;
+	let configPath: string;
+	let statusPath: string;
+	let caFile: string;
+	let proxyPort: number;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	let server: RunningServer;
+
+	// Each route reads its own copy of the cert/key, so deleting one route's file breaks only that route.
+	const certFiles = (sni: string) => {
+		const certChainFile = path.join(dir, `${sni}.crt`);
+		const privateKeyFile = path.join(dir, `${sni}.key`);
+		return { certChainFile, privateKeyFile };
+	};
+	const route = (sni: string, mtls?: object) => ({
+		sni,
+		upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+		terminateTls: true,
+		cert: certFiles(sni),
+		mtls,
+	});
+	const publish = (open: object) =>
+		writeConfigAtomic(configPath, {
+			version: 1,
+			proxies: [
+				{
+					listeners: [{ host: '127.0.0.1', port: proxyPort }],
+					routes: [
+						open,
+						route('inline-ca.local', { clientCaCert: clientCa.caCert, requireClientCert: true }),
+						route('file-ca.local', { clientCaCertFile: caFile, requireClientCert: true }),
+						// No client auth: a dropped route under it must not fall through to it.
+						route('*.local'),
+					],
+				},
+			],
+		});
+	const connects = async (servername: string, presented: Partial<typeof client> = {}) => {
+		try {
+			const reply = await tlsRoundTrip({ port: proxyPort, servername, data: Buffer.from('ping'), ...presented });
+			return reply.toString() === 'ping';
+		} catch {
+			return false;
+		}
+	};
+	const reloadedAt = (): string => {
+		try {
+			return JSON.parse(fs.readFileSync(statusPath, 'utf8')).reloadedAt ?? '';
+		} catch {
+			return '';
+		}
+	};
+	const becomesRefused = (servername: string, presented: Partial<typeof client> = {}) =>
+		waitFor(async () => !(await connects(servername, presented)), 8000, 150).then(
+			() => true,
+			() => false
+		);
+
+	before(async () => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-clientauth-'));
+		configPath = path.join(dir, 'config.json');
+		statusPath = path.join(dir, 'status.json');
+		caFile = path.join(dir, 'client-ca.pem');
+		fs.writeFileSync(caFile, clientCa.caCert);
+		for (const sni of ['open.local', 'inline-ca.local', 'file-ca.local', '*.local']) {
+			fs.writeFileSync(certFiles(sni).certChainFile, serverCert.cert);
+			fs.writeFileSync(certFiles(sni).privateKeyFile, serverCert.key);
+		}
+
+		echo = await startEchoServer();
+		proxyPort = await getFreePort();
+		publish(route('open.local'));
+		server = spawnServer(configPath, statusPath);
+		await waitFor(() => fs.existsSync(statusPath));
+	});
+
+	after(async () => {
+		await killServer(server);
+		await echo.close().catch(() => {});
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it('drops a route republished to require client certs under a CA no verifier can use', async () => {
+		await waitFor(() => connects('open.local'));
+		publish(route('open.local', { clientCaCert: '', requireClientCert: true }));
+		assert.ok(
+			await becomesRefused('open.local'),
+			'a certless client still reaches the route reloaded to require certs'
+		);
+		assert.match(server.getStderr(), /route 'open\.local'.*not retained/);
+		assert.equal(server.child.exitCode, null);
+		assert.equal(await connects('other.local'), true, 'the wildcard keeps serving its own subdomains');
+	});
+
+	it('drops a route whose client CA file becomes unreadable', async () => {
+		await waitFor(() => connects('file-ca.local', client));
+		fs.rmSync(caFile);
+		assert.ok(await becomesRefused('file-ca.local', client), 'the route kept trusting a CA it can no longer read');
+		assert.match(server.getStderr(), /route 'file-ca\.local'.*not retained/);
+		assert.equal(await connects('inline-ca.local', client), true, 'a co-tenant keeps serving');
+
+		fs.writeFileSync(caFile, clientCa.caCert);
+		await waitFor(() => connects('file-ca.local', client), 8000, 150);
+		assert.equal(await connects('file-ca.local'), false, 'the restored route requires a client cert again');
+	});
+
+	it('keeps the last-good route of an mTLS route whose cert file goes missing', async () => {
+		await waitFor(() => connects('inline-ca.local', client));
+		fs.rmSync(certFiles('inline-ca.local').privateKeyFile);
+		// status.json's reloadedAt is written once that reconcile has published its table.
+		const unreadable = /^(\S+) \[symphony-server\] failed to resolve cert material for route 'inline-ca\.local'/m;
+		await waitFor(() => unreadable.test(server.getStderr()), 8000, 100);
+		const loggedAt = server.getStderr().match(unreadable)![1];
+		await waitFor(() => reloadedAt() >= loggedAt, 8000, 50);
+		assert.equal(await connects('inline-ca.local', client), true, `stderr:\n${server.getStderr()}`);
+		assert.equal(await connects('inline-ca.local'), false, 'the retained route still requires a client cert');
 	});
 });
 
