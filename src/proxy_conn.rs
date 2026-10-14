@@ -398,7 +398,9 @@ where
 	// of a per-connection cache line per read chunk; do not "optimise" it away without also
 	// deciding to lose that metric.
 	let watch = HalfCloseWatch::new(&ctx.listener_metrics);
-	let copy = async {
+	// Pinned where it is created: moving it into `body` and pinning it there would keep both the
+	// captured copy and the pinned one in the connection's future.
+	let copy = std::pin::pin!(async {
 		write_connection_prefix(upstream, sf).await?;
 		let mut client = Watched::client(client, &watch);
 		let mut upstream = Watched::upstream(upstream, &watch);
@@ -412,17 +414,23 @@ where
 			)
 			.await
 		} else {
-			crate::http_proxy::proxy_http1_rewriting(&mut client, &mut upstream, &rewrites).await
+			// Boxed so its ~17 KiB of state is allocated only on header-rewriting routes, not
+			// carried inline in every connection's future.
+			Box::pin(crate::http_proxy::proxy_http1_rewriting(
+				&mut client,
+				&mut upstream,
+				&rewrites,
+			))
+			.await
 		}
-	};
+	});
 
 	let body = async {
 		if ctx.half_close_timeout.is_zero() {
 			copy.await.map_err(classify_copy_failure)
 		} else {
-			tokio::pin!(copy);
 			tokio::select! {
-				result = &mut copy => result.map_err(classify_copy_failure),
+				result = copy => result.map_err(classify_copy_failure),
 				_ = watch.expired(ctx.half_close_timeout) => Err(ErrorKind::HalfClosed),
 			}
 		}
@@ -797,6 +805,28 @@ mod tests {
 			.unwrap();
 		let max_of = |v: &Arc<Mutex<Vec<usize>>>| *v.lock().unwrap().iter().max().unwrap();
 		(max_of(&from_client), max_of(&from_upstream))
+	}
+
+	/// Read from the type alone, so the guard below needs no socket, runtime or `ConnContext`.
+	fn future_size<A, B, C, F: std::future::Future>(_: &impl FnOnce(A, B, C) -> F) -> usize {
+		std::mem::size_of::<F>()
+	}
+
+	/// `handle`'s future is the per-connection task, resident for the connection's whole life, so
+	/// at 100k parked connections each KiB of it is ~100 MB of RSS. It is ~8 KiB when every large,
+	/// rarely-taken branch is boxed and nothing is stored twice; inlining the 17 KiB HTTP/1
+	/// rewriter alone takes it to 25 KiB. The 4 KiB of headroom absorbs a new field or a
+	/// dependency's growth, not a buffer- or future-sized regression. The test profile's layout is
+	/// within 64 bytes of release.
+	#[test]
+	fn the_per_connection_future_stays_within_budget() {
+		const BUDGET: usize = 12 * 1024;
+		let size = future_size(&handle);
+		assert!(
+			size <= BUDGET,
+			"handle's future is {size} bytes, over the {BUDGET}-byte budget: look for a large \
+			 future held inline or stored twice (RUSTC_BOOTSTRAP=1 RUSTFLAGS=-Zprint-type-sizes)"
+		);
 	}
 
 	#[tokio::test]
