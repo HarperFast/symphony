@@ -230,7 +230,7 @@ fn build_server_config(
 	Ok(Arc::new(cfg))
 }
 
-fn sha256(data: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
 	let digest = ring::digest::digest(&ring::digest::SHA256, data);
 	let mut out = [0u8; 32];
 	out.copy_from_slice(digest.as_ref());
