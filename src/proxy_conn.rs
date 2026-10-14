@@ -240,7 +240,10 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	let upstream_result = if effective_route.terminate_tls {
 		if let Some(tls_cfg) = effective_route.tls_config {
 			let acceptor = TlsAcceptor::from(tls_cfg);
-			match timeout(hs_timeout, acceptor.accept(stream)).await {
+			// Matched and passed on by reference, so the 1.2 KB stream has one slot in the
+			// connection's future: each by-value move into a binding or an async fn argument
+			// would leave another, dead for the connection's life.
+			match &mut timeout(hs_timeout, acceptor.accept(stream)).await {
 				Ok(Ok(tls_stream)) => {
 					// Route by negotiated protocol: h2 connections go to the route's
 					// h2-marked upstreams (e.g. Harper's `-h2.sock` mirror) when present.
@@ -301,7 +304,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 // ── Proxy helpers ─────────────────────────────────────────────────────────────
 
 async fn proxy_via_tls(
-	client: tokio_rustls::server::TlsStream<TcpStream>,
+	client: &mut tokio_rustls::server::TlsStream<TcpStream>,
 	dest: &Destination,
 	sf: SourceForwarding<'_>,
 	ctx: &ConnContext,
@@ -807,25 +810,23 @@ mod tests {
 		(max_of(&from_client), max_of(&from_upstream))
 	}
 
-	/// Read from the type alone, so the guard below needs no socket, runtime or `ConnContext`.
 	fn future_size<A, B, C, F: std::future::Future>(_: &impl FnOnce(A, B, C) -> F) -> usize {
 		std::mem::size_of::<F>()
 	}
 
-	/// `handle`'s future is the per-connection task, resident for the connection's whole life, so
-	/// at 100k parked connections each KiB of it is ~100 MB of RSS. It is ~8 KiB when every large,
-	/// rarely-taken branch is boxed and nothing is stored twice; inlining the 17 KiB HTTP/1
-	/// rewriter alone takes it to 25 KiB. The 4 KiB of headroom absorbs a new field or a
-	/// dependency's growth, not a buffer- or future-sized regression. The test profile's layout is
-	/// within 64 bytes of release.
+	/// `handle`'s future is the connection's task, resident for its whole life, so each KiB here
+	/// is ~100 MB at 100k connections. It stays small only while large, rarely-taken futures are
+	/// boxed and the TLS stream is passed by reference; undoing either adds 1.2 to 17 KiB. The
+	/// budget leaves ~700 bytes for new fields and dependency growth. A small future stored twice
+	/// can still fit under it.
 	#[test]
 	fn the_per_connection_future_stays_within_budget() {
-		const BUDGET: usize = 12 * 1024;
+		const BUDGET: usize = 4 * 1024;
 		let size = future_size(&handle);
 		assert!(
 			size <= BUDGET,
 			"handle's future is {size} bytes, over the {BUDGET}-byte budget: look for a large \
-			 future held inline or stored twice (RUSTC_BOOTSTRAP=1 RUSTFLAGS=-Zprint-type-sizes)"
+			 future held inline or a value stored twice (RUSTC_BOOTSTRAP=1 RUSTFLAGS=-Zprint-type-sizes)"
 		);
 	}
 
