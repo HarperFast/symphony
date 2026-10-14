@@ -86,6 +86,8 @@ pub struct ConnContext {
 	/// MQTT is strongly asymmetric: after SUBSCRIBE a client sends almost nothing but PINGREQ,
 	/// while the broker carries the whole fan-out.
 	pub upstream_read_buffer_size: usize,
+	/// `SYMPHONY_TLS_BUFFER_LIMIT` benchmark hook; `None` keeps rustls' default.
+	pub tls_buffer_limit: Option<usize>,
 	pub js_emit: Arc<ThreadsafeFunction<JsEvent>>,
 }
 
@@ -242,7 +244,12 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 			let acceptor = TlsAcceptor::from(tls_cfg);
 			// By reference: binding or passing the stream by value would leave a dead copy of it
 			// in the connection's future.
-			match &mut timeout(hs_timeout, acceptor.accept(stream)).await {
+			match &mut timeout(
+				hs_timeout,
+				tls_accept(&acceptor, stream, ctx.tls_buffer_limit),
+			)
+			.await
+			{
 				Ok(Ok(tls_stream)) => {
 					// Route by negotiated protocol: h2 connections go to the route's
 					// h2-marked upstreams (e.g. Harper's `-h2.sock` mirror) when present.
@@ -301,6 +308,20 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 }
 
 // ── Proxy helpers ─────────────────────────────────────────────────────────────
+
+fn tls_accept<IO>(
+	acceptor: &TlsAcceptor,
+	stream: IO,
+	buffer_limit: Option<usize>,
+) -> tokio_rustls::Accept<IO>
+where
+	IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+	match buffer_limit {
+		Some(limit) => acceptor.accept_with(stream, |conn| conn.set_buffer_limit(Some(limit))),
+		None => acceptor.accept(stream),
+	}
+}
 
 async fn proxy_via_tls(
 	client: &mut tokio_rustls::server::TlsStream<TcpStream>,
@@ -847,6 +868,112 @@ mod tests {
 		let (from_client, from_upstream) = observed_read_sizes(4096, 1024).await;
 		assert_eq!(from_client, 4096);
 		assert_eq!(from_upstream, 1024);
+	}
+
+	#[derive(Debug)]
+	struct AcceptAnyCert(Arc<rustls::crypto::CryptoProvider>);
+
+	impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+		fn verify_server_cert(
+			&self,
+			_: &rustls::pki_types::CertificateDer<'_>,
+			_: &[rustls::pki_types::CertificateDer<'_>],
+			_: &rustls::pki_types::ServerName<'_>,
+			_: &[u8],
+			_: rustls::pki_types::UnixTime,
+		) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+			Ok(rustls::client::danger::ServerCertVerified::assertion())
+		}
+
+		fn verify_tls12_signature(
+			&self,
+			message: &[u8],
+			cert: &rustls::pki_types::CertificateDer<'_>,
+			dss: &rustls::DigitallySignedStruct,
+		) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+			rustls::crypto::verify_tls12_signature(
+				message,
+				cert,
+				dss,
+				&self.0.signature_verification_algorithms,
+			)
+		}
+
+		fn verify_tls13_signature(
+			&self,
+			message: &[u8],
+			cert: &rustls::pki_types::CertificateDer<'_>,
+			dss: &rustls::DigitallySignedStruct,
+		) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+			rustls::crypto::verify_tls13_signature(
+				message,
+				cert,
+				dss,
+				&self.0.signature_verification_algorithms,
+			)
+		}
+
+		fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+			self.0.signature_verification_algorithms.supported_schemes()
+		}
+	}
+
+	/// Plaintext the server accepts from one write loop before `Pending`, against a client that
+	/// completed the handshake and then never reads: rustls' queue plus the 4 KiB transport.
+	async fn accepted_while_client_stalls(buffer_limit: Option<usize>) -> usize {
+		use crate::router::tests::{CERT_A, KEY_A};
+		use crate::tls::{CertSpec, TlsConfigCache};
+
+		let provider = Arc::new(rustls::crypto::ring::default_provider());
+		let cert = CertSpec {
+			cert_chain_pem: CERT_A.to_vec(),
+			private_key_pem: zeroize::Zeroizing::new(KEY_A.to_vec()),
+		};
+		let server_cfg = TlsConfigCache::new()
+			.get_or_build(&cert, None, false)
+			.unwrap();
+		let client_cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
+			.with_safe_default_protocol_versions()
+			.unwrap()
+			.dangerous()
+			.with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+			.with_no_client_auth();
+		let (client_io, server_io) = tokio::io::duplex(4096);
+		let acceptor = TlsAcceptor::from(server_cfg);
+		let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+		let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+		let (server, client) = tokio::join!(
+			tls_accept(&acceptor, server_io, buffer_limit),
+			connector.connect(name, client_io),
+		);
+		let mut server = server.unwrap();
+		let _client = client.unwrap();
+		let chunk = [0u8; 1024];
+		std::future::poll_fn(|cx| {
+			let mut accepted = 0;
+			loop {
+				match Pin::new(&mut server).poll_write(cx, &chunk) {
+					Poll::Ready(Ok(n)) => accepted += n,
+					Poll::Pending => return Poll::Ready(accepted),
+					Poll::Ready(Err(e)) => panic!("write failed: {e}"),
+				}
+			}
+		})
+		.await
+	}
+
+	#[tokio::test]
+	async fn the_tls_buffer_limit_bounds_what_a_stalled_reader_can_queue() {
+		let capped = accepted_while_client_stalls(Some(4096)).await;
+		let default = accepted_while_client_stalls(None).await;
+		assert!(
+			capped < 16 * 1024,
+			"a 4 KiB limit still accepted {capped} bytes"
+		);
+		assert!(
+			default > 48 * 1024,
+			"rustls' 64 KiB default accepted only {default} bytes"
+		);
 	}
 
 	// Direct coverage of the runtime gate itself, independent of the construction-time

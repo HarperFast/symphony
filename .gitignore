@@ -2,6 +2,7 @@ target/
 node_modules/
 dist/
 dist-test/
+bench-results/
 perf.data*
 *.node
 Cargo.lock
