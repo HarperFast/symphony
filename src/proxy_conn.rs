@@ -240,7 +240,9 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	let upstream_result = if effective_route.terminate_tls {
 		if let Some(tls_cfg) = effective_route.tls_config {
 			let acceptor = TlsAcceptor::from(tls_cfg);
-			match timeout(hs_timeout, acceptor.accept(stream)).await {
+			// By reference: binding or passing the stream by value would leave a dead copy of it
+			// in the connection's future.
+			match &mut timeout(hs_timeout, acceptor.accept(stream)).await {
 				Ok(Ok(tls_stream)) => {
 					// Route by negotiated protocol: h2 connections go to the route's
 					// h2-marked upstreams (e.g. Harper's `-h2.sock` mirror) when present.
@@ -301,7 +303,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 // ── Proxy helpers ─────────────────────────────────────────────────────────────
 
 async fn proxy_via_tls(
-	client: tokio_rustls::server::TlsStream<TcpStream>,
+	client: &mut tokio_rustls::server::TlsStream<TcpStream>,
 	dest: &Destination,
 	sf: SourceForwarding<'_>,
 	ctx: &ConnContext,
@@ -398,7 +400,8 @@ where
 	// of a per-connection cache line per read chunk; do not "optimise" it away without also
 	// deciding to lose that metric.
 	let watch = HalfCloseWatch::new(&ctx.listener_metrics);
-	let copy = async {
+	// Pinned here, not inside `body`: moving it into `body` first would store it twice.
+	let copy = std::pin::pin!(async {
 		write_connection_prefix(upstream, sf).await?;
 		let mut client = Watched::client(client, &watch);
 		let mut upstream = Watched::upstream(upstream, &watch);
@@ -412,17 +415,22 @@ where
 			)
 			.await
 		} else {
-			crate::http_proxy::proxy_http1_rewriting(&mut client, &mut upstream, &rewrites).await
+			// Boxed: its state would otherwise sit in every connection's future.
+			Box::pin(crate::http_proxy::proxy_http1_rewriting(
+				&mut client,
+				&mut upstream,
+				&rewrites,
+			))
+			.await
 		}
-	};
+	});
 
 	let body = async {
 		if ctx.half_close_timeout.is_zero() {
 			copy.await.map_err(classify_copy_failure)
 		} else {
-			tokio::pin!(copy);
 			tokio::select! {
-				result = &mut copy => result.map_err(classify_copy_failure),
+				result = copy => result.map_err(classify_copy_failure),
 				_ = watch.expired(ctx.half_close_timeout) => Err(ErrorKind::HalfClosed),
 			}
 		}
@@ -797,6 +805,24 @@ mod tests {
 			.unwrap();
 		let max_of = |v: &Arc<Mutex<Vec<usize>>>| *v.lock().unwrap().iter().max().unwrap();
 		(max_of(&from_client), max_of(&from_upstream))
+	}
+
+	fn future_size<A, B, C, F: std::future::Future>(_: &impl FnOnce(A, B, C) -> F) -> usize {
+		std::mem::size_of::<F>()
+	}
+
+	/// `handle`'s future is held for each connection's whole life. The budget fails if a large,
+	/// rarely-taken future is held inline or the TLS stream is stored by value again, and leaves
+	/// room for new fields; a small future stored twice can still fit.
+	#[test]
+	fn the_per_connection_future_stays_within_budget() {
+		const BUDGET: usize = 4 * 1024;
+		let size = future_size(&handle);
+		assert!(
+			size <= BUDGET,
+			"handle's future is {size} bytes, over the {BUDGET}-byte budget: look for a large \
+			 future held inline or a value stored twice (RUSTC_BOOTSTRAP=1 RUSTFLAGS=-Zprint-type-sizes)"
+		);
 	}
 
 	#[tokio::test]

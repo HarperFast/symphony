@@ -11,9 +11,10 @@
 import assert from 'node:assert/strict';
 import { after, describe, it } from 'node:test';
 import * as net from 'node:net';
+import * as tls from 'node:tls';
 import { SymphonyProxy } from '../ts/index.js';
-import type { ProxyConfig } from '../ts/types.js';
-import { clientHello, getFreePort, sleep } from './util.js';
+import type { ProxyConfig, RouteConfig } from '../ts/types.js';
+import { clientHello, generateSelfSignedCert, getFreePort, sleep } from './util.js';
 
 const HALF_CLOSE_MS = 300;
 const SNI = 'liveness.test';
@@ -47,10 +48,11 @@ describe('dead connection reaping', () => {
 		await Promise.all(servers.map((s) => new Promise((r) => s.close(() => r(undefined)))));
 	});
 
-	/** A passthrough proxy in front of `onConnection`, so a client FIN is a plain TCP FIN. */
+	/** A proxy in front of `onConnection`; passthrough unless `route` overrides it, so a client FIN is a plain TCP FIN. */
 	async function startProxy(
 		onConnection: (socket: net.Socket) => void,
-		overrides: Partial<ProxyConfig> = {}
+		overrides: Partial<ProxyConfig> = {},
+		route: Partial<RouteConfig> = {}
 	): Promise<{ proxy: SymphonyProxy; port: number }> {
 		// allowHalfOpen so the upstream models a server that keeps working after the client
 		// half-closes; Node's default would answer that FIN with its own and end the response.
@@ -66,7 +68,12 @@ describe('dead connection reaping', () => {
 		const proxy = new SymphonyProxy({
 			listeners: [{ host: '127.0.0.1', port }],
 			routes: [
-				{ sni: SNI, upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: upstreamPort }], terminateTls: false },
+				{
+					sni: SNI,
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: upstreamPort }],
+					terminateTls: false,
+					...route,
+				},
 			],
 			halfCloseTimeoutMs: HALF_CLOSE_MS,
 			...overrides,
@@ -196,6 +203,70 @@ describe('dead connection reaping', () => {
 		await sleep(HALF_CLOSE_MS * 4);
 		assert.equal(proxy.metrics().listeners[0].activeConnections, 1, 'halfCloseTimeoutMs: 0 disables the bound');
 		client.destroy();
+	});
+
+	const cert = generateSelfSignedCert(SNI);
+
+	/** A TLS-terminated `protocol: 'http'` route with XFF, so the connection runs the HTTP/1 header rewriter. */
+	async function rewritingRoundTrip(
+		halfCloseTimeoutMs: number
+	): Promise<{ proxy: SymphonyProxy; client: tls.TLSSocket; request: string; response: string }> {
+		let request = '';
+		const { proxy, port } = await startProxy(
+			(socket) =>
+				socket.on('data', (chunk) => {
+					request += chunk;
+					if (request.includes('\r\n\r\n')) socket.end('HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello');
+				}),
+			{ halfCloseTimeoutMs },
+			{
+				terminateTls: true,
+				cert: { certChain: cert.cert, privateKey: cert.key },
+				protocol: 'http',
+				sourceAddressHeader: 'xForwardedFor',
+			}
+		);
+		// allowHalfOpen is a tls.connect option, though @types/node 20 does not declare it.
+		const client = tls.connect({
+			host: '127.0.0.1',
+			port,
+			servername: SNI,
+			rejectUnauthorized: false,
+			allowHalfOpen: true,
+		} as tls.ConnectionOptions);
+		client.on('error', () => {});
+		sockets.push(client);
+		const response = await new Promise<string>((resolve, reject) => {
+			let body = '';
+			client.on('data', (c) => (body += c));
+			client.on('end', () => resolve(body));
+			client.on('close', () => reject(new Error(`closed before the response ended: '${body}'`)));
+			client.on('secureConnect', () => client.write(`GET / HTTP/1.1\r\nHost: ${SNI}\r\n\r\n`));
+		});
+		return { proxy, client, request, response };
+	}
+
+	it('reclaims a half-closed connection on a route that rewrites HTTP headers', { timeout: 10_000 }, async () => {
+		const { proxy, request, response } = await rewritingRoundTrip(HALF_CLOSE_MS);
+		assert.match(request, /\r\nX-Forwarded-For: 127\.0\.0\.1\r\n/i, 'the request went through the rewriter');
+		assert.match(response, /\r\n\r\nhello$/);
+
+		await waitFor(() => proxy.metrics().listeners[0].activeConnections === 0);
+		const listener = proxy.metrics().listeners[0];
+		assert.equal(reasonCount(listener.errorsByReason, 'half_closed'), 1);
+		assert.equal(listener.halfClosedConnections, 0);
+	});
+
+	it('holds a half-closed rewriting connection when the bound is disabled', { timeout: 10_000 }, async () => {
+		const { proxy, client, response } = await rewritingRoundTrip(0);
+		assert.match(response, /\r\n\r\nhello$/);
+
+		await waitFor(() => proxy.metrics().listeners[0].halfClosedConnections === 1);
+		await sleep(HALF_CLOSE_MS * 4);
+		assert.equal(proxy.metrics().listeners[0].activeConnections, 1);
+		client.destroy();
+		await waitFor(() => proxy.metrics().listeners[0].activeConnections === 0);
+		assert.equal(proxy.metrics().listeners[0].halfClosedConnections, 0);
 	});
 
 	it('rejects a keepalive schedule that cannot be honoured', async () => {

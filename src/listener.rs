@@ -77,10 +77,7 @@ async fn accept_loop(
 						if let Some(cfg) = &ctx.keepalive {
 							arm_accepted(&stream, cfg);
 						}
-						let ctx2 = ctx.clone();
-						tokio::spawn(async move {
-							handle(stream, peer_addr, ctx2).await;
-						});
+						tokio::spawn(handle(stream, peer_addr, ctx.clone()));
 					}
 					Err(e) => {
 						tracing::error!("accept error on {}: {e}", ctx.listener_addr);
