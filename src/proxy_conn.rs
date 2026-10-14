@@ -240,9 +240,8 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	let upstream_result = if effective_route.terminate_tls {
 		if let Some(tls_cfg) = effective_route.tls_config {
 			let acceptor = TlsAcceptor::from(tls_cfg);
-			// Matched and passed on by reference, so the 1.2 KB stream has one slot in the
-			// connection's future: each by-value move into a binding or an async fn argument
-			// would leave another, dead for the connection's life.
+			// By reference: binding or passing the stream by value would leave a dead copy of it
+			// in the connection's future.
 			match &mut timeout(hs_timeout, acceptor.accept(stream)).await {
 				Ok(Ok(tls_stream)) => {
 					// Route by negotiated protocol: h2 connections go to the route's
@@ -401,8 +400,7 @@ where
 	// of a per-connection cache line per read chunk; do not "optimise" it away without also
 	// deciding to lose that metric.
 	let watch = HalfCloseWatch::new(&ctx.listener_metrics);
-	// Pinned where it is created: moving it into `body` and pinning it there would keep both the
-	// captured copy and the pinned one in the connection's future.
+	// Pinned here, not inside `body`: moving it into `body` first would store it twice.
 	let copy = std::pin::pin!(async {
 		write_connection_prefix(upstream, sf).await?;
 		let mut client = Watched::client(client, &watch);
@@ -417,8 +415,7 @@ where
 			)
 			.await
 		} else {
-			// Boxed so its ~17 KiB of state is allocated only on header-rewriting routes, not
-			// carried inline in every connection's future.
+			// Boxed: its state would otherwise sit in every connection's future.
 			Box::pin(crate::http_proxy::proxy_http1_rewriting(
 				&mut client,
 				&mut upstream,
@@ -814,11 +811,9 @@ mod tests {
 		std::mem::size_of::<F>()
 	}
 
-	/// `handle`'s future is the connection's task, resident for its whole life, so each KiB here
-	/// is ~100 MB at 100k connections. It stays small only while large, rarely-taken futures are
-	/// boxed and the TLS stream is passed by reference; undoing either adds 1.2 to 17 KiB. The
-	/// budget leaves ~700 bytes for new fields and dependency growth. A small future stored twice
-	/// can still fit under it.
+	/// `handle`'s future is held for each connection's whole life. The budget fails if a large,
+	/// rarely-taken future is held inline or the TLS stream is stored by value again, and leaves
+	/// room for new fields; a small future stored twice can still fit.
 	#[test]
 	fn the_per_connection_future_stays_within_budget() {
 		const BUDGET: usize = 4 * 1024;

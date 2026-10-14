@@ -207,11 +207,7 @@ describe('dead connection reaping', () => {
 
 	const cert = generateSelfSignedCert(SNI);
 
-	/**
-	 * A terminated `protocol: 'http'` route with XFF, so the copy phase is the HTTP/1 header
-	 * rewriter rather than the plain copy. The upstream answers one request and closes, which
-	 * shuts down the write half to the client; the client stays silent and never sends its FIN.
-	 */
+	/** A TLS-terminated `protocol: 'http'` route with XFF, so the connection runs the HTTP/1 header rewriter. */
 	async function rewritingRoundTrip(
 		halfCloseTimeoutMs: number
 	): Promise<{ proxy: SymphonyProxy; client: tls.TLSSocket; request: string; response: string }> {
@@ -240,16 +236,17 @@ describe('dead connection reaping', () => {
 		} as tls.ConnectionOptions);
 		client.on('error', () => {});
 		sockets.push(client);
-		const response = await new Promise<string>((resolve) => {
+		const response = await new Promise<string>((resolve, reject) => {
 			let body = '';
 			client.on('data', (c) => (body += c));
 			client.on('end', () => resolve(body));
+			client.on('close', () => reject(new Error(`closed before the response ended: '${body}'`)));
 			client.on('secureConnect', () => client.write(`GET / HTTP/1.1\r\nHost: ${SNI}\r\n\r\n`));
 		});
 		return { proxy, client, request, response };
 	}
 
-	it('reclaims a half-closed connection on a route that rewrites HTTP headers', async () => {
+	it('reclaims a half-closed connection on a route that rewrites HTTP headers', { timeout: 10_000 }, async () => {
 		const { proxy, request, response } = await rewritingRoundTrip(HALF_CLOSE_MS);
 		assert.match(request, /\r\nX-Forwarded-For: 127\.0\.0\.1\r\n/i, 'the request went through the rewriter');
 		assert.match(response, /\r\n\r\nhello$/);
@@ -260,7 +257,7 @@ describe('dead connection reaping', () => {
 		assert.equal(listener.halfClosedConnections, 0);
 	});
 
-	it('holds a half-closed rewriting connection when the bound is disabled', async () => {
+	it('holds a half-closed rewriting connection when the bound is disabled', { timeout: 10_000 }, async () => {
 		const { proxy, client, response } = await rewritingRoundTrip(0);
 		assert.match(response, /\r\n\r\nhello$/);
 
