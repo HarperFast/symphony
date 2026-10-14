@@ -46,6 +46,9 @@ const AFFINITY_RECLAIM_MS = 300_000 + 60_000;
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
+type PhaseKind = 'abc' | 'd' | 'soak' | 'cpu';
+const PHASE_KINDS: PhaseKind[] = ['abc', 'd', 'soak', 'cpu'];
+
 interface Options {
 	conns: number;
 	clients: number;
@@ -77,8 +80,14 @@ interface Options {
 	clientReadBufferSize?: number;
 	upstreamReadBufferSize?: number;
 	workerThreads?: number;
+	cycles: number;
+	troughHoldMs: number;
+	cpuWindowMs: number;
+	cpuWindows: number;
+	symphonyCpus?: string;
+	fixedOrder: boolean;
 	arms: string[];
-	phases: ('abc' | 'd')[];
+	phases: PhaseKind[];
 	repeats: number;
 	jemalloc: string;
 	mimalloc?: string;
@@ -131,6 +140,15 @@ const HELP = `Options (defaults in brackets):
   --arms a,b,...            ${ALL_ARMS.join(', ')}
                             [every arm whose prerequisites exist]
   --phases abc,d            abc = parked → active → slow in one process; d = churn-then-drop [abc,d]
+                            soak = --cycles of churned ramp to --conns, --peak-hold-ms, drop to
+                            --drop-fraction, --trough-hold-ms; cpu = --conns parked, then --cpu-windows
+                            windows of --cpu-window-ms at --msg-rate with no pings: symphony CPU s per GB
+                            and per 1M messages, and delivery latency (upstream write → client read)
+  --cycles N                soak cycles [5]
+  --trough-hold-ms T        soak hold at each trough [390000]
+  --cpu-window-ms T / --cpu-windows N   [60000 / 3]
+  --symphony-cpus LIST      run symphony under taskset -c LIST (pin the orchestrator elsewhere yourself)
+  --fixed-order             run arms in --arms order every repeat instead of shuffling
   --repeats N               [3]
   --jemalloc PATH           LD_PRELOAD library [/usr/lib/<arch>-linux-gnu/libjemalloc.so.2]
   --mimalloc PATH           LD_PRELOAD library for mimalloc-preload [none]
@@ -174,7 +192,8 @@ function parseOptions(argv: string[]): Options {
 	}
 	const phases = (argValue(argv, '--phases') ?? 'abc,d').split(',');
 	for (const phase of phases) {
-		if (phase !== 'abc' && phase !== 'd') throw new Error(`--phases takes abc and/or d, got '${phase}'`);
+		if (!PHASE_KINDS.includes(phase as PhaseKind))
+			throw new Error(`--phases takes ${PHASE_KINDS.join(', ')}, got '${phase}'`);
 	}
 	const opts: Options = {
 		conns,
@@ -207,8 +226,14 @@ function parseOptions(argv: string[]): Options {
 		clientReadBufferSize: optionalNum('--client-read-buffer-size'),
 		upstreamReadBufferSize: optionalNum('--upstream-read-buffer-size'),
 		workerThreads: optionalNum('--worker-threads'),
+		cycles: Math.max(1, num('--cycles', 5)),
+		troughHoldMs: num('--trough-hold-ms', AFFINITY_RECLAIM_MS + 30_000),
+		cpuWindowMs: num('--cpu-window-ms', 60_000),
+		cpuWindows: Math.max(1, num('--cpu-windows', 3)),
+		symphonyCpus: argValue(argv, '--symphony-cpus'),
+		fixedOrder: argv.includes('--fixed-order'),
 		arms: [],
-		phases: phases as ('abc' | 'd')[],
+		phases: phases as PhaseKind[],
 		repeats: Math.max(1, num('--repeats', 3)),
 		jemalloc: argValue(argv, '--jemalloc') ?? `/usr/lib/${libArch}-linux-gnu/libjemalloc.so.2`,
 		mimalloc: argValue(argv, '--mimalloc'),
@@ -267,7 +292,7 @@ interface Arm {
 	addon?: string;
 	/** A library that must show up in symphony's memory map, proving the arm is what ran. */
 	mustMap?: string;
-	phases: ('abc' | 'd')[];
+	phases: PhaseKind[];
 }
 
 function armUnavailable(name: string, opts: Options): string | undefined {
@@ -343,6 +368,7 @@ type ClientCommand =
 	| { type: 'pause' }
 	| { type: 'resume' }
 	| { type: 'ping'; intervalMs: number; size: number }
+	| { type: 'latency'; msgSize: number }
 	| { type: 'stats'; seq: number }
 	| { type: 'exit' };
 
@@ -358,10 +384,12 @@ interface ClientStats {
 	bytesIn: number;
 	bytesOut: number;
 	rss: number;
+	/** Delivery latency histogram (LATENCY_BUCKETS), when stamped messages are on. */
+	latency?: number[];
 }
 
 type UpstreamCommand =
-	| { type: 'push'; rate: number; size: number }
+	| { type: 'push'; rate: number; size: number; stamp?: boolean }
 	| { type: 'slow'; rate: number }
 	| { type: 'stats'; seq: number }
 	| { type: 'exit' };
@@ -376,6 +404,23 @@ interface UpstreamStats {
 	bytesIn: number;
 	bytesOut: number;
 	rss: number;
+}
+
+/** Eight buckets per power of two of microseconds, ~9% wide. */
+const LATENCY_BUCKETS = 8 * 32;
+const latencyBucket = (micros: number): number =>
+	Math.min(LATENCY_BUCKETS - 1, Math.max(0, Math.floor(Math.log2(Math.max(1, micros)) * 8)));
+const bucketMicros = (bucket: number): number => 2 ** ((bucket + 1) / 8);
+
+function percentileMicros(histogram: number[], fraction: number): number {
+	const total = histogram.reduce((a, b) => a + b, 0);
+	if (total === 0) return NaN;
+	let seen = 0;
+	for (let i = 0; i < histogram.length; i++) {
+		seen += histogram[i];
+		if (seen >= total * fraction) return bucketMicros(i);
+	}
+	return bucketMicros(histogram.length - 1);
 }
 
 const emptyClientStats = (): ClientStats => ({
@@ -413,6 +458,10 @@ interface ClientConn {
 	/** Position in `live`; -1 once removed. */
 	index: number;
 	closing: boolean;
+	/** Stamped-message framing: echoed burst bytes still to skip, offset in the current message. */
+	skip: number;
+	pos: number;
+	stamp?: Buffer;
 }
 
 function runClient(argv: string[]): void {
@@ -434,6 +483,25 @@ function runClient(argv: string[]): void {
 	let pingCursor = 0;
 	let ping = Buffer.alloc(0);
 	let nextSlot = 0;
+	let stampedSize = 0;
+	let latency: number[] | undefined;
+
+	// The upstream's first 8 bytes of each message are its CLOCK_MONOTONIC write time, shared host-wide.
+	const readStamps = (conn: ClientConn, chunk: Buffer): void => {
+		const now = process.hrtime.bigint();
+		let i = Math.min(conn.skip, chunk.length);
+		conn.skip -= i;
+		while (i < chunk.length) {
+			const n = Math.min((conn.pos < 8 ? 8 : stampedSize) - conn.pos, chunk.length - i);
+			if (conn.pos < 8) {
+				chunk.copy(conn.stamp!, conn.pos, i, i + n);
+				if (conn.pos + n === 8) latency![latencyBucket(Number(now - conn.stamp!.readBigUInt64LE(0)) / 1000)]++;
+			}
+			conn.pos += n;
+			i += n;
+			if (conn.pos === stampedSize) conn.pos = 0;
+		}
+	};
 
 	const remove = (conn: ClientConn): void => {
 		if (conn.index < 0) return;
@@ -460,7 +528,14 @@ function runClient(argv: string[]): void {
 		let established = false;
 		const tcp = netConnect({ host: '127.0.0.1', port, localAddress });
 		const socket = tlsConnect({ socket: tcp, servername: SNI, rejectUnauthorized: false });
-		const conn: ClientConn = { socket, index: -1, closing: false };
+		const conn: ClientConn = {
+			socket,
+			index: -1,
+			closing: false,
+			skip: burst.length,
+			pos: 0,
+			stamp: stampedSize ? Buffer.alloc(8) : undefined,
+		};
 		socket.on('secureConnect', () => {
 			established = true;
 			stats.inflight--;
@@ -471,6 +546,7 @@ function runClient(argv: string[]): void {
 		});
 		socket.on('data', (chunk: Buffer) => {
 			stats.bytesIn += chunk.length;
+			if (conn.stamp) readStamps(conn, chunk);
 		});
 		socket.on('error', () => {});
 		socket.on('close', () => {
@@ -546,9 +622,14 @@ function runClient(argv: string[]): void {
 				ping = Buffer.alloc(msg.size, 0x70);
 				pingBudget = 0;
 				break;
+			case 'latency':
+				stampedSize = msg.msgSize;
+				latency = new Array(LATENCY_BUCKETS).fill(0);
+				break;
 			case 'stats':
 				stats.live = live.length;
 				stats.rss = process.memoryUsage.rss();
+				stats.latency = latency;
 				process.send!({ type: 'stats', seq: msg.seq, stats });
 				break;
 			case 'exit':
@@ -577,6 +658,7 @@ function runUpstream(argv: string[]): void {
 	const conns: UpstreamConn[] = [];
 	const stats = emptyUpstreamStats();
 	let msg = Buffer.alloc(0);
+	let stamp = false;
 	let rate = 0;
 	let budget = 0;
 	let cursor = 0;
@@ -592,7 +674,11 @@ function runUpstream(argv: string[]): void {
 			stats.dropped++;
 			return false;
 		}
-		const sent = msg;
+		let sent = msg;
+		if (stamp) {
+			sent = Buffer.from(msg);
+			sent.writeBigUInt64LE(process.hrtime.bigint(), 0);
+		}
 		conn.socket.write(sent, (err) => {
 			if (!err) stats.bytesOut += sent.length;
 		});
@@ -676,6 +762,7 @@ function runUpstream(argv: string[]): void {
 		switch (cmd.type) {
 			case 'push':
 				rate = cmd.rate;
+				stamp = cmd.stamp === true;
 				msg = Buffer.alloc(cmd.size, 0x6d);
 				budget = 0;
 				break;
@@ -1224,8 +1311,8 @@ class Run {
 		for (const c of this.clients) c.send(cmd);
 	}
 
-	push(rate: number): void {
-		for (const u of this.upstreams) u.send({ type: 'push', rate, size: this.opts.msgSize });
+	push(rate: number, stamp = false): void {
+		for (const u of this.upstreams) u.send({ type: 'push', rate, size: this.opts.msgSize, stamp });
 	}
 
 	slow(cmd: ClientCommand): void {
@@ -1247,7 +1334,11 @@ class Run {
 		const sum = emptyClientStats();
 		const all = [...this.clients, ...this.slowClients];
 		for (const s of await Promise.all(all.map((c) => c.stats<ClientStats>()))) {
-			for (const k of Object.keys(sum) as (keyof ClientStats)[]) sum[k] += s[k];
+			for (const k of Object.keys(emptyClientStats()) as (keyof ClientStats)[]) (sum[k] as number) += s[k] as number;
+			if (s.latency) {
+				sum.latency ??= new Array(LATENCY_BUCKETS).fill(0);
+				s.latency.forEach((n, i) => (sum.latency![i] += n));
+			}
 		}
 		return sum;
 	}
@@ -1352,7 +1443,7 @@ class Run {
 
 interface RunResult {
 	arm: string;
-	kind: 'abc' | 'd';
+	kind: PhaseKind;
 	repeat: number;
 	error?: string;
 	samples: Sample[];
@@ -1362,6 +1453,8 @@ interface RunResult {
 	/** The LD_PRELOAD allocator library, for the preload arms. */
 	preloadSha256?: string;
 	maps?: string[];
+	/** symphony's Cpus_allowed_list, to show --symphony-cpus took effect. */
+	cpusAllowed?: string;
 }
 
 function generateCert(dir: string): { cert: string; key: string } {
@@ -1469,7 +1562,7 @@ async function stopAll(children: ChildProcess[]): Promise<void> {
 async function runProcess(
 	opts: Options,
 	arm: Arm,
-	kind: 'abc' | 'd',
+	kind: PhaseKind,
 	repeat: number,
 	useScope: boolean,
 	cert: { cert: string; key: string }
@@ -1544,11 +1637,14 @@ async function runProcess(
 			'SYMPHONY_MALLOC_TRIM_INTERVAL_MS',
 			'SYMPHONY_TLS_BUFFER_LIMIT',
 			'RUST_LOG',
+			'MALLOC_CONF',
+			'_RJEM_MALLOC_CONF',
 		]) {
 			delete env[name];
 		}
 		const unit = `symphony-memory-oop-${process.pid}-${arm.name}-${kind}-r${repeat}`;
 		const nodeCmd = [
+			...(opts.symphonyCpus ? ['taskset', '-c', opts.symphonyCpus] : []),
 			'env',
 			...Object.entries(arm.env).map(([k, v]) => `${k}=${v}`),
 			process.execPath,
@@ -1583,7 +1679,7 @@ async function runProcess(
 		let spawnError: Error | undefined;
 		symphony.once('error', (err) => (spawnError = err));
 		const pid = symphony.pid!;
-		// systemd-run --scope and env both exec in place, so the spawned pid must be the server itself.
+		// systemd-run --scope, taskset and env all exec in place, so the spawned pid must be the server itself.
 		await waitFor(
 			async () => {
 				if (spawnError) throw new RunAborted(`${command[0]}: ${spawnError.message}`);
@@ -1606,6 +1702,7 @@ async function runProcess(
 		if (arm.mustMap && !maps.includes(realpathSync(arm.mustMap))) {
 			throw new Error(`${arm.mustMap} is not mapped into symphony`);
 		}
+		result.cpusAllowed = /^Cpus_allowed_list:\s*(\S+)/m.exec(readFileSync(`/proc/${pid}/status`, 'utf8'))?.[1];
 		const cgroupDir = useScope ? cgroupDirOf(pid) : undefined;
 		if (cgroupDir && !cgroupDir.endsWith(`/${unit}.scope`))
 			throw new Error(`symphony landed in ${cgroupDir}, not its own scope`);
@@ -1720,6 +1817,69 @@ async function runProcess(
 				const mismatch = await run.drainAndVerify();
 				await run.sample('drained');
 				if (mismatch) throw new RunAborted(mismatch);
+			} else if (kind === 'soak') {
+				startTraffic();
+				run.broadcast({ type: 'churn', turnoverS: opts.churnTurnoverS });
+				const low = Math.round(opts.conns * opts.dropFraction);
+				// What a process that never saw the peak holds at the trough population: the troughs' floor.
+				run.phase = 'fresh-low';
+				run.setTarget(low);
+				await run.reach(low);
+				await run.hold(opts.peakHoldMs);
+				await run.sample('fresh-low');
+				for (let cycle = 1; cycle <= opts.cycles; cycle++) {
+					run.phase = `ramp${cycle}`;
+					run.setTarget(opts.conns);
+					await run.reach(opts.conns);
+					run.phase = `peak${cycle}`;
+					await run.hold(opts.peakHoldMs);
+					await run.sample(`peak${cycle}`);
+					run.phase = `trough${cycle}`;
+					run.setTarget(low);
+					await run.reach(low);
+					await run.hold(10_000);
+					await run.sample(`trough${cycle}-start`);
+					await run.hold(Math.max(0, opts.troughHoldMs - 10_000));
+					await run.sample(`trough${cycle}`);
+				}
+				// Without traffic or churn the allocator sees no activity, which is when lazy purging stalls.
+				run.phase = 'quiet-low';
+				run.broadcast({ type: 'churn', turnoverS: 0 });
+				run.push(0);
+				run.broadcast({ type: 'ping', intervalMs: 0, size: 0 });
+				await run.hold(opts.settleMs);
+				await run.sample('quiet-low-start');
+				await run.hold(Math.max(0, opts.troughHoldMs - opts.settleMs));
+				await run.sample('quiet-low');
+				run.phase = 'zero';
+				run.setTarget(0);
+				await run.reach(0);
+				await run.hold(opts.settleMs);
+				await run.sample('zero-start');
+				await run.hold(Math.max(0, opts.troughHoldMs - opts.settleMs));
+				await run.sample('zero');
+				const last = run.samples[run.samples.length - 1];
+				if (last.clients.lost > 0) {
+					throw new RunAborted(`${last.clients.lost} connections closed without the client closing them`);
+				}
+			} else if (kind === 'cpu') {
+				run.phase = 'parked';
+				run.broadcast({ type: 'latency', msgSize: opts.msgSize });
+				run.setTarget(opts.conns);
+				await run.reach(opts.conns);
+				await run.hold(opts.settleMs);
+				run.phase = 'warmup';
+				run.push(opts.msgRate, true);
+				await run.hold(opts.settleMs);
+				await run.sample('cpu-0');
+				for (let w = 1; w <= opts.cpuWindows; w++) {
+					run.phase = `window${w}`;
+					await run.hold(opts.cpuWindowMs);
+					await run.sample(`cpu-${w}`);
+				}
+				run.phase = 'drain';
+				const mismatch = await run.drainAndVerify();
+				if (mismatch) throw new RunAborted(mismatch);
 			} else {
 				run.phase = 'ramp';
 				startTraffic();
@@ -1821,6 +1981,65 @@ function derive(opts: Options, r: RunResult): Record<string, number> {
 			if (slow.cgroup && active.cgroup)
 				out.slowCgroupSockPerSlow = (slow.cgroup.sock - active.cgroup.sock) / slow.clients.paused;
 			if (slowMid) out.slowSecondHalfPerSlow = (slow.proc.vmRss - slowMid.proc.vmRss) / slow.clients.paused;
+		}
+	} else if (r.kind === 'soak') {
+		const footprint = (s: Sample): number => s.proc.vmRss + s.proc.vmSwap;
+		let firstPeak: Sample | undefined;
+		let maxPeak = 0;
+		for (let c = 1; c <= opts.cycles; c++) {
+			const peak = at(`peak${c}`);
+			const troughStart = at(`trough${c}-start`);
+			const trough = at(`trough${c}`);
+			if (!peak) break;
+			firstPeak ??= peak;
+			maxPeak = Math.max(maxPeak, footprint(peak));
+			out[`peak${c}MiB`] = footprint(peak) / 1048576;
+			if (troughStart) out[`troughStart${c}Pct`] = (footprint(troughStart) / footprint(peak)) * 100;
+			if (trough) {
+				out[`trough${c}MiB`] = footprint(trough) / 1048576;
+				out[`trough${c}Pct`] = (footprint(trough) / footprint(peak)) * 100;
+				out[`trough${c}PctOfMaxPeak`] = (footprint(trough) / maxPeak) * 100;
+			}
+		}
+		const lastPeak = at(`peak${opts.cycles}`);
+		const firstTrough = at('trough1');
+		const lastTrough = at(`trough${opts.cycles}`);
+		if (firstPeak) out.peak1PerConn = footprint(firstPeak) / firstPeak.conns;
+		const freshLow = at('fresh-low');
+		if (freshLow) {
+			out.freshLowMiB = footprint(freshLow) / 1048576;
+			for (let c = 1; c <= opts.cycles; c++) {
+				const trough = at(`trough${c}`);
+				if (trough) out[`trough${c}OverFreshMiB`] = (footprint(trough) - footprint(freshLow)) / 1048576;
+			}
+		}
+		for (const label of ['quiet-low-start', 'quiet-low', 'zero-start', 'zero']) {
+			const s = at(label);
+			if (s) out[`${label}MiB`] = footprint(s) / 1048576;
+		}
+		if (idle) out.idleMiB = footprint(idle) / 1048576;
+		if (firstPeak && lastPeak) out.peakGrowthMiB = (footprint(lastPeak) - footprint(firstPeak)) / 1048576;
+		if (firstTrough && lastTrough) out.troughGrowthMiB = (footprint(lastTrough) - footprint(firstTrough)) / 1048576;
+	} else if (r.kind === 'cpu') {
+		const first = at('cpu-0');
+		const last = at(`cpu-${opts.cpuWindows}`);
+		if (first && last) {
+			const seconds = (last.t - first.t) / 1000;
+			const cpu = last.proc.cpu - first.proc.cpu;
+			const fanOut = last.clients.bytesIn - first.clients.bytesIn;
+			const proxied = fanOut + (last.upstreams.bytesIn - first.upstreams.bytesIn);
+			const messages = fanOut / opts.msgSize;
+			out.cpuMsgsPerS = messages / seconds;
+			out.cpuDeliveredPct = (messages / (opts.msgRate * last.conns * seconds)) * 100;
+			out.cpuCores = cpu / seconds;
+			out.cpuSecPerGB = cpu / (proxied / 1e9);
+			out.cpuSecPerMMsgs = cpu / (messages / 1e6);
+			if (first.clients.latency && last.clients.latency) {
+				const window = last.clients.latency.map((n, i) => n - first.clients.latency![i]);
+				out.latencyP50Ms = percentileMicros(window, 0.5) / 1000;
+				out.latencyP99Ms = percentileMicros(window, 0.99) / 1000;
+				out.latencyP999Ms = percentileMicros(window, 0.999) / 1000;
+			}
 		}
 	} else {
 		const peak = at('peak');
@@ -1973,6 +2192,94 @@ function summarize(opts: Options, results: RunResult[]): string {
 			]
 		),
 	];
+	const cycles = Array.from({ length: opts.cycles }, (_, i) => i + 1);
+	if (groups.size && [...groups.keys()].some((key) => key.endsWith('|soak'))) {
+		lines.push(
+			'',
+			`Soak, ${opts.cycles} cycles of ramp to ${opts.conns} under churn → hold ${opts.peakHoldMs / 1000} s → ` +
+				`drop to ${opts.dropFraction * 100}% → hold ${opts.troughHoldMs / 1000} s. Footprint = VmRSS + VmSwap, MiB:`,
+			'',
+			...table(
+				'soak',
+				[
+					'peak/conn c1 (B)',
+					...cycles.map((c) => `peak c${c}`),
+					...cycles.map((c) => `trough c${c}`),
+					...cycles.map((c) => `trough c${c} % of peak`),
+					'trough c1 +10 s % of peak',
+					'peak growth c1→last',
+					'trough growth c1→last',
+				],
+				[
+					['peak1PerConn'],
+					...cycles.map((c): [string, number] => [`peak${c}MiB`, 0]),
+					...cycles.map((c): [string, number] => [`trough${c}MiB`, 0]),
+					...cycles.map((c): [string, number] => [`trough${c}Pct`, 1]),
+					['troughStart1Pct', 1],
+					['peakGrowthMiB', 0],
+					['troughGrowthMiB', 0],
+				]
+			),
+			'',
+			'Soak floors, MiB: fresh-low = a process that never saw the peak, at the trough population, before cycle 1; ' +
+				'quiet = trough population with traffic and churn stopped; zero = every connection closed (start = +settle, end = +trough hold):',
+			'',
+			...table(
+				'soak',
+				[
+					'idle',
+					'fresh-low',
+					...cycles.map((c) => `trough c${c} over fresh-low`),
+					'quiet start',
+					'quiet end',
+					'zero start',
+					'zero end',
+				],
+				[
+					['idleMiB', 0],
+					['freshLowMiB', 0],
+					...cycles.map((c): [string, number] => [`trough${c}OverFreshMiB`, 0]),
+					['quiet-low-startMiB', 0],
+					['quiet-lowMiB', 0],
+					['zero-startMiB', 0],
+					['zeroMiB', 0],
+				]
+			)
+		);
+	}
+	if ([...groups.keys()].some((key) => key.endsWith('|cpu'))) {
+		lines.push(
+			'',
+			`Fan-out CPU, ${opts.conns} connections, ${opts.msgSize} B at ${opts.msgRate}/s/conn, ` +
+				`${opts.cpuWindows} × ${opts.cpuWindowMs / 1000} s` +
+				(opts.symphonyCpus ? `, symphony pinned to CPUs ${opts.symphonyCpus}` : '') +
+				'. GB = payload bytes through symphony, both directions; latency = upstream write → client read:',
+			'',
+			...table(
+				'cpu',
+				[
+					'msgs/s',
+					'delivered %',
+					'symphony cores',
+					'CPU s per GB',
+					'CPU s per 1M msgs',
+					'p50 ms',
+					'p99 ms',
+					'p99.9 ms',
+				],
+				[
+					['cpuMsgsPerS'],
+					['cpuDeliveredPct', 1],
+					['cpuCores', 3],
+					['cpuSecPerGB', 2],
+					['cpuSecPerMMsgs', 3],
+					['latencyP50Ms', 2],
+					['latencyP99Ms', 2],
+					['latencyP999Ms', 2],
+				]
+			)
+		);
+	}
 	const failed = results.filter((r) => r.error);
 	if (failed.length)
 		lines.push('', 'Invalid runs (excluded):', ...failed.map((r) => `- ${r.arm} ${r.kind} r${r.repeat}: ${r.error}`));
@@ -2035,6 +2342,7 @@ function summarizeDirs(dirs: string[]): void {
 			jemalloc: undefined,
 			mimalloc: undefined,
 			phases: undefined,
+			fixedOrder: undefined,
 			minAvailableMb: undefined,
 		});
 	for (const run of runs.slice(1)) {
@@ -2100,7 +2408,7 @@ async function orchestrate(argv: string[]): Promise<void> {
 	const results: RunResult[] = [];
 	for (let repeat = 1; repeat <= opts.repeats; repeat++) {
 		// Shuffled per repeat, so drift on a shared host spreads across arms instead of biasing one.
-		for (const arm of shuffle(arms)) {
+		for (const arm of opts.fixedOrder ? arms : shuffle(arms)) {
 			for (const kind of arm.phases) {
 				if (stopping) return;
 				console.log(`[${new Date().toISOString()}] ${arm.name} ${kind} repeat ${repeat}`);
