@@ -2352,15 +2352,17 @@ function environment(): Record<string, string> {
 	};
 }
 
-function checkReleaseAddon(): void {
-	const addon = rootAddon();
-	if (!existsSync(join(ROOT, 'dist', 'server.js')) || !existsSync(addon)) {
-		throw new Error('dist/server.js or the native addon is missing: run `npm run build` (release) first');
+function checkReleaseAddons(arms: Arm[]): void {
+	if (!existsSync(join(ROOT, 'dist', 'server.js'))) {
+		throw new Error('dist/server.js is missing: run `npm run build` (release) first');
 	}
-	// The release profile strips symbols; a debug build keeps them and would skew every number.
-	const res = spawnSync('file', ['-L', addon], { encoding: 'utf8' });
-	if (res.status === 0 && /not stripped/.test(res.stdout)) {
-		throw new Error(`${addon} is a debug (unstripped) build: run \`npm run build\` before benchmarking`);
+	for (const addon of new Set(arms.map((arm) => arm.addon ?? rootAddon()))) {
+		if (!existsSync(addon)) throw new Error(`${addon} is missing: run \`npm run build\` (release) first`);
+		// The release profile strips symbols; a debug build keeps them and would skew every number.
+		const res = spawnSync('file', ['-L', addon], { encoding: 'utf8' });
+		if (res.status === 0 && /not stripped/.test(res.stdout)) {
+			throw new Error(`${addon} is a debug (unstripped) build: benchmark release builds only`);
+		}
 	}
 }
 
@@ -2429,7 +2431,6 @@ function socketRoot(): string {
 
 async function orchestrate(argv: string[]): Promise<void> {
 	const opts = parseOptions(argv);
-	checkReleaseAddon();
 	opts.out = join(opts.out, new Date().toISOString().replace(/[:.]/g, '-'));
 	mkdirSync(opts.out, { recursive: true, mode: 0o700 });
 	const cert = generateCert(opts.out);
@@ -2437,6 +2438,7 @@ async function orchestrate(argv: string[]): Promise<void> {
 	if (opts.cgroup && !useScope)
 		console.warn('systemd-run --user --scope unavailable: no cgroup stats, and symphony may swap');
 	const arms = opts.arms.map((name) => resolveArm(name, opts));
+	checkReleaseAddons(arms);
 	// sun_path holds 108 bytes, and the admin server first binds a `.<pid>` sibling (≤ 8 more).
 	const longest = join(socketRoot(), 'smo-XXXXXX', 'admin.sock');
 	if (Buffer.byteLength(longest) + 8 > 107) {
