@@ -1,0 +1,5 @@
+[env]
+# jemalloc fixes its page size when it is built and aborts on a kernel with larger pages. arm64
+# kernels run 4, 16 or 64 KiB pages and a cross build would detect the builder's, so build for 64 KiB.
+AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE = "16"
+AARCH64_UNKNOWN_LINUX_MUSL_JEMALLOC_SYS_WITH_LG_PAGE = "16"
