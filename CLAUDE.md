@@ -48,7 +48,7 @@ TCP accept (SO_REUSEPORT per worker thread)
 
 | File | Responsibility |
 |---|---|
-| `src/lib.rs` | Crate root; `mod` declarations; `#[macro_use] napi_derive` |
+| `src/lib.rs` | Crate root; `mod` declarations; `#[macro_use] napi_derive`; jemalloc as the global allocator on Linux |
 | `src/proxy.rs` | All `#[napi]`-exposed types and methods; config parsing helpers |
 | `src/listener.rs` | TCP accept loop for TLS listeners; SO_REUSEPORT per worker; RLIMIT_NOFILE |
 | `src/liveness.rs` | Dead-peer detection: TCP keepalive on the listening socket; the half-close bound |
@@ -150,6 +150,15 @@ Two further things are deliberately *not* solved: rustls' ring `Ticketer` rotate
 
 ### Send + Sync in napi classes
 napi `Buffer` contains raw pointers (`*mut napi_env__`, `*mut napi_ref__`) that are not `Sync`. The `SymphonyProxyWrap` struct must be `Send + Sync`. Solution: napi types (`Buffer`, `JsCertConfig`, etc.) are only used as constructor/method *parameters*, immediately converted to plain Rust (`Vec<u8>`, `ListenerTlsSpec`, etc.), and never stored in the struct. The struct only holds types that are provably `Send + Sync`.
+
+### jemalloc as the Rust allocator on Linux (`src/lib.rs`, default `jemalloc` feature)
+glibc keeps a fan-out node's peak footprint after its connections close: freed chunks are scattered across per-thread arenas, and glibc returns only the top of a heap. On a 100k ↔ 10k churned soak glibc held ~100% of peak at every trough and at zero connections, and its peaks crept up cycle over cycle; jemalloc fell to ~28% of peak at each trough and stayed flat. `--cargo-flags=--no-default-features` builds on the system allocator, for bisecting.
+
+- **Prefixed symbols are what make it safe in a Node process.** tikv-jemallocator exports `_rjem_*`, so only Rust's `#[global_allocator]` reaches it and Node/V8 stay on glibc. The invariant that follows: memory is freed by the allocator that allocated it. It holds because nothing crosses the boundary by ownership — JS `Buffer` arguments are borrowed (napi-rs unrefs them on drop, never frees the bytes) and `pem_bytes` copies them; values returned to JS are copied by `napi_create_*`; the class wrapper and threadsafe-function payloads are freed by Rust code in napi-rs's finalizers. Returning a Rust `Vec` to JS as an external buffer would still be fine (its finalizer is Rust), but a C library that `free()`s memory Rust allocated, or vice versa, would crash.
+- **`disable_initial_exec_tls`** is required: Node `dlopen()`s the addon, and jemalloc's default TLS model cannot be dlopened.
+- **arm64 page size is fixed at build time** (`.cargo/config.toml`): jemalloc refuses to start on a kernel whose pages are larger than the ones it was built for, and a cross build would detect the builder's 4 KiB. The aarch64 targets are built for 64 KiB, which also runs on 4 and 16 KiB kernels.
+- **Defaults are deliberate.** jemalloc purges freed pages only when that arena sees allocation activity, so a process with zero connections and no traffic keeps them (~25% of peak in the soak); `background_thread:true` returned them (717 → 196 MiB) but made no difference at a trough with live traffic, where the residue is pages pinned by surviving connections. If idle reclamation matters, enable it with `mallctl("background_thread")` after initialization — jemalloc documents that turning it on through `malloc_conf` at startup can deadlock.
+- `allocator_tests::rust_allocations_come_from_jemalloc` asks jemalloc (`arenas.lookup`) whether a live `Box` is its own, which proves selection, not just linkage.
 
 ---
 

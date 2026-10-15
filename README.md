@@ -821,6 +821,11 @@ npm run build:debug    # builds a dev .node file
 npm run build          # release build (LTO, stripped)
 ```
 
+On Linux the addon's Rust allocations go to a statically linked jemalloc, which returns memory to the
+OS after connections close; glibc's malloc keeps the peak resident. Its symbols are prefixed, so Node's
+own allocations stay on the system allocator. To build on the system allocator instead, for example
+to bisect a memory problem: `npm run build -- --cargo-flags=--no-default-features`.
+
 ### Cross-compilation
 
 Use the napi-rs Docker images (same ones used in CI):

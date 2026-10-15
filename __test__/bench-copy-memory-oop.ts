@@ -8,6 +8,7 @@
  * memory, not the proxy's; do not fold this back into one process.
  *
  *   npm run build                      # release build; never benchmark a debug addon
+ *   npm run build:bench-system-allocator   # the glibc-allocator build every arm but rust-jemalloc runs
  *   npm run benchmark:memory-oop -- --conns 100000 --repeats 3
  *
  * On a shared host, run it under whatever serialises benchmarks there. `--help` lists the options.
@@ -46,6 +47,9 @@ const AFFINITY_RECLAIM_MS = 300_000 + 60_000;
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
+type PhaseKind = 'abc' | 'd' | 'soak' | 'cpu';
+const PHASE_KINDS: PhaseKind[] = ['abc', 'd', 'soak', 'cpu'];
+
 interface Options {
 	conns: number;
 	clients: number;
@@ -77,14 +81,24 @@ interface Options {
 	clientReadBufferSize?: number;
 	upstreamReadBufferSize?: number;
 	workerThreads?: number;
+	cycles: number;
+	troughHoldMs: number;
+	cpuWindowMs: number;
+	cpuWindows: number;
+	symphonyCpus?: string;
+	fixedOrder: boolean;
 	arms: string[];
-	phases: ('abc' | 'd')[];
+	phases: PhaseKind[];
 	repeats: number;
 	jemalloc: string;
 	mimalloc?: string;
-	rustJemallocAddon?: string;
+	rustJemallocAddon: string;
+	/** A `--no-default-features` build: the allocator every arm except rust-jemalloc runs on. */
+	systemAddon?: string;
 	/** Extra arms that differ only by addon build, `--addon-arm name=path`. */
 	addonArms: Record<string, string>;
+	/** Extra environment per arm, `--arm-env name:KEY=VALUE`. */
+	armEnv: Record<string, Record<string, string>>;
 	out: string;
 	cgroup: boolean;
 	minAvailableMb: number;
@@ -131,14 +145,26 @@ const HELP = `Options (defaults in brackets):
   --arms a,b,...            ${ALL_ARMS.join(', ')}
                             [every arm whose prerequisites exist]
   --phases abc,d            abc = parked → active → slow in one process; d = churn-then-drop [abc,d]
+                            soak = --cycles of churned ramp to --conns, --peak-hold-ms, drop to
+                            --drop-fraction, --trough-hold-ms; cpu = --conns parked, then --cpu-windows
+                            windows of --cpu-window-ms at --msg-rate with no pings: symphony CPU s per GB
+                            and per 1M messages, and delivery latency (upstream write → client read)
+  --cycles N                soak cycles [5]
+  --trough-hold-ms T        soak hold at each trough [390000]
+  --cpu-window-ms T / --cpu-windows N   [60000 / 3]
+  --symphony-cpus LIST      run symphony under taskset -c LIST (pin the orchestrator elsewhere yourself)
+  --fixed-order             run arms in --arms order every repeat instead of shuffling
   --repeats N               [3]
   --jemalloc PATH           LD_PRELOAD library [/usr/lib/<arch>-linux-gnu/libjemalloc.so.2]
   --mimalloc PATH           LD_PRELOAD library for mimalloc-preload [none]
-  --rust-jemalloc-addon P   .node built with \`--features jemalloc\` (npm run build:bench-jemalloc)
-                            [target/bench-jemalloc/symphony.linux-<arch>-gnu.node if present]
-  --addon-arm NAME=PATH     an extra arm running another .node build on the default allocator, for
-                            comparing a native change; only the .node is swapped, the JS is this
+  --rust-jemalloc-addon P   .node with jemalloc as its Rust allocator [the default build in the repo root]
+  --system-addon P          .node built without it, for every other arm (npm run build:bench-system-allocator)
+                            [target/bench-system-allocator/symphony.linux-<arch>-gnu.node if present]
+  --addon-arm NAME=PATH     an extra arm running another .node build on whichever Rust allocator it was
+                            built with, for comparing a native change; only the .node is swapped, the JS is this
                             checkout's dist/; repeatable, and included in the default arm list
+  --arm-env NAME:KEY=VALUE  extra environment for one arm, e.g. an --addon-arm with
+                            _RJEM_MALLOC_CONF=background_thread:true; repeatable
   --out DIR                 results root; each invocation writes a timestamped directory under it
                             [$TMPDIR/symphony-memory-oop, else ./bench-results]
   --no-cgroup               run symphony without its own systemd scope
@@ -167,14 +193,15 @@ function parseOptions(argv: string[]): Options {
 		argValue(argv, name) === undefined ? undefined : num(name, 0);
 	const conns = num('--conns', 30000);
 	const libArch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
-	const defaultAddon = join(ROOT, 'target', 'bench-jemalloc', `symphony.linux-${process.arch}-gnu.node`);
+	const defaultSystemAddon = join(ROOT, 'target', 'bench-system-allocator', `symphony.linux-${process.arch}-gnu.node`);
 	const sourceHeader = argValue(argv, '--source-header') ?? 'proxyProtocol';
 	if (sourceHeader !== 'proxyProtocol' && sourceHeader !== 'none') {
 		throw new Error(`--source-header must be proxyProtocol or none, got '${sourceHeader}'`);
 	}
 	const phases = (argValue(argv, '--phases') ?? 'abc,d').split(',');
 	for (const phase of phases) {
-		if (phase !== 'abc' && phase !== 'd') throw new Error(`--phases takes abc and/or d, got '${phase}'`);
+		if (!PHASE_KINDS.includes(phase as PhaseKind))
+			throw new Error(`--phases takes ${PHASE_KINDS.join(', ')}, got '${phase}'`);
 	}
 	const opts: Options = {
 		conns,
@@ -207,12 +234,19 @@ function parseOptions(argv: string[]): Options {
 		clientReadBufferSize: optionalNum('--client-read-buffer-size'),
 		upstreamReadBufferSize: optionalNum('--upstream-read-buffer-size'),
 		workerThreads: optionalNum('--worker-threads'),
+		cycles: Math.max(1, num('--cycles', 5)),
+		troughHoldMs: num('--trough-hold-ms', AFFINITY_RECLAIM_MS + 30_000),
+		cpuWindowMs: num('--cpu-window-ms', 60_000),
+		cpuWindows: Math.max(1, num('--cpu-windows', 3)),
+		symphonyCpus: argValue(argv, '--symphony-cpus'),
+		fixedOrder: argv.includes('--fixed-order'),
 		arms: [],
-		phases: phases as ('abc' | 'd')[],
+		phases: phases as PhaseKind[],
 		repeats: Math.max(1, num('--repeats', 3)),
 		jemalloc: argValue(argv, '--jemalloc') ?? `/usr/lib/${libArch}-linux-gnu/libjemalloc.so.2`,
 		mimalloc: argValue(argv, '--mimalloc'),
-		rustJemallocAddon: argValue(argv, '--rust-jemalloc-addon') ?? (existsSync(defaultAddon) ? defaultAddon : undefined),
+		rustJemallocAddon: argValue(argv, '--rust-jemalloc-addon') ?? rootAddon(),
+		systemAddon: argValue(argv, '--system-addon') ?? (existsSync(defaultSystemAddon) ? defaultSystemAddon : undefined),
 		addonArms: Object.fromEntries(
 			argv
 				.flatMap((arg, i) => (arg === '--addon-arm' ? [argv[i + 1] ?? ''] : []))
@@ -227,6 +261,14 @@ function parseOptions(argv: string[]): Options {
 					return [name, resolve(spec.slice(eq + 1))];
 				})
 		),
+		armEnv: argv
+			.flatMap((arg, i) => (arg === '--arm-env' ? [argv[i + 1] ?? ''] : []))
+			.reduce<Record<string, Record<string, string>>>((all, spec) => {
+				const m = /^([a-z0-9-]+):([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(spec);
+				if (!m) throw new Error(`--arm-env takes NAME:KEY=VALUE, got '${spec}'`);
+				(all[m[1]] ??= {})[m[2]] = m[3];
+				return all;
+			}, {}),
 		out: resolve(
 			argValue(argv, '--out') ??
 				(process.env.TMPDIR ? join(process.env.TMPDIR, 'symphony-memory-oop') : join(ROOT, 'bench-results'))
@@ -240,6 +282,9 @@ function parseOptions(argv: string[]): Options {
 		);
 	}
 	if (opts.slowFraction >= 1) throw new Error('--slow-fraction must be below 1');
+	if (opts.phases.includes('cpu') && !(Number.isInteger(opts.msgSize) && opts.msgSize >= 8)) {
+		throw new Error('--phases cpu needs an integer --msg-size >= 8: each message carries an 8-byte send timestamp');
+	}
 	if (opts.slowFraction > 0 && spawnSync('python3', ['--version']).status !== 0) {
 		throw new Error('the slow-reader phase needs python3 (or pass --slow-fraction 0)');
 	}
@@ -267,18 +312,24 @@ interface Arm {
 	addon?: string;
 	/** A library that must show up in symphony's memory map, proving the arm is what ran. */
 	mustMap?: string;
-	phases: ('abc' | 'd')[];
+	phases: PhaseKind[];
 }
 
 function armUnavailable(name: string, opts: Options): string | undefined {
 	if (Object.hasOwn(opts.addonArms, name))
 		return existsSync(opts.addonArms[name]) ? undefined : `${opts.addonArms[name]} not found`;
+	if (name === 'rust-jemalloc') {
+		if (!existsSync(opts.rustJemallocAddon)) return `${opts.rustJemallocAddon} not found`;
+		return isJemallocBuild(opts.rustJemallocAddon)
+			? undefined
+			: `${opts.rustJemallocAddon} was built without its jemalloc feature`;
+	}
+	if (!ALL_ARMS.includes(name)) return 'unknown arm';
+	if (!opts.systemAddon || !existsSync(opts.systemAddon)) {
+		return 'no --system-addon (npm run build:bench-system-allocator)';
+	}
+	if (isJemallocBuild(opts.systemAddon)) return `${opts.systemAddon} has jemalloc as its Rust allocator`;
 	switch (name) {
-		case 'glibc':
-		case 'arena2':
-		case 'buflimit':
-		case 'buf-small':
-			return undefined;
 		case 'trim':
 			return process.report?.getReport && (process.report.getReport() as any).header.glibcVersionRuntime
 				? undefined
@@ -287,21 +338,24 @@ function armUnavailable(name: string, opts: Options): string | undefined {
 			return existsSync(opts.jemalloc) ? undefined : `${opts.jemalloc} not found (--jemalloc)`;
 		case 'mimalloc-preload':
 			return opts.mimalloc && existsSync(opts.mimalloc) ? undefined : 'no --mimalloc library given';
-		case 'rust-jemalloc':
-			if (!opts.rustJemallocAddon || !existsSync(opts.rustJemallocAddon)) {
-				return 'no --rust-jemalloc-addon (npm run build:bench-jemalloc)';
-			}
-			// Statically linked, so it never shows up in /proc/<pid>/maps; its message prefix does in the file.
-			return readFileSync(opts.rustJemallocAddon).includes('<jemalloc>')
-				? undefined
-				: `${opts.rustJemallocAddon} was not built with --features jemalloc`;
 		default:
-			return 'unknown arm';
+			return undefined;
 	}
 }
 
+const rootAddon = (): string => join(ROOT, `symphony.linux-${process.arch}-gnu.node`);
+
+/** Statically linked, so it never shows up in /proc/<pid>/maps; its message prefix does in the file. */
+const isJemallocBuild = (addon: string): boolean => readFileSync(addon).includes('<jemalloc>');
+
 function resolveArm(name: string, opts: Options): Arm {
-	const arm: Arm = { name, env: {}, config: {}, phases: opts.phases, addon: opts.addonArms[name] };
+	const arm: Arm = {
+		name,
+		env: {},
+		config: {},
+		phases: opts.phases,
+		addon: opts.addonArms[name] ?? (name === 'rust-jemalloc' ? opts.rustJemallocAddon : opts.systemAddon),
+	};
 	switch (name) {
 		case 'arena2':
 			arm.env.MALLOC_ARENA_MAX = '2';
@@ -318,9 +372,6 @@ function resolveArm(name: string, opts: Options): Arm {
 			arm.env.LD_PRELOAD = opts.mimalloc!;
 			arm.mustMap = opts.mimalloc;
 			break;
-		case 'rust-jemalloc':
-			arm.addon = opts.rustJemallocAddon;
-			break;
 		case 'buflimit':
 			arm.env.SYMPHONY_TLS_BUFFER_LIMIT = String(opts.tlsBufferLimit);
 			// The queue cap only matters where queues form: active fan-out and slow readers.
@@ -331,6 +382,7 @@ function resolveArm(name: string, opts: Options): Arm {
 			arm.config = { clientReadBufferSize: 1024, upstreamReadBufferSize: 4096 };
 			break;
 	}
+	Object.assign(arm.env, opts.armEnv[name]);
 	return arm;
 }
 
@@ -343,6 +395,7 @@ type ClientCommand =
 	| { type: 'pause' }
 	| { type: 'resume' }
 	| { type: 'ping'; intervalMs: number; size: number }
+	| { type: 'latency'; msgSize: number }
 	| { type: 'stats'; seq: number }
 	| { type: 'exit' };
 
@@ -358,10 +411,12 @@ interface ClientStats {
 	bytesIn: number;
 	bytesOut: number;
 	rss: number;
+	/** Delivery latency histogram (LATENCY_BUCKETS), when stamped messages are on. */
+	latency?: number[];
 }
 
 type UpstreamCommand =
-	| { type: 'push'; rate: number; size: number }
+	| { type: 'push'; rate: number; size: number; stamp?: boolean }
 	| { type: 'slow'; rate: number }
 	| { type: 'stats'; seq: number }
 	| { type: 'exit' };
@@ -376,6 +431,23 @@ interface UpstreamStats {
 	bytesIn: number;
 	bytesOut: number;
 	rss: number;
+}
+
+/** Eight buckets per power of two of microseconds, ~9% wide. */
+const LATENCY_BUCKETS = 8 * 32;
+const latencyBucket = (micros: number): number =>
+	Math.min(LATENCY_BUCKETS - 1, Math.max(0, Math.floor(Math.log2(Math.max(1, micros)) * 8)));
+const bucketMicros = (bucket: number): number => 2 ** ((bucket + 1) / 8);
+
+function percentileMicros(histogram: number[], fraction: number): number {
+	const total = histogram.reduce((a, b) => a + b, 0);
+	if (total === 0) return NaN;
+	let seen = 0;
+	for (let i = 0; i < histogram.length; i++) {
+		seen += histogram[i];
+		if (seen >= total * fraction) return bucketMicros(i);
+	}
+	return bucketMicros(histogram.length - 1);
 }
 
 const emptyClientStats = (): ClientStats => ({
@@ -413,6 +485,10 @@ interface ClientConn {
 	/** Position in `live`; -1 once removed. */
 	index: number;
 	closing: boolean;
+	/** Stamped-message framing: echoed burst bytes still to skip, offset in the current message. */
+	skip: number;
+	pos: number;
+	stamp?: Buffer;
 }
 
 function runClient(argv: string[]): void {
@@ -434,6 +510,25 @@ function runClient(argv: string[]): void {
 	let pingCursor = 0;
 	let ping = Buffer.alloc(0);
 	let nextSlot = 0;
+	let stampedSize = 0;
+	let latency: number[] | undefined;
+
+	// The upstream's first 8 bytes of each message are its CLOCK_MONOTONIC write time, shared host-wide.
+	const readStamps = (conn: ClientConn, chunk: Buffer): void => {
+		const now = process.hrtime.bigint();
+		let i = Math.min(conn.skip, chunk.length);
+		conn.skip -= i;
+		while (i < chunk.length) {
+			const n = Math.min((conn.pos < 8 ? 8 : stampedSize) - conn.pos, chunk.length - i);
+			if (conn.pos < 8) {
+				chunk.copy(conn.stamp!, conn.pos, i, i + n);
+				if (conn.pos + n === 8) latency![latencyBucket(Number(now - conn.stamp!.readBigUInt64LE(0)) / 1000)]++;
+			}
+			conn.pos += n;
+			i += n;
+			if (conn.pos === stampedSize) conn.pos = 0;
+		}
+	};
 
 	const remove = (conn: ClientConn): void => {
 		if (conn.index < 0) return;
@@ -460,7 +555,14 @@ function runClient(argv: string[]): void {
 		let established = false;
 		const tcp = netConnect({ host: '127.0.0.1', port, localAddress });
 		const socket = tlsConnect({ socket: tcp, servername: SNI, rejectUnauthorized: false });
-		const conn: ClientConn = { socket, index: -1, closing: false };
+		const conn: ClientConn = {
+			socket,
+			index: -1,
+			closing: false,
+			skip: burst.length,
+			pos: 0,
+			stamp: stampedSize ? Buffer.alloc(8) : undefined,
+		};
 		socket.on('secureConnect', () => {
 			established = true;
 			stats.inflight--;
@@ -471,6 +573,7 @@ function runClient(argv: string[]): void {
 		});
 		socket.on('data', (chunk: Buffer) => {
 			stats.bytesIn += chunk.length;
+			if (conn.stamp) readStamps(conn, chunk);
 		});
 		socket.on('error', () => {});
 		socket.on('close', () => {
@@ -546,9 +649,14 @@ function runClient(argv: string[]): void {
 				ping = Buffer.alloc(msg.size, 0x70);
 				pingBudget = 0;
 				break;
+			case 'latency':
+				stampedSize = msg.msgSize;
+				latency = new Array(LATENCY_BUCKETS).fill(0);
+				break;
 			case 'stats':
 				stats.live = live.length;
 				stats.rss = process.memoryUsage.rss();
+				stats.latency = latency;
 				process.send!({ type: 'stats', seq: msg.seq, stats });
 				break;
 			case 'exit':
@@ -569,14 +677,18 @@ interface UpstreamConn {
 	slow: boolean;
 	/** Bytes received before the PROXY v1 line ended; undefined once it has. */
 	header?: Buffer;
+	/** Burst bytes not yet echoed. A stamped message must not precede them: the client frames after them. */
+	burstPending: number;
 }
 
 function runUpstream(argv: string[]): void {
 	const path = argValue(argv, '--socket')!;
+	const burst = Number(argValue(argv, '--burst'));
 	const expectHeader = argValue(argv, '--source-header') === 'proxyProtocol';
 	const conns: UpstreamConn[] = [];
 	const stats = emptyUpstreamStats();
 	let msg = Buffer.alloc(0);
+	let stamp = false;
 	let rate = 0;
 	let budget = 0;
 	let cursor = 0;
@@ -592,7 +704,12 @@ function runUpstream(argv: string[]): void {
 			stats.dropped++;
 			return false;
 		}
-		const sent = msg;
+		if (stamp && conn.burstPending > 0) return false;
+		let sent = msg;
+		if (stamp) {
+			sent = Buffer.from(msg);
+			sent.writeBigUInt64LE(process.hrtime.bigint(), 0);
+		}
 		conn.socket.write(sent, (err) => {
 			if (!err) stats.bytesOut += sent.length;
 		});
@@ -606,6 +723,7 @@ function runUpstream(argv: string[]): void {
 			index: conns.length,
 			slow: false,
 			header: expectHeader ? Buffer.alloc(0) : undefined,
+			burstPending: burst,
 		};
 		conns.push(conn);
 		socket.on('data', (chunk: Buffer) => {
@@ -627,6 +745,7 @@ function runUpstream(argv: string[]): void {
 				if (chunk.length === 0) return;
 			}
 			stats.bytesIn += chunk.length;
+			conn.burstPending = Math.max(0, conn.burstPending - chunk.length);
 			const echoed = chunk;
 			// Echoed: the burst and pings come back like a broker's acks.
 			socket.write(echoed, (err) => {
@@ -676,6 +795,7 @@ function runUpstream(argv: string[]): void {
 		switch (cmd.type) {
 			case 'push':
 				rate = cmd.rate;
+				stamp = cmd.stamp === true;
 				msg = Buffer.alloc(cmd.size, 0x6d);
 				budget = 0;
 				break;
@@ -961,6 +1081,8 @@ interface ProcMem {
 	privateDirty: number;
 	/** utime + stime, seconds. */
 	cpu: number;
+	/** Page faults served without I/O: what an allocator that purges and re-touches pages pays. */
+	minorFaults: number;
 }
 
 function procMem(pid: number): ProcMem {
@@ -976,6 +1098,7 @@ function procMem(pid: number): ProcMem {
 		anonymous: smaps.Anonymous,
 		privateDirty: smaps.Private_Dirty,
 		cpu: (Number(fields[11]) + Number(fields[12])) / 100, // USER_HZ is 100 on Linux
+		minorFaults: Number(fields[7]),
 	};
 }
 
@@ -1224,8 +1347,8 @@ class Run {
 		for (const c of this.clients) c.send(cmd);
 	}
 
-	push(rate: number): void {
-		for (const u of this.upstreams) u.send({ type: 'push', rate, size: this.opts.msgSize });
+	push(rate: number, stamp = false): void {
+		for (const u of this.upstreams) u.send({ type: 'push', rate, size: this.opts.msgSize, stamp });
 	}
 
 	slow(cmd: ClientCommand): void {
@@ -1247,7 +1370,11 @@ class Run {
 		const sum = emptyClientStats();
 		const all = [...this.clients, ...this.slowClients];
 		for (const s of await Promise.all(all.map((c) => c.stats<ClientStats>()))) {
-			for (const k of Object.keys(sum) as (keyof ClientStats)[]) sum[k] += s[k];
+			for (const k of Object.keys(emptyClientStats()) as (keyof ClientStats)[]) (sum[k] as number) += s[k] as number;
+			if (s.latency) {
+				sum.latency ??= new Array(LATENCY_BUCKETS).fill(0);
+				s.latency.forEach((n, i) => (sum.latency![i] += n));
+			}
 		}
 		return sum;
 	}
@@ -1352,7 +1479,7 @@ class Run {
 
 interface RunResult {
 	arm: string;
-	kind: 'abc' | 'd';
+	kind: PhaseKind;
 	repeat: number;
 	error?: string;
 	samples: Sample[];
@@ -1361,7 +1488,10 @@ interface RunResult {
 	addonSha256?: string;
 	/** The LD_PRELOAD allocator library, for the preload arms. */
 	preloadSha256?: string;
+	env?: Record<string, string>;
 	maps?: string[];
+	/** symphony's Cpus_allowed_list, to show --symphony-cpus took effect. */
+	cpusAllowed?: string;
 }
 
 function generateCert(dir: string): { cert: string; key: string } {
@@ -1469,7 +1599,7 @@ async function stopAll(children: ChildProcess[]): Promise<void> {
 async function runProcess(
 	opts: Options,
 	arm: Arm,
-	kind: 'abc' | 'd',
+	kind: PhaseKind,
 	repeat: number,
 	useScope: boolean,
 	cert: { cert: string; key: string }
@@ -1523,9 +1653,22 @@ async function runProcess(
 				new Child(
 					`upstream ${i}`,
 					track(
-						fork(__filename, ['--role', 'upstream', '--socket', path, '--source-header', opts.sourceHeader], {
-							stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
-						})
+						fork(
+							__filename,
+							[
+								'--role',
+								'upstream',
+								'--socket',
+								path,
+								'--source-header',
+								opts.sourceHeader,
+								'--burst',
+								String(opts.burstSize),
+							],
+							{
+								stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+							}
+						)
 					)
 				)
 		);
@@ -1533,9 +1676,10 @@ async function runProcess(
 
 		const staged = arm.addon ? stageAddon(arm.addon, join(runDir, 'stage')) : undefined;
 		const serverJs = staged?.serverJs ?? join(ROOT, 'dist', 'server.js');
-		const expectedAddon = staged?.addon ?? join(ROOT, `symphony.linux-${process.arch}-gnu.node`);
+		const expectedAddon = staged?.addon ?? rootAddon();
 		result.addonSha256 = sha256(expectedAddon);
 		if (arm.mustMap) result.preloadSha256 = sha256(arm.mustMap);
+		result.env = arm.env;
 		// Only this arm's allocator variables reach symphony, whatever the orchestrator was started with.
 		const env: Record<string, string> = { ...(process.env as Record<string, string>) };
 		for (const name of [
@@ -1544,11 +1688,14 @@ async function runProcess(
 			'SYMPHONY_MALLOC_TRIM_INTERVAL_MS',
 			'SYMPHONY_TLS_BUFFER_LIMIT',
 			'RUST_LOG',
+			'MALLOC_CONF',
+			'_RJEM_MALLOC_CONF',
 		]) {
 			delete env[name];
 		}
 		const unit = `symphony-memory-oop-${process.pid}-${arm.name}-${kind}-r${repeat}`;
 		const nodeCmd = [
+			...(opts.symphonyCpus ? ['taskset', '-c', opts.symphonyCpus] : []),
 			'env',
 			...Object.entries(arm.env).map(([k, v]) => `${k}=${v}`),
 			process.execPath,
@@ -1583,7 +1730,7 @@ async function runProcess(
 		let spawnError: Error | undefined;
 		symphony.once('error', (err) => (spawnError = err));
 		const pid = symphony.pid!;
-		// systemd-run --scope and env both exec in place, so the spawned pid must be the server itself.
+		// systemd-run --scope, taskset and env all exec in place, so the spawned pid must be the server itself.
 		await waitFor(
 			async () => {
 				if (spawnError) throw new RunAborted(`${command[0]}: ${spawnError.message}`);
@@ -1606,6 +1753,7 @@ async function runProcess(
 		if (arm.mustMap && !maps.includes(realpathSync(arm.mustMap))) {
 			throw new Error(`${arm.mustMap} is not mapped into symphony`);
 		}
+		result.cpusAllowed = /^Cpus_allowed_list:\s*(\S+)/m.exec(readFileSync(`/proc/${pid}/status`, 'utf8'))?.[1];
 		const cgroupDir = useScope ? cgroupDirOf(pid) : undefined;
 		if (cgroupDir && !cgroupDir.endsWith(`/${unit}.scope`))
 			throw new Error(`symphony landed in ${cgroupDir}, not its own scope`);
@@ -1720,6 +1868,70 @@ async function runProcess(
 				const mismatch = await run.drainAndVerify();
 				await run.sample('drained');
 				if (mismatch) throw new RunAborted(mismatch);
+			} else if (kind === 'soak') {
+				startTraffic();
+				run.broadcast({ type: 'churn', turnoverS: opts.churnTurnoverS });
+				const low = Math.round(opts.conns * opts.dropFraction);
+				// What a process that never saw the peak holds at the trough population: the troughs' floor.
+				run.phase = 'fresh-low';
+				run.setTarget(low);
+				await run.reach(low);
+				await run.hold(opts.peakHoldMs);
+				await run.sample('fresh-low');
+				for (let cycle = 1; cycle <= opts.cycles; cycle++) {
+					run.phase = `ramp${cycle}`;
+					run.setTarget(opts.conns);
+					await run.reach(opts.conns);
+					run.phase = `peak${cycle}`;
+					await run.hold(opts.peakHoldMs);
+					await run.sample(`peak${cycle}`);
+					run.phase = `trough${cycle}`;
+					run.setTarget(low);
+					await run.reach(low);
+					await run.hold(10_000);
+					await run.sample(`trough${cycle}-start`);
+					await run.hold(Math.max(0, opts.troughHoldMs - 10_000));
+					await run.sample(`trough${cycle}`);
+				}
+				// Without traffic or churn the allocator sees no activity, which is when lazy purging stalls.
+				run.phase = 'quiet-low';
+				run.broadcast({ type: 'churn', turnoverS: 0 });
+				run.push(0);
+				run.broadcast({ type: 'ping', intervalMs: 0, size: 0 });
+				await run.hold(opts.settleMs);
+				await run.sample('quiet-low-start');
+				await run.hold(Math.max(0, opts.troughHoldMs - opts.settleMs));
+				await run.sample('quiet-low');
+				run.phase = 'zero';
+				run.setTarget(0);
+				await run.reach(0);
+				await run.hold(opts.settleMs);
+				await run.sample('zero-start');
+				await run.hold(Math.max(0, opts.troughHoldMs - opts.settleMs));
+				await run.sample('zero');
+				const last = run.samples[run.samples.length - 1];
+				if (last.clients.lost > 0) {
+					throw new RunAborted(`${last.clients.lost} connections closed without the client closing them`);
+				}
+			} else if (kind === 'cpu') {
+				run.phase = 'parked';
+				run.broadcast({ type: 'latency', msgSize: opts.msgSize });
+				run.setTarget(opts.conns);
+				await run.reach(opts.conns);
+				await run.hold(opts.settleMs);
+				run.phase = 'warmup';
+				run.push(opts.msgRate, true);
+				await run.hold(opts.settleMs);
+				await run.sample('cpu-0');
+				for (let w = 1; w <= opts.cpuWindows; w++) {
+					run.phase = `window${w}`;
+					await run.hold(opts.cpuWindowMs);
+					await run.sample(`cpu-${w}`);
+				}
+				run.phase = 'drain';
+				const mismatch = await run.drainAndVerify();
+				await run.sample('drained');
+				if (mismatch) throw new RunAborted(mismatch);
 			} else {
 				run.phase = 'ramp';
 				startTraffic();
@@ -1821,6 +2033,66 @@ function derive(opts: Options, r: RunResult): Record<string, number> {
 			if (slow.cgroup && active.cgroup)
 				out.slowCgroupSockPerSlow = (slow.cgroup.sock - active.cgroup.sock) / slow.clients.paused;
 			if (slowMid) out.slowSecondHalfPerSlow = (slow.proc.vmRss - slowMid.proc.vmRss) / slow.clients.paused;
+		}
+	} else if (r.kind === 'soak') {
+		const footprint = (s: Sample): number => s.proc.vmRss + s.proc.vmSwap;
+		let firstPeak: Sample | undefined;
+		let maxPeak = 0;
+		for (let c = 1; c <= opts.cycles; c++) {
+			const peak = at(`peak${c}`);
+			const troughStart = at(`trough${c}-start`);
+			const trough = at(`trough${c}`);
+			if (!peak) break;
+			firstPeak ??= peak;
+			maxPeak = Math.max(maxPeak, footprint(peak));
+			out[`peak${c}MiB`] = footprint(peak) / 1048576;
+			if (troughStart) out[`troughStart${c}Pct`] = (footprint(troughStart) / footprint(peak)) * 100;
+			if (trough) {
+				out[`trough${c}MiB`] = footprint(trough) / 1048576;
+				out[`trough${c}Pct`] = (footprint(trough) / footprint(peak)) * 100;
+				out[`trough${c}PctOfMaxPeak`] = (footprint(trough) / maxPeak) * 100;
+			}
+		}
+		const lastPeak = at(`peak${opts.cycles}`);
+		const firstTrough = at('trough1');
+		const lastTrough = at(`trough${opts.cycles}`);
+		if (firstPeak) out.peak1PerConn = footprint(firstPeak) / firstPeak.conns;
+		const freshLow = at('fresh-low');
+		if (freshLow) {
+			out.freshLowMiB = footprint(freshLow) / 1048576;
+			for (let c = 1; c <= opts.cycles; c++) {
+				const trough = at(`trough${c}`);
+				if (trough) out[`trough${c}OverFreshMiB`] = (footprint(trough) - footprint(freshLow)) / 1048576;
+			}
+		}
+		for (const label of ['quiet-low-start', 'quiet-low', 'zero-start', 'zero']) {
+			const s = at(label);
+			if (s) out[`${label}MiB`] = footprint(s) / 1048576;
+		}
+		if (idle) out.idleMiB = footprint(idle) / 1048576;
+		if (firstPeak && lastPeak) out.peakGrowthMiB = (footprint(lastPeak) - footprint(firstPeak)) / 1048576;
+		if (firstTrough && lastTrough) out.troughGrowthMiB = (footprint(lastTrough) - footprint(firstTrough)) / 1048576;
+	} else if (r.kind === 'cpu') {
+		const first = at('cpu-0');
+		const last = at(`cpu-${opts.cpuWindows}`);
+		if (first && last) {
+			const seconds = (last.t - first.t) / 1000;
+			const cpu = last.proc.cpu - first.proc.cpu;
+			const fanOut = last.clients.bytesIn - first.clients.bytesIn;
+			const proxied = fanOut + (last.upstreams.bytesIn - first.upstreams.bytesIn);
+			const messages = fanOut / opts.msgSize;
+			out.cpuMsgsPerS = messages / seconds;
+			out.cpuDeliveredPct = (messages / (opts.msgRate * last.conns * seconds)) * 100;
+			out.cpuCores = cpu / seconds;
+			out.cpuSecPerGB = cpu / (proxied / 1e9);
+			out.cpuSecPerMMsgs = cpu / (messages / 1e6);
+			out.minorFaultsPerS = (last.proc.minorFaults - first.proc.minorFaults) / seconds;
+			if (first.clients.latency && last.clients.latency) {
+				const window = last.clients.latency.map((n, i) => n - first.clients.latency![i]);
+				out.latencyP50Ms = percentileMicros(window, 0.5) / 1000;
+				out.latencyP99Ms = percentileMicros(window, 0.99) / 1000;
+				out.latencyP999Ms = percentileMicros(window, 0.999) / 1000;
+			}
 		}
 	} else {
 		const peak = at('peak');
@@ -1973,6 +2245,96 @@ function summarize(opts: Options, results: RunResult[]): string {
 			]
 		),
 	];
+	const cycles = Array.from({ length: opts.cycles }, (_, i) => i + 1);
+	if (groups.size && [...groups.keys()].some((key) => key.endsWith('|soak'))) {
+		lines.push(
+			'',
+			`Soak, ${opts.cycles} cycles of ramp to ${opts.conns} under churn → hold ${opts.peakHoldMs / 1000} s → ` +
+				`drop to ${opts.dropFraction * 100}% → hold ${opts.troughHoldMs / 1000} s. Footprint = VmRSS + VmSwap, MiB:`,
+			'',
+			...table(
+				'soak',
+				[
+					'peak/conn c1 (B)',
+					...cycles.map((c) => `peak c${c}`),
+					...cycles.map((c) => `trough c${c}`),
+					...cycles.map((c) => `trough c${c} % of peak`),
+					'trough c1 +10 s % of peak',
+					'peak growth c1→last',
+					'trough growth c1→last',
+				],
+				[
+					['peak1PerConn'],
+					...cycles.map((c): [string, number] => [`peak${c}MiB`, 0]),
+					...cycles.map((c): [string, number] => [`trough${c}MiB`, 0]),
+					...cycles.map((c): [string, number] => [`trough${c}Pct`, 1]),
+					['troughStart1Pct', 1],
+					['peakGrowthMiB', 0],
+					['troughGrowthMiB', 0],
+				]
+			),
+			'',
+			'Soak floors, MiB: fresh-low = a process that never saw the peak, at the trough population, before cycle 1; ' +
+				'quiet = trough population with traffic and churn stopped; zero = every connection closed (start = +settle, end = +trough hold):',
+			'',
+			...table(
+				'soak',
+				[
+					'idle',
+					'fresh-low',
+					...cycles.map((c) => `trough c${c} over fresh-low`),
+					'quiet start',
+					'quiet end',
+					'zero start',
+					'zero end',
+				],
+				[
+					['idleMiB', 0],
+					['freshLowMiB', 0],
+					...cycles.map((c): [string, number] => [`trough${c}OverFreshMiB`, 0]),
+					['quiet-low-startMiB', 0],
+					['quiet-lowMiB', 0],
+					['zero-startMiB', 0],
+					['zeroMiB', 0],
+				]
+			)
+		);
+	}
+	if ([...groups.keys()].some((key) => key.endsWith('|cpu'))) {
+		lines.push(
+			'',
+			`Fan-out CPU, ${opts.conns} connections, ${opts.msgSize} B at ${opts.msgRate}/s/conn, ` +
+				`${opts.cpuWindows} × ${opts.cpuWindowMs / 1000} s` +
+				(opts.symphonyCpus ? `, symphony pinned to CPUs ${opts.symphonyCpus}` : '') +
+				'. GB = payload bytes through symphony, both directions; latency = upstream write → client read:',
+			'',
+			...table(
+				'cpu',
+				[
+					'msgs/s',
+					'delivered %',
+					'symphony cores',
+					'CPU s per GB',
+					'CPU s per 1M msgs',
+					'minor faults/s',
+					'p50 ms',
+					'p99 ms',
+					'p99.9 ms',
+				],
+				[
+					['cpuMsgsPerS'],
+					['cpuDeliveredPct', 1],
+					['cpuCores', 3],
+					['cpuSecPerGB', 2],
+					['cpuSecPerMMsgs', 3],
+					['minorFaultsPerS', 0],
+					['latencyP50Ms', 2],
+					['latencyP99Ms', 2],
+					['latencyP999Ms', 2],
+				]
+			)
+		);
+	}
 	const failed = results.filter((r) => r.error);
 	if (failed.length)
 		lines.push('', 'Invalid runs (excluded):', ...failed.map((r) => `- ${r.arm} ${r.kind} r${r.repeat}: ${r.error}`));
@@ -1995,15 +2357,17 @@ function environment(): Record<string, string> {
 	};
 }
 
-function checkReleaseAddon(): void {
-	const addon = join(ROOT, `symphony.linux-${process.arch}-gnu.node`);
-	if (!existsSync(join(ROOT, 'dist', 'server.js')) || !existsSync(addon)) {
-		throw new Error('dist/server.js or the native addon is missing: run `npm run build` (release) first');
+function checkReleaseAddons(arms: Arm[]): void {
+	if (!existsSync(join(ROOT, 'dist', 'server.js'))) {
+		throw new Error('dist/server.js is missing: run `npm run build` (release) first');
 	}
-	// The release profile strips symbols; a debug build keeps them and would skew every number.
-	const res = spawnSync('file', ['-L', addon], { encoding: 'utf8' });
-	if (res.status === 0 && /not stripped/.test(res.stdout)) {
-		throw new Error(`${addon} is a debug (unstripped) build: run \`npm run build\` before benchmarking`);
+	for (const addon of new Set(arms.map((arm) => arm.addon ?? rootAddon()))) {
+		if (!existsSync(addon)) throw new Error(`${addon} is missing: run \`npm run build\` (release) first`);
+		// The release profile strips symbols; a debug build keeps them and would skew every number.
+		const res = spawnSync('file', ['-L', addon], { encoding: 'utf8' });
+		if (res.status === 0 && /not stripped/.test(res.stdout)) {
+			throw new Error(`${addon} is a debug (unstripped) build: benchmark release builds only`);
+		}
 	}
 }
 
@@ -2031,10 +2395,13 @@ function summarizeDirs(dirs: string[]): void {
 			repeats: undefined,
 			out: undefined,
 			addonArms: undefined,
+			armEnv: undefined,
 			rustJemallocAddon: undefined,
+			systemAddon: undefined,
 			jemalloc: undefined,
 			mimalloc: undefined,
 			phases: undefined,
+			fixedOrder: undefined,
 			minAvailableMb: undefined,
 		});
 	for (const run of runs.slice(1)) {
@@ -2049,11 +2416,11 @@ function summarizeDirs(dirs: string[]): void {
 	if (harnesses.size > 1) {
 		console.warn(`--summarize: pooling ${harnesses.size} harness versions; check they measure the same way`);
 	}
-	// An arm name pools runs only when they ran the same native build and preloaded allocator.
+	// An arm name pools runs only when they ran the same native build, preloaded allocator and environment.
 	const builds = new Map<string, string>();
 	for (const r of results) {
 		if (r.error) continue;
-		const build = `${r.addonSha256}+${r.preloadSha256 ?? ''}`;
+		const build = `${r.addonSha256}+${r.preloadSha256 ?? ''}+${JSON.stringify(Object.entries(r.env ?? {}).sort())}`;
 		if (builds.has(r.arm) && builds.get(r.arm) !== build) {
 			throw new Error(`--summarize: arm '${r.arm}' ran different builds across the directories`);
 		}
@@ -2069,7 +2436,6 @@ function socketRoot(): string {
 
 async function orchestrate(argv: string[]): Promise<void> {
 	const opts = parseOptions(argv);
-	checkReleaseAddon();
 	opts.out = join(opts.out, new Date().toISOString().replace(/[:.]/g, '-'));
 	mkdirSync(opts.out, { recursive: true, mode: 0o700 });
 	const cert = generateCert(opts.out);
@@ -2077,6 +2443,7 @@ async function orchestrate(argv: string[]): Promise<void> {
 	if (opts.cgroup && !useScope)
 		console.warn('systemd-run --user --scope unavailable: no cgroup stats, and symphony may swap');
 	const arms = opts.arms.map((name) => resolveArm(name, opts));
+	checkReleaseAddons(arms);
 	// sun_path holds 108 bytes, and the admin server first binds a `.<pid>` sibling (≤ 8 more).
 	const longest = join(socketRoot(), 'smo-XXXXXX', 'admin.sock');
 	if (Buffer.byteLength(longest) + 8 > 107) {
@@ -2100,7 +2467,7 @@ async function orchestrate(argv: string[]): Promise<void> {
 	const results: RunResult[] = [];
 	for (let repeat = 1; repeat <= opts.repeats; repeat++) {
 		// Shuffled per repeat, so drift on a shared host spreads across arms instead of biasing one.
-		for (const arm of shuffle(arms)) {
+		for (const arm of opts.fixedOrder ? arms : shuffle(arms)) {
 			for (const kind of arm.phases) {
 				if (stopping) return;
 				console.log(`[${new Date().toISOString()}] ${arm.name} ${kind} repeat ${repeat}`);

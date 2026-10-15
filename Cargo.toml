@@ -27,12 +27,14 @@ ring        = "0.17"
 md-5        = "0.10"
 sha2        = "0.10"
 zeroize     = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 # `disable_initial_exec_tls`: jemalloc's default TLS model cannot be dlopen()ed, which is how Node
 # loads this cdylib.
 tikv-jemallocator = { version = "0.6", optional = true, features = ["disable_initial_exec_tls"] }
 
 [features]
-# Memory-benchmark arm only (see src/lib.rs); never enabled in published builds.
+default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dev-dependencies]
