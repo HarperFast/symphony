@@ -102,12 +102,14 @@ jobs:
               export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
               export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
             fi
-            # jemalloc's configure links a test program, which the image's clang cannot do for these targets.
+            # jemalloc's configure links a test program, which the image's clang cannot do for these
+            # targets on its own. aarch64 keeps clang (ring's assembly needs it) and borrows the cross
+            # GCC toolchain's linker and runtime.
             if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
               export CC_x86_64_unknown_linux_musl=gcc
             fi
             if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-              export CC_aarch64_unknown_linux_gnu=/usr/aarch64-unknown-linux-gnu/bin/aarch64-unknown-linux-gnu-gcc
+              export CFLAGS_aarch64_unknown_linux_gnu="${CFLAGS:-} --gcc-toolchain=/usr/aarch64-unknown-linux-gnu"
             fi
             npm run build -- --target ${{ matrix.target }}
             strip --strip-unneeded ${{ matrix.artifact }} 2>/dev/null || true
