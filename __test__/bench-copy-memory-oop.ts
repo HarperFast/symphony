@@ -282,8 +282,8 @@ function parseOptions(argv: string[]): Options {
 		);
 	}
 	if (opts.slowFraction >= 1) throw new Error('--slow-fraction must be below 1');
-	if (opts.phases.includes('cpu') && opts.msgSize < 8) {
-		throw new Error('--phases cpu needs --msg-size >= 8: each message carries an 8-byte send timestamp');
+	if (opts.phases.includes('cpu') && !(Number.isInteger(opts.msgSize) && opts.msgSize >= 8)) {
+		throw new Error('--phases cpu needs an integer --msg-size >= 8: each message carries an 8-byte send timestamp');
 	}
 	if (opts.slowFraction > 0 && spawnSync('python3', ['--version']).status !== 0) {
 		throw new Error('the slow-reader phase needs python3 (or pass --slow-fraction 0)');
@@ -1081,6 +1081,8 @@ interface ProcMem {
 	privateDirty: number;
 	/** utime + stime, seconds. */
 	cpu: number;
+	/** Page faults served without I/O: what an allocator that purges and re-touches pages pays. */
+	minorFaults: number;
 }
 
 function procMem(pid: number): ProcMem {
@@ -1096,6 +1098,7 @@ function procMem(pid: number): ProcMem {
 		anonymous: smaps.Anonymous,
 		privateDirty: smaps.Private_Dirty,
 		cpu: (Number(fields[11]) + Number(fields[12])) / 100, // USER_HZ is 100 on Linux
+		minorFaults: Number(fields[7]),
 	};
 }
 
@@ -1485,7 +1488,6 @@ interface RunResult {
 	addonSha256?: string;
 	/** The LD_PRELOAD allocator library, for the preload arms. */
 	preloadSha256?: string;
-	/** What this arm added to symphony's environment. */
 	env?: Record<string, string>;
 	maps?: string[];
 	/** symphony's Cpus_allowed_list, to show --symphony-cpus took effect. */
@@ -2084,6 +2086,7 @@ function derive(opts: Options, r: RunResult): Record<string, number> {
 			out.cpuCores = cpu / seconds;
 			out.cpuSecPerGB = cpu / (proxied / 1e9);
 			out.cpuSecPerMMsgs = cpu / (messages / 1e6);
+			out.minorFaultsPerS = (last.proc.minorFaults - first.proc.minorFaults) / seconds;
 			if (first.clients.latency && last.clients.latency) {
 				const window = last.clients.latency.map((n, i) => n - first.clients.latency![i]);
 				out.latencyP50Ms = percentileMicros(window, 0.5) / 1000;
@@ -2313,6 +2316,7 @@ function summarize(opts: Options, results: RunResult[]): string {
 					'symphony cores',
 					'CPU s per GB',
 					'CPU s per 1M msgs',
+					'minor faults/s',
 					'p50 ms',
 					'p99 ms',
 					'p99.9 ms',
@@ -2323,6 +2327,7 @@ function summarize(opts: Options, results: RunResult[]): string {
 					['cpuCores', 3],
 					['cpuSecPerGB', 2],
 					['cpuSecPerMMsgs', 3],
+					['minorFaultsPerS', 0],
 					['latencyP50Ms', 2],
 					['latencyP99Ms', 2],
 					['latencyP999Ms', 2],
@@ -2415,7 +2420,7 @@ function summarizeDirs(dirs: string[]): void {
 	const builds = new Map<string, string>();
 	for (const r of results) {
 		if (r.error) continue;
-		const build = `${r.addonSha256}+${r.preloadSha256 ?? ''}+${JSON.stringify(r.env ?? {})}`;
+		const build = `${r.addonSha256}+${r.preloadSha256 ?? ''}+${JSON.stringify(Object.entries(r.env ?? {}).sort())}`;
 		if (builds.has(r.arm) && builds.get(r.arm) !== build) {
 			throw new Error(`--summarize: arm '${r.arm}' ran different builds across the directories`);
 		}

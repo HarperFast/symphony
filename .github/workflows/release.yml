@@ -61,6 +61,7 @@ jobs:
             fi
             npm run build -- --target ${{ matrix.target }}
             strip --strip-unneeded ${{ matrix.artifact }} 2>/dev/null || true
+            grep -q '<jemalloc>' ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
