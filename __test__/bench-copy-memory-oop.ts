@@ -8,6 +8,7 @@
  * memory, not the proxy's; do not fold this back into one process.
  *
  *   npm run build                      # release build; never benchmark a debug addon
+ *   npm run build:bench-system-allocator   # the glibc-allocator build every arm but rust-jemalloc runs
  *   npm run benchmark:memory-oop -- --conns 100000 --repeats 3
  *
  * On a shared host, run it under whatever serialises benchmarks there. `--help` lists the options.
@@ -91,9 +92,13 @@ interface Options {
 	repeats: number;
 	jemalloc: string;
 	mimalloc?: string;
-	rustJemallocAddon?: string;
+	rustJemallocAddon: string;
+	/** A `--no-default-features` build: the allocator every arm except rust-jemalloc runs on. */
+	systemAddon?: string;
 	/** Extra arms that differ only by addon build, `--addon-arm name=path`. */
 	addonArms: Record<string, string>;
+	/** Extra environment per arm, `--arm-env name:KEY=VALUE`. */
+	armEnv: Record<string, Record<string, string>>;
 	out: string;
 	cgroup: boolean;
 	minAvailableMb: number;
@@ -152,11 +157,14 @@ const HELP = `Options (defaults in brackets):
   --repeats N               [3]
   --jemalloc PATH           LD_PRELOAD library [/usr/lib/<arch>-linux-gnu/libjemalloc.so.2]
   --mimalloc PATH           LD_PRELOAD library for mimalloc-preload [none]
-  --rust-jemalloc-addon P   .node built with \`--features jemalloc\` (npm run build:bench-jemalloc)
-                            [target/bench-jemalloc/symphony.linux-<arch>-gnu.node if present]
-  --addon-arm NAME=PATH     an extra arm running another .node build on the default allocator, for
-                            comparing a native change; only the .node is swapped, the JS is this
+  --rust-jemalloc-addon P   .node with jemalloc as its Rust allocator [the default build in the repo root]
+  --system-addon P          .node built without it, for every other arm (npm run build:bench-system-allocator)
+                            [target/bench-system-allocator/symphony.linux-<arch>-gnu.node if present]
+  --addon-arm NAME=PATH     an extra arm running another .node build on whichever Rust allocator it was
+                            built with, for comparing a native change; only the .node is swapped, the JS is this
                             checkout's dist/; repeatable, and included in the default arm list
+  --arm-env NAME:KEY=VALUE  extra environment for one arm, e.g. an --addon-arm with
+                            _RJEM_MALLOC_CONF=background_thread:true; repeatable
   --out DIR                 results root; each invocation writes a timestamped directory under it
                             [$TMPDIR/symphony-memory-oop, else ./bench-results]
   --no-cgroup               run symphony without its own systemd scope
@@ -185,7 +193,7 @@ function parseOptions(argv: string[]): Options {
 		argValue(argv, name) === undefined ? undefined : num(name, 0);
 	const conns = num('--conns', 30000);
 	const libArch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
-	const defaultAddon = join(ROOT, 'target', 'bench-jemalloc', `symphony.linux-${process.arch}-gnu.node`);
+	const defaultSystemAddon = join(ROOT, 'target', 'bench-system-allocator', `symphony.linux-${process.arch}-gnu.node`);
 	const sourceHeader = argValue(argv, '--source-header') ?? 'proxyProtocol';
 	if (sourceHeader !== 'proxyProtocol' && sourceHeader !== 'none') {
 		throw new Error(`--source-header must be proxyProtocol or none, got '${sourceHeader}'`);
@@ -237,7 +245,8 @@ function parseOptions(argv: string[]): Options {
 		repeats: Math.max(1, num('--repeats', 3)),
 		jemalloc: argValue(argv, '--jemalloc') ?? `/usr/lib/${libArch}-linux-gnu/libjemalloc.so.2`,
 		mimalloc: argValue(argv, '--mimalloc'),
-		rustJemallocAddon: argValue(argv, '--rust-jemalloc-addon') ?? (existsSync(defaultAddon) ? defaultAddon : undefined),
+		rustJemallocAddon: argValue(argv, '--rust-jemalloc-addon') ?? rootAddon(),
+		systemAddon: argValue(argv, '--system-addon') ?? (existsSync(defaultSystemAddon) ? defaultSystemAddon : undefined),
 		addonArms: Object.fromEntries(
 			argv
 				.flatMap((arg, i) => (arg === '--addon-arm' ? [argv[i + 1] ?? ''] : []))
@@ -252,6 +261,14 @@ function parseOptions(argv: string[]): Options {
 					return [name, resolve(spec.slice(eq + 1))];
 				})
 		),
+		armEnv: argv
+			.flatMap((arg, i) => (arg === '--arm-env' ? [argv[i + 1] ?? ''] : []))
+			.reduce<Record<string, Record<string, string>>>((all, spec) => {
+				const m = /^([a-z0-9-]+):([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(spec);
+				if (!m) throw new Error(`--arm-env takes NAME:KEY=VALUE, got '${spec}'`);
+				(all[m[1]] ??= {})[m[2]] = m[3];
+				return all;
+			}, {}),
 		out: resolve(
 			argValue(argv, '--out') ??
 				(process.env.TMPDIR ? join(process.env.TMPDIR, 'symphony-memory-oop') : join(ROOT, 'bench-results'))
@@ -298,12 +315,18 @@ interface Arm {
 function armUnavailable(name: string, opts: Options): string | undefined {
 	if (Object.hasOwn(opts.addonArms, name))
 		return existsSync(opts.addonArms[name]) ? undefined : `${opts.addonArms[name]} not found`;
+	if (name === 'rust-jemalloc') {
+		if (!existsSync(opts.rustJemallocAddon)) return `${opts.rustJemallocAddon} not found`;
+		return isJemallocBuild(opts.rustJemallocAddon)
+			? undefined
+			: `${opts.rustJemallocAddon} was built without its jemalloc feature`;
+	}
+	if (!ALL_ARMS.includes(name)) return 'unknown arm';
+	if (!opts.systemAddon || !existsSync(opts.systemAddon)) {
+		return 'no --system-addon (npm run build:bench-system-allocator)';
+	}
+	if (isJemallocBuild(opts.systemAddon)) return `${opts.systemAddon} has jemalloc as its Rust allocator`;
 	switch (name) {
-		case 'glibc':
-		case 'arena2':
-		case 'buflimit':
-		case 'buf-small':
-			return undefined;
 		case 'trim':
 			return process.report?.getReport && (process.report.getReport() as any).header.glibcVersionRuntime
 				? undefined
@@ -312,21 +335,24 @@ function armUnavailable(name: string, opts: Options): string | undefined {
 			return existsSync(opts.jemalloc) ? undefined : `${opts.jemalloc} not found (--jemalloc)`;
 		case 'mimalloc-preload':
 			return opts.mimalloc && existsSync(opts.mimalloc) ? undefined : 'no --mimalloc library given';
-		case 'rust-jemalloc':
-			if (!opts.rustJemallocAddon || !existsSync(opts.rustJemallocAddon)) {
-				return 'no --rust-jemalloc-addon (npm run build:bench-jemalloc)';
-			}
-			// Statically linked, so it never shows up in /proc/<pid>/maps; its message prefix does in the file.
-			return readFileSync(opts.rustJemallocAddon).includes('<jemalloc>')
-				? undefined
-				: `${opts.rustJemallocAddon} was not built with --features jemalloc`;
 		default:
-			return 'unknown arm';
+			return undefined;
 	}
 }
 
+const rootAddon = (): string => join(ROOT, `symphony.linux-${process.arch}-gnu.node`);
+
+/** Statically linked, so it never shows up in /proc/<pid>/maps; its message prefix does in the file. */
+const isJemallocBuild = (addon: string): boolean => readFileSync(addon).includes('<jemalloc>');
+
 function resolveArm(name: string, opts: Options): Arm {
-	const arm: Arm = { name, env: {}, config: {}, phases: opts.phases, addon: opts.addonArms[name] };
+	const arm: Arm = {
+		name,
+		env: {},
+		config: {},
+		phases: opts.phases,
+		addon: opts.addonArms[name] ?? (name === 'rust-jemalloc' ? opts.rustJemallocAddon : opts.systemAddon),
+	};
 	switch (name) {
 		case 'arena2':
 			arm.env.MALLOC_ARENA_MAX = '2';
@@ -343,9 +369,6 @@ function resolveArm(name: string, opts: Options): Arm {
 			arm.env.LD_PRELOAD = opts.mimalloc!;
 			arm.mustMap = opts.mimalloc;
 			break;
-		case 'rust-jemalloc':
-			arm.addon = opts.rustJemallocAddon;
-			break;
 		case 'buflimit':
 			arm.env.SYMPHONY_TLS_BUFFER_LIMIT = String(opts.tlsBufferLimit);
 			// The queue cap only matters where queues form: active fan-out and slow readers.
@@ -356,6 +379,7 @@ function resolveArm(name: string, opts: Options): Arm {
 			arm.config = { clientReadBufferSize: 1024, upstreamReadBufferSize: 4096 };
 			break;
 	}
+	Object.assign(arm.env, opts.armEnv[name]);
 	return arm;
 }
 
@@ -1626,7 +1650,7 @@ async function runProcess(
 
 		const staged = arm.addon ? stageAddon(arm.addon, join(runDir, 'stage')) : undefined;
 		const serverJs = staged?.serverJs ?? join(ROOT, 'dist', 'server.js');
-		const expectedAddon = staged?.addon ?? join(ROOT, `symphony.linux-${process.arch}-gnu.node`);
+		const expectedAddon = staged?.addon ?? rootAddon();
 		result.addonSha256 = sha256(expectedAddon);
 		if (arm.mustMap) result.preloadSha256 = sha256(arm.mustMap);
 		// Only this arm's allocator variables reach symphony, whatever the orchestrator was started with.
@@ -2303,7 +2327,7 @@ function environment(): Record<string, string> {
 }
 
 function checkReleaseAddon(): void {
-	const addon = join(ROOT, `symphony.linux-${process.arch}-gnu.node`);
+	const addon = rootAddon();
 	if (!existsSync(join(ROOT, 'dist', 'server.js')) || !existsSync(addon)) {
 		throw new Error('dist/server.js or the native addon is missing: run `npm run build` (release) first');
 	}
@@ -2338,7 +2362,9 @@ function summarizeDirs(dirs: string[]): void {
 			repeats: undefined,
 			out: undefined,
 			addonArms: undefined,
+			armEnv: undefined,
 			rustJemallocAddon: undefined,
+			systemAddon: undefined,
 			jemalloc: undefined,
 			mimalloc: undefined,
 			phases: undefined,

@@ -37,7 +37,7 @@
 		"benchmark:throughput": "tsc -p tsconfig.test.json && node dist-test/__test__/benchmark-throughput.js",
 		"diagnostic:keepalive": "tsc -p tsconfig.test.json && node dist-test/__test__/diagnostic-uds-keepalive.js",
 		"benchmark:memory-oop": "tsc -p tsconfig.test.json && node dist-test/__test__/bench-copy-memory-oop.js",
-		"build:bench-jemalloc": "napi build --platform --release --features jemalloc --js false --dts addon.d.ts target/bench-jemalloc"
+		"build:bench-system-allocator": "napi build --platform --release --cargo-flags=--no-default-features --js false --dts addon.d.ts target/bench-system-allocator"
 	},
 	"devDependencies": {
 		"@harperfast/integration-testing": "^0.2.0",
