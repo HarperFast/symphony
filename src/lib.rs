@@ -21,10 +21,8 @@ mod suspended;
 mod tls;
 mod upstream;
 
-// glibc keeps the peak footprint resident after connections close: freed chunks stranded across its
-// per-thread arenas are never returned to the OS. jemalloc returns them. Only the addon's Rust
-// allocations move; its symbols stay prefixed, so Node's malloc is untouched, and nothing either
-// side allocates is freed by the other (Rust↔JS values are copied, and napi finalizers run Rust drops).
+// glibc keeps the peak footprint resident after connections close; jemalloc returns it. Prefixed
+// symbols keep Node on its own malloc, so memory must never be freed across the boundary (CLAUDE.md).
 #[cfg(all(target_os = "linux", feature = "jemalloc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -44,7 +42,7 @@ mod allocator_tests {
 		) -> c_int;
 	}
 
-	/// Linking jemalloc is not selecting it: `arenas.lookup` only succeeds for memory jemalloc handed out.
+	/// `arenas.lookup` only succeeds for memory jemalloc handed out, so this proves selection, not linkage.
 	#[test]
 	fn rust_allocations_come_from_jemalloc() {
 		let boxed = Box::new([7u8; 64]);

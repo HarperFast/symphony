@@ -282,6 +282,9 @@ function parseOptions(argv: string[]): Options {
 		);
 	}
 	if (opts.slowFraction >= 1) throw new Error('--slow-fraction must be below 1');
+	if (opts.phases.includes('cpu') && opts.msgSize < 8) {
+		throw new Error('--phases cpu needs --msg-size >= 8: each message carries an 8-byte send timestamp');
+	}
 	if (opts.slowFraction > 0 && spawnSync('python3', ['--version']).status !== 0) {
 		throw new Error('the slow-reader phase needs python3 (or pass --slow-fraction 0)');
 	}
@@ -674,10 +677,13 @@ interface UpstreamConn {
 	slow: boolean;
 	/** Bytes received before the PROXY v1 line ended; undefined once it has. */
 	header?: Buffer;
+	/** Burst bytes not yet echoed. A stamped message must not precede them: the client frames after them. */
+	burstPending: number;
 }
 
 function runUpstream(argv: string[]): void {
 	const path = argValue(argv, '--socket')!;
+	const burst = Number(argValue(argv, '--burst'));
 	const expectHeader = argValue(argv, '--source-header') === 'proxyProtocol';
 	const conns: UpstreamConn[] = [];
 	const stats = emptyUpstreamStats();
@@ -698,6 +704,7 @@ function runUpstream(argv: string[]): void {
 			stats.dropped++;
 			return false;
 		}
+		if (stamp && conn.burstPending > 0) return false;
 		let sent = msg;
 		if (stamp) {
 			sent = Buffer.from(msg);
@@ -716,6 +723,7 @@ function runUpstream(argv: string[]): void {
 			index: conns.length,
 			slow: false,
 			header: expectHeader ? Buffer.alloc(0) : undefined,
+			burstPending: burst,
 		};
 		conns.push(conn);
 		socket.on('data', (chunk: Buffer) => {
@@ -737,6 +745,7 @@ function runUpstream(argv: string[]): void {
 				if (chunk.length === 0) return;
 			}
 			stats.bytesIn += chunk.length;
+			conn.burstPending = Math.max(0, conn.burstPending - chunk.length);
 			const echoed = chunk;
 			// Echoed: the burst and pings come back like a broker's acks.
 			socket.write(echoed, (err) => {
@@ -1476,6 +1485,8 @@ interface RunResult {
 	addonSha256?: string;
 	/** The LD_PRELOAD allocator library, for the preload arms. */
 	preloadSha256?: string;
+	/** What this arm added to symphony's environment. */
+	env?: Record<string, string>;
 	maps?: string[];
 	/** symphony's Cpus_allowed_list, to show --symphony-cpus took effect. */
 	cpusAllowed?: string;
@@ -1640,9 +1651,22 @@ async function runProcess(
 				new Child(
 					`upstream ${i}`,
 					track(
-						fork(__filename, ['--role', 'upstream', '--socket', path, '--source-header', opts.sourceHeader], {
-							stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
-						})
+						fork(
+							__filename,
+							[
+								'--role',
+								'upstream',
+								'--socket',
+								path,
+								'--source-header',
+								opts.sourceHeader,
+								'--burst',
+								String(opts.burstSize),
+							],
+							{
+								stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+							}
+						)
 					)
 				)
 		);
@@ -1653,6 +1677,7 @@ async function runProcess(
 		const expectedAddon = staged?.addon ?? rootAddon();
 		result.addonSha256 = sha256(expectedAddon);
 		if (arm.mustMap) result.preloadSha256 = sha256(arm.mustMap);
+		result.env = arm.env;
 		// Only this arm's allocator variables reach symphony, whatever the orchestrator was started with.
 		const env: Record<string, string> = { ...(process.env as Record<string, string>) };
 		for (const name of [
@@ -1903,6 +1928,7 @@ async function runProcess(
 				}
 				run.phase = 'drain';
 				const mismatch = await run.drainAndVerify();
+				await run.sample('drained');
 				if (mismatch) throw new RunAborted(mismatch);
 			} else {
 				run.phase = 'ramp';
@@ -2383,11 +2409,11 @@ function summarizeDirs(dirs: string[]): void {
 	if (harnesses.size > 1) {
 		console.warn(`--summarize: pooling ${harnesses.size} harness versions; check they measure the same way`);
 	}
-	// An arm name pools runs only when they ran the same native build and preloaded allocator.
+	// An arm name pools runs only when they ran the same native build, preloaded allocator and environment.
 	const builds = new Map<string, string>();
 	for (const r of results) {
 		if (r.error) continue;
-		const build = `${r.addonSha256}+${r.preloadSha256 ?? ''}`;
+		const build = `${r.addonSha256}+${r.preloadSha256 ?? ''}+${JSON.stringify(r.env ?? {})}`;
 		if (builds.has(r.arm) && builds.get(r.arm) !== build) {
 			throw new Error(`--summarize: arm '${r.arm}' ran different builds across the directories`);
 		}

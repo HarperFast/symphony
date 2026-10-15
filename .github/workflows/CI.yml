@@ -203,11 +203,9 @@ jobs:
         run: npm test
 
   test-linux-variants:
-    # Every Linux build links its own jemalloc (page size and libc differ per target), so each one is
-    # loaded and exercised, not just x64 glibc.
+    # Each Linux artifact links its own jemalloc (libc and page size differ per target).
     name: Test – ${{ matrix.artifact }}
     runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
     needs: [build-linux]
     timeout-minutes: 15
     strategy:
@@ -215,13 +213,13 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04-arm
-            container: node:22-bookworm
+            image: node:22-bookworm
             artifact: symphony.linux-arm64-gnu.node
           - os: ubuntu-latest
-            container: node:22-alpine
+            image: node:22-alpine
             artifact: symphony.linux-x64-musl.node
           - os: ubuntu-24.04-arm
-            container: node:22-alpine
+            image: node:22-alpine
             artifact: symphony.linux-arm64-musl.node
 
     steps:
@@ -232,18 +230,16 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
 
-      # The local-build loader looks for the flat `<platform>-<arch>[-gnu].node` names only.
-      - name: Stage addon
-        run: |
-          arch=$(node -p process.arch)
-          [ -f "symphony.linux-$arch-gnu.node" ] || mv "${{ matrix.artifact }}" "symphony.linux-$arch.node"
-          if command -v apk >/dev/null; then apk add --no-cache openssl; fi
-
-      - name: Install dependencies
-        run: npm ci
-
+      # `docker run`, not a job container: the runner cannot run JavaScript actions inside Alpine on
+      # arm64. The local-build loader looks only for the flat `<platform>-<arch>[-gnu].node` names.
       - name: Run tests
-        run: npm test
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w ${{ matrix.image }} sh -ec '
+            arch=$(node -p process.arch)
+            [ -f "symphony.linux-$arch-gnu.node" ] || mv ${{ matrix.artifact }} "symphony.linux-$arch.node"
+            if command -v apk >/dev/null; then apk add --no-cache openssl; fi
+            npm ci
+            npm test'
 
   integration-test:
     name: Integration Test – Harper UDS proxy

@@ -35,8 +35,7 @@ tikv-jemallocator = { version = "0.6", optional = true, features = ["disable_ini
 
 [features]
 default = ["jemalloc"]
-# Rust's global allocator on Linux (see src/lib.rs). `--no-default-features` builds on the system
-# allocator instead.
+# The Linux global allocator; build with `--no-default-features` to bisect against the system one.
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dev-dependencies]
