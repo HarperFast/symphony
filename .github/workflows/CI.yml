@@ -234,6 +234,7 @@ jobs:
       # arm64. The local-build loader looks only for the flat `<platform>-<arch>[-gnu].node` names.
       - name: Run tests
         run: |
+          grep -q '<jemalloc>' ${{ matrix.artifact }}
           docker run --rm -v "$PWD:/w" -w /w ${{ matrix.image }} sh -ec '
             arch=$(node -p process.arch)
             [ -f "symphony.linux-$arch-gnu.node" ] || mv ${{ matrix.artifact }} "symphony.linux-$arch.node"
