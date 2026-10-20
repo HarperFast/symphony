@@ -1900,7 +1900,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		assert!(mapped.permits(ip("::ffff:10.1.2.3")));
 		assert!(!mapped.permits(ip("11.1.2.3")));
 
-		// A v6 CIDR shorter than the mapped prefix stays v6, matching only native v6 peers.
+		// `::` is not an IPv4-mapped address, so `::/0` stays v6 and matches only native v6 peers.
 		let broad = allowlist(&["::/0"]);
 		assert!(broad.permits(ip("2001:db8::1")));
 		assert!(!broad.permits(ip("10.1.2.3")));

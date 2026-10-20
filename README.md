@@ -404,6 +404,10 @@ routes: [
   [HTTP listener](#http-listener-acme--https-redirect)'s ACME challenge proxy. A list on a route
   that answers ACME HTTP-01 challenges therefore also refuses the CA's validators, whose addresses
   are not published.
+- It restricts a route, not the upstream behind it. The client picks the SNI, so a second route
+  reaching the same upstream (an alias, or a wildcard that also matches) is a way around a list
+  it doesn't carry — and symphony does not compare the HTTP `Host` header with the SNI. Give
+  every route to a restricted upstream the same list.
 - This is unrelated to `protection.allowlist`, which exempts listener-wide addresses from protection
   checks rather than restricting anything.
 - An older symphony ignores the field, admitting every client. A config producer should not count

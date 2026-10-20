@@ -174,6 +174,9 @@ export interface RouteConfig {
 	 * validators. The list is checked once, when a connection is admitted: an `updateConfig()`
 	 * that changes it applies to new connections, and established ones are not dropped.
 	 *
+	 * It restricts this route, not its upstream: the client chooses the SNI, so every route that
+	 * reaches a restricted upstream needs the same list.
+	 *
 	 * An invalid entry drops this route (it then refuses every connection, counted in
 	 * `failingRoutes`) rather than failing `new SymphonyProxy()`/`updateConfig()` for every other
 	 * route on the port-set.
