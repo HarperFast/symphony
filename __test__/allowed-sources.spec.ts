@@ -128,8 +128,8 @@ describe('allowedSources – passthrough routes', () => {
 	});
 
 	after(async () => {
-		await proxy.stop();
-		await upstream.close();
+		await proxy?.stop();
+		await upstream?.close();
 	});
 
 	it('admits a peer matching a bare-IP entry', async () => {
@@ -187,8 +187,8 @@ describe('allowedSources – terminated TLS', () => {
 	});
 
 	after(async () => {
-		await proxy.stop();
-		await upstream.close();
+		await proxy?.stop();
+		await upstream?.close();
 	});
 
 	function handshake(servername: string): Promise<boolean> {
@@ -229,7 +229,7 @@ describe('allowedSources – IPv6 and IPv4-mapped peers', () => {
 	});
 
 	after(async () => {
-		await upstream.close();
+		await upstream?.close();
 	});
 
 	async function withProxy(host: string, routes: RouteConfig[], body: (port: number) => Promise<void>, t: TestContext) {
@@ -316,8 +316,8 @@ describe('allowedSources – route rate limiter', () => {
 	});
 
 	after(async () => {
-		await proxy.stop();
-		await upstream.close();
+		await proxy?.stop();
+		await upstream?.close();
 	});
 
 	it('spends no route tokens on refused peers', async (t) => {
@@ -352,8 +352,8 @@ describe('allowedSources – hot reload', () => {
 	});
 
 	after(async () => {
-		await proxy.stop();
-		await upstream.close();
+		await proxy?.stop();
+		await upstream?.close();
 	});
 
 	it('applies added and removed entries to new connections', async () => {
@@ -410,8 +410,8 @@ describe('allowedSources – invalid entries', () => {
 	});
 
 	after(async () => {
-		await proxy.stop();
-		await upstream.close();
+		await proxy?.stop();
+		await upstream?.close();
 	});
 
 	it('drops only the route with the invalid entry, failing closed', async () => {
@@ -467,8 +467,8 @@ describe('allowedSources – suspended routes', () => {
 	});
 
 	after(async () => {
-		await proxy.stop();
-		await upstream.close();
+		await proxy?.stop();
+		await upstream?.close();
 	});
 
 	const resolved = (allowedSources?: string[]) => (conn: SuspendedConnection) =>
@@ -548,8 +548,8 @@ describe('allowedSources – HTTP listener ACME proxy', () => {
 	});
 
 	after(async () => {
-		await proxy.stop();
-		await new Promise<void>((resolve) => acmeUpstream.close(() => resolve()));
+		await proxy?.stop();
+		if (acmeUpstream) await new Promise<void>((resolve) => acmeUpstream.close(() => resolve()));
 	});
 
 	function challenge(host: string): Promise<string> {
