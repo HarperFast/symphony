@@ -2,9 +2,10 @@ use crate::balancer::{UdsBalancer, UdsSlotSpec};
 use crate::metrics::RouteMetrics;
 use crate::tls::{sha256, CertSpec, MtlsSpec, TlsConfigCache};
 use arc_swap::ArcSwap;
+use ipnetwork::{IpNetwork, Ipv4Network};
 use rustls::ServerConfig;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -162,6 +163,49 @@ pub fn requires_http_protocol(mode: SourceAddressMode, fingerprint: ForwardFinge
 		|| (!fingerprint.is_empty() && mode != SourceAddressMode::ProxyProtocolV2)
 }
 
+// ── Route source allowlist ────────────────────────────────────────────────────
+
+/// A route's `allowedSources`: the only TCP peers admitted to it. Unrelated to the listener-level
+/// `protection.allowlist`, which exempts peers from protection checks rather than restricting them.
+#[derive(Clone, Debug)]
+pub struct SourceAllowlist(Arc<[IpNetwork]>);
+
+impl SourceAllowlist {
+	/// `Ok(None)` for an empty list, which restricts nothing.
+	pub fn parse(entries: &[String]) -> Result<Option<Self>, String> {
+		if entries.is_empty() {
+			return Ok(None);
+		}
+		let networks = entries
+			.iter()
+			.map(|entry| parse_source_network(entry))
+			.collect::<Result<Vec<_>, _>>()?;
+		Ok(Some(Self(networks.into())))
+	}
+
+	/// A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`; it is matched as IPv4.
+	pub fn permits(&self, peer: IpAddr) -> bool {
+		let peer = peer.to_canonical();
+		self.0.iter().any(|network| network.contains(peer))
+	}
+}
+
+/// An IPv4-mapped IPv6 CIDR is stored as its IPv4 form: peers are canonicalised to IPv4 before
+/// matching, so the mapped form would otherwise never match anything.
+fn parse_source_network(entry: &str) -> Result<IpNetwork, String> {
+	let network: IpNetwork = entry
+		.parse()
+		.map_err(|e| format!("invalid allowedSources CIDR '{entry}': {e}"))?;
+	if let IpNetwork::V6(v6) = network {
+		if let (Some(v4), Some(prefix)) = (v6.ip().to_ipv4_mapped(), v6.prefix().checked_sub(96)) {
+			return Ipv4Network::new(v4, prefix)
+				.map(IpNetwork::V4)
+				.map_err(|e| format!("invalid allowedSources CIDR '{entry}': {e}"));
+		}
+	}
+	Ok(network)
+}
+
 // ── Route destination ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -193,6 +237,8 @@ pub struct Route {
 	pub forward_fingerprint: ForwardFingerprint,
 	/// The route's declared application protocol — gates HTTP/1 header rewriting.
 	pub protocol: RouteProtocol,
+	/// None = any peer.
+	pub allowed_sources: Option<SourceAllowlist>,
 }
 
 pub struct RouteMetricIdentity {
@@ -380,6 +426,9 @@ pub struct RouteSpec {
 	/// against `source_address_mode`/`forward_fingerprint` at parse time (`proxy.rs`), so by
 	/// the time a `RouteSpec` reaches `build_route` the combination is already known-valid.
 	pub protocol: RouteProtocol,
+	/// Unparsed: an invalid entry drops this route in `build_route_table` instead of failing the
+	/// whole config.
+	pub allowed_sources: Vec<String>,
 }
 
 /// Listener-level fallback cert/mTLS spec.
@@ -540,6 +589,25 @@ pub fn build_route_table(
 			continue;
 		}
 
+		// Like the protocol declaration, a permanent config error: never carried forward, and the
+		// SNI is tombstoned so it fails closed rather than serving unrestricted or falling through
+		// to a broader route. Logged also when an already-failing SNI was still serving a
+		// carried-forward route, since this is the call that takes it offline.
+		let allowed_sources = match SourceAllowlist::parse(&spec.allowed_sources) {
+			Ok(allowed_sources) => allowed_sources,
+			Err(e) => {
+				let newly_failing =
+					previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
+				let was_serving = previous.is_some_and(|p| p.get_for_spec_sni(&spec.sni).is_some());
+				failing_snis.insert(Arc::from(spec.sni.as_str()));
+				if newly_failing || was_serving {
+					eprintln!("symphony: skipping route '{}': {}", spec.sni, e);
+				}
+				tombstone(&spec.sni, &mut dropped_exact, &mut dropped_wildcard);
+				continue;
+			}
+		};
+
 		let requested_auth = ClientAuth::of(spec, listener_tls);
 
 		// Isolate per-route failures: a single route whose cert can't be built (e.g. a
@@ -605,6 +673,11 @@ pub fn build_route_table(
 				}
 			}
 		};
+
+		// Assigned here rather than in `build_route` so a carried-forward route enforces the list
+		// the new spec asks for, not the one it was built with: narrowing a list in the same
+		// reconcile as a cert-rotation race must not keep admitting the removed peers.
+		route.allowed_sources = allowed_sources;
 
 		// Reusing by the full metric identity keeps ordinary cert/upstream reloads continuous
 		// without moving historical counters when a route changes tenant groups.
@@ -779,6 +852,7 @@ fn build_route(
 		source_address_mode: spec.source_address_mode,
 		forward_fingerprint: spec.forward_fingerprint,
 		protocol: spec.protocol,
+		allowed_sources: None,
 	})
 }
 
@@ -1013,6 +1087,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			forward_fingerprint: ForwardFingerprint::NONE,
 			http2: false,
 			protocol: RouteProtocol::Opaque,
+			allowed_sources: Vec::new(),
 		}
 	}
 
@@ -1789,5 +1864,109 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			.await
 			.expect("the task must exit on shutdown")
 			.unwrap();
+	}
+
+	fn allowlist(entries: &[&str]) -> SourceAllowlist {
+		let entries: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
+		SourceAllowlist::parse(&entries)
+			.expect("valid")
+			.expect("non-empty")
+	}
+
+	fn ip(s: &str) -> IpAddr {
+		s.parse().unwrap()
+	}
+
+	#[test]
+	fn source_allowlist_matches_v4_v6_and_bare_hosts() {
+		let allowed = allowlist(&["10.0.0.0/8", "2001:db8::/32", "192.0.2.7"]);
+		assert!(allowed.permits(ip("10.1.2.3")));
+		assert!(allowed.permits(ip("2001:db8::1")));
+		assert!(allowed.permits(ip("192.0.2.7")));
+		assert!(!allowed.permits(ip("192.0.2.8")));
+		assert!(!allowed.permits(ip("11.0.0.1")));
+		assert!(!allowed.permits(ip("2001:db9::1")));
+	}
+
+	#[test]
+	fn source_allowlist_matches_ipv4_mapped_peers_and_cidrs_as_ipv4() {
+		let v4 = allowlist(&["10.0.0.0/8"]);
+		assert!(v4.permits(ip("::ffff:10.1.2.3")));
+		assert!(!v4.permits(ip("::ffff:11.1.2.3")));
+
+		let mapped = allowlist(&["::ffff:10.0.0.0/104"]);
+		assert!(mapped.permits(ip("10.1.2.3")));
+		assert!(mapped.permits(ip("::ffff:10.1.2.3")));
+		assert!(!mapped.permits(ip("11.1.2.3")));
+
+		// A v6 CIDR shorter than the mapped prefix stays v6, matching only native v6 peers.
+		let broad = allowlist(&["::/0"]);
+		assert!(broad.permits(ip("2001:db8::1")));
+		assert!(!broad.permits(ip("10.1.2.3")));
+	}
+
+	#[test]
+	fn source_allowlist_parse_empty_and_invalid() {
+		assert!(SourceAllowlist::parse(&[]).unwrap().is_none());
+		for bad in ["nope", "10.0.0.0/33", "", " 10.0.0.1"] {
+			let err = SourceAllowlist::parse(&["10.0.0.0/8".into(), bad.into()]).unwrap_err();
+			assert!(err.contains(&format!("'{bad}'")), "{err}");
+		}
+	}
+
+	#[test]
+	fn invalid_allowed_sources_drops_only_that_route_and_fails_closed() {
+		let listener = ListenerTlsSpec::empty();
+		let wildcard = tls_route("*.example.com", CERT_A, KEY_A);
+		let mut bad = tls_route("tenant.example.com", CERT_A, KEY_A);
+		bad.allowed_sources = vec!["10.0.0.0/8".into(), "not-a-cidr".into()];
+
+		let table = build(&[wildcard.clone(), bad.clone()], &listener, None);
+		assert!(
+			table.resolve(Some("tenant.example.com")).is_none(),
+			"a rejected list must not fall through to the wildcard"
+		);
+		assert!(table.resolve(Some("other.example.com")).is_some());
+		assert_eq!(table.failing_route_count(), 1);
+
+		// On a hot-swap there is no carry-forward either: the previous route had no restriction.
+		let live = build(
+			&[
+				wildcard.clone(),
+				tls_route("tenant.example.com", CERT_A, KEY_A),
+			],
+			&listener,
+			None,
+		);
+		let swapped = build(&[wildcard, bad], &listener, Some(&live));
+		assert!(swapped.resolve(Some("tenant.example.com")).is_none());
+	}
+
+	#[test]
+	fn a_carried_forward_route_enforces_the_new_allowed_sources() {
+		let listener = ListenerTlsSpec::empty();
+		let sni = "tenant.example.com";
+		let mut live_spec = tls_route(sni, CERT_A, KEY_A);
+		live_spec.allowed_sources = vec!["10.0.0.0/8".into(), "192.0.2.0/24".into()];
+		let live = build(&[live_spec], &listener, None);
+
+		// KEY_B does not match CERT_A, so the rebuild fails and the last-good route is retained.
+		let mut narrowed = tls_route(sni, CERT_A, KEY_B);
+		narrowed.allowed_sources = vec!["192.0.2.0/24".into()];
+		let swapped = build(&[narrowed.clone()], &listener, Some(&live));
+		assert!(swapped.failing_snis.contains(sni));
+		let route = swapped
+			.resolve(Some(sni))
+			.expect("last-good route retained");
+		let allowed = route.allowed_sources.as_ref().expect("restricted");
+		assert!(allowed.permits(ip("192.0.2.1")));
+		assert!(
+			!allowed.permits(ip("10.0.0.1")),
+			"the removed CIDR must stop admitting"
+		);
+
+		narrowed.allowed_sources.clear();
+		let lifted = build(&[narrowed], &listener, Some(&live));
+		assert!(lifted.resolve(Some(sni)).unwrap().allowed_sources.is_none());
 	}
 }

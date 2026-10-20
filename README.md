@@ -120,6 +120,7 @@ above `TCP_KEEPCNT`'s ceiling of 127.
 | `sourceAddressHeader` | `'proxyProtocol' \| 'proxyProtocolV2' \| 'xForwardedFor' \| 'none'` | `'proxyProtocol'` for UDS, `'none'` for TCP | How the real client IP is forwarded to the upstream. See [Source address forwarding](#source-address-forwarding). |
 | `forwardFingerprint` | `'ja3' \| 'ja4' \| 'none' \| ('ja3' \| 'ja4')[]` | `'none'` | Forward the client TLS fingerprint(s) downstream. See [Forwarding the fingerprint](#forwarding-the-fingerprint-downstream). |
 | `protocol` | `'http' \| 'opaque'` | `'opaque'` | The route's application protocol. Required to be `'http'` before `sourceAddressHeader: 'xForwardedFor'` or a header-carried `forwardFingerprint` is accepted — see [Source address forwarding](#source-address-forwarding). |
+| `allowedSources` | `string[]` | — (any client) | Only clients whose TCP peer address is in one of these CIDRs reach the route. See [Per-route source allowlist](#per-route-source-allowlist). |
 
 ### `Upstream`
 
@@ -363,6 +364,49 @@ routes: [
 ```
 
 Connections that exceed the limit are silently dropped (TCP RST). This is a global token bucket per route — not per IP. For per-IP rate limiting use `protection.rateLimit`.
+
+## Per-route source allowlist
+
+`allowedSources` restricts a route to a set of client addresses. Several tenants can share one
+listener and still each have their own list, since the list belongs to the route the SNI selects:
+
+```typescript
+routes: [
+  {
+    sni: 'tenant-a.example.com',
+    allowedSources: ['203.0.113.0/24', '198.51.100.7', '2001:db8:1::/48'],
+    upstreams: [{ kind: 'uds', path: '/run/tenant-a.sock' }],
+    terminateTls: true,
+    cert: { certChain, privateKey },
+  },
+]
+```
+
+- Entries are IPv4 or IPv6 CIDRs; a bare IP is a single host. Absent or empty = any client.
+- The client address is the TCP peer symphony sees. Inbound PROXY headers and `X-Forwarded-For`
+  are never consulted. An IPv4 client on a dual-stack (`[::]`) listener (`::ffff:a.b.c.d`) is
+  matched against the IPv4 entries.
+- A refused connection is closed (TCP RST) right after route selection: before the TLS handshake,
+  the upstream connect, the route's `maxConnectionsPerSecond` bucket and any `'suspended'` event.
+  It is counted as `source_not_allowed` in the route's and the listener's `blockedByReason`, and
+  no `'blocked'` event is emitted.
+- On a suspended route, the route's own list decides whether the connection is suspended at all.
+  A `resolveConnection()` route may carry its own `allowedSources`, checked in addition before the
+  handshake and upstream connect; an invalid entry there rejects the resolution with an `'error'`
+  event.
+- `updateConfig()` changes apply to new connections. The list is checked once, when a connection
+  is admitted, so established connections are not dropped when their address is removed.
+- An invalid entry drops the route (it refuses every connection and is counted in `failingRoutes`)
+  instead of failing the whole `new SymphonyProxy()` / `updateConfig()` call for every other route.
+  A rejected route never falls through to a wildcard or default route.
+- The list applies on every listener that resolves the route, including an
+  [HTTP listener](#http-listener-acme--https-redirect)'s ACME challenge proxy. A list on a route
+  that answers ACME HTTP-01 challenges therefore also refuses the CA's validators, whose addresses
+  are not published.
+- This is unrelated to `protection.allowlist`, which exempts listener-wide addresses from protection
+  checks rather than restricting anything.
+- An older symphony ignores the field, admitting every client. A config producer should not count
+  on enforcement until every process accepting on the port runs a version that supports it.
 
 ---
 
@@ -657,7 +701,7 @@ const m = proxy.metrics();
 // m.suspendedResolved     — suspended connections that were resolved with a route
 // m.suspendedUnresolved   — suspended connections that timed out or were rejected
 // m.routes                — routes in the live table, including the default route
-// m.failingRoutes         — rejected cert/protocol/carrier routes or duplicate wildcards
+// m.failingRoutes         — rejected cert/protocol/carrier/allowedSources routes or duplicate wildcards
 
 // Per listener, in configuration order
 for (const l of m.listeners) {
@@ -679,6 +723,7 @@ for (const r of m.routeMetrics) {
   // r.metricsGroup — optional RouteConfig.metricsGroup, or ''
   // r.activeConnections, r.connections
   // r.bytesReceived, r.bytesSent
+  // r.blockedByReason — sparse post-route refusals (`source_not_allowed`)
   // r.errorsByReason — sparse post-route failures; zero-valued reasons are omitted
 }
 
@@ -693,8 +738,8 @@ Every listener reason is reported on every call, including reasons still at zero
 exists before the first incident rather than appearing mid-outage. `l.blocked` / `l.errors` are
 summed from the very reason values reported alongside them, and `m.blockedConnections` from the
 listener values in the same snapshot — so a reading taken mid-traffic is internally consistent
-rather than only adding up while the proxy is idle. Route errors are sparse to avoid multiplying
-every zero-valued reason by every configured tenant route.
+rather than only adding up while the proxy is idle. Route blocks and errors are sparse to avoid
+multiplying every zero-valued reason by every configured tenant route.
 
 Route counters begin only after resolution succeeds. Listener-level protection blocks,
 `maxConnections`, malformed/no SNI, unmatched routes, and HTTP header failures therefore have no
@@ -711,7 +756,9 @@ samples per route); deployments with thousands of routes should size their scrap
 accordingly.
 
 **Block reasons:** `max_connections`, `cidr_blocked`, `ja3_blocked`, `ja4_blocked`,
-`incomplete_handshake`, `no_sni`, `rate_limited`, `too_many_connections`, `penalty_boxed`.
+`incomplete_handshake`, `no_sni`, `rate_limited`, `too_many_connections`, `penalty_boxed`,
+`source_not_allowed`. Only `source_not_allowed` is route-scoped (also in `r.blockedByReason` and
+`symphony_route_blocked_total`).
 
 **Error reasons:** `no_route`, `route_rate_limited`, `suspend_unresolved`, `tls_handshake`,
 `tls_missing_cert`, `upstream_connect`, `idle_timeout`, `half_closed`, `peer_timeout`, `stream`,

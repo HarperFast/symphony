@@ -146,7 +146,7 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 		out.sample(
 			'symphony_routes_failing',
 			'gauge',
-			'Routes rejected at build time (cert failure, protocol/carrier validation failure, or duplicate wildcard) — dropped, or (cert failures only) serving a carried-forward last-good cert.',
+			'Routes rejected at build time (cert failure, protocol/carrier validation failure, invalid allowedSources, or duplicate wildcard) — dropped, or (cert failures only) serving a carried-forward last-good cert.',
 			metrics.failingRoutes,
 			proxy
 		);
@@ -261,6 +261,15 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 				route.bytesSent,
 				tags
 			);
+			for (const { reason, count } of route.blockedByReason) {
+				out.sample(
+					'symphony_route_blocked_total',
+					'counter',
+					'Connections refused after route assignment, by reason.',
+					count,
+					{ ...tags, reason }
+				);
+			}
 			for (const { reason, count } of route.errorsByReason) {
 				out.sample('symphony_route_errors_total', 'counter', 'Post-route connection failures by reason.', count, {
 					...tags,

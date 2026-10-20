@@ -114,9 +114,11 @@ describe('proxy.metrics()', () => {
 				metricsGroup: 'tenant-1',
 				activeConnections: 0,
 				connections: 0,
+				blocked: 0,
 				errors: 0,
 				bytesReceived: 0,
 				bytesSent: 0,
+				blockedByReason: [],
 				errorsByReason: [],
 			},
 		]);
@@ -182,9 +184,11 @@ describe('proxy.metrics()', () => {
 				metricsGroup: 'tenant-2',
 				activeConnections: 0,
 				connections: 0,
+				blocked: 0,
 				errors: 0,
 				bytesReceived: 0,
 				bytesSent: 0,
+				blockedByReason: [],
 				errorsByReason: [],
 			},
 		]);
@@ -427,9 +431,11 @@ describe('renderPrometheus', () => {
 							metricsGroup: 'tenant-1',
 							activeConnections: 2,
 							connections: 8,
+							blocked: 3,
 							errors: 1,
 							bytesReceived: 768,
 							bytesSent: 1536,
+							blockedByReason: [{ reason: 'source_not_allowed', count: 3 }],
 							errorsByReason: [{ reason: 'upstream_connect', count: 1 }],
 						},
 					],
@@ -491,6 +497,11 @@ describe('renderPrometheus', () => {
 		assert.ok(
 			lines.includes(
 				'symphony_route_errors_total{proxy="80,443",route="api.example.com",group="tenant-1",reason="upstream_connect"} 1'
+			)
+		);
+		assert.ok(
+			lines.includes(
+				'symphony_route_blocked_total{proxy="80,443",route="api.example.com",group="tenant-1",reason="source_not_allowed"} 3'
 			)
 		);
 	});
@@ -577,9 +588,11 @@ describe('renderPrometheus', () => {
 			metricsGroup: `tenant-${i}`,
 			activeConnections: 0,
 			connections: 0,
+			blocked: 0,
 			errors: 0,
 			bytesReceived: 0,
 			bytesSent: 0,
+			blockedByReason: [],
 			errorsByReason: [],
 		}));
 		const rendered = renderPrometheus({
@@ -593,6 +606,7 @@ describe('renderPrometheus', () => {
 		});
 		assert.equal(rendered.match(/^symphony_route_connections_total\{/gm)?.length, count);
 		assert.equal(rendered.match(/^symphony_route_errors_total\{/gm)?.length ?? 0, 0);
+		assert.equal(rendered.match(/^symphony_route_blocked_total\{/gm)?.length ?? 0, 0);
 	});
 });
 

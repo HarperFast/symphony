@@ -18,7 +18,9 @@ use crate::http_proxy::{
 };
 use crate::listener::{make_reuseport_socket, set_rlimit_nofile};
 use crate::liveness::arm_accepted;
-use crate::metrics::{inc_route_error, BlockKind, CountingStream, ErrorKind, RouteActiveGuard};
+use crate::metrics::{
+	inc_route_blocked, inc_route_error, BlockKind, CountingStream, ErrorKind, RouteActiveGuard,
+};
 use crate::proxy_conn::ConnContext;
 use crate::upstream::{self, UpstreamStream};
 use std::net::SocketAddr;
@@ -218,6 +220,20 @@ async fn proxy_acme(
 	};
 	drop(table);
 	let _route_guard = RouteActiveGuard::new(route.metric_identity.counters.clone());
+
+	// Same order as the TLS path: a refused peer spends none of the route's tokens.
+	if route
+		.allowed_sources
+		.as_ref()
+		.is_some_and(|allowed| !allowed.permits(peer_addr.ip()))
+	{
+		inc_route_blocked(
+			&ctx.listener_metrics,
+			&route.metric_identity.counters,
+			BlockKind::SourceNotAllowed,
+		);
+		return;
+	}
 
 	// Honour the route's global rate limit the same way the TLS path does, so
 	// a flood of /.well-known/acme-challenge/ requests can't bypass the cap.

@@ -39,7 +39,15 @@ labeled_enum!(BlockKind {
 	RateLimited => "rate_limited",
 	TooManyConnections => "too_many_connections",
 	PenaltyBoxed => "penalty_boxed",
+	/// The peer is outside the resolved route's `allowedSources`.
+	SourceNotAllowed => "source_not_allowed",
 });
+
+impl BlockKind {
+	pub fn is_route_scoped(self) -> bool {
+		matches!(self, Self::SourceNotAllowed)
+	}
+}
 
 // Exhaustive by construction: adding a BlockReason variant fails to compile until it is given
 // a BlockKind, so a new protection check can never silently land in an unlabeled bucket.
@@ -206,6 +214,7 @@ pub struct RouteMetrics {
 	pub total_connections: AtomicU64,
 	pub bytes_in: AtomicU64,
 	pub bytes_out: AtomicU64,
+	blocked_by_kind: [AtomicU64; BlockKind::COUNT],
 	errors_by_kind: [AtomicU64; ErrorKind::COUNT],
 }
 
@@ -216,6 +225,7 @@ impl Default for RouteMetrics {
 			total_connections: AtomicU64::new(0),
 			bytes_in: AtomicU64::new(0),
 			bytes_out: AtomicU64::new(0),
+			blocked_by_kind: std::array::from_fn(|_| AtomicU64::new(0)),
 			errors_by_kind: std::array::from_fn(|_| AtomicU64::new(0)),
 		}
 	}
@@ -254,6 +264,28 @@ impl RouteMetrics {
 		}
 	}
 
+	pub fn inc_blocked(&self, kind: BlockKind) {
+		debug_assert!(
+			kind.is_route_scoped(),
+			"pre-route block attributed to a route"
+		);
+		if kind.is_route_scoped() {
+			self.blocked_by_kind[kind as usize].fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	/// Sparse, like `errors_by_reason`.
+	pub fn blocked_by_reason(&self) -> Vec<(&'static str, u64)> {
+		BlockKind::ALL
+			.iter()
+			.filter(|kind| kind.is_route_scoped())
+			.filter_map(|kind| {
+				let count = self.blocked_by_kind[*kind as usize].load(Ordering::Relaxed);
+				(count > 0).then_some((kind.as_str(), count))
+			})
+			.collect()
+	}
+
 	/// Route error series are sparse to keep scrape cardinality proportional to failures rather
 	/// than multiplying every zero-valued reason by every configured tenant route.
 	pub fn errors_by_reason(&self) -> Vec<(&'static str, u64)> {
@@ -266,6 +298,11 @@ impl RouteMetrics {
 			})
 			.collect()
 	}
+}
+
+pub fn inc_route_blocked(listener: &ListenerMetrics, route: &RouteMetrics, kind: BlockKind) {
+	route.inc_blocked(kind);
+	listener.inc_blocked(kind);
 }
 
 pub fn inc_route_error(listener: &ListenerMetrics, route: &RouteMetrics, kind: ErrorKind) {
