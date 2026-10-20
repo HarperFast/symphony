@@ -192,7 +192,7 @@ describe('allowedSources – terminated TLS', () => {
 	});
 
 	function handshake(servername: string): Promise<boolean> {
-		return new Promise((resolve) => {
+		return new Promise((resolve, reject) => {
 			const socket = tls.connect({ port: proxyPort, host: '127.0.0.1', servername, rejectUnauthorized: false });
 			socket.once('secureConnect', () => {
 				socket.end();
@@ -200,6 +200,10 @@ describe('allowedSources – terminated TLS', () => {
 			});
 			socket.once('error', () => resolve(false));
 			socket.once('close', () => resolve(false));
+			setTimeout(() => {
+				socket.destroy();
+				reject(new Error('handshake timeout'));
+			}, 5000).unref();
 		});
 	}
 
@@ -272,7 +276,10 @@ describe('allowedSources – IPv6 and IPv4-mapped peers', () => {
 			],
 			async (port) => {
 				// Reaching a `::` listener over IPv4 needs a dual-stack socket (Linux's default).
-				const echoed = await passthroughProbe({ port, host: '127.0.0.1', sni: 'mapped.test' }).catch(() => null);
+				const echoed = await passthroughProbe({ port, host: '127.0.0.1', sni: 'mapped.test' }).catch((err) => {
+					if (err.code === 'ECONNREFUSED') return null;
+					throw err;
+				});
 				if (echoed === null) {
 					t.skip('dual-stack listener not reachable over IPv4');
 					return;
@@ -314,15 +321,11 @@ describe('allowedSources – route rate limiter', () => {
 	});
 
 	it('spends no route tokens on refused peers', async (t) => {
-		const refused = await passthroughProbe({ port: proxyPort, sni: 'limited.test', localAddress: SECOND_SOURCE }).catch(
-			() => null
-		);
-		if (refused === null) {
+		if (!(await canBind(SECOND_SOURCE))) {
 			t.skip(`${SECOND_SOURCE} is not assignable on this host`);
 			return;
 		}
-		assert.equal(refused, 0);
-		for (let i = 0; i < 2; i++) {
+		for (let i = 0; i < 3; i++) {
 			assert.equal(await passthroughProbe({ port: proxyPort, sni: 'limited.test', localAddress: SECOND_SOURCE }), 0);
 		}
 		assert.ok(
@@ -558,6 +561,10 @@ describe('allowedSources – HTTP listener ACME proxy', () => {
 			socket.on('data', (chunk) => (body += chunk.toString()));
 			socket.on('error', (err) => (socket.connecting ? reject(err) : undefined));
 			socket.on('close', () => resolve(body));
+			setTimeout(() => {
+				socket.destroy();
+				reject(new Error('challenge timeout'));
+			}, 5000).unref();
 		});
 	}
 

@@ -39,7 +39,6 @@ labeled_enum!(BlockKind {
 	RateLimited => "rate_limited",
 	TooManyConnections => "too_many_connections",
 	PenaltyBoxed => "penalty_boxed",
-	/// The peer is outside the resolved route's `allowedSources`.
 	SourceNotAllowed => "source_not_allowed",
 });
 
