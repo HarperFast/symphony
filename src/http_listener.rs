@@ -221,7 +221,7 @@ async fn proxy_acme(
 	drop(table);
 	let _route_guard = RouteActiveGuard::new(route.metric_identity.counters.clone());
 
-	// Same order as the TLS path: a refused peer spends none of the route's tokens.
+	// Before the rate limiter, so a refused peer spends none of the route's tokens.
 	if route
 		.allowed_sources
 		.as_ref()

@@ -385,7 +385,8 @@ routes: [
 - Entries are IPv4 or IPv6 CIDRs; a bare IP is a single host. Absent or empty = any client.
 - The client address is the TCP peer symphony sees. Inbound PROXY headers and `X-Forwarded-For`
   are never consulted. An IPv4 client on a dual-stack (`[::]`) listener (`::ffff:a.b.c.d`) is
-  matched against the IPv4 entries.
+  matched against the IPv4 entries only, so `::/0` does not admit it; an IPv4-mapped entry
+  (`::ffff:10.0.0.0/104`) is treated as its IPv4 form (`10.0.0.0/8`).
 - A refused connection is closed (TCP RST) right after route selection: before the TLS handshake,
   the upstream connect, the route's `maxConnectionsPerSecond` bucket and any `'suspended'` event.
   It is counted as `source_not_allowed` in the route's and the listener's `blockedByReason`, and

@@ -274,7 +274,6 @@ impl RouteMetrics {
 		}
 	}
 
-	/// Sparse, like `errors_by_reason`.
 	pub fn blocked_by_reason(&self) -> Vec<(&'static str, u64)> {
 		BlockKind::ALL
 			.iter()

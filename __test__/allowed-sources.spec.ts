@@ -1,8 +1,9 @@
 /**
  * Per-route `allowedSources`: only peers inside a route's CIDRs reach its upstream.
  *
- * The denied peer and the allowed peer are both local: Linux routes all of 127.0.0.0/8 to
- * loopback, so binding the client to 127.0.0.2 gives a second source address.
+ * Every client here connects from 127.0.0.1, so a refusal is provoked with a list that excludes
+ * it (`DENY_LOCAL`). The one case that needs two sources on a single route binds 127.0.0.2, which
+ * Linux routes to loopback but macOS does not without an alias, and skips where it is missing.
  */
 
 import assert from 'node:assert/strict';
@@ -13,7 +14,8 @@ import { SymphonyProxy } from '../ts/proxy.js';
 import type { RouteConfig, SuspendedConnection } from '../ts/types.js';
 import { clientHello, generateSelfSignedCert, getFreePort, sleep } from './util.js';
 
-const OTHER_SOURCE = '127.0.0.2';
+const DENY_LOCAL = ['10.0.0.0/8', '2001:db8::/32'];
+const SECOND_SOURCE = '127.0.0.2';
 
 interface CountingUpstream {
 	port: number;
@@ -21,7 +23,6 @@ interface CountingUpstream {
 	close(): Promise<void>;
 }
 
-/** An echo upstream that counts the connections it accepts. */
 function startCountingUpstream(): Promise<CountingUpstream> {
 	return new Promise((resolve, reject) => {
 		let accepted = 0;
@@ -41,33 +42,41 @@ function startCountingUpstream(): Promise<CountingUpstream> {
 	});
 }
 
-interface Probe {
-	/** Bytes echoed back through the proxy before the connection closed. */
-	echoed: number;
-}
-
 /**
- * Send a synthetic ClientHello over plain TCP (passthrough routes) and collect what comes back.
- * The client closes once its bytes are echoed; a refused connection closes with nothing.
+ * Bytes echoed back through a passthrough route for a synthetic ClientHello; 0 when symphony
+ * refuses the connection. Rejects if the client never connects, so a setup failure (an
+ * unassignable source address, a listener not yet bound) can't pass for a refusal.
  */
-function passthroughProbe(opts: { port: number; host?: string; localAddress?: string; sni: string }): Promise<Probe> {
+function passthroughProbe(opts: { port: number; host?: string; localAddress?: string; sni: string }): Promise<number> {
 	return new Promise((resolve, reject) => {
 		const hello = clientHello(opts.sni);
 		let echoed = 0;
+		let connected = false;
 		const socket = net.createConnection(
 			{ port: opts.port, host: opts.host ?? '127.0.0.1', localAddress: opts.localAddress },
-			() => socket.write(hello)
+			() => {
+				connected = true;
+				socket.write(hello);
+			}
 		);
+		const timer = setTimeout(() => {
+			socket.destroy();
+			reject(new Error('passthroughProbe timeout'));
+		}, 5000);
 		socket.on('data', (chunk: Buffer) => {
 			echoed += chunk.length;
 			if (echoed >= hello.length) socket.end();
 		});
-		socket.on('error', () => {});
-		socket.on('close', () => resolve({ echoed }));
-		setTimeout(() => {
-			socket.destroy();
-			reject(new Error('passthroughProbe timeout'));
-		}, 5000);
+		socket.on('error', (err) => {
+			if (!connected) {
+				clearTimeout(timer);
+				reject(err);
+			}
+		});
+		socket.on('close', () => {
+			clearTimeout(timer);
+			if (connected) resolve(echoed);
+		});
 	});
 }
 
@@ -110,7 +119,7 @@ describe('allowedSources – passthrough routes', () => {
 			routes: [
 				passthroughRoute('allowed.test', upstream.port, { allowedSources: ['127.0.0.1'] }),
 				passthroughRoute('cidr.test', upstream.port, { allowedSources: ['10.0.0.0/8', '127.0.0.0/30'] }),
-				passthroughRoute('denied.test', upstream.port, { allowedSources: [OTHER_SOURCE + '/32'] }),
+				passthroughRoute('denied.test', upstream.port, { allowedSources: DENY_LOCAL }),
 				passthroughRoute('open.test', upstream.port, { allowedSources: [] }),
 			],
 		});
@@ -125,20 +134,17 @@ describe('allowedSources – passthrough routes', () => {
 
 	it('admits a peer matching a bare-IP entry', async () => {
 		const before = upstream.accepted();
-		const { echoed } = await passthroughProbe({ port: proxyPort, sni: 'allowed.test' });
-		assert.equal(echoed, clientHello('allowed.test').length);
+		assert.equal(await passthroughProbe({ port: proxyPort, sni: 'allowed.test' }), clientHello('allowed.test').length);
 		assert.equal(upstream.accepted(), before + 1);
 	});
 
 	it('admits a peer matching any CIDR in the list', async () => {
-		const { echoed } = await passthroughProbe({ port: proxyPort, sni: 'cidr.test' });
-		assert.ok(echoed > 0);
+		assert.ok((await passthroughProbe({ port: proxyPort, sni: 'cidr.test' })) > 0);
 	});
 
 	it('refuses a peer outside the list without opening the upstream', async () => {
 		const before = upstream.accepted();
-		const { echoed } = await passthroughProbe({ port: proxyPort, sni: 'denied.test' });
-		assert.equal(echoed, 0);
+		assert.equal(await passthroughProbe({ port: proxyPort, sni: 'denied.test' }), 0);
 		await sleep(50);
 		assert.equal(upstream.accepted(), before, 'the upstream must never see a refused peer');
 		assert.equal(routeBlocked(proxy, 'denied.test'), 1);
@@ -149,20 +155,10 @@ describe('allowedSources – passthrough routes', () => {
 		assert.equal(proxy.metrics().listeners[0].blocked, 1);
 	});
 
-	it('admits the same route from a listed address', async () => {
-		const { echoed } = await passthroughProbe({ port: proxyPort, sni: 'denied.test', localAddress: OTHER_SOURCE });
-		assert.ok(echoed > 0);
-	});
-
 	it('treats an empty list as unrestricted', async () => {
-		const { echoed } = await passthroughProbe({ port: proxyPort, sni: 'open.test', localAddress: OTHER_SOURCE });
-		assert.ok(echoed > 0);
-		assert.equal(routeBlocked(proxy, 'open.test'), 0);
-	});
-
-	it('omits zero-valued route block reasons', () => {
+		assert.ok((await passthroughProbe({ port: proxyPort, sni: 'open.test' })) > 0);
 		const route = proxy.metrics().routeMetrics.find((r) => r.route === 'open.test')!;
-		assert.deepEqual(route.blockedByReason, []);
+		assert.deepEqual(route.blockedByReason, [], 'zero-valued route block reasons are omitted');
 	});
 });
 
@@ -175,17 +171,16 @@ describe('allowedSources – terminated TLS', () => {
 	before(async () => {
 		upstream = await startCountingUpstream();
 		proxyPort = await getFreePort();
+		const route = (sni: string, allowedSources: string[]): RouteConfig => ({
+			sni,
+			upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: upstream.port }],
+			terminateTls: true,
+			cert: { certChain: cert.cert, privateKey: cert.key },
+			allowedSources,
+		});
 		proxy = new SymphonyProxy({
 			listeners: [{ host: '127.0.0.1', port: proxyPort }],
-			routes: [
-				{
-					sni: 'tenant.test',
-					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: upstream.port }],
-					terminateTls: true,
-					cert: { certChain: cert.cert, privateKey: cert.key },
-					allowedSources: [OTHER_SOURCE],
-				},
-			],
+			routes: [route('tenant.test', ['127.0.0.1']), route('closed.test', DENY_LOCAL)],
 		});
 		await proxy.start();
 		await sleep(50);
@@ -196,11 +191,9 @@ describe('allowedSources – terminated TLS', () => {
 		await upstream.close();
 	});
 
-	function handshake(localAddress?: string): Promise<boolean> {
+	function handshake(servername: string): Promise<boolean> {
 		return new Promise((resolve) => {
-			const raw = net.createConnection({ port: proxyPort, host: '127.0.0.1', localAddress });
-			raw.on('error', () => {});
-			const socket = tls.connect({ socket: raw, servername: 'tenant.test', rejectUnauthorized: false });
+			const socket = tls.connect({ port: proxyPort, host: '127.0.0.1', servername, rejectUnauthorized: false });
 			socket.once('secureConnect', () => {
 				socket.end();
 				resolve(true);
@@ -211,16 +204,16 @@ describe('allowedSources – terminated TLS', () => {
 	}
 
 	it('refuses before the TLS handshake and the upstream connect', async () => {
-		assert.equal(await handshake(), false, 'a refused peer must never complete a handshake');
+		assert.equal(await handshake('closed.test'), false, 'a refused peer must never complete a handshake');
 		await sleep(50);
 		assert.equal(upstream.accepted(), 0);
-		assert.equal(routeBlocked(proxy, 'tenant.test'), 1);
-		const route = proxy.metrics().routeMetrics.find((r) => r.route === 'tenant.test')!;
+		assert.equal(routeBlocked(proxy, 'closed.test'), 1);
+		const route = proxy.metrics().routeMetrics.find((r) => r.route === 'closed.test')!;
 		assert.deepEqual(route.errorsByReason, [], 'no tls_handshake error: the handshake never started');
 	});
 
 	it('completes the handshake for a listed peer', async () => {
-		assert.equal(await handshake(OTHER_SOURCE), true);
+		assert.equal(await handshake('tenant.test'), true);
 	});
 });
 
@@ -260,9 +253,9 @@ describe('allowedSources – IPv6 and IPv4-mapped peers', () => {
 				passthroughRoute('v6-denied.test', upstream.port, { allowedSources: ['2001:db8::/32', '127.0.0.1'] }),
 			],
 			async (port) => {
-				assert.ok((await passthroughProbe({ port, host: '::1', sni: 'v6.test' })).echoed > 0);
+				assert.ok((await passthroughProbe({ port, host: '::1', sni: 'v6.test' })) > 0);
 				const before = upstream.accepted();
-				assert.equal((await passthroughProbe({ port, host: '::1', sni: 'v6-denied.test' })).echoed, 0);
+				assert.equal(await passthroughProbe({ port, host: '::1', sni: 'v6-denied.test' }), 0);
 				assert.equal(upstream.accepted(), before);
 			},
 			t
@@ -278,15 +271,15 @@ describe('allowedSources – IPv6 and IPv4-mapped peers', () => {
 				passthroughRoute('mapped-denied.test', upstream.port, { allowedSources: ['10.0.0.0/8'] }),
 			],
 			async (port) => {
-				// Reaching a `::` listener over IPv4 needs net.ipv6.bindv6only=0 (the Linux default).
-				const probe = await passthroughProbe({ port, host: '127.0.0.1', sni: 'mapped.test' }).catch(() => null);
-				if (!probe) {
+				// Reaching a `::` listener over IPv4 needs a dual-stack socket (Linux's default).
+				const echoed = await passthroughProbe({ port, host: '127.0.0.1', sni: 'mapped.test' }).catch(() => null);
+				if (echoed === null) {
 					t.skip('dual-stack listener not reachable over IPv4');
 					return;
 				}
-				assert.ok(probe.echoed > 0);
-				assert.ok((await passthroughProbe({ port, host: '127.0.0.1', sni: 'mapped-cidr.test' })).echoed > 0);
-				assert.equal((await passthroughProbe({ port, host: '127.0.0.1', sni: 'mapped-denied.test' })).echoed, 0);
+				assert.ok(echoed > 0);
+				assert.ok((await passthroughProbe({ port, host: '127.0.0.1', sni: 'mapped-cidr.test' })) > 0);
+				assert.equal(await passthroughProbe({ port, host: '127.0.0.1', sni: 'mapped-denied.test' }), 0);
 			},
 			t
 		);
@@ -320,12 +313,22 @@ describe('allowedSources – route rate limiter', () => {
 		await upstream.close();
 	});
 
-	it('spends no route tokens on refused peers', async () => {
-		for (let i = 0; i < 3; i++) {
-			await passthroughProbe({ port: proxyPort, sni: 'limited.test', localAddress: OTHER_SOURCE });
+	it('spends no route tokens on refused peers', async (t) => {
+		const refused = await passthroughProbe({ port: proxyPort, sni: 'limited.test', localAddress: SECOND_SOURCE }).catch(
+			() => null
+		);
+		if (refused === null) {
+			t.skip(`${SECOND_SOURCE} is not assignable on this host`);
+			return;
 		}
-		const { echoed } = await passthroughProbe({ port: proxyPort, sni: 'limited.test' });
-		assert.ok(echoed > 0, 'the single token must still be available to the listed peer');
+		assert.equal(refused, 0);
+		for (let i = 0; i < 2; i++) {
+			assert.equal(await passthroughProbe({ port: proxyPort, sni: 'limited.test', localAddress: SECOND_SOURCE }), 0);
+		}
+		assert.ok(
+			(await passthroughProbe({ port: proxyPort, sni: 'limited.test' })) > 0,
+			'the single token must still be available to the listed peer'
+		);
 		assert.equal(routeBlocked(proxy, 'limited.test'), 3);
 	});
 });
@@ -335,8 +338,7 @@ describe('allowedSources – hot reload', () => {
 	let proxyPort: number;
 	let proxy: SymphonyProxy;
 	const routes = (allowedSources?: string[]) => [passthroughRoute('reload.test', upstream.port, { allowedSources })];
-	const admitted = async (localAddress?: string) =>
-		(await passthroughProbe({ port: proxyPort, sni: 'reload.test', localAddress })).echoed > 0;
+	const admitted = async () => (await passthroughProbe({ port: proxyPort, sni: 'reload.test' })) > 0;
 
 	before(async () => {
 		upstream = await startCountingUpstream();
@@ -354,32 +356,30 @@ describe('allowedSources – hot reload', () => {
 	it('applies added and removed entries to new connections', async () => {
 		assert.equal(await admitted(), true);
 
-		proxy.updateConfig({ routes: routes([OTHER_SOURCE]) });
+		proxy.updateConfig({ routes: routes(['10.0.0.0/8']) });
 		assert.equal(await admitted(), false);
-		assert.equal(await admitted(OTHER_SOURCE), true);
 
-		proxy.updateConfig({ routes: routes([OTHER_SOURCE, '127.0.0.1']) });
+		proxy.updateConfig({ routes: routes(['10.0.0.0/8', '127.0.0.1']) });
 		assert.equal(await admitted(), true);
 
-		proxy.updateConfig({ routes: routes(['127.0.0.1']) });
-		assert.equal(await admitted(OTHER_SOURCE), false);
+		proxy.updateConfig({ routes: routes(['10.0.0.0/8']) });
+		assert.equal(await admitted(), false);
 
 		proxy.updateConfig({ routes: routes() });
-		assert.equal(await admitted(OTHER_SOURCE), true);
+		assert.equal(await admitted(), true);
 
 		const route = proxy.metrics().routeMetrics.find((r) => r.route === 'reload.test')!;
 		assert.equal(route.blocked, 2, 'counters survive list-only reloads');
-		assert.equal(route.connections, 6);
+		assert.equal(route.connections, 5);
 	});
 
 	it('does not drop an established connection when its peer is removed from the list', async () => {
-		const hello = clientHello('reload.test');
 		const socket = net.createConnection({ port: proxyPort, host: '127.0.0.1' });
 		await new Promise<void>((resolve) => socket.once('connect', () => resolve()));
-		socket.write(hello);
+		socket.write(clientHello('reload.test'));
 		await new Promise<void>((resolve) => socket.once('data', () => resolve()));
 
-		proxy.updateConfig({ routes: routes([OTHER_SOURCE]) });
+		proxy.updateConfig({ routes: routes(['10.0.0.0/8']) });
 		const echoed = new Promise<Buffer>((resolve) => socket.once('data', resolve));
 		socket.write('still here');
 		assert.equal((await echoed).toString(), 'still here');
@@ -414,9 +414,9 @@ describe('allowedSources – invalid entries', () => {
 	it('drops only the route with the invalid entry, failing closed', async () => {
 		assert.equal(proxy.metrics().failingRoutes, 1);
 		const before = upstream.accepted();
-		assert.equal((await passthroughProbe({ port: proxyPort, sni: 'bad.tenants.test' })).echoed, 0);
+		assert.equal(await passthroughProbe({ port: proxyPort, sni: 'bad.tenants.test' }), 0);
 		assert.equal(upstream.accepted(), before, 'must not fall through to the wildcard');
-		assert.ok((await passthroughProbe({ port: proxyPort, sni: 'good.tenants.test' })).echoed > 0);
+		assert.ok((await passthroughProbe({ port: proxyPort, sni: 'good.tenants.test' })) > 0);
 	});
 
 	it('recovers once the entry is fixed', async () => {
@@ -427,7 +427,7 @@ describe('allowedSources – invalid entries', () => {
 			],
 		});
 		assert.equal(proxy.metrics().failingRoutes, 0);
-		assert.ok((await passthroughProbe({ port: proxyPort, sni: 'bad.tenants.test' })).echoed > 0);
+		assert.ok((await passthroughProbe({ port: proxyPort, sni: 'bad.tenants.test' })) > 0);
 	});
 });
 
@@ -438,23 +438,21 @@ describe('allowedSources – suspended routes', () => {
 	const suspended: SuspendedConnection[] = [];
 	const errors: Error[] = [];
 	let resolveWith: (conn: SuspendedConnection) => void = () => {};
+	const held = (sni: string, allowedSources?: string[]): RouteConfig => ({
+		sni,
+		upstreams: [],
+		terminateTls: false,
+		suspended: true,
+		suspendTimeoutMs: 2000,
+		allowedSources,
+	});
 
 	before(async () => {
 		upstream = await startCountingUpstream();
 		proxyPort = await getFreePort();
 		proxy = new SymphonyProxy({
 			listeners: [{ host: '127.0.0.1', port: proxyPort }],
-			routes: [
-				{ sni: 'held.test', upstreams: [], terminateTls: false, suspended: true, suspendTimeoutMs: 2000 },
-				{
-					sni: 'held-restricted.test',
-					upstreams: [],
-					terminateTls: false,
-					suspended: true,
-					suspendTimeoutMs: 2000,
-					allowedSources: ['127.0.0.1'],
-				},
-			],
+			routes: [held('held.test'), held('held-local.test', ['127.0.0.1']), held('held-closed.test', DENY_LOCAL)],
 		});
 		proxy.on('suspended', (conn: SuspendedConnection) => {
 			suspended.push(conn);
@@ -480,16 +478,15 @@ describe('allowedSources – suspended routes', () => {
 	it('refuses a peer outside the static list before suspending it', async () => {
 		resolveWith = resolved(); // a permissive resolution must not get the chance to admit it
 		const before = suspended.length;
-		const { echoed } = await passthroughProbe({ port: proxyPort, sni: 'held-restricted.test', localAddress: OTHER_SOURCE });
-		assert.equal(echoed, 0);
+		assert.equal(await passthroughProbe({ port: proxyPort, sni: 'held-closed.test' }), 0);
 		assert.equal(suspended.length, before, "no 'suspended' event for a refused peer");
-		assert.equal(routeBlocked(proxy, 'held-restricted.test'), 1);
+		assert.equal(routeBlocked(proxy, 'held-closed.test'), 1);
 	});
 
 	it('enforces the resolution list after resolveConnection()', async () => {
 		resolveWith = resolved(['10.0.0.0/8']);
 		const before = upstream.accepted();
-		assert.equal((await passthroughProbe({ port: proxyPort, sni: 'held.test' })).echoed, 0);
+		assert.equal(await passthroughProbe({ port: proxyPort, sni: 'held.test' }), 0);
 		await sleep(50);
 		assert.equal(upstream.accepted(), before);
 		assert.equal(routeBlocked(proxy, 'held.test'), 1);
@@ -498,19 +495,21 @@ describe('allowedSources – suspended routes', () => {
 
 	it('admits a peer matching the resolution list', async () => {
 		resolveWith = resolved(['127.0.0.1']);
-		assert.ok((await passthroughProbe({ port: proxyPort, sni: 'held.test' })).echoed > 0);
+		assert.ok((await passthroughProbe({ port: proxyPort, sni: 'held.test' })) > 0);
 	});
 
 	it('applies both lists when both are set', async () => {
-		resolveWith = resolved([OTHER_SOURCE]);
-		assert.equal((await passthroughProbe({ port: proxyPort, sni: 'held-restricted.test' })).echoed, 0);
+		resolveWith = resolved(DENY_LOCAL);
+		assert.equal(await passthroughProbe({ port: proxyPort, sni: 'held-local.test' }), 0);
+		resolveWith = resolved(['127.0.0.0/8']);
+		assert.ok((await passthroughProbe({ port: proxyPort, sni: 'held-local.test' })) > 0);
 	});
 
 	it('rejects a resolution with an invalid entry and reports it', async () => {
 		resolveWith = resolved(['not-a-cidr']);
 		const before = upstream.accepted();
 		const errorsBefore = errors.length;
-		assert.equal((await passthroughProbe({ port: proxyPort, sni: 'held.test' })).echoed, 0);
+		assert.equal(await passthroughProbe({ port: proxyPort, sni: 'held.test' }), 0);
 		await sleep(50);
 		assert.equal(upstream.accepted(), before);
 		assert.equal(errors.length, errorsBefore + 1);
@@ -522,7 +521,6 @@ describe('allowedSources – suspended routes', () => {
 describe('allowedSources – HTTP listener ACME proxy', () => {
 	let acmeUpstream: net.Server;
 	let acmeAccepted = 0;
-	let acmePort: number;
 	let httpPort: number;
 	let proxy: SymphonyProxy;
 
@@ -533,11 +531,14 @@ describe('allowedSources – HTTP listener ACME proxy', () => {
 			socket.once('data', () => socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok'));
 		});
 		await new Promise<void>((resolve) => acmeUpstream.listen(0, '127.0.0.1', () => resolve()));
-		acmePort = (acmeUpstream.address() as net.AddressInfo).port;
+		const acmePort = (acmeUpstream.address() as net.AddressInfo).port;
 		httpPort = await getFreePort();
 		proxy = new SymphonyProxy({
 			listeners: [{ host: '127.0.0.1', port: httpPort, mode: 'http' }],
-			routes: [passthroughRoute('acme.test', acmePort, { allowedSources: ['127.0.0.1'] })],
+			routes: [
+				passthroughRoute('acme.test', acmePort, { allowedSources: ['127.0.0.1'] }),
+				passthroughRoute('acme-closed.test', acmePort, { allowedSources: DENY_LOCAL }),
+			],
 		});
 		await proxy.start();
 		await sleep(50);
@@ -548,26 +549,26 @@ describe('allowedSources – HTTP listener ACME proxy', () => {
 		await new Promise<void>((resolve) => acmeUpstream.close(() => resolve()));
 	});
 
-	function challenge(localAddress?: string): Promise<string> {
-		return new Promise((resolve) => {
+	function challenge(host: string): Promise<string> {
+		return new Promise((resolve, reject) => {
 			let body = '';
-			const socket = net.createConnection({ port: httpPort, host: '127.0.0.1', localAddress }, () =>
-				socket.write('GET /.well-known/acme-challenge/token HTTP/1.1\r\nHost: acme.test\r\n\r\n')
+			const socket = net.createConnection({ port: httpPort, host: '127.0.0.1' }, () =>
+				socket.write(`GET /.well-known/acme-challenge/token HTTP/1.1\r\nHost: ${host}\r\n\r\n`)
 			);
 			socket.on('data', (chunk) => (body += chunk.toString()));
-			socket.on('error', () => {});
+			socket.on('error', (err) => (socket.connecting ? reject(err) : undefined));
 			socket.on('close', () => resolve(body));
 		});
 	}
 
 	it('proxies the challenge for a listed peer', async () => {
-		assert.match(await challenge(), /200 OK/);
+		assert.match(await challenge('acme.test'), /200 OK/);
 		assert.equal(acmeAccepted, 1);
 	});
 
 	it('refuses an unlisted peer without opening the upstream', async () => {
-		assert.equal(await challenge(OTHER_SOURCE), '');
+		assert.equal(await challenge('acme-closed.test'), '');
 		assert.equal(acmeAccepted, 1);
-		assert.equal(routeBlocked(proxy, 'acme.test'), 1);
+		assert.equal(routeBlocked(proxy, 'acme-closed.test'), 1);
 	});
 });

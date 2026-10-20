@@ -171,7 +171,6 @@ pub fn requires_http_protocol(mode: SourceAddressMode, fingerprint: ForwardFinge
 pub struct SourceAllowlist(Arc<[IpNetwork]>);
 
 impl SourceAllowlist {
-	/// `Ok(None)` for an empty list, which restricts nothing.
 	pub fn parse(entries: &[String]) -> Result<Option<Self>, String> {
 		if entries.is_empty() {
 			return Ok(None);
@@ -183,7 +182,8 @@ impl SourceAllowlist {
 		Ok(Some(Self(networks.into())))
 	}
 
-	/// A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`; it is matched as IPv4.
+	/// A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`; it is matched as IPv4,
+	/// so IPv6 entries never admit it.
 	pub fn permits(&self, peer: IpAddr) -> bool {
 		let peer = peer.to_canonical();
 		self.0.iter().any(|network| network.contains(peer))
@@ -191,16 +191,21 @@ impl SourceAllowlist {
 }
 
 /// An IPv4-mapped IPv6 CIDR is stored as its IPv4 form: peers are canonicalised to IPv4 before
-/// matching, so the mapped form would otherwise never match anything.
+/// matching, so the mapped form would otherwise never match anything. One with a prefix under 96
+/// (`::ffff:10.0.0.0/8`, an IPv4 length on the mapped form) would instead be a v6 network around
+/// `::`, so it is rejected.
 fn parse_source_network(entry: &str) -> Result<IpNetwork, String> {
-	let network: IpNetwork = entry
-		.parse()
-		.map_err(|e| format!("invalid allowedSources CIDR '{entry}': {e}"))?;
+	let invalid =
+		|reason: &dyn std::fmt::Display| format!("invalid allowedSources CIDR '{entry}': {reason}");
+	let network: IpNetwork = entry.parse().map_err(|e| invalid(&e))?;
 	if let IpNetwork::V6(v6) = network {
-		if let (Some(v4), Some(prefix)) = (v6.ip().to_ipv4_mapped(), v6.prefix().checked_sub(96)) {
+		if let Some(v4) = v6.ip().to_ipv4_mapped() {
+			let prefix = v6.prefix().checked_sub(96).ok_or_else(|| {
+				invalid(&"an IPv4-mapped CIDR needs a prefix of at least 96 (or write it as IPv4)")
+			})?;
 			return Ipv4Network::new(v4, prefix)
 				.map(IpNetwork::V4)
-				.map_err(|e| format!("invalid allowedSources CIDR '{entry}': {e}"));
+				.map_err(|e| invalid(&e));
 		}
 	}
 	Ok(network)
@@ -237,7 +242,6 @@ pub struct Route {
 	pub forward_fingerprint: ForwardFingerprint,
 	/// The route's declared application protocol — gates HTTP/1 header rewriting.
 	pub protocol: RouteProtocol,
-	/// None = any peer.
 	pub allowed_sources: Option<SourceAllowlist>,
 }
 
@@ -589,10 +593,9 @@ pub fn build_route_table(
 			continue;
 		}
 
-		// Like the protocol declaration, a permanent config error: never carried forward, and the
-		// SNI is tombstoned so it fails closed rather than serving unrestricted or falling through
-		// to a broader route. Logged also when an already-failing SNI was still serving a
-		// carried-forward route, since this is the call that takes it offline.
+		// A permanent config error, like the protocol declaration: tombstoned, never carried forward.
+		// Logged also when an already-failing SNI was serving a carried-forward route, since this
+		// is the reconcile that takes it offline.
 		let allowed_sources = match SourceAllowlist::parse(&spec.allowed_sources) {
 			Ok(allowed_sources) => allowed_sources,
 			Err(e) => {
@@ -674,9 +677,7 @@ pub fn build_route_table(
 			}
 		};
 
-		// Assigned here rather than in `build_route` so a carried-forward route enforces the list
-		// the new spec asks for, not the one it was built with: narrowing a list in the same
-		// reconcile as a cert-rotation race must not keep admitting the removed peers.
+		// After the carry-forward branch, so a retained last-good route enforces the new list.
 		route.allowed_sources = allowed_sources;
 
 		// Reusing by the full metric identity keeps ordinary cert/upstream reloads continuous
@@ -1908,7 +1909,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	#[test]
 	fn source_allowlist_parse_empty_and_invalid() {
 		assert!(SourceAllowlist::parse(&[]).unwrap().is_none());
-		for bad in ["nope", "10.0.0.0/33", "", " 10.0.0.1"] {
+		for bad in ["nope", "10.0.0.0/33", "", " 10.0.0.1", "::ffff:10.0.0.0/8"] {
 			let err = SourceAllowlist::parse(&["10.0.0.0/8".into(), bad.into()]).unwrap_err();
 			assert!(err.contains(&format!("'{bad}'")), "{err}");
 		}
