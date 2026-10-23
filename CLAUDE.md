@@ -35,6 +35,7 @@ TCP accept (SO_REUSEPORT per worker thread)
   └─ sni.rs       peek() — MSG_PEEK ClientHello (reassembled when fragmented) → PeekInfo { sni, ja3, ja4, complete }
   └─ protection.rs check() → Block (emit 'blocked', drop) | Allow
   └─ router.rs    RouteTable.resolve(sni) → Route
+  └─ route.allowed_sources.permits(peer) → 'source_not_allowed' block | continue
   └─ [suspended.rs  register, emit 'suspended', await oneshot]
   └─ tls.rs       TlsAcceptor::accept() with handshake timeout (if terminate_tls)
   └─ upstream.rs  connect(Destination, peer_ip) → UpstreamStream
@@ -91,6 +92,26 @@ copy of an injected header so the value is authoritative (anti-spoof). `proxy_co
 fingerprint + the connection's `local_addr` (the PROXY v2 destination) into `apply_source_header`.
 Keep v2 **opt-in**: HAProxy/nginx speak it, but Harper core's own UDS reader currently parses v1 only,
 so the UDS default stays v1.
+
+### Per-route `allowedSources` (`router.rs::SourceAllowlist`)
+A route attribute, not a protection check: protection runs before route selection and is
+per-listener, while tenants share listeners and are told apart only by SNI. Four placements are
+load-bearing:
+
+- **Checked before the route rate limiter and before suspension** (`proxy_conn.rs`, and the ACME
+  path in `http_listener.rs`). After the limiter, refused peers would drain the route-wide bucket
+  and deny listed clients; after suspension, JS would see them. A `resolveConnection()` route's
+  own list is checked again after resolution (both apply).
+- **Assigned after the carry-forward branch in `build_route_table`**, not inside `build_route`.
+  The list is independent of the `ServerConfig`, so a carried-forward last-good route takes the
+  *new* spec's list; otherwise narrowing a list during a cert-rotation race would keep admitting
+  the removed peers until the cert healed.
+- **An invalid entry tombstones the route** (fail-closed, never carried forward) instead of
+  failing `updateConfig`. A throw from `parse_route_spec` would block reloads (cert renewals
+  included) for every tenant on the port-set over one tenant's typo.
+- **Canonicalisation (`to_canonical`) happens only inside `permits`**, so the peer address that
+  listener protection and the PROXY/XFF encoders see is unchanged. IPv4-mapped CIDRs are stored
+  as IPv4 at parse time for the same reason.
 
 ### ArcSwap for RouteTable
 `ArcSwap<RouteTable>` gives us a pointer-swap on writes (single atomic store) and a single `load()` on reads — no lock contention on the hot path. With ≤100 routes, rebuilding the full table on `updateConfig` costs ~microseconds (Arc pointer clones only). A partial-update scheme would be more complex without meaningful benefit.

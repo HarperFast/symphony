@@ -8,7 +8,8 @@ use crate::proxy_conn::{
 };
 use crate::router::{
 	build_route_table, evict_affinity_periodically, requires_http_protocol, ForwardFingerprint,
-	ListenerTlsSpec, LiveRouteTable, RouteProtocol, RouteSpec, SourceAddressMode, UpstreamSpec,
+	ListenerTlsSpec, LiveRouteTable, RouteProtocol, RouteSpec, SourceAddressMode, SourceAllowlist,
+	UpstreamSpec,
 };
 use crate::suspended::{build_resolved_route, ResolveSpec, ResolveUpstream, SuspendedRegistry};
 use crate::tls::TlsConfigCache;
@@ -86,6 +87,10 @@ pub struct JsRouteConfig {
 	/// tell a native non-HTTP protocol (which negotiates no ALPN) from an HTTPS client that
 	/// simply offered none, so the declaration must be explicit. Default: `'opaque'`.
 	pub protocol: Option<String>,
+	/// CIDRs (IPv4 or IPv6; a bare IP is a single host). When non-empty, only connections whose
+	/// TCP peer address falls in one of them are admitted to this route. An invalid entry drops
+	/// the route (counted in `failingRoutes`) rather than failing the whole config.
+	pub allowed_sources: Option<Vec<String>>,
 }
 
 #[napi(object)]
@@ -223,9 +228,12 @@ pub struct JsRouteMetrics {
 	pub metrics_group: String,
 	pub active_connections: f64,
 	pub connections: f64,
+	pub blocked: f64,
 	pub errors: f64,
 	pub bytes_received: f64,
 	pub bytes_sent: f64,
+	/// Sparse post-route blocks; zero-valued reasons are omitted.
+	pub blocked_by_reason: Vec<JsLabeledCount>,
 	/// Sparse post-route errors; zero-valued reasons are omitted.
 	pub errors_by_reason: Vec<JsLabeledCount>,
 }
@@ -243,9 +251,9 @@ pub struct JsProxyMetrics {
 	pub suspended_unresolved: f64,
 	/// Routes currently in the live table, including the default route.
 	pub routes: f64,
-	/// Routes rejected at build time — a cert failure, protocol/carrier validation failure, or
-	/// duplicate wildcard — either dropped, or (cert failures only) serving a carried-forward
-	/// last-good cert.
+	/// Routes rejected at build time — a cert failure, protocol/carrier validation failure, invalid
+	/// `allowedSources`, or duplicate wildcard — either dropped, or (cert failures only) serving a
+	/// carried-forward last-good cert.
 	pub failing_routes: f64,
 	pub listeners: Vec<JsListenerMetrics>,
 	/// Per-configured-route metrics, aggregated across this proxy's listeners.
@@ -273,6 +281,9 @@ pub struct JsResolveRoute {
 	/// See `JsRouteConfig::protocol` — the same declaration, required under the same
 	/// conditions, for a route resolved via `resolveConnection()`.
 	pub protocol: Option<String>,
+	/// Applied in addition to the suspended route's own `allowedSources`. An invalid entry
+	/// rejects the resolution, closing the connection.
+	pub allowed_sources: Option<Vec<String>>,
 }
 
 // ── Plain Rust internal config (all Send + Sync) ──────────────────────────────
@@ -798,6 +809,7 @@ impl SymphonyProxyWrap {
 			.metric_identities()
 			.iter()
 			.map(|identity| {
+				let blocked_by_reason = identity.counters.blocked_by_reason();
 				let errors_by_reason = identity.counters.errors_by_reason();
 				JsRouteMetrics {
 					route: identity.route.to_string(),
@@ -805,9 +817,11 @@ impl SymphonyProxyWrap {
 					active_connections: identity.counters.active_connections.load(Ordering::Relaxed)
 						as f64,
 					connections: identity.counters.total_connections.load(Ordering::Relaxed) as f64,
+					blocked: total_of(&blocked_by_reason) as f64,
 					errors: total_of(&errors_by_reason) as f64,
 					bytes_received: identity.counters.bytes_in.load(Ordering::Relaxed) as f64,
 					bytes_sent: identity.counters.bytes_out.load(Ordering::Relaxed) as f64,
+					blocked_by_reason: labeled_counts(blocked_by_reason),
 					errors_by_reason: labeled_counts(errors_by_reason),
 				}
 			})
@@ -983,6 +997,7 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 		forward_fingerprint,
 		http2: r.http2.unwrap_or(false),
 		protocol,
+		allowed_sources: r.allowed_sources.clone().unwrap_or_default(),
 	};
 
 	if spec.http2 && !spec.terminate_tls {
@@ -1136,6 +1151,9 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 		));
 	}
 
+	let allowed_sources = SourceAllowlist::parse(r.allowed_sources.as_deref().unwrap_or(&[]))
+		.map_err(napi::Error::from_reason)?;
+
 	Ok(ResolveSpec {
 		upstream,
 		terminate_tls: r.terminate_tls,
@@ -1151,6 +1169,7 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 		forward_fingerprint,
 		http2,
 		protocol,
+		allowed_sources,
 	})
 }
 

@@ -159,6 +159,29 @@ export interface RouteConfig {
 	 * declaration, or that route will stop serving traffic on upgrade.
 	 */
 	protocol?: 'http' | 'opaque';
+	/**
+	 * Restrict the route to these client addresses: CIDRs, IPv4 or IPv6 (`'203.0.113.0/24'`,
+	 * `'2001:db8::/32'`); a bare IP is a single host. Absent or empty = any client.
+	 *
+	 * Matched against the TCP peer address symphony sees, never a PROXY header or
+	 * `X-Forwarded-For`. An IPv4 client reaching a dual-stack (`::`) listener is matched as IPv4.
+	 * A refused connection is closed before the TLS handshake, the upstream connect, the route
+	 * rate limiter and any `'suspended'` event, and counted as `source_not_allowed` in the
+	 * route's and listener's `blockedByReason`.
+	 *
+	 * Applies on every listener that resolves this route, including an HTTP listener's ACME
+	 * HTTP-01 proxy — so a list on a route served by an ACME listener also refuses the CA's
+	 * validators. The list is checked once, when a connection is admitted: an `updateConfig()`
+	 * that changes it applies to new connections, and established ones are not dropped.
+	 *
+	 * It restricts this route, not its upstream: the client chooses the SNI, so every route that
+	 * reaches a restricted upstream needs the same list.
+	 *
+	 * An invalid entry drops this route (it then refuses every connection, counted in
+	 * `failingRoutes`) rather than failing `new SymphonyProxy()`/`updateConfig()` for every other
+	 * route on the port-set.
+	 */
+	allowedSources?: string[];
 }
 
 // ── Protection ────────────────────────────────────────────────────────────────
@@ -381,9 +404,12 @@ export interface RouteMetrics {
 	activeConnections: number;
 	/** Connections that matched this route since process start. */
 	connections: number;
+	blocked: number;
 	errors: number;
 	bytesReceived: number;
 	bytesSent: number;
+	/** Sparse post-route blocks (`source_not_allowed`); zero-valued reasons are omitted. */
+	blockedByReason: LabeledCount[];
 	/** Sparse post-route failures; zero-valued reasons are omitted. */
 	errorsByReason: LabeledCount[];
 }
@@ -402,8 +428,8 @@ export interface ProxyMetrics {
 	/** Routes in the live table, including the default route. */
 	routes: number;
 	/**
-	 * Routes rejected at build time — a cert failure, protocol/carrier validation failure, or
-	 * duplicate wildcard — either dropped, or (cert failures only) serving a carried-forward
+	 * Routes rejected at build time — a cert failure, protocol/carrier validation failure, invalid
+	 * `allowedSources`, or duplicate wildcard — either dropped, or (cert failures only) serving a carried-forward
 	 * last-good cert.
 	 */
 	failingRoutes: number;
@@ -451,6 +477,13 @@ export interface ResolveRoute {
 	http2?: boolean;
 	/** The resolved connection's application protocol. See RouteConfig.protocol. */
 	protocol?: 'http' | 'opaque';
+	/**
+	 * Client addresses this resolution admits; see RouteConfig.allowedSources. Checked in
+	 * addition to the suspended route's own list, which has already admitted the client by the
+	 * time the 'suspended' event fires. An invalid entry rejects the resolution: the connection
+	 * is closed and an 'error' event is emitted.
+	 */
+	allowedSources?: string[];
 }
 
 // ── Event payloads ────────────────────────────────────────────────────────────

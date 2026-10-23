@@ -107,6 +107,7 @@ function toJsRoute(r: RouteConfig): JsRouteConfig {
 		forwardFingerprint: r.forwardFingerprint,
 		http2: r.http2,
 		protocol: r.protocol,
+		allowedSources: r.allowedSources,
 	};
 }
 
@@ -302,9 +303,11 @@ export class SymphonyProxy extends EventEmitter {
 				metricsGroup: r.metricsGroup,
 				activeConnections: r.activeConnections,
 				connections: r.connections,
+				blocked: r.blocked,
 				errors: r.errors,
 				bytesReceived: r.bytesReceived,
 				bytesSent: r.bytesSent,
+				blockedByReason: r.blockedByReason.map((c) => ({ reason: c.reason, count: c.count })),
 				errorsByReason: r.errorsByReason.map((c) => ({ reason: c.reason, count: c.count })),
 			})),
 		};
@@ -341,6 +344,7 @@ export class SymphonyProxy extends EventEmitter {
 				forwardFingerprint: route.forwardFingerprint,
 				http2: route.http2,
 				protocol: route.protocol,
+				allowedSources: route.allowedSources,
 			});
 		} catch (err) {
 			this._inner.resolveConnection(id, null);

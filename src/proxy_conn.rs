@@ -1,7 +1,7 @@
 use crate::liveness::{HalfCloseWatch, KeepaliveConfig, Watched};
 use crate::metrics::{
-	inc_route_error, BlockKind, CountingStream, ErrorKind, GlobalMetrics, ListenerMetrics,
-	RouteActiveGuard,
+	inc_route_blocked, inc_route_error, BlockKind, CountingStream, ErrorKind, GlobalMetrics,
+	ListenerMetrics, RouteActiveGuard,
 };
 use crate::protection::{IpState, ProtectionState};
 use crate::router::{
@@ -155,7 +155,23 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	};
 	let _route_active_guard = RouteActiveGuard::new(route.metric_identity.counters.clone());
 
-	// ── 3b. Per-route rate limit ──────────────────────────────────────────────
+	// ── 3b. Source allowlist ──────────────────────────────────────────────────
+	// Before the rate limiter, so a refused peer spends none of the route's tokens, and before
+	// suspension, so JS never hears of it.
+	if route
+		.allowed_sources
+		.as_ref()
+		.is_some_and(|allowed| !allowed.permits(peer_ip))
+	{
+		inc_route_blocked(
+			&ctx.listener_metrics,
+			&route.metric_identity.counters,
+			BlockKind::SourceNotAllowed,
+		);
+		return;
+	}
+
+	// ── 3c. Per-route rate limit ──────────────────────────────────────────────
 	if let Some(rl) = &route.rate_limiter {
 		if !rl.try_acquire() {
 			inc_route_error(
@@ -198,6 +214,19 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		};
 
 		ctx.global_metrics.dec_suspended(true);
+
+		if resolved
+			.allowed_sources
+			.as_ref()
+			.is_some_and(|allowed| !allowed.permits(peer_ip))
+		{
+			inc_route_blocked(
+				&ctx.listener_metrics,
+				&route.metric_identity.counters,
+				BlockKind::SourceNotAllowed,
+			);
+			return;
+		}
 
 		EffectiveRoute {
 			destination: resolved.destination,

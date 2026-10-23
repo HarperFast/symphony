@@ -1,5 +1,7 @@
 use crate::balancer::{UdsBalancer, UdsSlotSpec};
-use crate::router::{Destination, ForwardFingerprint, RouteProtocol, SourceAddressMode};
+use crate::router::{
+	Destination, ForwardFingerprint, RouteProtocol, SourceAddressMode, SourceAllowlist,
+};
 use crate::tls::{CertSpec, MtlsSpec, TlsConfigCache};
 use dashmap::DashMap;
 use rustls::ServerConfig;
@@ -15,6 +17,8 @@ pub struct ResolvedRoute {
 	pub source_address_mode: SourceAddressMode,
 	pub forward_fingerprint: ForwardFingerprint,
 	pub protocol: RouteProtocol,
+	/// Checked in addition to the suspended route's own list, which already admitted the peer.
+	pub allowed_sources: Option<SourceAllowlist>,
 }
 
 /// Registry of suspended connections waiting for `resolveConnection()`.
@@ -78,6 +82,7 @@ pub struct ResolveSpec {
 	pub forward_fingerprint: ForwardFingerprint,
 	pub http2: bool,
 	pub protocol: RouteProtocol,
+	pub allowed_sources: Option<SourceAllowlist>,
 }
 
 #[derive(Debug)]
@@ -154,6 +159,7 @@ pub fn build_resolved_route(
 		source_address_mode: spec.source_address_mode,
 		forward_fingerprint: spec.forward_fingerprint,
 		protocol: spec.protocol,
+		allowed_sources: spec.allowed_sources.clone(),
 	})
 }
 
@@ -175,6 +181,7 @@ mod tests {
 			forward_fingerprint: ForwardFingerprint::NONE,
 			http2: false,
 			protocol: RouteProtocol::Opaque,
+			allowed_sources: None,
 		}
 	}
 

@@ -68,6 +68,12 @@ export interface JsRouteConfig {
    * simply offered none, so the declaration must be explicit. Default: `'opaque'`.
    */
   protocol?: string
+  /**
+   * CIDRs (IPv4 or IPv6; a bare IP is a single host). When non-empty, only connections whose
+   * TCP peer address falls in one of them are admitted to this route. An invalid entry drops
+   * the route (counted in `failingRoutes`) rather than failing the whole config.
+   */
+  allowedSources?: Array<string>
 }
 export interface JsRateLimitConfig {
   connectionsPerSecond: number
@@ -193,9 +199,12 @@ export interface JsRouteMetrics {
   metricsGroup: string
   activeConnections: number
   connections: number
+  blocked: number
   errors: number
   bytesReceived: number
   bytesSent: number
+  /** Sparse post-route blocks; zero-valued reasons are omitted. */
+  blockedByReason: Array<JsLabeledCount>
   /** Sparse post-route errors; zero-valued reasons are omitted. */
   errorsByReason: Array<JsLabeledCount>
 }
@@ -210,9 +219,9 @@ export interface JsProxyMetrics {
   /** Routes currently in the live table, including the default route. */
   routes: number
   /**
-   * Routes rejected at build time — a cert failure, protocol/carrier validation failure, or
-   * duplicate wildcard — either dropped, or (cert failures only) serving a carried-forward
-   * last-good cert.
+   * Routes rejected at build time — a cert failure, protocol/carrier validation failure, invalid
+   * `allowedSources`, or duplicate wildcard — either dropped, or (cert failures only) serving a
+   * carried-forward last-good cert.
    */
   failingRoutes: number
   listeners: Array<JsListenerMetrics>
@@ -239,6 +248,11 @@ export interface JsResolveRoute {
    * conditions, for a route resolved via `resolveConnection()`.
    */
   protocol?: string
+  /**
+   * Applied in addition to the suspended route's own `allowedSources`. An invalid entry
+   * rejects the resolution, closing the connection.
+   */
+  allowedSources?: Array<string>
 }
 export declare class SymphonyProxyWrap {
   constructor(config: JsProxyConfig, emitFn: (...args: any[]) => any)
