@@ -392,6 +392,10 @@ describe('peer failover', () => {
 			socket.once('data', () => void upstreamA.close());
 			socket.on('error', () => {});
 			socket.on('close', () => resolve('closed'));
+			setTimeout(() => {
+				socket.destroy();
+				resolve('still open');
+			}, 5000).unref();
 		});
 		assert.equal(await closed, 'closed');
 		assert.equal(upstreamB.sources.length, 0);

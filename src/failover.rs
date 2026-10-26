@@ -10,7 +10,7 @@ use crate::sni::PeekInfo;
 use napi::threadsafe_function::ThreadsafeFunction;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -108,12 +108,16 @@ impl FailoverSpec {
 	}
 }
 
+const COOLDOWN_STREAK_SHIFT: u32 = 56;
+const COOLDOWN_UNTIL_MASK: u64 = (1 << COOLDOWN_STREAK_SHIFT) - 1;
+
 /// One peer of one route. Cooldown is per (route, peer): on a shared host one tenant's Harper can
 /// be down while another's is up.
 pub struct FailoverPeer {
 	pub addr: SocketAddr,
-	cooldown_until_ns: AtomicU64,
-	consecutive_failures: AtomicU32,
+	/// Consecutive failures (top 8 bits) and cooldown deadline in monotonic ns (low 56 bits), one
+	/// word so a success and a concurrent failure cannot leave a streak without its cooldown.
+	cooldown: AtomicU64,
 	pub forwarded: AtomicU64,
 	failures: [AtomicU64; PeerFailureKind::COUNT],
 }
@@ -122,15 +126,18 @@ impl FailoverPeer {
 	fn new(addr: SocketAddr) -> Self {
 		Self {
 			addr,
-			cooldown_until_ns: AtomicU64::new(0),
-			consecutive_failures: AtomicU32::new(0),
+			cooldown: AtomicU64::new(0),
 			forwarded: AtomicU64::new(0),
 			failures: std::array::from_fn(|_| AtomicU64::new(0)),
 		}
 	}
 
+	fn cooldown_until(&self) -> u64 {
+		self.cooldown.load(Ordering::Relaxed) & COOLDOWN_UNTIL_MASK
+	}
+
 	pub fn cooling_down(&self, now: u64) -> bool {
-		now < self.cooldown_until_ns.load(Ordering::Relaxed)
+		now < self.cooldown_until()
 	}
 
 	/// Sparse, like route errors: zero-valued reasons are omitted so scrape size follows failures,
@@ -150,21 +157,23 @@ impl FailoverPeer {
 
 	fn record_failure(&self, kind: PeerFailureKind, min_ns: u64, max_ns: u64, now: u64) {
 		self.failures[kind as usize].fetch_add(1, Ordering::Relaxed);
-		let failures = self
-			.consecutive_failures
-			.fetch_add(1, Ordering::Relaxed)
-			.saturating_add(1);
-		let backoff = min_ns
-			.saturating_mul(1u64 << (failures - 1).min(63))
-			.min(max_ns);
-		// Concurrent failures finish in any order; the longest backoff must win.
-		self.cooldown_until_ns
-			.fetch_max(now.saturating_add(backoff), Ordering::Relaxed);
+		let _ = self
+			.cooldown
+			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+				let streak = (state >> COOLDOWN_STREAK_SHIFT).saturating_add(1).min(255);
+				let backoff = min_ns
+					.saturating_mul(1u64 << (streak - 1).min(63))
+					.min(max_ns);
+				// Concurrent failures finish in any order; the longest deadline wins.
+				let until = (state & COOLDOWN_UNTIL_MASK)
+					.max(now.saturating_add(backoff))
+					.min(COOLDOWN_UNTIL_MASK);
+				Some(streak << COOLDOWN_STREAK_SHIFT | until)
+			});
 	}
 
 	fn record_success(&self) {
-		self.consecutive_failures.store(0, Ordering::Relaxed);
-		self.cooldown_until_ns.store(0, Ordering::Relaxed);
+		self.cooldown.store(0, Ordering::Relaxed);
 		self.forwarded.fetch_add(1, Ordering::Relaxed);
 	}
 }
@@ -242,14 +251,14 @@ impl Failover {
 	/// peer is cooling down, only the one whose cooldown ends first.
 	fn candidates(&self, now: u64) -> (usize, impl Iterator<Item = &FailoverPeer>) {
 		let count = self.peers.len();
-		let start = self.cursor.fetch_add(1, Ordering::Relaxed) % count;
+		let start = if count == 1 {
+			0
+		} else {
+			self.cursor.fetch_add(1, Ordering::Relaxed) % count
+		};
 		let ready = self.peers.iter().filter(|p| !p.cooling_down(now)).count();
 		let earliest = (ready == 0)
-			.then(|| {
-				self.peers
-					.iter()
-					.min_by_key(|p| p.cooldown_until_ns.load(Ordering::Relaxed))
-			})
+			.then(|| self.peers.iter().min_by_key(|p| p.cooldown_until()))
 			.flatten();
 		let rotation = (0..count)
 			.map(move |i| &self.peers[(start + i) % count])
@@ -584,7 +593,7 @@ mod tests {
 		let mut until = Vec::new();
 		for _ in 0..6 {
 			peer.record_failure(PeerFailureKind::Refused, 100 * ms, 1_000 * ms, 0);
-			until.push(peer.cooldown_until_ns.load(Ordering::Relaxed) / ms);
+			until.push(peer.cooldown_until() / ms);
 		}
 		assert_eq!(until, vec![100, 200, 400, 800, 1_000, 1_000]);
 		assert!(peer.cooling_down(999 * ms));
@@ -592,22 +601,20 @@ mod tests {
 		assert!(!peer.cooling_down(0));
 		peer.record_failure(PeerFailureKind::Refused, 100 * ms, 1_000 * ms, 0);
 		assert_eq!(
-			peer.cooldown_until_ns.load(Ordering::Relaxed) / ms,
+			peer.cooldown_until() / ms,
 			100,
 			"backoff restarts at min after a success"
 		);
 	}
 
 	#[test]
-	fn a_shorter_backoff_finishing_late_does_not_shorten_the_cooldown() {
+	fn a_failure_with_an_earlier_clock_does_not_shorten_the_cooldown() {
 		let fo = failover(&[("10.0.0.2", 1)]);
 		let peer = &fo.peers[0];
+		peer.record_failure(PeerFailureKind::Refused, 100, 1_000, 500);
+		// Raced in with a `now` read before the first one's.
 		peer.record_failure(PeerFailureKind::Refused, 100, 1_000, 0);
-		peer.record_failure(PeerFailureKind::Refused, 100, 1_000, 0);
-		// A third failure computed from an older streak value lands last.
-		peer.consecutive_failures.store(0, Ordering::Relaxed);
-		peer.record_failure(PeerFailureKind::Refused, 100, 1_000, 0);
-		assert_eq!(peer.cooldown_until_ns.load(Ordering::Relaxed), 200);
+		assert_eq!(peer.cooldown_until(), 600);
 	}
 
 	#[test]
@@ -631,7 +638,7 @@ mod tests {
 				u64::MAX - 5,
 			);
 		}
-		assert_eq!(peer.cooldown_until_ns.load(Ordering::Relaxed), u64::MAX);
+		assert_eq!(peer.cooldown_until(), COOLDOWN_UNTIL_MASK);
 	}
 
 	#[test]
