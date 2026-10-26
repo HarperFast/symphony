@@ -795,7 +795,7 @@ const m = proxy.metrics();
 // m.suspendedResolved     — suspended connections that were resolved with a route
 // m.suspendedUnresolved   — suspended connections that timed out or were rejected
 // m.routes                — routes in the live table, including the default route
-// m.failingRoutes         — rejected cert/protocol/carrier/allowedSources routes or duplicate wildcards
+// m.failingRoutes         — rejected cert/protocol/carrier/allowedSources routes, duplicate wildcards, or invalid failover policies
 
 // Per listener, in configuration order
 for (const l of m.listeners) {

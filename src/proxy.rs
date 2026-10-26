@@ -326,7 +326,8 @@ pub struct JsProxyMetrics {
 	pub routes: f64,
 	/// Routes rejected at build time — a cert failure, protocol/carrier validation failure, invalid
 	/// `allowedSources`, or duplicate wildcard — either dropped, or (cert failures only) serving a
-	/// carried-forward last-good cert.
+	/// carried-forward last-good cert — plus routes serving without failover because their
+	/// `failover` policy is invalid.
 	pub failing_routes: f64,
 	pub listeners: Vec<JsListenerMetrics>,
 	/// Per-configured-route metrics, aggregated across this proxy's listeners.

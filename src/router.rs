@@ -327,8 +327,8 @@ impl RouteTable {
 		self.exact.len() + self.wildcard.len() + usize::from(self.default.is_some())
 	}
 
-	/// Number of SNIs whose cert failed to build in this table — either dropped, or serving a
-	/// carried-forward last-good cert. Non-zero means a rotation needs attention.
+	/// Number of SNIs rejected in this table — dropped, serving a carried-forward last-good cert, or
+	/// serving without an invalid `failover` policy. Non-zero means a config needs attention.
 	pub fn failing_route_count(&self) -> usize {
 		self.failing_snis.union(&self.invalid_failover).count()
 	}

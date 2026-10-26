@@ -520,7 +520,7 @@ export interface ProxyMetrics {
 	/**
 	 * Routes rejected at build time — a cert failure, protocol/carrier validation failure, invalid
 	 * `allowedSources`, or duplicate wildcard — either dropped, or (cert failures only) serving a carried-forward
-	 * last-good cert.
+	 * last-good cert — plus routes serving without failover because their `failover` policy is invalid.
 	 */
 	failingRoutes: number;
 	/** Per-listener breakdown, in configuration order. */
