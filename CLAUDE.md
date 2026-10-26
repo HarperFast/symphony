@@ -125,8 +125,9 @@ hand over the TLS session), and it lets the peer terminate and verify client cer
 
 - **Nothing past the ClientHello reaches a peer that may be retried.** `forward_to_peers` reads
   exactly `PeekInfo::hello_len` wire bytes (through the end of the record that completes the hello,
-  never the reassembled buffer), sends PROXY v2 + hello, and waits for the peer's first byte before
-  reading the client again. Only after that byte is written to the client is the attempt committed.
+  never the reassembled buffer), sends PROXY v2 + hello, and `peek`s for the peer's first byte
+  before reading the client again. Once a peer byte has arrived the attempt is committed: no retry
+  after that, and the byte reaches the client through the ordinary copy.
   An incomplete peek is never forwarded. rustls early data is not enabled anywhere; keep it so.
 - **Health is opt-in.** Only a failover route's balancer gets `SlotHealth` (`with_health`), because
   only the probe clears it; an untracked balancer that skipped a refusing slot would never re-test it.

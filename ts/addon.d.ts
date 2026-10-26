@@ -261,6 +261,7 @@ export interface JsRouteFailoverMetrics {
 export interface JsFailoverPeerMetrics {
   /** "host:port" as configured. */
   peer: string
+  /** Connections handed to this peer once it answered. */
   forwarded: number
   coolingDown: boolean
   /** Failed attempts by reason: refused, timeout, zero_byte_close, error. */

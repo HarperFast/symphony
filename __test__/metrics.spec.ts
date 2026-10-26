@@ -604,6 +604,10 @@ describe('renderPrometheus', () => {
 				},
 			],
 		});
+		assert.equal(rendered.match(/^symphony_route_connections_total\{/gm)?.length, count);
+		assert.equal(rendered.match(/^symphony_route_errors_total\{/gm)?.length ?? 0, 0);
+		assert.equal(rendered.match(/^symphony_route_blocked_total\{/gm)?.length ?? 0, 0);
+	});
 
 	it('renders failover route health and per-peer counters only for failover routes', () => {
 		const base = snapshot.proxies[0].metrics.routeMetrics[0];
@@ -655,10 +659,6 @@ describe('renderPrometheus', () => {
 			)
 		);
 		assert.equal(rendered.match(/^symphony_route_local_up\{/gm)?.length, 1, 'only the failover route');
-	});
-		assert.equal(rendered.match(/^symphony_route_connections_total\{/gm)?.length, count);
-		assert.equal(rendered.match(/^symphony_route_errors_total\{/gm)?.length ?? 0, 0);
-		assert.equal(rendered.match(/^symphony_route_blocked_total\{/gm)?.length ?? 0, 0);
 	});
 });
 

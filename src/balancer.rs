@@ -176,6 +176,30 @@ impl UdsBalancer {
 		self
 	}
 
+	/// The same slots and settings with health tracked or not; tracked state stays shared with
+	/// `self`. Connection counts and affinity entries start over, as on any rebuild.
+	pub fn retracked(&self, track: bool) -> UdsBalancer {
+		let slots = self
+			.sockets
+			.iter()
+			.map(|s| UdsSlotSpec {
+				path: s.path.to_string(),
+				pid: s.pid,
+				tid: s.tid,
+			})
+			.collect();
+		let (ip_affinity, ttl_ms) = self
+			.affinity
+			.as_ref()
+			.map_or((false, 0), |a| (true, a.ttl_ns / 1_000_000));
+		let balancer = UdsBalancer::new(slots, ip_affinity, ttl_ms);
+		if track {
+			balancer.with_health(Some(self))
+		} else {
+			balancer
+		}
+	}
+
 	/// Pick a socket for the given peer IP.
 	/// If affinity is enabled and the IP has a valid sticky mapping, returns that socket.
 	/// Otherwise returns the socket with the lowest combined score (active×1000 + cpu_util).

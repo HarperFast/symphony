@@ -497,7 +497,7 @@ export interface RouteFailoverMetrics {
 export interface FailoverPeerMetrics {
 	/** "host:port" */
 	peer: string;
-	/** Connections this peer served. */
+	/** Connections handed to this peer once it answered (its first byte arrived). */
 	forwarded: number;
 	coolingDown: boolean;
 	/** Failed attempts by reason (`refused`, `timeout`, `zero_byte_close`, `error`); zero-valued reasons are omitted. */

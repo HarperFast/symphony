@@ -304,6 +304,7 @@ pub struct JsRouteFailoverMetrics {
 pub struct JsFailoverPeerMetrics {
 	/// "host:port" as configured.
 	pub peer: String,
+	/// Connections handed to this peer once it answered.
 	pub forwarded: f64,
 	pub cooling_down: bool,
 	/// Failed attempts by reason: refused, timeout, zero_byte_close, error.

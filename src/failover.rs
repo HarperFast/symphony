@@ -238,25 +238,26 @@ impl Failover {
 		down(destination) || destination_h2.is_some_and(down)
 	}
 
-	/// Peers to try, in order: round-robin over those not cooling down; if every peer is cooling
-	/// down, only the one whose cooldown ends first.
-	fn candidates(&self, now: u64) -> Vec<Arc<FailoverPeer>> {
+	/// Peers to try, in order, and how many: round-robin over those not cooling down; if every
+	/// peer is cooling down, only the one whose cooldown ends first.
+	fn candidates(&self, now: u64) -> (usize, impl Iterator<Item = &FailoverPeer>) {
 		let count = self.peers.len();
 		let start = self.cursor.fetch_add(1, Ordering::Relaxed) % count;
-		let ready: Vec<_> = (0..count)
-			.map(|i| &self.peers[(start + i) % count])
-			.filter(|peer| !peer.cooling_down(now))
-			.cloned()
-			.collect();
-		if !ready.is_empty() {
-			return ready;
-		}
-		self.peers
-			.iter()
-			.min_by_key(|peer| peer.cooldown_until_ns.load(Ordering::Relaxed))
-			.cloned()
-			.into_iter()
-			.collect()
+		let ready = self.peers.iter().filter(|p| !p.cooling_down(now)).count();
+		let earliest = (ready == 0)
+			.then(|| {
+				self.peers
+					.iter()
+					.min_by_key(|p| p.cooldown_until_ns.load(Ordering::Relaxed))
+			})
+			.flatten();
+		let rotation = (0..count)
+			.map(move |i| &self.peers[(start + i) % count])
+			.filter(move |p| !p.cooling_down(now));
+		(
+			ready.max(usize::from(earliest.is_some())),
+			rotation.chain(earliest).map(|p| p.as_ref()),
+		)
 	}
 }
 
@@ -292,8 +293,8 @@ pub async fn forward_to_peers(
 		_ => return Err(ErrorKind::UpstreamConnect),
 	}
 
-	let candidates = failover.candidates(now_ns());
-	for (attempt, peer) in candidates.iter().enumerate() {
+	let (candidate_count, candidates) = failover.candidates(now_ns());
+	for (attempt, peer) in candidates.enumerate() {
 		let remaining = deadline.saturating_duration_since(Instant::now());
 		if remaining.is_zero() {
 			break;
@@ -302,13 +303,10 @@ pub async fn forward_to_peers(
 			failover.status.replays.fetch_add(1, Ordering::Relaxed);
 		}
 		// A fair share of what is left, so one silent peer cannot spend every later peer's turn.
-		let share = remaining / (candidates.len() - attempt) as u32;
+		let share = remaining / candidate_count.saturating_sub(attempt).max(1) as u32;
 		match attempt_peer(peer.addr, &prefix, share).await {
-			Ok((mut upstream, first, n)) => {
-				match timeout(ctx.handshake_timeout(), client.write_all(&first[..n])).await {
-					Ok(Ok(())) => peer.record_success(),
-					_ => return Err(ErrorKind::Stream),
-				}
+			Ok(mut upstream) => {
+				peer.record_success();
 				return forward_opaque(&mut client, &mut upstream, peer_addr, ctx).await;
 			}
 			Err(kind) => {
@@ -326,13 +324,12 @@ pub async fn forward_to_peers(
 	Err(ErrorKind::UpstreamConnect)
 }
 
-const FIRST_READ: usize = 4096;
-
+/// Ok once the peer has sent a byte. The byte is peeked, so the copy that follows forwards it.
 async fn attempt_peer(
 	addr: SocketAddr,
 	prefix: &[u8],
 	share: Duration,
-) -> Result<(TcpStream, Box<[u8; FIRST_READ]>, usize), PeerFailureKind> {
+) -> Result<TcpStream, PeerFailureKind> {
 	let attempt = async {
 		let mut stream = TcpStream::connect(addr).await.map_err(|e| match e.kind() {
 			std::io::ErrorKind::ConnectionRefused => PeerFailureKind::Refused,
@@ -343,10 +340,9 @@ async fn attempt_peer(
 			.write_all(prefix)
 			.await
 			.map_err(|_| PeerFailureKind::ZeroByteClose)?;
-		let mut first = Box::new([0u8; FIRST_READ]);
-		match stream.read(&mut first[..]).await {
+		match stream.peek(&mut [0u8; 1]).await {
 			Ok(0) | Err(_) => Err(PeerFailureKind::ZeroByteClose),
-			Ok(n) => Ok((stream, first, n)),
+			Ok(_) => Ok(stream),
 		}
 	};
 	timeout(share, attempt)
@@ -356,7 +352,6 @@ async fn attempt_peer(
 
 // ── Recovery probe ────────────────────────────────────────────────────────────
 
-/// A failover route as the probe task sees it.
 pub struct FailoverRoute {
 	pub identity: Arc<RouteMetricIdentity>,
 	pub failover: Arc<Failover>,
@@ -442,10 +437,13 @@ pub async fn probe_periodically(
 			{
 				continue;
 			}
-			status.last_probe_ns.store(now, Ordering::Relaxed);
+			// Stamped only when something is probed, so a slot that starts refusing is probed on
+			// the next tick rather than up to a full interval after the last idle pass.
+			let mut probed = false;
 			let mut add = |endpoint: Endpoint, health: &Arc<SlotHealth>| {
 				let observed = health.refused_at();
 				if observed != 0 {
+					probed = true;
 					due.entry(endpoint)
 						.or_default()
 						.push((health.clone(), observed));
@@ -464,6 +462,9 @@ pub async fn probe_periodically(
 						}
 					}
 				}
+			}
+			if probed {
+				status.last_probe_ns.store(now, Ordering::Relaxed);
 			}
 		}
 
@@ -636,10 +637,10 @@ mod tests {
 	#[test]
 	fn candidates_rotate_and_skip_peers_in_cooldown() {
 		let fo = failover(&[("10.0.0.1", 1), ("10.0.0.2", 1), ("10.0.0.3", 1)]);
-		let addrs = |c: Vec<Arc<FailoverPeer>>| {
-			c.iter()
-				.map(|p| p.addr.ip().to_string())
-				.collect::<Vec<_>>()
+		let addrs = |(count, c): (usize, _)| {
+			let c: Vec<_> = Iterator::map(c, |p: &FailoverPeer| p.addr.ip().to_string()).collect();
+			assert_eq!(count, c.len());
+			c
 		};
 		assert_eq!(
 			addrs(fo.candidates(0)),
@@ -660,8 +661,9 @@ mod tests {
 		let fo = failover(&[("10.0.0.1", 1), ("10.0.0.2", 1)]);
 		fo.peers[0].record_failure(PeerFailureKind::Refused, 50, 50, 100);
 		fo.peers[1].record_failure(PeerFailureKind::Refused, 20, 20, 100);
-		let c = fo.candidates(101);
-		assert_eq!(c.len(), 1);
+		let (count, c) = fo.candidates(101);
+		let c: Vec<_> = c.collect();
+		assert_eq!((count, c.len()), (1, 1));
 		assert_eq!(c[0].addr.ip().to_string(), "10.0.0.2");
 	}
 
