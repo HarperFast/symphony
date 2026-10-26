@@ -1,4 +1,6 @@
+use crate::failover::{probe_periodically, FailoverSpec};
 use crate::http_listener::spawn_http_listeners;
+use crate::ingress::IngressState;
 use crate::listener::spawn_listeners;
 use crate::liveness::KeepaliveConfig;
 use crate::metrics::{total_of, GlobalMetrics, ListenerMetrics};
@@ -8,8 +10,8 @@ use crate::proxy_conn::{
 };
 use crate::router::{
 	build_route_table, evict_affinity_periodically, requires_http_protocol, ForwardFingerprint,
-	ListenerTlsSpec, LiveRouteTable, RouteProtocol, RouteSpec, SourceAddressMode, SourceAllowlist,
-	UpstreamSpec,
+	ListenerTlsSpec, LiveRouteTable, RouteMetricIdentity, RouteProtocol, RouteSpec,
+	SourceAddressMode, SourceAllowlist, UpstreamSpec,
 };
 use crate::suspended::{build_resolved_route, ResolveSpec, ResolveUpstream, SuspendedRegistry};
 use crate::tls::TlsConfigCache;
@@ -91,6 +93,39 @@ pub struct JsRouteConfig {
 	/// TCP peer address falls in one of them are admitted to this route. An invalid entry drops
 	/// the route (counted in `failingRoutes`) rather than failing the whole config.
 	pub allowed_sources: Option<Vec<String>>,
+	/// Forward new connections, as raw TLS, to peer nodes while the local upstream is down.
+	pub failover: Option<JsFailoverConfig>,
+}
+
+#[napi(object)]
+pub struct JsFailoverPeer {
+	/// IP literal of the peer's failover ingress listener.
+	pub host: String,
+	pub port: u16,
+}
+
+#[napi(object)]
+pub struct JsPeerCooldown {
+	pub min: f64,
+	pub max: f64,
+}
+
+#[napi(object)]
+pub struct JsFailoverConfig {
+	pub peers: Vec<JsFailoverPeer>,
+	/// Forward every new connection whatever the local health. Default: false.
+	pub drain: Option<bool>,
+	/// Interval of the local-upstream recovery probe. Default: 1000.
+	pub probe_interval_ms: Option<f64>,
+	/// Per-(route, peer) cooldown after a failed attempt, doubling per consecutive failure.
+	/// Default: { min: 5000, max: 60000 }.
+	pub peer_cooldown_ms: Option<JsPeerCooldown>,
+}
+
+#[napi(object)]
+pub struct JsFailoverIngressConfig {
+	/// CIDRs of the peer nodes. Only they may connect, and an empty list admits nobody.
+	pub trusted_sources: Vec<String>,
 }
 
 #[napi(object)]
@@ -140,6 +175,8 @@ pub struct JsListenerConfig {
 	pub max_connections: Option<u32>,
 	pub idle_timeout_ms: Option<f64>,
 	pub protection: Option<JsProtectionConfig>,
+	/// Makes this TLS listener the receiving end of peer failover.
+	pub failover_ingress: Option<JsFailoverIngressConfig>,
 }
 
 #[napi(object)]
@@ -186,11 +223,20 @@ pub struct JsListenerProtectionHotConfig {
 }
 
 #[napi(object)]
+pub struct JsListenerFailoverIngressHotConfig {
+	/// Port of a listener started with `failoverIngress`.
+	pub port: u16,
+	pub trusted_sources: Vec<String>,
+}
+
+#[napi(object)]
 pub struct JsHotConfig {
 	pub routes: Option<Vec<JsRouteConfig>>,
 	/// Per-listener protection updates. Each entry must reference a listener that was
 	/// started WITH protection; a mismatched port or a port without protection is an error.
 	pub protection: Option<Vec<JsListenerProtectionHotConfig>>,
+	/// Per-listener `trustedSources` updates, under the same rules as `protection`.
+	pub failover_ingress: Option<Vec<JsListenerFailoverIngressHotConfig>>,
 }
 
 /// A single labelled counter — one entry per block/error reason.
@@ -236,6 +282,32 @@ pub struct JsRouteMetrics {
 	pub blocked_by_reason: Vec<JsLabeledCount>,
 	/// Sparse post-route errors; zero-valued reasons are omitted.
 	pub errors_by_reason: Vec<JsLabeledCount>,
+	/// Present only on routes with `failover`.
+	pub failover: Option<JsRouteFailoverMetrics>,
+}
+
+#[napi(object)]
+pub struct JsRouteFailoverMetrics {
+	/// False while every slot of the route's local upstream is refusing.
+	pub local_up: bool,
+	pub refusing_slots: f64,
+	pub slots: f64,
+	pub drain: bool,
+	/// Attempts that replayed the ClientHello to a second or later peer.
+	pub replays: f64,
+	/// Connections closed after every candidate peer failed.
+	pub exhausted: f64,
+	pub peers: Vec<JsFailoverPeerMetrics>,
+}
+
+#[napi(object)]
+pub struct JsFailoverPeerMetrics {
+	/// "host:port" as configured.
+	pub peer: String,
+	pub forwarded: f64,
+	pub cooling_down: bool,
+	/// Failed attempts by reason: refused, timeout, zero_byte_close, error.
+	pub failures_by_reason: Vec<JsLabeledCount>,
 }
 
 // Counters are reported as f64 because napi maps u64 to BigInt, which JSON.stringify cannot
@@ -318,6 +390,7 @@ struct ListenerState {
 	port: u16,
 	metrics: Arc<ListenerMetrics>,
 	protection: Option<Arc<ProtectionState>>,
+	ingress: Option<Arc<IngressState>>,
 }
 
 // ── SymphonyProxy napi class ──────────────────────────────────────────────────
@@ -443,11 +516,24 @@ impl SymphonyProxyWrap {
 				None
 			};
 
+			let ingress = match &l.failover_ingress {
+				None => None,
+				Some(_) if mode == ListenerMode::Http => {
+					return Err(napi::Error::from_reason(format!(
+						"listener {addr_str}: failoverIngress requires a TLS listener"
+					)))
+				}
+				Some(cfg) => Some(IngressState::new(parse_trusted_sources(
+					&cfg.trusted_sources,
+				)?)),
+			};
+
 			listener_states.push(ListenerState {
 				addr: addr_str,
 				port: l.port,
 				metrics: Arc::new(ListenerMetrics::default()),
 				protection,
+				ingress,
 			});
 		}
 
@@ -501,6 +587,16 @@ impl SymphonyProxyWrap {
 						obj.set("type", "error")?;
 						obj.set("message", message)?;
 						obj.set("listener", listener)?;
+					}
+					JsEvent::RouteHealth {
+						route,
+						metrics_group,
+						up,
+					} => {
+						obj.set("type", "routeHealth")?;
+						obj.set("route", route)?;
+						obj.set("metricsGroup", metrics_group)?;
+						obj.set("status", if up { "up" } else { "down" })?;
 					}
 				}
 				Ok(vec![obj])
@@ -568,6 +664,7 @@ impl SymphonyProxyWrap {
 				client_read_buffer_size: self.client_read_buffer_size,
 				upstream_read_buffer_size: self.upstream_read_buffer_size,
 				tls_buffer_limit: self.tls_buffer_limit,
+				ingress: state.ingress.clone(),
 				js_emit: self.js_emit.clone(),
 			});
 
@@ -613,6 +710,12 @@ impl SymphonyProxyWrap {
 		self.rt_handle.spawn(evict_affinity_periodically(
 			self.route_table.clone(),
 			Duration::from_secs(60),
+			tx.subscribe(),
+		));
+
+		self.rt_handle.spawn(probe_periodically(
+			self.route_table.clone(),
+			self.js_emit.clone(),
 			tx.subscribe(),
 		));
 
@@ -737,6 +840,40 @@ impl SymphonyProxyWrap {
 			None
 		};
 
+		let validated_ingress = if let Some(ingress_updates) = hot.failover_ingress {
+			let mut errors: Vec<String> = Vec::new();
+			let mut parsed = Vec::with_capacity(ingress_updates.len());
+			for update in &ingress_updates {
+				let matches: Vec<_> = self
+					.listener_states
+					.iter()
+					.filter(|s| s.port == update.port)
+					.collect();
+				match matches.as_slice() {
+					[] => errors.push(format!("port {} matches no listener", update.port)),
+					[single] => match &single.ingress {
+						None => errors.push(format!(
+							"port {} was started without failoverIngress; recreate to enable",
+							update.port
+						)),
+						Some(state) => match parse_trusted_sources(&update.trusted_sources) {
+							Ok(trusted) => parsed.push((state.clone(), trusted)),
+							Err(e) => errors.push(format!("port {}: {}", update.port, e.reason)),
+						},
+					},
+					_multiple => {
+						errors.push(format!("port {} matches multiple listeners", update.port))
+					}
+				}
+			}
+			if !errors.is_empty() {
+				return Err(napi::Error::from_reason(errors.join("; ")));
+			}
+			Some(parsed)
+		} else {
+			None
+		};
+
 		// All validation passed — apply atomically (routes then protection, neither applied on any error above).
 		if let Some(table) = new_route_table {
 			self.route_table.swap(table);
@@ -758,6 +895,9 @@ impl SymphonyProxyWrap {
 					.expect("validated above");
 				prot.config.store(Arc::new(cfg));
 			}
+		}
+		for (state, trusted) in validated_ingress.into_iter().flatten() {
+			state.set_trusted(trusted);
 		}
 		Ok(())
 	}
@@ -805,6 +945,34 @@ impl SymphonyProxyWrap {
 		// Likewise derived, so the proxy-wide total always equals the sum of the listener values
 		// in this same snapshot.
 		let blocked_connections = listeners.iter().map(|l| l.blocked).sum();
+		let failover_metrics = |identity: &Arc<RouteMetricIdentity>| {
+			let route = table
+				.failover_routes()
+				.iter()
+				.find(|r| Arc::ptr_eq(&r.identity, identity))?;
+			let (refusing, slots) = route.slot_counts();
+			let status = &route.failover.status;
+			let now = crate::protection::now_ns();
+			Some(JsRouteFailoverMetrics {
+				local_up: !route.locally_down(),
+				refusing_slots: refusing as f64,
+				slots: slots as f64,
+				drain: route.failover.drain,
+				replays: status.replays.load(Ordering::Relaxed) as f64,
+				exhausted: status.exhausted.load(Ordering::Relaxed) as f64,
+				peers: route
+					.failover
+					.peers
+					.iter()
+					.map(|peer| JsFailoverPeerMetrics {
+						peer: peer.addr.to_string(),
+						forwarded: peer.forwarded.load(Ordering::Relaxed) as f64,
+						cooling_down: peer.cooling_down(now),
+						failures_by_reason: labeled_counts(peer.failures_by_reason()),
+					})
+					.collect(),
+			})
+		};
 		let route_metrics = table
 			.metric_identities()
 			.iter()
@@ -823,6 +991,7 @@ impl SymphonyProxyWrap {
 					bytes_sent: identity.counters.bytes_out.load(Ordering::Relaxed) as f64,
 					blocked_by_reason: labeled_counts(blocked_by_reason),
 					errors_by_reason: labeled_counts(errors_by_reason),
+					failover: failover_metrics(identity),
 				}
 			})
 			.collect();
@@ -998,6 +1167,13 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 		http2: r.http2.unwrap_or(false),
 		protocol,
 		allowed_sources: r.allowed_sources.clone().unwrap_or_default(),
+		failover: r.failover.as_ref().map(|f| FailoverSpec {
+			peers: f.peers.iter().map(|p| (p.host.clone(), p.port)).collect(),
+			drain: f.drain.unwrap_or(false),
+			probe_interval_ms: f.probe_interval_ms,
+			cooldown_min_ms: f.peer_cooldown_ms.as_ref().map(|c| c.min),
+			cooldown_max_ms: f.peer_cooldown_ms.as_ref().map(|c| c.max),
+		}),
 	};
 
 	if spec.http2 && !spec.terminate_tls {
@@ -1272,6 +1448,11 @@ fn parse_protection_config(
 		.collect::<Result<Vec<_>>>()?;
 
 	Ok(cfg.precompute())
+}
+
+fn parse_trusted_sources(entries: &[String]) -> Result<SourceAllowlist> {
+	SourceAllowlist::parse_required(entries, "failoverIngress.trustedSources")
+		.map_err(napi::Error::from_reason)
 }
 
 fn listener_tls_spec(l: &JsListenerConfig) -> ListenerTlsSpec {

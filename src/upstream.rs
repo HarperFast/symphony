@@ -1,4 +1,4 @@
-use crate::balancer::{BalancerGuard, UdsBalancer};
+use crate::balancer::{BalancerGuard, SlotHealth, UdsBalancer};
 use crate::router::Destination;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -19,22 +19,27 @@ pub enum UpstreamStream {
 
 /// Connect to an upstream destination.
 /// `peer_ip` is passed to UDS balancers for IP affinity.
-/// `connect_timeout` caps the time spent waiting for the initial connection.
+/// `connect_timeout` caps the time spent waiting for the connection, across every slot tried.
+/// `tcp_health` is a failover route's state for a TCP destination; UDS slots carry their own.
 pub async fn connect(
 	destination: &Destination,
 	peer_ip: Option<IpAddr>,
 	connect_timeout: Duration,
+	tcp_health: Option<&SlotHealth>,
 ) -> crate::error::Result<UpstreamStream> {
 	match destination {
 		Destination::Tcp(addr) => {
-			let stream = timeout(connect_timeout, TcpStream::connect(addr))
+			let result = timeout(connect_timeout, TcpStream::connect(addr))
 				.await
-				.map_err(|_| {
-					crate::error::SymphonyError::Io(std::io::Error::new(
-						std::io::ErrorKind::TimedOut,
-						"upstream connect timeout",
-					))
-				})??;
+				.unwrap_or_else(|_| Err(connect_timed_out()));
+			if let Some(health) = tcp_health {
+				match &result {
+					Ok(_) => health.mark_accepting(),
+					Err(e) if is_refusal(e) => health.mark_refused(),
+					Err(_) => {}
+				}
+			}
+			let stream = result?;
 			stream.set_nodelay(true)?;
 			Ok(UpstreamStream::Tcp(stream))
 		}
@@ -42,31 +47,73 @@ pub async fn connect(
 	}
 }
 
+fn connect_timed_out() -> std::io::Error {
+	std::io::Error::new(std::io::ErrorKind::TimedOut, "upstream connect timeout")
+}
+
+/// The failures that say "nothing is accepting here": a stopped listener, a socket file that is
+/// gone, or a listener that cannot take the connection in time.
+pub fn is_refusal(e: &std::io::Error) -> bool {
+	matches!(
+		e.kind(),
+		std::io::ErrorKind::ConnectionRefused
+			| std::io::ErrorKind::NotFound
+			| std::io::ErrorKind::TimedOut
+	)
+}
+
+/// Connect to the picked slot; on a refusal try each remaining slot once, best score first, all
+/// within one `connect_timeout`. One dead worker socket then costs a failed connect instead of
+/// the client's connection.
 async fn connect_uds(
 	balancer: &Arc<UdsBalancer>,
 	peer_ip: Option<IpAddr>,
 	connect_timeout: Duration,
 ) -> crate::error::Result<UpstreamStream> {
-	let path = balancer.pick(peer_ip).ok_or_else(|| {
+	let mut idx = balancer.pick(peer_ip).ok_or_else(|| {
 		crate::error::SymphonyError::Config("UDS balancer has no sockets configured".into())
 	})?;
+	let deadline = tokio::time::Instant::now() + connect_timeout;
+	// Allocated only once a slot has refused.
+	let mut tried: Vec<bool> = Vec::new();
 
-	let stream = timeout(connect_timeout, UnixStream::connect(path.as_ref()))
-		.await
-		.map_err(|_| {
-			crate::error::SymphonyError::Io(std::io::Error::new(
-				std::io::ErrorKind::TimedOut,
-				"upstream connect timeout",
-			))
-		})??;
-
-	// The guard increments the counter on construction and decrements on drop.
-	let guard = BalancerGuard::new(balancer.clone(), path.to_string());
-
-	Ok(UpstreamStream::Uds {
-		stream,
-		_guard: guard,
-	})
+	loop {
+		let path = balancer.path(idx);
+		let result = tokio::time::timeout_at(deadline, UnixStream::connect(path.as_ref()))
+			.await
+			.unwrap_or_else(|_| Err(connect_timed_out()));
+		let health = balancer.health(idx);
+		match result {
+			Ok(stream) => {
+				if let Some(h) = health {
+					h.mark_accepting();
+				}
+				if !tried.is_empty() {
+					balancer.rebind_affinity(peer_ip, idx);
+				}
+				// The guard increments the counter on construction and decrements on drop.
+				let guard = BalancerGuard::new(balancer.clone(), path.to_string());
+				return Ok(UpstreamStream::Uds {
+					stream,
+					_guard: guard,
+				});
+			}
+			Err(e) if is_refusal(&e) => {
+				if let Some(h) = health {
+					h.mark_refused();
+				}
+				if tried.is_empty() {
+					tried.resize(balancer.slot_count(), false);
+				}
+				tried[idx] = true;
+				match balancer.next_untried(&tried) {
+					Some(next) if tokio::time::Instant::now() < deadline => idx = next,
+					_ => return Err(e.into()),
+				}
+			}
+			Err(e) => return Err(e.into()),
+		}
+	}
 }
 
 /// Write a PROXY protocol v1 header so the backend can recover the real client
@@ -230,6 +277,125 @@ pub async fn write_proxy_v2_header<W: tokio::io::AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::balancer::UdsSlotSpec;
+
+	fn socket_dir(name: &str) -> std::path::PathBuf {
+		let dir = std::env::temp_dir().join(format!("symphony-{name}-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		dir
+	}
+
+	fn balancer(paths: &[&std::path::Path], affinity: bool) -> UdsBalancer {
+		let slots = paths
+			.iter()
+			.map(|p| UdsSlotSpec {
+				path: p.to_str().unwrap().to_string(),
+				pid: None,
+				tid: None,
+			})
+			.collect();
+		UdsBalancer::new(slots, affinity, 60_000)
+	}
+
+	async fn connected_path(dest: &Destination, ip: Option<IpAddr>) -> Option<String> {
+		match connect(dest, ip, Duration::from_secs(1), None).await {
+			Ok(UpstreamStream::Uds { stream, .. }) => Some(
+				stream
+					.peer_addr()
+					.unwrap()
+					.as_pathname()?
+					.to_str()?
+					.to_string(),
+			),
+			_ => None,
+		}
+	}
+
+	#[tokio::test]
+	async fn a_refusing_slot_falls_through_to_the_next_without_tracking() {
+		let dir = socket_dir("fallthrough");
+		let dead = dir.join("dead.sock"); // never bound: ENOENT
+		let live = dir.join("live.sock");
+		let _listener = tokio::net::UnixListener::bind(&live).unwrap();
+		let ip: IpAddr = "192.0.2.1".parse().unwrap();
+		let bal = Arc::new(balancer(&[&dead, &live], true));
+		let dest = Destination::UdsSet(bal.clone());
+		for _ in 0..3 {
+			assert_eq!(
+				connected_path(&dest, Some(ip)).await.as_deref(),
+				live.to_str()
+			);
+		}
+		assert_eq!(
+			bal.pick(Some(ip)),
+			Some(1),
+			"affinity rebinds to the slot that accepted"
+		);
+		assert!(
+			!bal.all_refusing(),
+			"an untracked balancer never reports down"
+		);
+	}
+
+	#[tokio::test]
+	async fn tracked_slots_are_skipped_once_refusing_and_down_when_all_refuse() {
+		let dir = socket_dir("tracked");
+		let a = dir.join("a.sock");
+		let b = dir.join("b.sock");
+		let listener = tokio::net::UnixListener::bind(&b).unwrap();
+		let bal = Arc::new(balancer(&[&a, &b], false).with_health(None));
+		let dest = Destination::UdsSet(bal.clone());
+
+		assert_eq!(connected_path(&dest, None).await.as_deref(), b.to_str());
+		assert!(bal.health(0).unwrap().refusing());
+		assert!(!bal.health(1).unwrap().refusing());
+		assert_eq!(
+			bal.pick(None),
+			Some(1),
+			"the refusing slot is no longer picked first"
+		);
+		assert!(!bal.all_refusing());
+
+		drop(listener);
+		std::fs::remove_file(&b).unwrap();
+		assert!(connected_path(&dest, None).await.is_none());
+		assert!(bal.all_refusing());
+
+		let rebuilt = balancer(&[&a, &b], false).with_health(Some(&bal));
+		assert!(rebuilt.all_refusing(), "a rebuild keeps the refusals");
+		assert!(Arc::ptr_eq(
+			rebuilt.health(0).unwrap(),
+			bal.health(0).unwrap()
+		));
+
+		let _listener = tokio::net::UnixListener::bind(&a).unwrap();
+		let observed = bal.health(0).unwrap().refused_at();
+		assert!(bal.health(0).unwrap().clear_if_unchanged(observed));
+		assert!(
+			!rebuilt.all_refusing(),
+			"clearing the shared state reaches the rebuilt table"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_tcp_destination_marks_its_health_only_when_given_one() {
+		let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let addr = closed.local_addr().unwrap();
+		drop(closed);
+		let dest = Destination::Tcp(addr);
+		let health = SlotHealth::default();
+		assert!(connect(&dest, None, Duration::from_secs(1), Some(&health))
+			.await
+			.is_err());
+		assert!(health.refusing());
+		let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+		assert!(connect(&dest, None, Duration::from_secs(1), Some(&health))
+			.await
+			.is_ok());
+		assert!(!health.refusing());
+		drop(listener);
+	}
 
 	// A JA3-shaped value (32 hex chars) for TLV assertions.
 	const JA3: &str = "0123456789abcdef0123456789abcdef";

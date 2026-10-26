@@ -74,6 +74,33 @@ export interface JsRouteConfig {
    * the route (counted in `failingRoutes`) rather than failing the whole config.
    */
   allowedSources?: Array<string>
+  /** Forward new connections, as raw TLS, to peer nodes while the local upstream is down. */
+  failover?: JsFailoverConfig
+}
+export interface JsFailoverPeer {
+  /** IP literal of the peer's failover ingress listener. */
+  host: string
+  port: number
+}
+export interface JsPeerCooldown {
+  min: number
+  max: number
+}
+export interface JsFailoverConfig {
+  peers: Array<JsFailoverPeer>
+  /** Forward every new connection whatever the local health. Default: false. */
+  drain?: boolean
+  /** Interval of the local-upstream recovery probe. Default: 1000. */
+  probeIntervalMs?: number
+  /**
+   * Per-(route, peer) cooldown after a failed attempt, doubling per consecutive failure.
+   * Default: { min: 5000, max: 60000 }.
+   */
+  peerCooldownMs?: JsPeerCooldown
+}
+export interface JsFailoverIngressConfig {
+  /** CIDRs of the peer nodes. Only they may connect, and an empty list admits nobody. */
+  trustedSources: Array<string>
 }
 export interface JsRateLimitConfig {
   connectionsPerSecond: number
@@ -115,6 +142,8 @@ export interface JsListenerConfig {
   maxConnections?: number
   idleTimeoutMs?: number
   protection?: JsProtectionConfig
+  /** Makes this TLS listener the receiving end of peer failover. */
+  failoverIngress?: JsFailoverIngressConfig
 }
 export interface JsProxyConfig {
   listeners: Array<JsListenerConfig>
@@ -161,6 +190,11 @@ export interface JsListenerProtectionHotConfig {
   port: number
   protection: JsProtectionConfig
 }
+export interface JsListenerFailoverIngressHotConfig {
+  /** Port of a listener started with `failoverIngress`. */
+  port: number
+  trustedSources: Array<string>
+}
 export interface JsHotConfig {
   routes?: Array<JsRouteConfig>
   /**
@@ -168,6 +202,8 @@ export interface JsHotConfig {
    * started WITH protection; a mismatched port or a port without protection is an error.
    */
   protection?: Array<JsListenerProtectionHotConfig>
+  /** Per-listener `trustedSources` updates, under the same rules as `protection`. */
+  failoverIngress?: Array<JsListenerFailoverIngressHotConfig>
 }
 /** A single labelled counter — one entry per block/error reason. */
 export interface JsLabeledCount {
@@ -207,6 +243,28 @@ export interface JsRouteMetrics {
   blockedByReason: Array<JsLabeledCount>
   /** Sparse post-route errors; zero-valued reasons are omitted. */
   errorsByReason: Array<JsLabeledCount>
+  /** Present only on routes with `failover`. */
+  failover?: JsRouteFailoverMetrics
+}
+export interface JsRouteFailoverMetrics {
+  /** False while every slot of the route's local upstream is refusing. */
+  localUp: boolean
+  refusingSlots: number
+  slots: number
+  drain: boolean
+  /** Attempts that replayed the ClientHello to a second or later peer. */
+  replays: number
+  /** Connections closed after every candidate peer failed. */
+  exhausted: number
+  peers: Array<JsFailoverPeerMetrics>
+}
+export interface JsFailoverPeerMetrics {
+  /** "host:port" as configured. */
+  peer: string
+  forwarded: number
+  coolingDown: boolean
+  /** Failed attempts by reason: refused, timeout, zero_byte_close, error. */
+  failuresByReason: Array<JsLabeledCount>
 }
 export interface JsProxyMetrics {
   activeConnections: number

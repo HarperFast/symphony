@@ -1613,6 +1613,7 @@ mod tests {
 			ja3: String::new(),
 			ja4: ja4.into(),
 			complete,
+			hello_len: 0,
 		}
 	}
 

@@ -1,3 +1,5 @@
+use crate::balancer::SlotHealth;
+use crate::ingress::IngressState;
 use crate::liveness::{HalfCloseWatch, KeepaliveConfig, Watched};
 use crate::metrics::{
 	inc_route_blocked, inc_route_error, BlockKind, CountingStream, ErrorKind, GlobalMetrics,
@@ -63,6 +65,12 @@ pub enum JsEvent {
 		message: String,
 		listener: String,
 	},
+	/// A failover route's local upstream went down or came back.
+	RouteHealth {
+		route: String,
+		metrics_group: String,
+		up: bool,
+	},
 }
 
 pub struct ConnContext {
@@ -88,11 +96,21 @@ pub struct ConnContext {
 	pub upstream_read_buffer_size: usize,
 	/// `SYMPHONY_TLS_BUFFER_LIMIT` benchmark hook; `None` keeps rustls' default.
 	pub tls_buffer_limit: Option<usize>,
+	/// `Some` on a failover ingress listener.
+	pub ingress: Option<Arc<IngressState>>,
 	pub js_emit: Arc<ThreadsafeFunction<JsEvent>>,
 }
 
-pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnContext>) {
-	let peer_ip = peer_addr.ip();
+impl ConnContext {
+	pub(crate) fn handshake_timeout(&self) -> Duration {
+		self.protection
+			.as_ref()
+			.map(|p| p.config.load().tls_handshake_timeout())
+			.unwrap_or(Duration::from_secs(10))
+	}
+}
+
+pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<ConnContext>) {
 	// The address the client connected to — the PROXY v2 destination. Captured before the
 	// stream is consumed by the TLS handshake.
 	let local_addr = stream.local_addr().ok();
@@ -110,6 +128,24 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		listener: ctx.listener_metrics.clone(),
 		ip_state: None,
 	};
+	let hs_timeout = ctx.handshake_timeout();
+
+	// ── 0b. Failover ingress: the real TCP peer must be trusted before any byte is read, and
+	// the client address it asserts replaces it for everything that follows.
+	if let Some(ingress) = &ctx.ingress {
+		if !ingress.trusts(peer_addr.ip()) {
+			ctx.listener_metrics.inc_blocked(BlockKind::UntrustedSource);
+			return;
+		}
+		match crate::ingress::read_proxy_v2(&mut stream, hs_timeout).await {
+			Ok(source) => peer_addr = source,
+			Err(reject) => {
+				ctx.listener_metrics.inc_blocked(reject.into());
+				return;
+			}
+		}
+	}
+	let peer_ip = peer_addr.ip();
 
 	// ── 1. Peek: extract SNI + JA3 ───────────────────────────────────────────
 	let peek_info = sni::peek(&stream).await;
@@ -146,7 +182,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	// ── 3. Route lookup ───────────────────────────────────────────────────────
 	let table = ctx.route_table.0.load();
 	let sni_str = peek_info.sni.as_deref();
-	let route = match table.resolve(sni_str) {
+	let route = match table.resolve_with(sni_str, ctx.ingress.is_none()) {
 		Some(r) => r.clone(),
 		None => {
 			ctx.listener_metrics.inc_error(ErrorKind::NoRoute);
@@ -182,6 +218,44 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 			return;
 		}
 	}
+
+	// ── 3d. Failover, decided before the handshake so the connection can still go to a peer as
+	// raw TLS. An ingress connection is never forwarded again: if this node cannot serve it, a
+	// close with no bytes sends the forwarding node on to its next peer.
+	if let Some(failover) = &route.failover {
+		let unavailable = failover.drain
+			|| failover.locally_down(&route.destination, route.destination_h2.as_ref());
+		if ctx.ingress.is_some() {
+			if unavailable {
+				inc_route_error(
+					&ctx.listener_metrics,
+					&route.metric_identity.counters,
+					ErrorKind::LocallyDown,
+				);
+				return;
+			}
+		} else if unavailable && !route.suspended {
+			// Boxed: its state would otherwise sit in every connection's future.
+			let result = Box::pin(crate::failover::forward_to_peers(
+				stream,
+				&peek_info,
+				failover,
+				peer_addr,
+				local_addr,
+				&ctx,
+				&route.metric_identity,
+			))
+			.await;
+			if let Err(kind) = result {
+				inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, kind);
+			}
+			return;
+		}
+	}
+	let tcp_health = route
+		.failover
+		.as_ref()
+		.and_then(|f| f.tcp_health.as_deref());
 
 	// ── 4. Suspended route handling ───────────────────────────────────────────
 	let effective_route: EffectiveRoute = if route.suspended {
@@ -251,12 +325,6 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 	};
 
 	// ── 5. TLS handshake ──────────────────────────────────────────────────────
-	let cfg = ctx.protection.as_ref().map(|p| p.config.load());
-	let hs_timeout = cfg
-		.as_ref()
-		.map(|c| c.tls_handshake_timeout())
-		.unwrap_or(Duration::from_secs(10));
-
 	let sf = SourceForwarding {
 		mode: effective_route.source_address_mode,
 		fingerprint: effective_route.forward_fingerprint,
@@ -290,7 +358,15 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 					// Header injection (XFF / X-JA3) never touches an h2 stream: forward()
 					// gates it on the route's declared protocol (RouteProtocol::Http) plus
 					// the negotiated ALPN, covering static and suspended-route configs alike.
-					proxy_via_tls(tls_stream, destination, sf, &ctx, &route.metric_identity).await
+					proxy_via_tls(
+						tls_stream,
+						destination,
+						tcp_health,
+						sf,
+						&ctx,
+						&route.metric_identity,
+					)
+					.await
 				}
 				Ok(Err(e)) => {
 					tracing::debug!("TLS handshake error from {peer_ip}: {e}");
@@ -324,6 +400,7 @@ pub async fn handle(stream: TcpStream, peer_addr: SocketAddr, ctx: Arc<ConnConte
 		proxy_raw(
 			stream,
 			&effective_route.destination,
+			tcp_health,
 			sf,
 			&ctx,
 			&route.metric_identity,
@@ -355,6 +432,7 @@ where
 async fn proxy_via_tls(
 	client: &mut tokio_rustls::server::TlsStream<TcpStream>,
 	dest: &Destination,
+	tcp_health: Option<&SlotHealth>,
 	sf: SourceForwarding<'_>,
 	ctx: &ConnContext,
 	route_metrics: &RouteMetricIdentity,
@@ -378,13 +456,17 @@ async fn proxy_via_tls(
 	let negotiated_h2 = client.get_ref().1.alpn_protocol() == Some(b"h2".as_ref());
 	let l7_http1 = eligible_for_header_rewriting(sf.protocol, negotiated_h2);
 
-	let mut upstream =
-		upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
-			.await
-			.map_err(|e| {
-				tracing::debug!("upstream connect failed for {}: {e}", sf.peer_addr.ip());
-				ErrorKind::UpstreamConnect
-			})?;
+	let mut upstream = upstream::connect(
+		dest,
+		Some(sf.peer_addr.ip()),
+		ctx.upstream_connect_timeout,
+		tcp_health,
+	)
+	.await
+	.map_err(|e| {
+		tracing::debug!("upstream connect failed for {}: {e}", sf.peer_addr.ip());
+		ErrorKind::UpstreamConnect
+	})?;
 
 	let mut client =
 		CountingStream::new(client, &ctx.listener_metrics, Some(&route_metrics.counters));
@@ -400,17 +482,22 @@ async fn proxy_via_tls(
 async fn proxy_raw(
 	client: TcpStream,
 	dest: &Destination,
+	tcp_health: Option<&SlotHealth>,
 	sf: SourceForwarding<'_>,
 	ctx: &ConnContext,
 	route_metrics: &RouteMetricIdentity,
 ) -> std::result::Result<(), ErrorKind> {
-	let mut upstream =
-		upstream::connect(dest, Some(sf.peer_addr.ip()), ctx.upstream_connect_timeout)
-			.await
-			.map_err(|e| {
-				tracing::debug!("upstream connect failed for {}: {e}", sf.peer_addr.ip());
-				ErrorKind::UpstreamConnect
-			})?;
+	let mut upstream = upstream::connect(
+		dest,
+		Some(sf.peer_addr.ip()),
+		ctx.upstream_connect_timeout,
+		tcp_health,
+	)
+	.await
+	.map_err(|e| {
+		tracing::debug!("upstream connect failed for {}: {e}", sf.peer_addr.ip());
+		ErrorKind::UpstreamConnect
+	})?;
 
 	let mut client =
 		CountingStream::new(client, &ctx.listener_metrics, Some(&route_metrics.counters));
@@ -496,6 +583,32 @@ where
 			Err(_) => Err(ErrorKind::IdleTimeout),
 		}
 	}
+}
+
+/// Proxy a connection already set up end to end (a failover peer that has answered): no
+/// connection prefix, no header rewriting, the same timeouts and liveness bound as any route.
+pub(crate) async fn forward_opaque<C, U>(
+	client: &mut C,
+	upstream: &mut U,
+	peer_addr: SocketAddr,
+	ctx: &ConnContext,
+) -> std::result::Result<(), ErrorKind>
+where
+	C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+	let sf = SourceForwarding {
+		mode: SourceAddressMode::None,
+		fingerprint: ForwardFingerprint::NONE,
+		protocol: RouteProtocol::Opaque,
+		ja3: "",
+		ja4: "",
+		sni: None,
+		tls: None,
+		peer_addr,
+		local_addr: None,
+	};
+	forward(client, upstream, &sf, false, ctx).await
 }
 
 /// `TimedOut` here is the kernel of either peer abandoning an unreachable host — keepalive probes

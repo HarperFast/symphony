@@ -182,6 +182,51 @@ export interface RouteConfig {
 	 * route on the port-set.
 	 */
 	allowedSources?: string[];
+	/**
+	 * Send new connections to peer nodes while this route's local upstream is down, or always
+	 * when `drain` is set. The connection is forwarded as raw TLS, before any handshake, to a
+	 * peer's `failoverIngress` listener, which terminates it with its own copy of the
+	 * certificate. Connections already established are never moved.
+	 *
+	 * An invalid policy serves the route without failover (counted in `failingRoutes`).
+	 */
+	failover?: FailoverConfig;
+}
+
+export interface FailoverPeer {
+	/** IP literal of the peer's failover ingress listener. Hostnames are not resolved. */
+	host: string;
+	port: number;
+}
+
+export interface FailoverConfig {
+	/** Tried round-robin, skipping peers in cooldown. At least one. */
+	peers: FailoverPeer[];
+	/**
+	 * Forward every new connection whatever the local health — for a local upstream that is up
+	 * but unhealthy. A `failoverIngress` listener also refuses forwarded connections for a
+	 * draining route, so peers move on. Default: false.
+	 */
+	drain?: boolean;
+	/**
+	 * How often a refusing local upstream slot is re-tested (connect, then close). Minimum 10.
+	 * Default: 1000.
+	 */
+	probeIntervalMs?: number;
+	/**
+	 * After a failed attempt a peer is skipped for `min` ms, doubling per consecutive failure up to
+	 * `max`; one success resets it. Per (route, peer). Default: `{ min: 5000, max: 60000 }`.
+	 */
+	peerCooldownMs?: { min: number; max: number };
+}
+
+export interface FailoverIngressConfig {
+	/**
+	 * CIDRs of the peer nodes. A connection from anywhere else is closed before any byte is
+	 * read; an empty list admits nobody. A trusted peer can assert any client IP, so container
+	 * or tenant traffic that leaves with the host's address must be kept off this port.
+	 */
+	trustedSources: string[];
 }
 
 // ── Protection ────────────────────────────────────────────────────────────────
@@ -278,6 +323,14 @@ export interface ListenerConfig {
 	/** Drop the connection if it is idle for this many ms. Default: 60000. */
 	idleTimeoutMs?: number;
 	protection?: ProtectionConfig;
+	/**
+	 * Make this TLS listener the receiving end of peer failover. Every connection must come from
+	 * `trustedSources` and start with a PROXY protocol v2 header, whose source address then
+	 * stands in for the client for protection, `allowedSources` and the upstream. Connections
+	 * here are never forwarded again, never use a default route, and are closed before the
+	 * handshake when the route's local upstream is down or draining.
+	 */
+	failoverIngress?: FailoverIngressConfig;
 }
 
 // ── Top-level proxy config ────────────────────────────────────────────────────
@@ -347,6 +400,13 @@ export interface ListenerProtectionHotConfig {
 	protection: ProtectionConfig;
 }
 
+/** `trustedSources` update for one failover ingress listener in a hot-config call. */
+export interface ListenerFailoverIngressHotConfig {
+	/** Port of a listener started with `failoverIngress`. */
+	port: number;
+	trustedSources: string[];
+}
+
 /**
  * Fields that can be updated live without restarting listeners.
  *
@@ -368,6 +428,11 @@ export interface HotConfig {
 	 * replaces its entire protection config atomically. Absent = leave unchanged.
 	 */
 	protection?: ListenerProtectionHotConfig[];
+	/**
+	 * Per-listener `trustedSources` updates, under the same presence rule as `protection`:
+	 * only listeners started with `failoverIngress`.
+	 */
+	failoverIngress?: ListenerFailoverIngressHotConfig[];
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
@@ -412,6 +477,31 @@ export interface RouteMetrics {
 	blockedByReason: LabeledCount[];
 	/** Sparse post-route failures; zero-valued reasons are omitted. */
 	errorsByReason: LabeledCount[];
+	/** Present only on routes with `failover`. */
+	failover?: RouteFailoverMetrics;
+}
+
+export interface RouteFailoverMetrics {
+	/** False while every slot of the local upstream (or of its h2 upstream) is refusing. */
+	localUp: boolean;
+	refusingSlots: number;
+	slots: number;
+	drain: boolean;
+	/** Attempts that replayed the ClientHello to a second or later peer. */
+	replays: number;
+	/** Connections closed after every candidate peer failed. */
+	exhausted: number;
+	peers: FailoverPeerMetrics[];
+}
+
+export interface FailoverPeerMetrics {
+	/** "host:port" */
+	peer: string;
+	/** Connections this peer served. */
+	forwarded: number;
+	coolingDown: boolean;
+	/** Failed attempts by reason: `refused`, `timeout`, `zero_byte_close`, `error`. */
+	failuresByReason: LabeledCount[];
 }
 
 export interface ProxyMetrics {
@@ -509,4 +599,12 @@ export interface ErrorEvent {
 	listener: string;
 }
 
-export type ProxyEvent = BlockedEvent | SuspendedEvent | ErrorEvent;
+/** A failover route's local upstream went down or came back (checked every probe interval). */
+export interface RouteHealthEvent {
+	type: 'routeHealth';
+	route: string;
+	metricsGroup: string;
+	status: 'up' | 'down';
+}
+
+export type ProxyEvent = BlockedEvent | SuspendedEvent | ErrorEvent | RouteHealthEvent;
