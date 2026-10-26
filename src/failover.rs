@@ -138,7 +138,7 @@ impl FailoverPeer {
 	}
 
 	pub fn cooling_down(&self, now: u64) -> bool {
-		now < self.cooldown_until()
+		now.min(COOLDOWN_UNTIL_MASK) < self.cooldown_until()
 	}
 
 	/// Sparse, like route errors: zero-valued reasons are omitted so scrape size follows failures,

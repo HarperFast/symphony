@@ -298,6 +298,9 @@ pub struct RouteTable {
 	/// SNIs whose cert failed to build in this table. Carried across a hot-swap so a
 	/// persistently-broken route is logged only on the good→bad transition, not every reconcile.
 	failing_snis: HashSet<Arc<str>>,
+	/// SNIs served without failover because their `failover` policy is invalid. Separate from
+	/// `failing_snis` so one failure's log-once state cannot silence the other's.
+	invalid_failover: HashSet<Arc<str>>,
 	/// Exact SNIs dropped with no last-good route to carry forward (a subset of `failing_snis` —
 	/// this excludes SNIs whose last-good route IS still present in `exact`/`wildcard` and
 	/// serving traffic). `resolve()` must fail closed for these rather than falling through to a
@@ -327,7 +330,7 @@ impl RouteTable {
 	/// Number of SNIs whose cert failed to build in this table — either dropped, or serving a
 	/// carried-forward last-good cert. Non-zero means a rotation needs attention.
 	pub fn failing_route_count(&self) -> usize {
-		self.failing_snis.len()
+		self.failing_snis.union(&self.invalid_failover).count()
 	}
 
 	pub fn metric_identities(&self) -> &[Arc<RouteMetricIdentity>] {
@@ -567,6 +570,7 @@ pub fn build_route_table(
 	let mut monitored_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
 	let mut affinity_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
 	let mut failing_snis: HashSet<Arc<str>> = HashSet::new();
+	let mut invalid_failover: HashSet<Arc<str>> = HashSet::new();
 	let mut configured_wildcards = HashSet::with_capacity(specs.len());
 	let mut dropped_exact: HashSet<Arc<str>> = HashSet::new();
 	let mut dropped_wildcard: Vec<Arc<str>> = Vec::new();
@@ -649,8 +653,8 @@ pub fn build_route_table(
 			Some(Ok(policy)) => Some(policy),
 			Some(Err(e)) => {
 				let newly_failing =
-					previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
-				failing_snis.insert(Arc::from(spec.sni.as_str()));
+					previous.is_none_or(|p| !p.invalid_failover.contains(spec.sni.as_str()));
+				invalid_failover.insert(Arc::from(spec.sni.as_str()));
 				if newly_failing {
 					eprintln!(
 						"symphony: route '{}': {e}; serving it without failover",
@@ -824,6 +828,7 @@ pub fn build_route_table(
 		monitored_balancers,
 		affinity_balancers,
 		failing_snis,
+		invalid_failover,
 		dropped_exact,
 		dropped_wildcard,
 		client_auth,
@@ -1671,7 +1676,12 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		);
 		let route = table.resolve(Some(sni)).expect("route still served");
 		assert!(route.failover.is_none());
-		assert!(table.failing_snis.contains(sni));
+		assert!(table.invalid_failover.contains(sni));
+		assert!(
+			!table.failing_snis.contains(sni),
+			"a later cert failure still logs"
+		);
+		assert_eq!(table.failing_route_count(), 1);
 		assert!(table.failover_routes().is_empty());
 		match &route.destination {
 			Destination::UdsSet(balancer) => assert_eq!(
