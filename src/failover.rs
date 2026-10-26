@@ -445,8 +445,8 @@ pub async fn probe_periodically(
 			let interval = route.failover.probe_interval.as_nanos() as u64;
 			// The tick is the shortest interval; a route with a longer one skips ticks. Small
 			// slack keeps a route whose interval equals the tick from skipping every other one.
-			if now.saturating_sub(status.last_probe_ns.load(Ordering::Relaxed)) + interval / 10
-				< interval
+			if now.saturating_sub(status.last_probe_ns.load(Ordering::Relaxed))
+				< interval - interval / 10
 			{
 				continue;
 			}
