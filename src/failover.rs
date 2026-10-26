@@ -290,7 +290,8 @@ pub async fn forward_to_peers(
 	let deadline = Instant::now() + ctx.handshake_timeout();
 	let mut client = CountingStream::new(client, &ctx.listener_metrics, Some(&route.counters));
 
-	let mut prefix = Vec::with_capacity(28 + peek.hello_len);
+	// 52: a PROXY v2 header with IPv6 addresses and no TLVs, the largest this writes.
+	let mut prefix = Vec::with_capacity(52 + peek.hello_len);
 	crate::upstream::write_proxy_v2_header(&mut prefix, peer_addr, local_addr, &[])
 		.await
 		.map_err(|_| ErrorKind::UpstreamConnect)?;

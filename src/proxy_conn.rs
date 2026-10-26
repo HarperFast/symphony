@@ -252,9 +252,12 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 			return;
 		}
 	}
+	// A suspended route's destination is whatever `resolveConnection()` returns, not the one this
+	// health describes.
 	let tcp_health = route
 		.failover
 		.as_ref()
+		.filter(|_| !route.suspended)
 		.and_then(|f| f.tcp_health.as_deref());
 
 	// ── 4. Suspended route handling ───────────────────────────────────────────
