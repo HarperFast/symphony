@@ -29,6 +29,7 @@ const MAX_INTERVAL_MS: f64 = 86_400_000.0;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Longest the probe task sleeps, so a reload that shortens `probeIntervalMs` takes effect promptly.
 const MAX_PROBE_TICK: Duration = Duration::from_secs(1);
+const MAX_CONCURRENT_PROBES: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct FailoverSpec {
@@ -317,6 +318,8 @@ pub async fn forward_to_peers(
 		match attempt_peer(peer.addr, &prefix, share).await {
 			Ok(mut upstream) => {
 				peer.record_success();
+				// The replay copy is not needed once a peer answered; do not hold it for the tunnel.
+				drop(prefix);
 				return forward_opaque(&mut client, &mut upstream, peer_addr, ctx).await;
 			}
 			Err(kind) => {
@@ -478,22 +481,26 @@ pub async fn probe_periodically(
 			}
 		}
 
-		let mut probes = JoinSet::new();
-		for (endpoint, healths) in due {
-			probes.spawn(async move {
-				if probe(&endpoint).await {
-					for (health, observed) in healths {
-						health.clear_if_unchanged(observed);
-					}
+		// Dropping the pass on shutdown drops its JoinSet, which aborts the probes still running.
+		let pass = async {
+			let mut probes = JoinSet::new();
+			for (endpoint, healths) in due {
+				if probes.len() >= MAX_CONCURRENT_PROBES {
+					probes.join_next().await;
 				}
-			});
-		}
-		tokio::select! {
-			_ = shutdown.recv() => {
-				probes.abort_all();
-				return;
+				probes.spawn(async move {
+					if probe(&endpoint).await {
+						for (health, observed) in healths {
+							health.clear_if_unchanged(observed);
+						}
+					}
+				});
 			}
-			_ = async { while probes.join_next().await.is_some() {} } => {}
+			while probes.join_next().await.is_some() {}
+		};
+		tokio::select! {
+			_ = shutdown.recv() => return,
+			_ = pass => {}
 		}
 
 		for route in routes {
