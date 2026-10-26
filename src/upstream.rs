@@ -29,14 +29,17 @@ pub async fn connect(
 ) -> crate::error::Result<UpstreamStream> {
 	match destination {
 		Destination::Tcp(addr) => {
+			let observed = tcp_health.map_or(0, |h| h.refused_at());
 			let result = timeout(connect_timeout, TcpStream::connect(addr))
 				.await
 				.unwrap_or_else(|_| Err(connect_timed_out()));
 			if let Some(health) = tcp_health {
 				match &result {
-					Ok(_) => health.mark_accepting(),
+					Ok(_) if observed != 0 => {
+						health.clear_if_unchanged(observed);
+					}
 					Err(e) if is_refusal(e) => health.mark_refused(),
-					Err(_) => {}
+					_ => {}
 				}
 			}
 			let stream = result?;
@@ -52,13 +55,15 @@ fn connect_timed_out() -> std::io::Error {
 }
 
 /// The failures that say "nothing is accepting here": a stopped listener, a socket file that is
-/// gone, or a listener that cannot take the connection in time.
+/// gone, a listener that cannot take the connection in time — or, for a Unix socket, a full accept
+/// queue, which a non-blocking connect reports at once as `WouldBlock` instead of waiting.
 pub fn is_refusal(e: &std::io::Error) -> bool {
 	matches!(
 		e.kind(),
 		std::io::ErrorKind::ConnectionRefused
 			| std::io::ErrorKind::NotFound
 			| std::io::ErrorKind::TimedOut
+			| std::io::ErrorKind::WouldBlock
 	)
 }
 
@@ -79,14 +84,17 @@ async fn connect_uds(
 
 	loop {
 		let path = balancer.path(idx);
+		let health = balancer.health(idx);
+		// Read before connecting: clearing only this refusal means a connect that raced a newer
+		// one cannot erase it, and an accepting slot costs no write.
+		let observed = health.map_or(0, |h| h.refused_at());
 		let result = tokio::time::timeout_at(deadline, UnixStream::connect(path.as_ref()))
 			.await
 			.unwrap_or_else(|_| Err(connect_timed_out()));
-		let health = balancer.health(idx);
 		match result {
 			Ok(stream) => {
-				if let Some(h) = health {
-					h.mark_accepting();
+				if let (Some(h), true) = (health, observed != 0) {
+					h.clear_if_unchanged(observed);
 				}
 				if !tried.is_empty() {
 					balancer.rebind_affinity(peer_ip, idx);

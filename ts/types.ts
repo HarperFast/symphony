@@ -500,7 +500,7 @@ export interface FailoverPeerMetrics {
 	/** Connections this peer served. */
 	forwarded: number;
 	coolingDown: boolean;
-	/** Failed attempts by reason: `refused`, `timeout`, `zero_byte_close`, `error`. */
+	/** Failed attempts by reason (`refused`, `timeout`, `zero_byte_close`, `error`); zero-valued reasons are omitted. */
 	failuresByReason: LabeledCount[];
 }
 

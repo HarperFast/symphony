@@ -312,7 +312,8 @@ upstreams: [
 ]
 ```
 
-If the picked socket refuses the connection (not listening, file missing, or connect timeout),
+If the picked socket refuses the connection (not listening, file missing, accept queue full, or
+connect timeout),
 symphony tries each remaining socket once, best score first, within the same connect timeout. One
 dead worker socket then costs a failed connect instead of the client's connection.
 
@@ -451,7 +452,7 @@ routes: [{
 `allowedSources` and the route rate limit, and before the TLS handshake: if the route has `failover`,
 is not suspended, and either `drain` is set or every slot of its local upstream (or of its h2
 upstream) is refusing connections. A slot is marked refusing when a connect to it is refused, finds
-no socket file, or times out. A background probe connects to each refusing slot every
+no socket file, finds its accept queue full, or times out. A background probe connects to each refusing slot every
 `probeIntervalMs` and closes at once; a successful connect clears the slot. A `routeHealth` event
 (`{ route, metricsGroup, status: 'up' | 'down' }`) reports each transition. A connect proves the
 socket accepts, not that the application behind it is ready.
@@ -496,7 +497,7 @@ ends first is tried once.
 
 Metrics: each failover route's `routeMetrics[].failover` carries `localUp`, refusing/total slots,
 replays, budget exhaustion and per-peer forwarded counts and failures by reason (`refused`,
-`timeout`, `zero_byte_close`, `error`). Ingress refusals are listener block reasons
+`timeout`, `zero_byte_close`, `error`; zero-valued reasons omitted). Ingress refusals are listener block reasons
 (`untrusted_source`, `proxy_header_invalid`, `proxy_header_local`, `proxy_header_v1`,
 `proxy_header_timeout`); a forwarded connection refused for a down route is the route error
 `locally_down`.

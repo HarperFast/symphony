@@ -69,19 +69,29 @@ pub async fn read_proxy_v2<S: AsyncRead + Unpin>(
 			.await
 			.map_err(|_| HeaderReject::Invalid)?;
 		let len = parse_fixed(&fixed)?;
-		let mut payload = vec![0u8; len];
+		let addr_len = if fixed[13] == 0x11 { 12 } else { 36 };
+		let mut addresses = [0u8; 36];
 		stream
-			.read_exact(&mut payload)
+			.read_exact(&mut addresses[..addr_len])
 			.await
 			.map_err(|_| HeaderReject::Invalid)?;
-		parse_source(fixed[13], &payload)
+		let mut tlvs = len - addr_len;
+		let mut discard = [0u8; 64];
+		while tlvs > 0 {
+			let chunk = tlvs.min(discard.len());
+			stream
+				.read_exact(&mut discard[..chunk])
+				.await
+				.map_err(|_| HeaderReject::Invalid)?;
+			tlvs -= chunk;
+		}
+		parse_source(fixed[13], &addresses[..addr_len])
 	};
 	tokio::time::timeout(limit, read)
 		.await
 		.unwrap_or(Err(HeaderReject::Timeout))
 }
 
-/// Validate the 16-byte fixed part and return the length of what follows it.
 fn parse_fixed(fixed: &[u8; 16]) -> Result<usize, HeaderReject> {
 	if fixed.starts_with(b"PROXY ") {
 		return Err(HeaderReject::V1);
@@ -173,6 +183,19 @@ mod tests {
 			read(&bytes).await.unwrap(),
 			"[2001:db8::7]:443".parse().unwrap()
 		);
+	}
+
+	#[tokio::test]
+	async fn tlvs_longer_than_the_discard_buffer_are_consumed_exactly() {
+		let tlv = vec![0x5A; 200];
+		let mut bytes = header("203.0.113.7:5000", "10.0.0.1:9443", &[(0xE0, &tlv)]).await;
+		bytes.extend_from_slice(b"\x16next");
+		let mut input = &bytes[..];
+		let src = read_proxy_v2(&mut input, Duration::from_secs(1))
+			.await
+			.unwrap();
+		assert_eq!(src, "203.0.113.7:5000".parse().unwrap());
+		assert_eq!(input, b"\x16next");
 	}
 
 	#[tokio::test]

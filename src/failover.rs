@@ -24,10 +24,12 @@ const DEFAULT_COOLDOWN_MIN_MS: f64 = 5_000.0;
 const DEFAULT_COOLDOWN_MAX_MS: f64 = 60_000.0;
 const MIN_PROBE_INTERVAL_MS: f64 = 10.0;
 const MAX_INTERVAL_MS: f64 = 86_400_000.0;
-/// Upper bound on one probe connect; a slow accept is still an accept.
-const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// One probe connect's limit, independent of `probeIntervalMs`: a short interval must not turn a
+/// slow accept into a refusal that keeps the route failed over.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Longest the probe task sleeps, so a reload that shortens `probeIntervalMs` takes effect promptly.
+const MAX_PROBE_TICK: Duration = Duration::from_secs(1);
 
-/// `failover` as configured, before validation.
 #[derive(Clone, Debug)]
 pub struct FailoverSpec {
 	pub peers: Vec<(String, u16)>,
@@ -131,6 +133,8 @@ impl FailoverPeer {
 		now < self.cooldown_until_ns.load(Ordering::Relaxed)
 	}
 
+	/// Sparse, like route errors: zero-valued reasons are omitted so scrape size follows failures,
+	/// not routes × peers × reasons.
 	pub fn failures_by_reason(&self) -> Vec<(&'static str, u64)> {
 		PeerFailureKind::ALL
 			.iter()
@@ -140,6 +144,7 @@ impl FailoverPeer {
 					self.failures[*k as usize].load(Ordering::Relaxed),
 				)
 			})
+			.filter(|(_, count)| *count > 0)
 			.collect()
 	}
 
@@ -152,8 +157,9 @@ impl FailoverPeer {
 		let backoff = min_ns
 			.saturating_mul(1u64 << (failures - 1).min(63))
 			.min(max_ns);
+		// Concurrent failures finish in any order; the longest backoff must win.
 		self.cooldown_until_ns
-			.store(now.saturating_add(backoff), Ordering::Relaxed);
+			.fetch_max(now.saturating_add(backoff), Ordering::Relaxed);
 	}
 
 	fn record_success(&self) {
@@ -299,9 +305,9 @@ pub async fn forward_to_peers(
 		let share = remaining / (candidates.len() - attempt) as u32;
 		match attempt_peer(peer.addr, &prefix, share).await {
 			Ok((mut upstream, first, n)) => {
-				peer.record_success();
-				if client.write_all(&first[..n]).await.is_err() {
-					return Err(ErrorKind::Stream);
+				match timeout(ctx.handshake_timeout(), client.write_all(&first[..n])).await {
+					Ok(Ok(())) => peer.record_success(),
+					_ => return Err(ErrorKind::Stream),
 				}
 				return forward_opaque(&mut client, &mut upstream, peer_addr, ctx).await;
 			}
@@ -364,7 +370,6 @@ impl FailoverRoute {
 			.locally_down(&self.destination, self.destination_h2.as_ref())
 	}
 
-	/// `(refusing, total)` slots across the route's destinations.
 	pub fn slot_counts(&self) -> (usize, usize) {
 		let mut refusing = 0;
 		let mut total = 0;
@@ -413,7 +418,8 @@ pub async fn probe_periodically(
 			.iter()
 			.map(|r| r.failover.probe_interval)
 			.min()
-			.unwrap_or(Duration::from_millis(DEFAULT_PROBE_INTERVAL_MS as u64));
+			.unwrap_or(MAX_PROBE_TICK)
+			.min(MAX_PROBE_TICK);
 		tokio::select! {
 			_ = shutdown.recv() => return,
 			_ = tokio::time::sleep(tick) => {}
@@ -426,7 +432,6 @@ pub async fn probe_periodically(
 
 		let now = now_ns();
 		let mut due: HashMap<Endpoint, Vec<(Arc<SlotHealth>, u64)>> = HashMap::new();
-		let mut probe_timeout = MAX_PROBE_TIMEOUT;
 		for route in routes {
 			let status = &route.failover.status;
 			let interval = route.failover.probe_interval.as_nanos() as u64;
@@ -438,7 +443,6 @@ pub async fn probe_periodically(
 				continue;
 			}
 			status.last_probe_ns.store(now, Ordering::Relaxed);
-			probe_timeout = probe_timeout.min(route.failover.probe_interval);
 			let mut add = |endpoint: Endpoint, health: &Arc<SlotHealth>| {
 				let observed = health.refused_at();
 				if observed != 0 {
@@ -466,7 +470,7 @@ pub async fn probe_periodically(
 		let mut probes = JoinSet::new();
 		for (endpoint, healths) in due {
 			probes.spawn(async move {
-				if probe(&endpoint, probe_timeout).await {
+				if probe(&endpoint).await {
 					for (health, observed) in healths {
 						health.clear_if_unchanged(observed);
 					}
@@ -483,14 +487,9 @@ pub async fn probe_periodically(
 
 		for route in routes {
 			let down = route.locally_down();
-			if route
-				.failover
-				.status
-				.reported_down
-				.swap(down, Ordering::Relaxed)
-				!= down
-			{
-				emit(
+			let reported = &route.failover.status.reported_down;
+			if reported.load(Ordering::Relaxed) != down {
+				let queued = emit(
 					&js_emit,
 					JsEvent::RouteHealth {
 						route: route.identity.route.to_string(),
@@ -498,6 +497,10 @@ pub async fn probe_periodically(
 						up: !down,
 					},
 				);
+				// A transition dropped by a full event queue is sent again next tick.
+				if queued {
+					reported.store(down, Ordering::Relaxed);
+				}
 			}
 		}
 	}
@@ -505,13 +508,16 @@ pub async fn probe_periodically(
 
 /// Connect and close at once. Proves the socket accepts, not that the application behind it is
 /// ready.
-async fn probe(endpoint: &Endpoint, limit: Duration) -> bool {
+async fn probe(endpoint: &Endpoint) -> bool {
 	match endpoint {
 		Endpoint::Uds(path) => matches!(
-			timeout(limit, UnixStream::connect(path.as_ref())).await,
+			timeout(PROBE_TIMEOUT, UnixStream::connect(path.as_ref())).await,
 			Ok(Ok(_))
 		),
-		Endpoint::Tcp(addr) => matches!(timeout(limit, TcpStream::connect(addr)).await, Ok(Ok(_))),
+		Endpoint::Tcp(addr) => matches!(
+			timeout(PROBE_TIMEOUT, TcpStream::connect(addr)).await,
+			Ok(Ok(_))
+		),
 	}
 }
 
@@ -589,6 +595,27 @@ mod tests {
 			100,
 			"backoff restarts at min after a success"
 		);
+	}
+
+	#[test]
+	fn a_shorter_backoff_finishing_late_does_not_shorten_the_cooldown() {
+		let fo = failover(&[("10.0.0.2", 1)]);
+		let peer = &fo.peers[0];
+		peer.record_failure(PeerFailureKind::Refused, 100, 1_000, 0);
+		peer.record_failure(PeerFailureKind::Refused, 100, 1_000, 0);
+		// A third failure computed from an older streak value lands last.
+		peer.consecutive_failures.store(0, Ordering::Relaxed);
+		peer.record_failure(PeerFailureKind::Refused, 100, 1_000, 0);
+		assert_eq!(peer.cooldown_until_ns.load(Ordering::Relaxed), 200);
+	}
+
+	#[test]
+	fn failures_are_reported_sparsely() {
+		let fo = failover(&[("10.0.0.2", 1)]);
+		let peer = &fo.peers[0];
+		assert!(peer.failures_by_reason().is_empty());
+		peer.record_failure(PeerFailureKind::ZeroByteClose, 1, 1, 0);
+		assert_eq!(peer.failures_by_reason(), vec![("zero_byte_close", 1)]);
 	}
 
 	#[test]

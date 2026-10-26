@@ -890,12 +890,12 @@ impl Drop for ActiveGuard {
 	}
 }
 
-pub(crate) fn emit(tsf: &ThreadsafeFunction<JsEvent>, event: JsEvent) {
-	// Non-blocking — drop the event if the JS queue is full
+/// Non-blocking: the event is dropped when the JS queue is full, and `false` says so.
+pub(crate) fn emit(tsf: &ThreadsafeFunction<JsEvent>, event: JsEvent) -> bool {
 	tsf.call(
 		Ok(event),
 		napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-	);
+	) == napi::Status::Ok
 }
 
 #[cfg(test)]

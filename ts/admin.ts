@@ -281,7 +281,7 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 				out.sample(
 					'symphony_route_local_up',
 					'gauge',
-					'1 while a failover route has a local upstream slot that is not refusing connections.',
+					'0 while every local upstream slot of a failover route (or of its h2 upstream) refuses connections.',
 					failover.localUp ? 1 : 0,
 					tags
 				);

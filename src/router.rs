@@ -669,6 +669,7 @@ pub fn build_route_table(
 		let health = failover_policy.is_some().then_some(HealthTracking {
 			previous: previous_route,
 		});
+		let mut carried = false;
 		let mut route = match build_route(spec, listener_tls, cache, health) {
 			Ok(route) => route,
 			Err(e) => {
@@ -700,6 +701,7 @@ pub fn build_route_table(
 								spec.sni, e
 							);
 						}
+						carried = true;
 						prev.clone()
 					}
 					// The previous route's `tls_config` holds its client verifier, so retaining it
@@ -733,6 +735,20 @@ pub fn build_route_table(
 		// After the carry-forward branch, so a retained last-good route enforces the new list.
 		route.allowed_sources = allowed_sources;
 
+		// A route's UDS slots track health exactly when it has failover, since only the failover
+		// probe clears a tracked slot. A carried-forward route brings its old destinations, so when
+		// the policy's presence changed they are rebuilt; if they cannot be, the old policy stays too.
+		let mut keep_previous_failover = false;
+		if carried && !tracks_health_as(&route, failover_policy.is_some()) {
+			match build_destinations(spec, health) {
+				Ok((destination, destination_h2)) => {
+					route.destination = destination;
+					route.destination_h2 = destination_h2;
+				}
+				Err(_) => keep_previous_failover = true,
+			}
+		}
+
 		// Reusing by the full metric identity keeps ordinary cert/upstream reloads continuous
 		// without moving historical counters when a route changes tenant groups.
 		if let Some(previous_route) = previous_route {
@@ -743,25 +759,29 @@ pub fn build_route_table(
 
 		// After the carry-forward branch, like `allowed_sources`: a retained last-good route takes
 		// the new policy, so a reload that sets `drain` during a cert rotation still drains.
-		route.failover = failover_policy.map(|policy| {
-			let previous_failover = previous_route
-				.filter(|p| Arc::ptr_eq(&p.metric_identity, &route.metric_identity))
-				.and_then(|p| p.failover.as_deref());
-			let tcp_health = match &route.destination {
-				Destination::Tcp(addr) => Some(
-					previous_route
-						.and_then(|p| match (&p.destination, &p.failover) {
-							(Destination::Tcp(prev), Some(f)) if prev == addr => {
-								f.tcp_health.clone()
-							}
-							_ => None,
-						})
-						.unwrap_or_default(),
-				),
-				Destination::UdsSet(_) => None,
-			};
-			Arc::new(Failover::new(policy, previous_failover, tcp_health))
-		});
+		route.failover = if keep_previous_failover {
+			route.failover.clone()
+		} else {
+			failover_policy.map(|policy| {
+				let previous_failover = previous_route
+					.filter(|p| Arc::ptr_eq(&p.metric_identity, &route.metric_identity))
+					.and_then(|p| p.failover.as_deref());
+				let tcp_health = match &route.destination {
+					Destination::Tcp(addr) => Some(
+						previous_route
+							.and_then(|p| match (&p.destination, &p.failover) {
+								(Destination::Tcp(prev), Some(f)) if prev == addr => {
+									f.tcp_health.clone()
+								}
+								_ => None,
+							})
+							.unwrap_or_default(),
+					),
+					Destination::UdsSet(_) => None,
+				};
+				Arc::new(Failover::new(policy, previous_failover, tcp_health))
+			})
+		};
 		if let Some(failover) = &route.failover {
 			failover_routes.push(FailoverRoute {
 				identity: route.metric_identity.clone(),
@@ -842,6 +862,15 @@ fn validate_route_protocol_declaration(spec: &RouteSpec) -> crate::error::Result
 	}
 
 	Ok(())
+}
+
+fn tracks_health_as(route: &Route, tracked: bool) -> bool {
+	std::iter::once(&route.destination)
+		.chain(route.destination_h2.iter())
+		.all(|dest| match dest {
+			Destination::UdsSet(balancer) => balancer.tracked_slots().next().is_some() == tracked,
+			Destination::Tcp(_) => true,
+		})
 }
 
 /// Per-slot health tracking for a failover route's balancers, inheriting the state of the route
@@ -1578,6 +1607,49 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		);
 		assert!(Arc::ptr_eq(&failover.peers[0], &live_failover.peers[0]));
 		assert_eq!(swapped.failover_routes().len(), 1);
+	}
+
+	fn tracked(route: &Route) -> bool {
+		match &route.destination {
+			Destination::UdsSet(balancer) => balancer.tracked_slots().next().is_some(),
+			Destination::Tcp(_) => panic!("expected a UDS destination"),
+		}
+	}
+
+	#[test]
+	fn a_carried_forward_route_tracks_health_exactly_when_it_has_failover() {
+		let sni = "tenant.example.com";
+		let mut plain = with_failover(tls_route(sni, CERT_A, KEY_A), false, "10.0.0.2");
+		plain.failover = None;
+		let live = build(
+			std::slice::from_ref(&plain),
+			&ListenerTlsSpec::empty(),
+			None,
+		);
+		assert!(!tracked(live.resolve(Some(sni)).unwrap()));
+
+		// Failover enabled in the same reload that a cert rotation breaks.
+		let enabled = build(
+			&[with_failover(
+				tls_route(sni, CERT_A, KEY_B),
+				false,
+				"10.0.0.2",
+			)],
+			&ListenerTlsSpec::empty(),
+			Some(&live),
+		);
+		let route = enabled.resolve(Some(sni)).unwrap();
+		assert!(enabled.failing_snis.contains(sni));
+		assert!(route.failover.is_some());
+		assert!(tracked(route), "rebuilt so the probe has slots to clear");
+
+		// And removed again while the cert is still broken.
+		let mut removed_spec = tls_route(sni, CERT_A, KEY_B);
+		removed_spec.upstreams = plain.upstreams.clone();
+		let removed = build(&[removed_spec], &ListenerTlsSpec::empty(), Some(&enabled));
+		let route = removed.resolve(Some(sni)).unwrap();
+		assert!(route.failover.is_none());
+		assert!(!tracked(route), "no tracked slot is left without a probe");
 	}
 
 	#[test]

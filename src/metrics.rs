@@ -117,9 +117,10 @@ labeled_enum!(PeerFailureKind {
 	Refused => "refused",
 	/// Connect or first-byte wait used up the attempt's share of the handshake budget.
 	Timeout => "timeout",
-	/// The peer closed or reset before sending a byte: its symphony is up but declined the route.
+	/// The peer closed or reset — while the hello was written or before it answered — without
+	/// sending a byte: its symphony is up but declined the route.
 	ZeroByteClose => "zero_byte_close",
-	/// Any other connect or write failure (unreachable host, etc.).
+	/// Any other connect failure (unreachable host, etc.).
 	Error => "error",
 });
 

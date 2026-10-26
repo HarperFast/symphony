@@ -77,10 +77,6 @@ impl SlotHealth {
 			.store(crate::protection::now_ns().max(1), Ordering::Relaxed);
 	}
 
-	pub fn mark_accepting(&self) {
-		self.refused_at_ns.store(0, Ordering::Relaxed);
-	}
-
 	/// Clears the refusal a probe observed before it connected. A refusal recorded after that
 	/// observation has a different timestamp and survives.
 	pub fn clear_if_unchanged(&self, observed: u64) -> bool {
@@ -257,7 +253,6 @@ impl UdsBalancer {
 		}
 	}
 
-	/// True when health is tracked and every slot is refusing.
 	pub fn all_refusing(&self) -> bool {
 		!self.sockets.is_empty()
 			&& self
@@ -266,7 +261,6 @@ impl UdsBalancer {
 				.all(|s| s.health.as_ref().is_some_and(|h| h.refusing()))
 	}
 
-	/// Health-tracked slots: `(path, health)`.
 	pub fn tracked_slots(&self) -> impl Iterator<Item = (&Arc<str>, &Arc<SlotHealth>)> {
 		self.sockets
 			.iter()

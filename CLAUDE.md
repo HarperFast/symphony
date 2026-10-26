@@ -134,8 +134,12 @@ hand over the TLS session), and it lets the peer terminate and verify client cer
   destination's one-slot health lives on `Failover::tcp_health`, so `Destination::Tcp` stays a value.
 - **Health is shared across reloads, not copied.** A rebuild reuses the previous `Arc<SlotHealth>`
   per unchanged path/addr, so a connection on the old table marks what the live table reads. The
-  probe clears with `clear_if_unchanged(observed)`, so a probe that started before a newer refusal
-  cannot erase it. Peer state and counters carry only when the route keeps its metric identity.
+  probe and a successful connect both clear with `clear_if_unchanged(observed)` (the value read
+  before connecting), so neither can erase a newer refusal, and an accepting slot costs no write.
+  Peer state and counters carry only when the route keeps its metric identity.
+- **Slots tracked ⇔ route has failover**, enforced in `build_route_table` even for a carried-forward
+  route (its destinations are rebuilt when the policy's presence changed). A tracked slot with no
+  probe would be skipped forever; a failover route without tracking would never go down.
 - **Policy is applied after the cert carry-forward branch**, like `allowed_sources`, so a reload that
   sets `drain` during a cert rotation still drains. An invalid policy serves the route without
   failover (availability must not cost the tenant its route); `allowedSources` tombstones because it
