@@ -108,6 +108,14 @@ function toJsRoute(r: RouteConfig): JsRouteConfig {
 		http2: r.http2,
 		protocol: r.protocol,
 		allowedSources: r.allowedSources,
+		failover: r.failover
+			? {
+					peers: r.failover.peers.map((p) => ({ host: p.host, port: p.port })),
+					drain: r.failover.drain,
+					probeIntervalMs: r.failover.probeIntervalMs,
+					peerCooldownMs: r.failover.peerCooldownMs,
+				}
+			: undefined,
 	};
 }
 
@@ -140,6 +148,7 @@ function toJsListenerConfig(l: import('./types.js').ListenerConfig): JsListenerC
 		maxConnections: l.maxConnections,
 		idleTimeoutMs: l.idleTimeoutMs,
 		protection: l.protection ? toJsProtectionConfig(l.protection) : undefined,
+		failoverIngress: l.failoverIngress ? { trustedSources: l.failoverIngress.trustedSources } : undefined,
 	};
 }
 
@@ -147,6 +156,7 @@ export interface SymphonyProxyEvents {
 	blocked: [event: { ip: string; reason: string; listener: string; ja3: string; ja4: string }];
 	suspended: [conn: SuspendedConnection];
 	error: [err: Error, ctx?: { listener?: string }];
+	routeHealth: [event: { route: string; metricsGroup: string; status: 'up' | 'down' }];
 	ready: [];
 	close: [];
 }
@@ -160,6 +170,8 @@ export interface SymphonyProxyEvents {
  *   'blocked'   — { ip, reason, listener } when a connection is blocked
  *   'suspended' — { id, sni, peerIp, peerPort, listener } when a suspended route receives a connection
  *   'error'     — (err, { listener }) for internal errors
+ *   'routeHealth' — { route, metricsGroup, status: 'up' | 'down' } when a failover route's local
+ *                   upstream goes down or comes back
  */
 export class SymphonyProxy extends EventEmitter {
 	private readonly _inner: SymphonyProxyWrap;
@@ -224,6 +236,13 @@ export class SymphonyProxy extends EventEmitter {
 					case 'error':
 						this._emitError(new Error(event.message), { listener: event.listener });
 						break;
+					case 'routeHealth':
+						this.emit('routeHealth', {
+							route: event.route,
+							metricsGroup: event.metricsGroup,
+							status: event.status,
+						});
+						break;
 				}
 			});
 		});
@@ -263,7 +282,8 @@ export class SymphonyProxy extends EventEmitter {
 	/**
 	 * Atomically update routes and/or per-listener protection config.
 	 * In-flight connections are unaffected.
-	 * Throws if any protection entry references a port that has no protection or matches no listener.
+	 * Throws if any protection (or failoverIngress) entry references a port that was started without
+	 * it or matches no listener; nothing is applied in that case.
 	 */
 	updateConfig(config: HotConfig): void {
 		this._inner.updateConfig({
@@ -272,6 +292,7 @@ export class SymphonyProxy extends EventEmitter {
 				port: p.port,
 				protection: toJsProtectionConfig(p.protection),
 			})),
+			failoverIngress: config.failoverIngress?.map((f) => ({ port: f.port, trustedSources: f.trustedSources })),
 		});
 	}
 
@@ -309,6 +330,22 @@ export class SymphonyProxy extends EventEmitter {
 				bytesSent: r.bytesSent,
 				blockedByReason: r.blockedByReason.map((c) => ({ reason: c.reason, count: c.count })),
 				errorsByReason: r.errorsByReason.map((c) => ({ reason: c.reason, count: c.count })),
+				...(r.failover && {
+					failover: {
+						localUp: r.failover.localUp,
+						refusingSlots: r.failover.refusingSlots,
+						slots: r.failover.slots,
+						drain: r.failover.drain,
+						replays: r.failover.replays,
+						exhausted: r.failover.exhausted,
+						peers: r.failover.peers.map((p) => ({
+							peer: p.peer,
+							forwarded: p.forwarded,
+							coolingDown: p.coolingDown,
+							failuresByReason: p.failuresByReason.map((c) => ({ reason: c.reason, count: c.count })),
+						})),
+					},
+				}),
 			})),
 		};
 	}

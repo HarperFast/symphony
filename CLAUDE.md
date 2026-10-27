@@ -32,10 +32,12 @@ The server also **watches the cert/key files referenced by the config** (grouped
 
 ```
 TCP accept (SO_REUSEPORT per worker thread)
+  └─ [ingress.rs  failoverIngress only: trustedSources gate, read PROXY v2 → peer addr]
   └─ sni.rs       peek() — MSG_PEEK ClientHello (reassembled when fragmented) → PeekInfo { sni, ja3, ja4, complete }
   └─ protection.rs check() → Block (emit 'blocked', drop) | Allow
   └─ router.rs    RouteTable.resolve(sni) → Route
   └─ route.allowed_sources.permits(peer) → 'source_not_allowed' block | continue
+  └─ [failover.rs route down or draining → forward_to_peers (raw TLS) | ingress: close]
   └─ [suspended.rs  register, emit 'suspended', await oneshot]
   └─ tls.rs       TlsAcceptor::accept() with handshake timeout (if terminate_tls)
   └─ upstream.rs  connect(Destination, peer_ip) → UpstreamStream
@@ -58,7 +60,9 @@ TCP accept (SO_REUSEPORT per worker thread)
 | `src/sni.rs` | MSG_PEEK ClientHello parser; SNI extraction; JA3 fingerprint |
 | `src/router.rs` | RouteTable (exact + wildcard HashMap); ArcSwap hot-swap |
 | `src/upstream.rs` | UpstreamStream enum (Tcp/Uds); connect(); TCP_NODELAY; PROXY v1/v2 header encoders; HTTP header injection (XFF, X-JA3/X-JA4) |
-| `src/balancer.rs` | UdsBalancer: AtomicU32 least-connections; IP affinity DashMap |
+| `src/balancer.rs` | UdsBalancer: AtomicU32 least-connections; IP affinity DashMap; per-slot `SlotHealth` (failover routes only) |
+| `src/failover.rs` | Peer failover: policy parsing, per-(route, peer) cooldown, `forward_to_peers`, the recovery probe + `routeHealth` |
+| `src/ingress.rs` | Failover ingress listener: `trustedSources` gate and the PROXY v2 reader |
 | `src/tls.rs` | rustls ServerConfig builder; SHA-256 deduplication cache |
 | `src/mtls.rs` | SymphonyClientVerifier wrapping WebPkiClientVerifier |
 | `src/proxy_conn.rs` | Per-connection handler: the full 7-step flow |
@@ -112,6 +116,45 @@ load-bearing:
 - **Canonicalisation (`to_canonical`) happens only inside `permits`**, so the peer address that
   listener protection and the PROXY/XFF encoders see is unchanged. IPv4-mapped CIDRs are stored
   as IPv4 at parse time for the same reason.
+
+### Peer failover (`failover.rs`, `ingress.rs`)
+symphony#70. A route with `failover` forwards new connections, as raw TLS and before the handshake,
+to a peer's `failoverIngress` listener while its local upstream is down or `drain` is set. Raw TLS
+because the decision has to precede the handshake (the local connect happens after it, too late to
+hand over the TLS session), and it lets the peer terminate and verify client certs itself.
+
+- **Nothing past the ClientHello reaches a peer that may be retried.** `forward_to_peers` reads
+  exactly `PeekInfo::hello_len` wire bytes (through the end of the record that completes the hello,
+  never the reassembled buffer), sends PROXY v2 + hello, and `peek`s for the peer's first byte
+  before reading the client again. Once a peer byte has arrived the attempt is committed: no retry
+  after that, and the byte reaches the client through the ordinary copy.
+  An incomplete peek is never forwarded. rustls early data is not enabled anywhere; keep it so.
+- **Health is opt-in.** Only a failover route's balancer gets `SlotHealth` (`with_health`), because
+  only the probe clears it; an untracked balancer that skipped a refusing slot would never re-test it.
+  Every UDS set does get next-slot retry on a refused connect (no state, failure path only). A TCP
+  destination's one-slot health lives on `Failover::tcp_health`, so `Destination::Tcp` stays a value.
+- **Health is shared across reloads, not copied.** A rebuild reuses the previous `Arc<SlotHealth>`
+  per unchanged path/addr, so a connection on the old table marks what the live table reads. The
+  probe and a successful connect both clear with `clear_if_unchanged(observed)` (the value read
+  before connecting), so neither can erase a newer refusal, and an accepting slot costs no write.
+  Peer state and counters carry only when the route keeps its metric identity.
+- **Slots tracked ⇔ route has failover**, enforced in `build_route_table` even for a carried-forward
+  route (its destinations are rebuilt when the policy's presence changed). A tracked slot with no
+  probe would be skipped forever; a failover route without tracking would never go down.
+- **Policy is applied after the cert carry-forward branch**, like `allowed_sources`, so a reload that
+  sets `drain` during a cert rotation still drains. An invalid policy serves the route without
+  failover (availability must not cost the tenant its route); `allowedSources` tombstones because it
+  is a restriction.
+- **Down = h1 OR h2 destination all refusing**: the client picks its protocol in the handshake we are
+  deciding before.
+- **Ingress never forwards and never uses a default route** (`resolve_with(sni, false)`); a down or
+  draining failover route closes before the handshake. That zero-byte close is the forwarder's
+  "next peer" signal, which is how loops are ruled out without a hop counter. The trust gate reads
+  no byte; empty `trustedSources` admits nobody; only the header's source address is used (TLVs
+  ignored). Ingress *presence* is fixed at construction like protection; `trustedSources` hot-swaps
+  through `ArcSwap`, validated with the rest of `updateConfig` before anything is stored.
+- **The probe task is the only writer of `reported_down`**, so each transition emits one
+  `routeHealth`. It dedups endpoints across routes, runs probes concurrently, and stops on shutdown.
 
 ### ArcSwap for RouteTable
 `ArcSwap<RouteTable>` gives us a pointer-swap on writes (single atomic store) and a single `load()` on reads — no lock contention on the hot path. With ≤100 routes, rebuilding the full table on `updateConfig` costs ~microseconds (Arc pointer clones only). A partial-update scheme would be more complex without meaningful benefit.
@@ -254,6 +297,7 @@ instead.
 - **`suspended.spec.ts`** — hold → resolve → proxy, hold → null → close, hold → timeout → drop
 - **`mtls.spec.ts`** — mTLS termination + PROXY v2 TLV forwarding of the client cert chain (0xE2, SSL TLV 0x20); skips without openssl
 - **`metrics.spec.ts`** — per-listener breakdown and byte counting, `renderPrometheus` output shape, the admin endpoint over UDS + TCP, and stale-socket reclaim after a `SIGKILL`
+- **`failover.spec.ts`** — peer failover across two or three proxies in one process (UDS upstreams that record the PROXY v1 source); the client binds 127.0.0.2 so the forwarded client address differs from the forwarding node's. A route learns it is down only by losing one connection (`markDown`), as in production
 - **`liveness.spec.ts`** — the half-close bound over a real passthrough proxy. Its client uses `allowHalfOpen: true` (otherwise Node answers the proxy's FIN with its own and there is no half-close to bound) and a synthetic `clientHello()` from `util.ts` (otherwise `peek()` blocks for its 5s reassembly timeout and a no-SNI connection resolves to no route)
 
 The Rust toolchain is pinned to `1.94.1` in `rust-toolchain.toml`. Ensure rustup's

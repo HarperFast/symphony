@@ -101,6 +101,7 @@ above `TCP_KEEPCNT`'s ceiling of 127.
 | `maxConnections` | `number` | `0` (unlimited) | Drop new connections when active count reaches this |
 | `idleTimeoutMs` | `number` | `60000` | Close connections silent for this many ms |
 | `protection` | `ProtectionConfig` | — | IP-level protection |
+| `failoverIngress` | `{ trustedSources: string[] }` | — | Makes this listener the receiving end of peer failover. See [Peer failover](#peer-failover). |
 
 ### `RouteConfig`
 
@@ -121,6 +122,7 @@ above `TCP_KEEPCNT`'s ceiling of 127.
 | `forwardFingerprint` | `'ja3' \| 'ja4' \| 'none' \| ('ja3' \| 'ja4')[]` | `'none'` | Forward the client TLS fingerprint(s) downstream. See [Forwarding the fingerprint](#forwarding-the-fingerprint-downstream). |
 | `protocol` | `'http' \| 'opaque'` | `'opaque'` | The route's application protocol. Required to be `'http'` before `sourceAddressHeader: 'xForwardedFor'` or a header-carried `forwardFingerprint` is accepted — see [Source address forwarding](#source-address-forwarding). |
 | `allowedSources` | `string[]` | — (any client) | Only clients whose TCP peer address is in one of these CIDRs reach the route. See [Per-route source allowlist](#per-route-source-allowlist). |
+| `failover` | `FailoverConfig` | — | Forward new connections to peer nodes while the local upstream is down. See [Peer failover](#peer-failover). |
 
 ### `Upstream`
 
@@ -310,6 +312,11 @@ upstreams: [
 ]
 ```
 
+If the picked socket refuses the connection (not listening, file missing, accept queue full, or
+connect timeout),
+symphony tries each remaining socket once, best score first, within the same connect timeout. One
+dead worker socket then costs a failed connect instead of the client's connection.
+
 ### IP session affinity
 
 Add `ipAffinity: true` to any UDS upstream entry to pin source IPs to the same socket:
@@ -412,6 +419,88 @@ routes: [
   checks rather than restricting anything.
 - An older symphony ignores the field, admitting every client. A config producer should not count
   on enforcement until every process accepting on the port runs a version that supports it.
+
+---
+
+## Peer failover
+
+Every node of a cluster serves the same hostname with the same certificate. While a route's local
+upstream is down (Harper restarting, crashed, deploying), symphony can send that route's **new**
+connections to another node instead of failing them, so a restart needs no load-balancer change.
+
+```typescript
+// On every node: the public listener, plus an ingress listener that only peers may reach.
+listeners: [
+  { port: 443 },
+  { port: 9443, failoverIngress: { trustedSources: ['10.0.1.0/24'] } },
+],
+routes: [{
+  sni: 'app.example.com',
+  terminateTls: true,
+  cert,
+  upstreams: [{ kind: 'uds', path: '/run/harper/http.sock' }],
+  failover: {
+    peers: [{ host: '10.0.1.12', port: 9443 }, { host: '10.0.1.13', port: 9443 }],
+    // drain: true,              // forward every new connection, whatever the local health
+    // probeIntervalMs: 1000,
+    // peerCooldownMs: { min: 5000, max: 60000 },
+  },
+}],
+```
+
+**When a connection is forwarded.** After the ClientHello peek, protection, route lookup,
+`allowedSources` and the route rate limit, and before the TLS handshake: if the route has `failover`,
+is not suspended, and either `drain` is set or every slot of its local upstream (or of its h2
+upstream) is refusing connections. A slot is marked refusing when a connect to it is refused, finds
+no socket file, finds its accept queue full, or times out. A background probe connects to each refusing slot every
+`probeIntervalMs` and closes at once; a successful connect clears the slot. A `routeHealth` event
+(`{ route, metricsGroup, status: 'up' | 'down' }`) reports each transition. A connect proves the
+socket accepts, not that the application behind it is ready.
+
+**How.** The connection is forwarded as raw TLS: the peer's symphony terminates it with its own copy
+of the certificate, so client certificates and ALPN are negotiated with the peer. symphony sends a
+PROXY v2 header (the real client address) and the ClientHello, then waits for the peer's first byte
+before reading anything more from the client. A peer that refuses, times out, or closes without
+sending a byte received nothing a retry could duplicate, so the same ClientHello is replayed to the
+next peer. Peers are tried round-robin, skipping peers in cooldown (per route and peer, starting at
+`min`, doubling per consecutive failure up to `max`, reset by a success), at most once each, all
+within the listener's TLS handshake timeout. If every peer is cooling down, the one whose cooldown
+ends first is tried once.
+
+**The ingress listener** (`failoverIngress`) is the receiving end:
+
+- A connection from outside `trustedSources` is closed before any byte is read. An empty list
+  admits nobody.
+- A PROXY v2 header is required (v1, LOCAL, malformed or slow headers are refused). Its source
+  address replaces the TCP peer address for protection, `allowedSources` and the header sent to the
+  upstream. Its TLVs are ignored.
+- A connection is never forwarded again, and a name with no exact or wildcard route is closed rather
+  than served by a default route. If the route's local upstream is down or draining, the connection
+  is closed before the handshake, which the forwarding node treats as "try the next peer".
+
+**Limits and security.**
+
+- Only new connections are forwarded; established ones close with their upstream.
+- The first connection after an upstream dies, before anything has marked it refusing, is lost —
+  on the public listener and, at a peer, on its ingress listener alike.
+- A trusted source can assert any client address, which bypasses per-IP limits and
+  `allowedSources`. It grants no identity: the peer verifies client certificates itself. On hosts
+  where containers egress with the host's address, block container traffic to the ingress port.
+- Peers must be IP literals; symphony does not resolve names.
+- Roll out `failoverIngress` on every node before any node's routes gain `failover`: an older
+  listener given a forwarded connection reads the PROXY header as TLS and fails it.
+- An invalid `failover` serves the route without failover, counted in `failingRoutes`. An invalid
+  `trustedSources` CIDR fails construction or `updateConfig()`.
+- Both `failover` (with the routes) and `trustedSources` (`updateConfig({ failoverIngress: [{ port,
+  trustedSources }] })`) are hot-swappable; adding or removing `failoverIngress` on a listener needs a
+  restart (`symphony-server` recreates the proxy).
+
+Metrics: each failover route's `routeMetrics[].failover` carries `localUp`, refusing/total slots,
+replays, budget exhaustion and per-peer forwarded counts and failures by reason (`refused`,
+`timeout`, `zero_byte_close`, `error`; zero-valued reasons omitted). Ingress refusals are listener block reasons
+(`untrusted_source`, `proxy_header_invalid`, `proxy_header_local`, `proxy_header_v1`,
+`proxy_header_timeout`); a forwarded connection refused for a down route is the route error
+`locally_down`.
 
 ---
 
@@ -706,7 +795,7 @@ const m = proxy.metrics();
 // m.suspendedResolved     — suspended connections that were resolved with a route
 // m.suspendedUnresolved   — suspended connections that timed out or were rejected
 // m.routes                — routes in the live table, including the default route
-// m.failingRoutes         — rejected cert/protocol/carrier/allowedSources routes or duplicate wildcards
+// m.failingRoutes         — rejected cert/protocol/carrier/allowedSources routes, duplicate wildcards, or invalid failover policies
 
 // Per listener, in configuration order
 for (const l of m.listeners) {
@@ -857,7 +946,7 @@ proxy.updateConfig({
 });
 ```
 
-**What can be hot-swapped:** routes (destinations, TLS certs, suspension state) and per-listener protection (CIDR allowlist/blocklist, JA3 blocklist, rate limits, sustained rate limits, penalty box, concurrency caps, handshake timeout, requireSni).
+**What can be hot-swapped:** routes (destinations, TLS certs, suspension state, `failover`), per-listener protection (CIDR allowlist/blocklist, JA3 blocklist, rate limits, sustained rate limits, penalty box, concurrency caps, handshake timeout, requireSni), and a failover ingress listener's `trustedSources`.
 
 **What requires a restart:** bind address, port, idle timeout, worker threads. When calling `updateConfig()` directly, protection presence (None↔Some) cannot change at runtime — the listener must be restarted. The `symphony-server` bin handles this automatically via seamless recreate.
 

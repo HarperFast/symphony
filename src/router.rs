@@ -1,4 +1,5 @@
 use crate::balancer::{UdsBalancer, UdsSlotSpec};
+use crate::failover::{Failover, FailoverRoute, FailoverSpec};
 use crate::metrics::RouteMetrics;
 use crate::tls::{sha256, CertSpec, MtlsSpec, TlsConfigCache};
 use arc_swap::ArcSwap;
@@ -175,11 +176,16 @@ impl SourceAllowlist {
 		if entries.is_empty() {
 			return Ok(None);
 		}
+		Self::parse_required(entries, "allowedSources").map(Some)
+	}
+
+	/// For a list whose absence must not mean "anyone": an empty list permits nobody.
+	pub fn parse_required(entries: &[String], label: &str) -> Result<Self, String> {
 		let networks = entries
 			.iter()
-			.map(|entry| parse_source_network(entry))
+			.map(|entry| parse_source_network(entry, label))
 			.collect::<Result<Vec<_>, _>>()?;
-		Ok(Some(Self(networks.into())))
+		Ok(Self(networks.into()))
 	}
 
 	/// A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`; it is matched as IPv4,
@@ -194,9 +200,9 @@ impl SourceAllowlist {
 /// matching, so the mapped form would otherwise never match anything. One with a prefix under 96
 /// (`::ffff:10.0.0.0/8`, an IPv4 length on the mapped form) would instead be a v6 network around
 /// `::`, so it is rejected.
-fn parse_source_network(entry: &str) -> Result<IpNetwork, String> {
+fn parse_source_network(entry: &str, label: &str) -> Result<IpNetwork, String> {
 	let invalid =
-		|reason: &dyn std::fmt::Display| format!("invalid allowedSources CIDR '{entry}': {reason}");
+		|reason: &dyn std::fmt::Display| format!("invalid {label} CIDR '{entry}': {reason}");
 	let network: IpNetwork = entry.parse().map_err(|e| invalid(&e))?;
 	if let IpNetwork::V6(v6) = network {
 		if let Some(v4) = v6.ip().to_ipv4_mapped() {
@@ -243,6 +249,7 @@ pub struct Route {
 	/// The route's declared application protocol — gates HTTP/1 header rewriting.
 	pub protocol: RouteProtocol,
 	pub allowed_sources: Option<SourceAllowlist>,
+	pub failover: Option<Arc<Failover>>,
 }
 
 pub struct RouteMetricIdentity {
@@ -291,6 +298,9 @@ pub struct RouteTable {
 	/// SNIs whose cert failed to build in this table. Carried across a hot-swap so a
 	/// persistently-broken route is logged only on the good→bad transition, not every reconcile.
 	failing_snis: HashSet<Arc<str>>,
+	/// SNIs served without failover because their `failover` policy is invalid. Separate from
+	/// `failing_snis` so one failure's log-once state cannot silence the other's.
+	invalid_failover: HashSet<Arc<str>>,
 	/// Exact SNIs dropped with no last-good route to carry forward (a subset of `failing_snis` —
 	/// this excludes SNIs whose last-good route IS still present in `exact`/`wildcard` and
 	/// serving traffic). `resolve()` must fail closed for these rather than falling through to a
@@ -307,6 +317,8 @@ pub struct RouteTable {
 	/// (`*.`-prefixed for a wildcard). Kept here rather than on `Route`, which every connection
 	/// clones into its task.
 	client_auth: HashMap<Arc<str>, ClientAuth>,
+	/// Routes with `failover`, for the recovery probe and the metrics export.
+	failover_routes: Vec<FailoverRoute>,
 }
 
 impl RouteTable {
@@ -315,19 +327,37 @@ impl RouteTable {
 		self.exact.len() + self.wildcard.len() + usize::from(self.default.is_some())
 	}
 
-	/// Number of SNIs whose cert failed to build in this table — either dropped, or serving a
-	/// carried-forward last-good cert. Non-zero means a rotation needs attention.
+	/// Number of SNIs rejected in this table — dropped, serving a carried-forward last-good cert, or
+	/// serving without an invalid `failover` policy. Non-zero means a config needs attention.
 	pub fn failing_route_count(&self) -> usize {
-		self.failing_snis.len()
+		self.failing_snis.union(&self.invalid_failover).count()
 	}
 
 	pub fn metric_identities(&self) -> &[Arc<RouteMetricIdentity>] {
 		&self.metric_identities
 	}
 
+	pub fn failover_routes(&self) -> &[FailoverRoute] {
+		&self.failover_routes
+	}
+
 	pub fn resolve(&self, sni: Option<&str>) -> Option<&Route> {
+		self.resolve_with(sni, true)
+	}
+
+	/// `allow_default: false` is the failover ingress lookup: a peer that does not serve this name
+	/// must close before the handshake so the forwarding node tries another peer, rather than
+	/// answer with the default route's certificate.
+	pub fn resolve_with(&self, sni: Option<&str>, allow_default: bool) -> Option<&Route> {
+		let default = || {
+			if allow_default {
+				self.default.as_ref()
+			} else {
+				None
+			}
+		};
 		let Some(sni) = sni else {
-			return self.default.as_ref();
+			return default();
 		};
 
 		// A route rejected outright (no last-good to carry forward) must fail closed, not fall
@@ -362,7 +392,7 @@ impl RouteTable {
 			return None;
 		}
 
-		self.default.as_ref()
+		default()
 	}
 
 	/// Look up the route stored under the key a spec's SNI would insert to (the exact SNI,
@@ -433,6 +463,9 @@ pub struct RouteSpec {
 	/// Unparsed: an invalid entry drops this route in `build_route_table` instead of failing the
 	/// whole config.
 	pub allowed_sources: Vec<String>,
+	/// Unvalidated: an invalid policy serves the route without failover rather than failing the
+	/// whole config.
+	pub failover: Option<FailoverSpec>,
 }
 
 /// Listener-level fallback cert/mTLS spec.
@@ -537,10 +570,12 @@ pub fn build_route_table(
 	let mut monitored_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
 	let mut affinity_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
 	let mut failing_snis: HashSet<Arc<str>> = HashSet::new();
+	let mut invalid_failover: HashSet<Arc<str>> = HashSet::new();
 	let mut configured_wildcards = HashSet::with_capacity(specs.len());
 	let mut dropped_exact: HashSet<Arc<str>> = HashSet::new();
 	let mut dropped_wildcard: Vec<Arc<str>> = Vec::new();
 	let mut client_auth: HashMap<Arc<str>, ClientAuth> = HashMap::new();
+	let mut failover_routes: Vec<FailoverRoute> = Vec::new();
 	let last_exact: HashMap<&str, usize> = specs
 		.iter()
 		.enumerate()
@@ -611,12 +646,35 @@ pub fn build_route_table(
 			}
 		};
 
+		let previous_route = previous.and_then(|p| p.get_for_spec_sni(&spec.sni));
+		// Failover adds availability; a broken policy must not remove the route itself.
+		let failover_policy = match spec.failover.as_ref().map(FailoverSpec::parse) {
+			None => None,
+			Some(Ok(policy)) => Some(policy),
+			Some(Err(e)) => {
+				let newly_failing =
+					previous.is_none_or(|p| !p.invalid_failover.contains(spec.sni.as_str()));
+				invalid_failover.insert(Arc::from(spec.sni.as_str()));
+				if newly_failing {
+					eprintln!(
+						"symphony: route '{}': {e}; serving it without failover",
+						spec.sni
+					);
+				}
+				None
+			}
+		};
+
 		let requested_auth = ClientAuth::of(spec, listener_tls);
 
 		// Isolate per-route failures: a single route whose cert can't be built (e.g. a
 		// rotated key no longer matching an inlined chain → rustls KeyMismatch) must not
 		// abort the whole table and take every other tenant on the port down with it.
-		let mut route = match build_route(spec, listener_tls, cache) {
+		let health = failover_policy.is_some().then_some(HealthTracking {
+			previous: previous_route,
+		});
+		let mut carried = false;
+		let mut route = match build_route(spec, listener_tls, cache, health) {
 			Ok(route) => route,
 			Err(e) => {
 				// Log only on the good→bad transition: a persistently-broken cert would
@@ -647,6 +705,7 @@ pub fn build_route_table(
 								spec.sni, e
 							);
 						}
+						carried = true;
 						prev.clone()
 					}
 					// The previous route's `tls_config` holds its client verifier, so retaining it
@@ -680,12 +739,54 @@ pub fn build_route_table(
 		// After the carry-forward branch, so a retained last-good route enforces the new list.
 		route.allowed_sources = allowed_sources;
 
+		// A route's UDS slots track health exactly when it has failover, since only the failover
+		// probe clears a tracked slot. A carried-forward route keeps its own slots, re-created with
+		// tracking switched when the policy's presence changed.
+		if carried && !tracks_health_as(&route, failover_policy.is_some()) {
+			let track = failover_policy.is_some();
+			route.destination = retracked(&route.destination, track);
+			route.destination_h2 = route
+				.destination_h2
+				.as_ref()
+				.map(|dest| retracked(dest, track));
+		}
+
 		// Reusing by the full metric identity keeps ordinary cert/upstream reloads continuous
 		// without moving historical counters when a route changes tenant groups.
-		if let Some(previous_route) = previous.and_then(|table| table.get_for_spec_sni(&spec.sni)) {
+		if let Some(previous_route) = previous_route {
 			if previous_route.metric_identity.group.as_ref() == spec.metrics_group {
 				route.metric_identity = previous_route.metric_identity.clone();
 			}
+		}
+
+		// After the carry-forward branch, like `allowed_sources`: a retained last-good route takes
+		// the new policy, so a reload that sets `drain` during a cert rotation still drains.
+		route.failover = failover_policy.map(|policy| {
+			let previous_failover = previous_route
+				.filter(|p| Arc::ptr_eq(&p.metric_identity, &route.metric_identity))
+				.and_then(|p| p.failover.as_deref());
+			let tcp_health = match &route.destination {
+				Destination::Tcp(addr) => Some(
+					previous_route
+						.and_then(|p| match (&p.destination, &p.failover) {
+							(Destination::Tcp(prev), Some(f)) if prev == addr => {
+								f.tcp_health.clone()
+							}
+							_ => None,
+						})
+						.unwrap_or_default(),
+				),
+				Destination::UdsSet(_) => None,
+			};
+			Arc::new(Failover::new(policy, previous_failover, tcp_health))
+		});
+		if let Some(failover) = &route.failover {
+			failover_routes.push(FailoverRoute {
+				identity: route.metric_identity.clone(),
+				failover: failover.clone(),
+				destination: route.destination.clone(),
+				destination_h2: route.destination_h2.clone(),
+			});
 		}
 		// Collected from the route actually installed, which may be a carried-forward one.
 		for dest in std::iter::once(&route.destination).chain(route.destination_h2.iter()) {
@@ -727,9 +828,11 @@ pub fn build_route_table(
 		monitored_balancers,
 		affinity_balancers,
 		failing_snis,
+		invalid_failover,
 		dropped_exact,
 		dropped_wildcard,
 		client_auth,
+		failover_routes,
 	})
 }
 
@@ -760,10 +863,34 @@ fn validate_route_protocol_declaration(spec: &RouteSpec) -> crate::error::Result
 	Ok(())
 }
 
+fn retracked(dest: &Destination, track: bool) -> Destination {
+	match dest {
+		Destination::UdsSet(balancer) => Destination::UdsSet(Arc::new(balancer.retracked(track))),
+		Destination::Tcp(addr) => Destination::Tcp(*addr),
+	}
+}
+
+fn tracks_health_as(route: &Route, tracked: bool) -> bool {
+	std::iter::once(&route.destination)
+		.chain(route.destination_h2.iter())
+		.all(|dest| match dest {
+			Destination::UdsSet(balancer) => balancer.tracked_slots().next().is_some() == tracked,
+			Destination::Tcp(_) => true,
+		})
+}
+
+/// Per-slot health tracking for a failover route's balancers, inheriting the state of the route
+/// it replaces.
+#[derive(Clone, Copy)]
+struct HealthTracking<'a> {
+	previous: Option<&'a Route>,
+}
+
 fn build_route(
 	spec: &RouteSpec,
 	listener_tls: &ListenerTlsSpec,
 	cache: &mut TlsConfigCache,
+	health: Option<HealthTracking>,
 ) -> crate::error::Result<Route> {
 	let tls_config = if spec.terminate_tls {
 		let cert_pem = spec
@@ -802,7 +929,7 @@ fn build_route(
 		None
 	};
 
-	let (destination, destination_h2) = build_destinations(spec)?;
+	let (destination, destination_h2) = build_destinations(spec, health)?;
 
 	// Header injection cannot apply to h2 frames; PROXY protocol rides before the
 	// preface and works for both protocols. Any route that can carry h2 to an
@@ -854,6 +981,7 @@ fn build_route(
 		forward_fingerprint: spec.forward_fingerprint,
 		protocol: spec.protocol,
 		allowed_sources: None,
+		failover: None,
 	})
 }
 
@@ -862,6 +990,7 @@ fn build_route(
 /// that negotiated h2 in ALPN.
 fn build_destinations(
 	spec: &RouteSpec,
+	health: Option<HealthTracking>,
 ) -> crate::error::Result<(Destination, Option<Destination>)> {
 	// Suspended routes or routes with no upstreams use a placeholder TCP dest
 	// that is replaced by resolveConnection() before any data flows.
@@ -881,16 +1010,30 @@ fn build_destinations(
 		)));
 	}
 
-	let destination = build_destination_for(&h1_specs)?;
+	let previous_balancer = |pick: fn(&Route) -> Option<&Destination>| {
+		health.map(|h| match h.previous.and_then(pick) {
+			Some(Destination::UdsSet(balancer)) => Some(balancer.as_ref()),
+			_ => None,
+		})
+	};
+	let destination =
+		build_destination_for(&h1_specs, previous_balancer(|r| Some(&r.destination)))?;
 	let destination_h2 = if h2_specs.is_empty() {
 		None
 	} else {
-		Some(build_destination_for(&h2_specs)?)
+		Some(build_destination_for(
+			&h2_specs,
+			previous_balancer(|r| r.destination_h2.as_ref()),
+		)?)
 	};
 	Ok((destination, destination_h2))
 }
 
-fn build_destination_for(upstreams: &[&UpstreamSpec]) -> crate::error::Result<Destination> {
+/// `health`: `Some` to track per-slot health, inheriting it from the given previous balancer.
+fn build_destination_for(
+	upstreams: &[&UpstreamSpec],
+	health: Option<Option<&UdsBalancer>>,
+) -> crate::error::Result<Destination> {
 	let first = upstreams
 		.first()
 		.ok_or_else(|| crate::error::SymphonyError::Config("route has no upstreams".to_string()))?;
@@ -928,11 +1071,11 @@ fn build_destination_for(upstreams: &[&UpstreamSpec]) -> crate::error::Result<De
 					affinity_ttl_ms = *ttl;
 				}
 			}
-			Ok(Destination::UdsSet(Arc::new(UdsBalancer::new(
-				slots,
-				ip_affinity,
-				affinity_ttl_ms,
-			))))
+			let balancer = UdsBalancer::new(slots, ip_affinity, affinity_ttl_ms);
+			Ok(Destination::UdsSet(Arc::new(match health {
+				Some(previous) => balancer.with_health(previous),
+				None => balancer,
+			})))
 		}
 	}
 }
@@ -1089,6 +1232,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			http2: false,
 			protocol: RouteProtocol::Opaque,
 			allowed_sources: Vec::new(),
+			failover: None,
 		}
 	}
 
@@ -1410,6 +1554,156 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		live: Option<&RouteTable>,
 	) -> RouteTable {
 		build_route_table(specs, listener, live, &mut TlsConfigCache::new()).expect("build")
+	}
+
+	fn with_failover(mut spec: RouteSpec, drain: bool, peer: &str) -> RouteSpec {
+		spec.upstreams = vec![UpstreamSpec::Uds {
+			paths: vec!["/tmp/symphony-failover-test.sock".into()],
+			pids: vec![None],
+			tids: vec![None],
+			ip_affinity: false,
+			affinity_ttl_ms: 1,
+			protocol: None,
+		}];
+		spec.failover = Some(FailoverSpec {
+			peers: vec![(peer.into(), 9443)],
+			drain,
+			probe_interval_ms: None,
+			cooldown_min_ms: None,
+			cooldown_max_ms: None,
+		});
+		spec
+	}
+
+	#[test]
+	fn a_carried_forward_route_takes_the_new_failover_policy() {
+		let sni = "tenant.example.com";
+		let live = build(
+			&[with_failover(
+				tls_route(sni, CERT_A, KEY_A),
+				false,
+				"10.0.0.2",
+			)],
+			&ListenerTlsSpec::empty(),
+			None,
+		);
+		let live_failover = live.resolve(Some(sni)).unwrap().failover.clone().unwrap();
+		live_failover.peers[0]
+			.forwarded
+			.fetch_add(7, Ordering::Relaxed);
+
+		let swapped = build(
+			&[with_failover(
+				tls_route(sni, CERT_A, KEY_B),
+				true,
+				"10.0.0.2",
+			)],
+			&ListenerTlsSpec::empty(),
+			Some(&live),
+		);
+		let route = swapped.resolve(Some(sni)).unwrap();
+		assert!(
+			swapped.failing_snis.contains(sni),
+			"the cert failure carried the route forward"
+		);
+		let failover = route.failover.as_ref().unwrap();
+		assert!(
+			failover.drain,
+			"drain from the new spec applies to the retained route"
+		);
+		assert!(Arc::ptr_eq(&failover.peers[0], &live_failover.peers[0]));
+		assert_eq!(swapped.failover_routes().len(), 1);
+	}
+
+	fn tracked(route: &Route) -> bool {
+		match &route.destination {
+			Destination::UdsSet(balancer) => balancer.tracked_slots().next().is_some(),
+			Destination::Tcp(_) => panic!("expected a UDS destination"),
+		}
+	}
+
+	#[test]
+	fn a_carried_forward_route_tracks_health_exactly_when_it_has_failover() {
+		let sni = "tenant.example.com";
+		let mut plain = with_failover(tls_route(sni, CERT_A, KEY_A), false, "10.0.0.2");
+		plain.failover = None;
+		let live = build(
+			std::slice::from_ref(&plain),
+			&ListenerTlsSpec::empty(),
+			None,
+		);
+		assert!(!tracked(live.resolve(Some(sni)).unwrap()));
+
+		// Failover enabled (and the upstream moved) in the same reload that a cert rotation breaks.
+		let mut enabling = with_failover(tls_route(sni, CERT_A, KEY_B), false, "10.0.0.2");
+		if let UpstreamSpec::Uds { paths, .. } = &mut enabling.upstreams[0] {
+			paths[0] = "/tmp/symphony-failover-moved.sock".into();
+		}
+		let enabled = build(&[enabling], &ListenerTlsSpec::empty(), Some(&live));
+		let route = enabled.resolve(Some(sni)).unwrap();
+		assert!(enabled.failing_snis.contains(sni));
+		assert!(route.failover.is_some());
+		match &route.destination {
+			Destination::UdsSet(balancer) => assert_eq!(
+				balancer.path(0).as_ref(),
+				"/tmp/symphony-failover-test.sock",
+				"the carried route keeps its own upstream until the cert heals"
+			),
+			Destination::Tcp(_) => unreachable!(),
+		}
+		assert!(tracked(route), "rebuilt so the probe has slots to clear");
+
+		// And removed again while the cert is still broken.
+		let mut removed_spec = tls_route(sni, CERT_A, KEY_B);
+		removed_spec.upstreams = plain.upstreams.clone();
+		let removed = build(&[removed_spec], &ListenerTlsSpec::empty(), Some(&enabled));
+		let route = removed.resolve(Some(sni)).unwrap();
+		assert!(route.failover.is_none());
+		assert!(!tracked(route), "no tracked slot is left without a probe");
+	}
+
+	#[test]
+	fn an_invalid_failover_policy_serves_the_route_without_failover() {
+		let sni = "tenant.example.com";
+		let table = build(
+			&[with_failover(
+				tls_route(sni, CERT_A, KEY_A),
+				false,
+				"peer.example",
+			)],
+			&ListenerTlsSpec::empty(),
+			None,
+		);
+		let route = table.resolve(Some(sni)).expect("route still served");
+		assert!(route.failover.is_none());
+		assert!(table.invalid_failover.contains(sni));
+		assert!(
+			!table.failing_snis.contains(sni),
+			"a later cert failure still logs"
+		);
+		assert_eq!(table.failing_route_count(), 1);
+		assert!(table.failover_routes().is_empty());
+		match &route.destination {
+			Destination::UdsSet(balancer) => assert_eq!(
+				balancer.tracked_slots().count(),
+				0,
+				"no health tracking without a probe to clear it"
+			),
+			Destination::Tcp(_) => panic!("expected a UDS destination"),
+		}
+	}
+
+	#[test]
+	fn a_failover_rebuild_shares_slot_health_with_the_previous_table() {
+		let sni = "tenant.example.com";
+		let spec = with_failover(tls_route(sni, CERT_A, KEY_A), false, "10.0.0.2");
+		let live = build(std::slice::from_ref(&spec), &ListenerTlsSpec::empty(), None);
+		let rebuilt = build(&[spec], &ListenerTlsSpec::empty(), Some(&live));
+		let health = |table: &RouteTable| match &table.resolve(Some(sni)).unwrap().destination {
+			Destination::UdsSet(balancer) => balancer.health(0).unwrap().clone(),
+			Destination::Tcp(_) => panic!("expected a UDS destination"),
+		};
+		assert!(Arc::ptr_eq(&health(&live), &health(&rebuilt)));
 	}
 
 	/// A passthrough spec whose build fails: every upstream is h2-marked, so it has no default one.

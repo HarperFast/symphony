@@ -146,7 +146,7 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 		out.sample(
 			'symphony_routes_failing',
 			'gauge',
-			'Routes rejected at build time (cert failure, protocol/carrier validation failure, invalid allowedSources, or duplicate wildcard) — dropped, or (cert failures only) serving a carried-forward last-good cert.',
+			'Routes rejected at build time (cert failure, protocol/carrier validation failure, invalid allowedSources, or duplicate wildcard) — dropped, or (cert failures only) serving a carried-forward last-good cert — plus routes serving without failover because their failover policy is invalid.',
 			metrics.failingRoutes,
 			proxy
 		);
@@ -275,6 +275,56 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 					...tags,
 					reason,
 				});
+			}
+			const failover = route.failover;
+			if (failover) {
+				out.sample(
+					'symphony_route_local_up',
+					'gauge',
+					'0 while every local upstream slot of a failover route (or of its h2 upstream) refuses connections.',
+					failover.localUp ? 1 : 0,
+					tags
+				);
+				out.sample(
+					'symphony_route_refusing_slots',
+					'gauge',
+					'Local upstream slots of a failover route that are refusing connections.',
+					failover.refusingSlots,
+					tags
+				);
+				out.sample(
+					'symphony_failover_replays_total',
+					'counter',
+					'Forwarding attempts that replayed the ClientHello to a second or later peer.',
+					failover.replays,
+					tags
+				);
+				out.sample(
+					'symphony_failover_exhausted_total',
+					'counter',
+					'Connections closed after every candidate failover peer failed.',
+					failover.exhausted,
+					tags
+				);
+				for (const peer of failover.peers) {
+					const peerTags = { ...tags, peer: peer.peer };
+					out.sample(
+						'symphony_failover_forwarded_total',
+						'counter',
+						'Connections forwarded to a failover peer.',
+						peer.forwarded,
+						peerTags
+					);
+					for (const { reason, count } of peer.failuresByReason) {
+						out.sample(
+							'symphony_failover_peer_failures_total',
+							'counter',
+							'Failed attempts to forward to a failover peer, by reason.',
+							count,
+							{ ...peerTags, reason }
+						);
+					}
+				}
 			}
 		}
 	}

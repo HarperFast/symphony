@@ -40,6 +40,16 @@ labeled_enum!(BlockKind {
 	TooManyConnections => "too_many_connections",
 	PenaltyBoxed => "penalty_boxed",
 	SourceNotAllowed => "source_not_allowed",
+	/// Failover ingress: the TCP peer is outside `trustedSources`; closed before any read.
+	UntrustedSource => "untrusted_source",
+	/// Failover ingress: the PROXY v2 header was malformed, oversized, or not TCP over IPv4/IPv6.
+	ProxyHeaderInvalid => "proxy_header_invalid",
+	/// Failover ingress: a PROXY v2 LOCAL command, which carries no client address.
+	ProxyHeaderLocal => "proxy_header_local",
+	/// Failover ingress: a PROXY v1 (text) header; only v2 is accepted.
+	ProxyHeaderV1 => "proxy_header_v1",
+	/// Failover ingress: the PROXY v2 header did not arrive within the handshake timeout.
+	ProxyHeaderTimeout => "proxy_header_timeout",
 });
 
 impl BlockKind {
@@ -76,8 +86,11 @@ labeled_enum!(ErrorKind {
 	TlsHandshake => "tls_handshake",
 	/// Route asks for TLS termination but has no usable cert (e.g. cert build failed).
 	TlsMissingCert => "tls_missing_cert",
-	/// Could not establish the upstream connection.
+	/// Could not establish the upstream connection — locally, or, on a failover route, to any peer.
 	UpstreamConnect => "upstream_connect",
+	/// Failover ingress: the route's local upstream is down (or draining), so the forwarded
+	/// connection is closed before the handshake and the forwarding node tries its next peer.
+	LocallyDown => "locally_down",
 	/// The proxied session hit `idleTimeoutMs`. Note that today this fires on *total* duration,
 	/// not idleness — `forward()` wraps the copy in a hard `tokio::time::timeout` that does not
 	/// reset on activity (issue #34, pre-existing). Until that is fixed this counts busy
@@ -97,6 +110,18 @@ labeled_enum!(ErrorKind {
 	Stream => "stream",
 	/// HTTP-mode listener could not read the request head.
 	HttpHeader => "http_header",
+});
+
+labeled_enum!(PeerFailureKind {
+	/// The peer refused the TCP connection.
+	Refused => "refused",
+	/// Connect or first-byte wait used up the attempt's share of the handshake budget.
+	Timeout => "timeout",
+	/// The peer closed or reset — while the hello was written or before it answered — without
+	/// sending a byte: its symphony is up but declined the route.
+	ZeroByteClose => "zero_byte_close",
+	/// Any other connect failure (unreachable host, etc.).
+	Error => "error",
 });
 
 impl ErrorKind {

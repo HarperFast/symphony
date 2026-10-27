@@ -22,6 +22,12 @@ export type {
 	BlockedEvent,
 	SuspendedEvent,
 	ErrorEvent,
+	RouteHealthEvent,
+	FailoverConfig,
+	FailoverPeer,
+	FailoverIngressConfig,
+	RouteFailoverMetrics,
+	FailoverPeerMetrics,
 } from './types.js';
 // `renderPrometheus` and the standalone server's snapshot shape are deliberately NOT exported
 // from the package root. They are an implementation detail of the symphony-server admin

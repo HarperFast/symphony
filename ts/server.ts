@@ -363,15 +363,17 @@ class ServerState {
 				// some→none transitions force a seamless recreate so the new listener is
 				// constructed with the correct Option<ProtectionState>. Protection CONTENTS are
 				// excluded so a contents-only change stays on the hot-swap path without recreating.
+				// failoverIngress follows the same rule: presence recreates, trustedSources hot-swaps.
 				//
 				// The proxy-level fields below are frozen at construction on the Rust side too, and
 				// updateConfig reaches neither: without them in the signature, editing only a buffer
 				// size (or workerThreads) leaves the sig unchanged, so the reload takes the hot-swap
 				// branch, reports success, and keeps running the old value.
 				const constructionSig = JSON.stringify({
-					listeners: proxyConfig.listeners.map(({ protection, ...rest }) => ({
+					listeners: proxyConfig.listeners.map(({ protection, failoverIngress, ...rest }) => ({
 						...rest,
 						hasProtection: protection != null,
+						isFailoverIngress: failoverIngress != null,
 					})),
 					workerThreads: proxyConfig.workerThreads,
 					readBufferSize: proxyConfig.readBufferSize,
@@ -389,6 +391,9 @@ class ServerState {
 						protection: proxyConfig.listeners
 							.filter((l) => l.protection != null)
 							.map((l) => ({ port: l.port, protection: l.protection! })),
+						failoverIngress: proxyConfig.listeners
+							.filter((l) => l.failoverIngress != null)
+							.map((l) => ({ port: l.port, trustedSources: l.failoverIngress!.trustedSources })),
 					});
 				} else {
 					// New port-set, or a construction-frozen setting changed → (re)create. SO_REUSEPORT lets the

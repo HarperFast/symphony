@@ -608,6 +608,58 @@ describe('renderPrometheus', () => {
 		assert.equal(rendered.match(/^symphony_route_errors_total\{/gm)?.length ?? 0, 0);
 		assert.equal(rendered.match(/^symphony_route_blocked_total\{/gm)?.length ?? 0, 0);
 	});
+
+	it('renders failover route health and per-peer counters only for failover routes', () => {
+		const base = snapshot.proxies[0].metrics.routeMetrics[0];
+		const rendered = renderPrometheus({
+			...snapshot,
+			proxies: [
+				{
+					...snapshot.proxies[0],
+					metrics: {
+						...snapshot.proxies[0].metrics,
+						routeMetrics: [
+							base,
+							{
+								...base,
+								route: 'app.example.com',
+								failover: {
+									localUp: false,
+									refusingSlots: 2,
+									slots: 2,
+									drain: false,
+									replays: 3,
+									exhausted: 1,
+									peers: [
+										{
+											peer: '10.0.0.2:9443',
+											forwarded: 5,
+											coolingDown: true,
+											failuresByReason: [{ reason: 'zero_byte_close', count: 2 }],
+										},
+									],
+								},
+							},
+						],
+					},
+				},
+			],
+		});
+		const tags = 'proxy="80,443",route="app.example.com",group="tenant-1"';
+		assert.match(rendered, new RegExp(`^symphony_route_local_up\\{${tags}\\} 0$`, 'm'));
+		assert.match(rendered, new RegExp(`^symphony_route_refusing_slots\\{${tags}\\} 2$`, 'm'));
+		assert.match(rendered, new RegExp(`^symphony_failover_replays_total\\{${tags}\\} 3$`, 'm'));
+		assert.match(rendered, new RegExp(`^symphony_failover_exhausted_total\\{${tags}\\} 1$`, 'm'));
+		assert.match(rendered, new RegExp(`^symphony_failover_forwarded_total\\{${tags},peer="10.0.0.2:9443"\\} 5$`, 'm'));
+		assert.match(
+			rendered,
+			new RegExp(
+				`^symphony_failover_peer_failures_total\\{${tags},peer="10.0.0.2:9443",reason="zero_byte_close"\\} 2$`,
+				'm'
+			)
+		);
+		assert.equal(rendered.match(/^symphony_route_local_up\{/gm)?.length, 1, 'only the failover route');
+	});
 });
 
 describe('symphony-server admin endpoint', () => {

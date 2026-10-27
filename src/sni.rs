@@ -36,6 +36,10 @@ pub struct PeekInfo {
 	/// for enforcement — a client can fragment the ClientHello to force a different/empty
 	/// fingerprint here while rustls later reads the complete handshake (blocklist bypass).
 	pub complete: bool,
+	/// Wire bytes from the start of the stream through the end of the TLS record that completes
+	/// the ClientHello; 0 unless `complete`. Reading exactly this many bytes consumes the hello and
+	/// leaves any later record (early data included) unread.
+	pub hello_len: usize,
 }
 
 /// Result of scanning as many buffered TLS records as are available for a ClientHello.
@@ -47,8 +51,9 @@ enum RecordScan {
 	/// this many raw wire bytes are available.
 	NeedMoreRaw(usize),
 	/// The complete handshake-layer payload (msg_type(1) + length(3) + body, with every TLS
-	/// record header stripped out) has been reassembled.
-	Complete(Vec<u8>),
+	/// record header stripped out) has been reassembled. `wire_len` is the raw byte count through
+	/// the end of the record that completed it.
+	Complete { hs: Vec<u8>, wire_len: usize },
 }
 
 /// Walk `raw` (the raw MSG_PEEK'd wire bytes, which may span several TLS records) as a
@@ -68,7 +73,10 @@ fn scan_handshake_records(raw: &[u8]) -> RecordScan {
 		if let Some(total) = declared_hs_len {
 			if hs_buf.len() >= total {
 				hs_buf.truncate(total);
-				return RecordScan::Complete(hs_buf);
+				return RecordScan::Complete {
+					hs: hs_buf,
+					wire_len: offset,
+				};
 			}
 		}
 
@@ -126,11 +134,12 @@ pub async fn peek(stream: &TcpStream) -> PeekInfo {
 
 async fn peek_with_timeout(stream: &TcpStream, timeout: Duration) -> PeekInfo {
 	match tokio::time::timeout(timeout, peek_reassemble(stream)).await {
-		Ok(Some((buf, complete))) => {
+		Ok(Some((buf, hello_len))) => {
 			let mut info = parse_client_hello(&buf);
 			// A parse from a truncated buffer is never trustworthy for enforcement, even if
 			// it happened to yield a fingerprint.
-			info.complete = complete;
+			info.complete = hello_len.is_some();
+			info.hello_len = hello_len.unwrap_or(0);
 			info
 		}
 		// Timed out mid-reassembly, or the peek errored: parse whatever last arrived, if any.
@@ -140,9 +149,9 @@ async fn peek_with_timeout(stream: &TcpStream, timeout: Duration) -> PeekInfo {
 }
 
 /// Peek repeatedly until the full declared ClientHello is buffered or the size cap is hit.
-/// Returns `(buffer, complete)`, or `None` if the input is not a TLS ClientHello at all (fail
-/// fast) or the stream errored before any bytes.
-async fn peek_reassemble(stream: &TcpStream) -> Option<(Vec<u8>, bool)> {
+/// Returns `(buffer, Some(wire_len))` when complete, `(buffer, None)` when truncated, or `None` if
+/// the input is not a TLS ClientHello at all (fail fast) or the stream errored before any bytes.
+async fn peek_reassemble(stream: &TcpStream) -> Option<(Vec<u8>, Option<usize>)> {
 	let mut buf = vec![0u8; INITIAL_PEEK];
 	loop {
 		let n = match stream.peek(&mut buf).await {
@@ -152,11 +161,13 @@ async fn peek_reassemble(stream: &TcpStream) -> Option<(Vec<u8>, bool)> {
 		};
 		match scan_handshake_records(&buf[..n]) {
 			RecordScan::Invalid => return None,
-			RecordScan::Complete(hs_bytes) => return Some((wrap_as_record(&hs_bytes), true)),
+			RecordScan::Complete { hs, wire_len } => {
+				return Some((wrap_as_record(&hs), Some(wire_len)))
+			}
 			RecordScan::NeedMoreRaw(target) => {
 				if target > MAX_CLIENT_HELLO {
 					// Declared hello exceeds our cap — parse what we have, marked incomplete.
-					return Some((buf[..n].to_vec(), false));
+					return Some((buf[..n].to_vec(), None));
 				}
 				if buf.len() < target {
 					buf.resize(target, 0);
@@ -184,6 +195,7 @@ fn parse_client_hello(buf: &[u8]) -> PeekInfo {
 		ja3,
 		ja4,
 		complete: false,
+		hello_len: 0,
 	}
 }
 
@@ -992,7 +1004,7 @@ mod tests {
 
 	fn scan_complete(raw: &[u8]) -> Option<Vec<u8>> {
 		match scan_handshake_records(raw) {
-			RecordScan::Complete(hs) => Some(hs),
+			RecordScan::Complete { hs, .. } => Some(hs),
 			_ => None,
 		}
 	}
@@ -1173,6 +1185,9 @@ mod tests {
 		}
 
 		let expected = parse_client_hello(&hello);
+		let hello_wire_len = wire.len();
+		// A following record (e.g. early data) must not count as part of the hello.
+		wire.extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x02, 0xAA, 0xBB]);
 
 		let info = peek_with_client(Duration::from_secs(5), move |mut sock| async move {
 			use tokio::io::AsyncWriteExt;
@@ -1190,6 +1205,10 @@ mod tests {
 			info.ja4, expected.ja4,
 			"fingerprint from a multi-record hello must match the equivalent single-record hello \
 			 — otherwise a JA4 blocklist entry for this client can be bypassed by splitting records"
+		);
+		assert_eq!(
+			info.hello_len, hello_wire_len,
+			"hello_len covers both hello records and stops before the next record"
 		);
 	}
 
