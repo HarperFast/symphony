@@ -573,7 +573,6 @@ class ServerState {
 		this.recheckStatus();
 	}
 
-	// symphony#53: both processes accept on the same SO_REUSEPORT ports until one exits.
 	private considerStandingDown(owner: StatusOwner, verified: boolean): void {
 		const missing = owner.listeners ? this.endpoints().filter((e) => !owner.listeners!.includes(e)) : [];
 		const ownStart = procStat(process.pid)?.startTicks;

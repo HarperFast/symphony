@@ -638,9 +638,8 @@ impl SymphonyProxyWrap {
 
 	#[napi]
 	pub async fn start(&self) -> Result<()> {
-		// Every socket is bound before any accept loop exists, so a rejected start() never served
-		// a connection and leaves nothing listening. symphony-server relies on this: a resolved
-		// start() is what lets a successor claim status.json and retire the process it replaces.
+		// Every socket is bound before any accept loop exists: symphony-server publishes status.json,
+		// which lets it retire the process it replaces, only once start() has resolved.
 		let mut shutdown_tx = self.shutdown_tx.lock().unwrap();
 		if shutdown_tx.is_some() {
 			return Err(napi::Error::from_reason("proxy is already started"));
