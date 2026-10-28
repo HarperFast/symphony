@@ -175,7 +175,7 @@ export interface SymphonyProxyEvents {
  */
 export class SymphonyProxy extends EventEmitter {
 	private readonly _inner: SymphonyProxyWrap;
-	private _started = false;
+	private _started: Promise<void> | null = null;
 
 	constructor(config: ProxyConfig) {
 		super();
@@ -266,16 +266,25 @@ export class SymphonyProxy extends EventEmitter {
 		}
 	}
 
-	async start(): Promise<void> {
-		if (this._started) return;
-		this._started = true;
-		await this._inner.start();
-		this.emit('ready');
+	/** Resolves once every listener is bound; rejects, leaving nothing listening, if any can't be. */
+	start(): Promise<void> {
+		this._started ??= this._inner.start().then(
+			() => {
+				this.emit('ready');
+			},
+			(err: unknown) => {
+				this._started = null;
+				throw err;
+			}
+		);
+		return this._started;
 	}
 
 	async stop(timeoutMs = 100): Promise<void> {
+		// A start still binding would otherwise install its listeners after this stop ran.
+		await this._started?.catch(() => {});
 		await this._inner.stop(timeoutMs);
-		this._started = false;
+		this._started = null;
 		this.emit('close');
 	}
 

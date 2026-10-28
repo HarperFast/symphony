@@ -10,7 +10,16 @@ symphony is a **napi-rs cdylib** loaded by Node.js. The tokio multi-thread runti
 
 ### Standalone server (`ts/server.ts` → `dist/server.js`, the `symphony-server` bin)
 
-For consumers that want symphony as its own OS process rather than embedded in their Node app, the package ships a `symphony-server` bin. It reads a JSON config file (`{ version, proxies: [{ listeners, routes }] }` — one entry per port-set, since the route table is per-proxy), constructs a `SymphonyProxy` per entry, and **watches the config file** to hot-reload (route change → `updateConfig`; listener change → recreate that proxy). Cert material may be given inline (`certChain`/`privateKey`) or by path (`certChainFile`/`privateKeyFile`) — the path form is resolved in `server.ts` only, so the napi `CertConfig` stays inline-only. It writes a `status.json` (`{ pid, version, startedAt, ports, ... }`) for supervisors that names the newest live process on that config. No process deletes it on stop, because a successor can rename its status over the path between an ownership check and the unlink; supervisors read a dead pid as not running. During an overlapped upgrade the outgoing process doesn't rewrite it once its successor has claimed it, and keeps checking so it can take the file back if the successor exits first. The successor re-checks for 15s after each write and takes the file back from an older or dead owner, which covers incumbents that predate the guard. It handles `SIGHUP` (reload) / `SIGTERM`/`SIGINT` (graceful stop). host-manager uses this to supervise symphony out-of-process.
+For consumers that want symphony as its own OS process rather than embedded in their Node app, the package ships a `symphony-server` bin. It reads a JSON config file (`{ version, proxies: [{ listeners, routes }] }` — one entry per port-set, since the route table is per-proxy), constructs a `SymphonyProxy` per entry, and **watches the config file** to hot-reload (route change → `updateConfig`; listener change → recreate that proxy). Cert material may be given inline (`certChain`/`privateKey`) or by path (`certChainFile`/`privateKeyFile`) — the path form is resolved in `server.ts` only, so the napi `CertConfig` stays inline-only. It writes a `status.json` (`{ pid, version, startedAt, ports, ... }`) for supervisors that names the newest live process on that config. No process deletes it on stop, because a successor can rename its status over the path between an ownership check and the unlink; supervisors read a dead pid as not running. Every process reads it once a second for life (`recheckStatus`, after a faster 1/2/4/8-poll phase following each own write): a newer same-config owner makes it stop rewriting the file, and a dead or older owner makes it take the file back, which also covers incumbents that predate the guard. It handles `SIGHUP` (reload) / `SIGTERM`/`SIGINT` (graceful stop). host-manager uses this to supervise symphony out-of-process.
+
+**An outgoing process stops itself (symphony#53).** host-manager spawns symphony detached so proxying survives host-manager restarts, so nothing kills an incumbent whose handoff failed partway, and `SO_REUSEPORT` lets both processes accept forever. `considerStandingDown` (in the yield branch of `writeStatus`) runs the normal `SIGTERM` stop once one newer owner, identified by `(pid, startedAt)`, has held `status.json` continuously for `SUPERSEDE_GRACE_MS` (10 s). Four conditions keep that from ever leaving nothing serving, and each closes a real hole:
+
+- **`start()` resolving means bound.** `SymphonyProxyWrap::start` binds every worker socket of every listener (`listener::bind_workers`) before it spawns any accept loop, and rejects with nothing listening if one fails. Before, it returned before binding, so a successor whose bind failed still published `status.json` and could retire the only working process.
+- **Coverage.** The owner's `listeners` (`host:port` of its committed proxies) must include every listener this process has. A successor that could not read a listener cert this process still has cached would otherwise take over without that port.
+- **Verified identity.** `servesConfig` must read `/proc/<pid>/cmdline` and `cwd` (the peer's `--config` is resolved against its own cwd, so relative paths match) and the status `configPath` must match. The liveness-only fallback without `/proc` still yields the file but never retires.
+- **Continuous tenure.** The clock restarts when the owner changes, dies, stops qualifying, or the file names this process again. 10 s exceeds host-manager's reap of a failed successor (its 10 s readiness wait, then SIGTERM and SIGKILL after 5 s), so a successor being reaped is seen to exit first.
+
+The last check is the tick that calls `onSuperseded`. A successor that dies during the stop itself (admin close, pending reconcile, 100 ms per proxy) is not re-checked, and the supervisor's health poll respawns. `PR_SET_PDEATHSIG` is deliberately not used: dying with host-manager would cut all traffic on every host-manager restart.
 
 ### Admin/metrics endpoint (`ts/admin.ts`)
 
@@ -96,6 +105,25 @@ copy of an injected header so the value is authoritative (anti-spoof). `proxy_co
 fingerprint + the connection's `local_addr` (the PROXY v2 destination) into `apply_source_header`.
 Keep v2 **opt-in**: HAProxy/nginx speak it, but Harper core's own UDS reader currently parses v1 only,
 so the UDS default stays v1.
+
+### IPv4 clients of a dual-stack listener are IPv4 everywhere
+A `[::]` listener reports an IPv4 client as `::ffff:a.b.c.d`, and `IpNetwork::contains` is
+family-strict. Every place that matches a peer against CIDRs converts it with `to_canonical()`:
+`ProtectionState::check_at` (once, at the top, so the `ip_table` key for rate/penalty/concurrency
+state is canonical too — one client, one bucket; symphony#68), `SourceAllowlist::permits`
+(`allowedSources`, ingress `trustedSources`). Every CIDR list is parsed by
+`router::parse_source_network`, which stores a mapped entry as IPv4; a mapped entry left in v6 form
+would never match a canonical peer. The address forwarded upstream and reported in `'blocked'`
+events is left as accepted.
+
+### The default route (`sni: ''`)
+`build_route_table` puts the empty-SNI spec in `RouteTable::default` (symphony#47); everything
+before insertion — duplicate selection, tombstones, cert carry-forward, `client_auth` — keys it by
+`""` like any other SNI, and `get_for_spec_sni("")` returns `default` so carry-forward finds it.
+`resolve_with(sni, allow_default: false)` is used where only a route configured for the name may
+answer: the failover ingress, and the ACME http-01 proxy in `http_listener.rs` (a default upstream
+answering challenges for any `Host` could validate certificates for names it does not serve).
+`RouteTable::resolve` is test-only so production lookups state that choice.
 
 ### Per-route `allowedSources` (`router.rs::SourceAllowlist`)
 A route attribute, not a protection check: protection runs before route selection and is
@@ -292,8 +320,9 @@ without `Buffer`, like `JsProtectionConfig`, already have `#[test]` coverage) wi
 instead.
 
 - **`util.ts`** — self-signed cert generation via `openssl` (or a fallback baked-in cert if openssl is unavailable), free-port helper, echo servers, TLS/TCP round-trip helpers
-- **`proxy.spec.ts`** — TLS termination, wildcard SNI routing, `updateConfig` hot-swap
-- **`protection.spec.ts`** — rate limit token bucket exhaustion, CIDR blocklist in `blockedIps()`
+- **`proxy.spec.ts`** — TLS termination, wildcard SNI routing, `updateConfig` hot-swap, all-or-nothing `start()`, the default route
+- **`protection.spec.ts`** — rate limit token bucket exhaustion, CIDR blocklist in `blockedIps()`, IPv4 clients of a `[::]` listener (skips where `net.ipv6.bindv6only=1`)
+- **`server.spec.ts`** — the `symphony-server` bin as real processes: reloads, cert-file watching, `status.json` ownership, and an older process standing down (short `SYMPHONY_STATUS_POLL_MS` / `SYMPHONY_SUPERSEDE_GRACE_MS`, test-only env overrides)
 - **`suspended.spec.ts`** — hold → resolve → proxy, hold → null → close, hold → timeout → drop
 - **`mtls.spec.ts`** — mTLS termination + PROXY v2 TLV forwarding of the client cert chain (0xE2, SSL TLV 0x20); skips without openssl
 - **`metrics.spec.ts`** — per-listener breakdown and byte counting, `renderPrometheus` output shape, the admin endpoint over UDS + TCP, and stale-socket reclaim after a `SIGKILL`

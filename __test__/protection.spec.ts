@@ -3,11 +3,13 @@
  */
 
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as tls from 'node:tls';
-import { after, before, describe, it } from 'node:test';
+import { after, before, describe, it, type TestContext } from 'node:test';
 import { SymphonyProxy } from '../ts/proxy.js';
-import { generateSelfSignedCert, getFreePort, startEchoServer, sleep } from './util.js';
+import type { ProtectionConfig } from '../ts/types.js';
+import { generateSelfSignedCert, getFreePort, startEchoServer, sleep, tlsRoundTrip } from './util.js';
 
 /** Attempt a raw TCP connection without reading/writing, then close it. */
 async function openAndClose(port: number): Promise<void> {
@@ -669,5 +671,84 @@ describe('Protection – fingerprint blocklist validation', () => {
 			/invalid ja4Blocklist/,
 			'unreachable version should be rejected',
 		);
+	});
+});
+
+// symphony#68: a `[::]` listener reports an IPv4 client as `::ffff:a.b.c.d`; protection must match it
+// against IPv4 entries.
+describe('Protection – IPv4 clients of a dual-stack listener', () => {
+	const cert = generateSelfSignedCert('localhost');
+	const dualStack =
+		process.platform !== 'linux' || fs.readFileSync('/proc/sys/net/ipv6/bindv6only', 'utf8').trim() === '0';
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+
+	before(async () => {
+		echo = await startEchoServer();
+	});
+
+	after(async () => {
+		await echo.close();
+	});
+
+	async function dualStackProxy(
+		t: TestContext,
+		protection: ProtectionConfig
+	): Promise<{ proxy: SymphonyProxy; port: number; blocked: { ip: string; reason: string }[] } | undefined> {
+		if (!dualStack) {
+			t.skip('[::] is IPv6-only here (net.ipv6.bindv6only=1)');
+			return undefined;
+		}
+		const port = await getFreePort();
+		const proxy = new SymphonyProxy({
+			listeners: [{ host: '[::]', port, protection }],
+			routes: [
+				{
+					sni: 'localhost',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+				},
+			],
+		});
+		try {
+			await proxy.start();
+		} catch (err) {
+			t.skip(`no IPv6 listener: ${(err as Error).message}`);
+			return undefined;
+		}
+		t.after(() => proxy.stop());
+		const blocked: { ip: string; reason: string }[] = [];
+		proxy.on('blocked', (event) => blocked.push(event));
+		return { proxy, port, blocked };
+	}
+
+	const roundTrip = (port: number) => tlsRoundTrip({ port, servername: 'localhost', data: Buffer.from('ping') });
+
+	it('blocks an IPv4 client covered by an IPv4 blocklist entry', async (t) => {
+		const setup = await dualStackProxy(t, { blocklist: ['127.0.0.0/8'] });
+		if (!setup) return;
+		await assert.rejects(roundTrip(setup.port));
+		await sleep(20);
+		assert.deepEqual(
+			setup.blocked.map(({ ip, reason }) => ({ ip, reason })),
+			[{ ip: '::ffff:127.0.0.1', reason: 'cidr_blocked' }],
+			'the event keeps the address as accepted'
+		);
+	});
+
+	it('exempts an IPv4 client named by an IPv4 allowlist entry, and counts the others as IPv4', async (t) => {
+		const rateLimit = { connectionsPerSecond: 1, burst: 1 };
+		const limited = await dualStackProxy(t, { rateLimit });
+		if (!limited) return;
+		assert.equal((await roundTrip(limited.port)).toString(), 'ping');
+		await assert.rejects(roundTrip(limited.port));
+		await sleep(20);
+		assert.equal(limited.blocked[0]?.reason, 'rate_limited');
+		assert.deepEqual(limited.proxy.blockedIps().rateLimited, ['127.0.0.1']);
+
+		const exempt = await dualStackProxy(t, { rateLimit, allowlist: ['127.0.0.1/32'] });
+		if (!exempt) return;
+		for (let i = 0; i < 3; i++) assert.equal((await roundTrip(exempt.port)).toString(), 'ping');
+		assert.deepEqual(exempt.blocked, []);
 	});
 });

@@ -165,12 +165,19 @@ Both fields accept PEM-encoded strings or `Buffer`. The cert chain may include i
 | `sustained` | `{ connectionsPerMinute, burst? }` | — | Per-minute token bucket per source IP (independent of `rateLimit`) |
 | `penaltyBox` | `{ durationMs? }` | — | Block an IP for `durationMs` after any rate limit exhaustion |
 | `maxConcurrentPerIp` | `number` | `0` (unlimited) | Max simultaneous connections per source IP |
-| `allowlist` | `string[]` | `[]` | CIDRs that bypass all checks |
-| `blocklist` | `string[]` | `[]` | CIDRs that are always blocked |
+| `allowlist` | `string[]` | `[]` | CIDRs that bypass all checks. IPv4 clients of a dual-stack listener are matched as IPv4 (see below) |
+| `blocklist` | `string[]` | `[]` | CIDRs that are always blocked. IPv4 clients of a dual-stack listener are matched as IPv4 (see below) |
 | `ja3Blocklist` | `string[]` | `[]` | JA3 MD5 hex fingerprints to block (32 chars each) |
 | `ja4Blocklist` | `string[]` | `[]` | JA4 TLS fingerprints to block (36-char strings; see [JA4 blocking](#ja4-blocking)) |
 | `tlsHandshakeTimeoutMs` | `number` | `10000` | Abort slow TLS handshakes |
 | `requireSni` | `boolean` | `false` | Reject connections without an SNI extension |
+
+A dual-stack (`[::]`) listener reports an IPv4 client as `::ffff:a.b.c.d`. Protection treats it as
+`a.b.c.d`: only IPv4 `allowlist`/`blocklist` entries match it (`::/0` does not; use `0.0.0.0/0`
+alongside it), it shares rate-limit, penalty and concurrency state with that IPv4 address, and
+`blockedIps()` reports the IPv4 form. An IPv4-mapped entry (`::ffff:10.0.0.0/104`) is stored as its
+IPv4 form (`10.0.0.0/8`); one with a prefix under 96 is rejected. The `'blocked'` event still
+reports the address as accepted.
 
 ---
 
@@ -236,6 +243,16 @@ routes: [
   { sni: '', ... },                        // catch-all default
 ]
 ```
+
+The default route serves a connection that sends no SNI (including a plain-TCP client on a
+passthrough route, which sends no ClientHello at all) and one whose SNI matches no exact or
+wildcard route. It is never used for:
+
+- a name whose own exact or wildcard route was rejected: that name resolves to nothing;
+- a [failover ingress](#peer-failover) listener, which closes an unmatched name before the handshake so the forwarding node tries its next peer;
+- an ACME challenge on an [HTTP listener](#http-listener-acme--https-redirect): only a route configured for the `Host` can answer one, so the default route's upstream can't validate certificates for names it doesn't serve.
+
+`requireSni: true` still blocks a connection with no SNI before any route is chosen.
 
 ### Suspended routes
 
@@ -949,6 +966,27 @@ proxy.updateConfig({
 **What can be hot-swapped:** routes (destinations, TLS certs, suspension state, `failover`), per-listener protection (CIDR allowlist/blocklist, JA3 blocklist, rate limits, sustained rate limits, penalty box, concurrency caps, handshake timeout, requireSni), and a failover ingress listener's `trustedSources`.
 
 **What requires a restart:** bind address, port, idle timeout, worker threads. When calling `updateConfig()` directly, protection presence (None↔Some) cannot change at runtime — the listener must be restarted. The `symphony-server` bin handles this automatically via seamless recreate.
+
+`start()` binds every listener before it accepts a connection on any of them. If one can't bind, it
+rejects and leaves nothing listening; calling it again retries.
+
+---
+
+## Replacing a running `symphony-server`
+
+A supervisor upgrades `symphony-server` by starting the new process on the same `--config` and
+`--status` paths while the old one still runs; `SO_REUSEPORT` lets both accept on the same ports.
+`status.json` names the newest live process (`pid`, `version`, `startedAt`, `configPath`, `ports`,
+and `listeners` — the `host:port` of every listener it has bound). The supervisor waits for the
+file to name the new process, then sends the old one `SIGTERM`.
+
+If the old process is not stopped (a handoff that failed partway, or a supervisor that restarted
+during it), it stops itself: once a newer process has held `status.json` for 10 seconds, serving
+the same config on every listener the old process has, the old process runs its normal `SIGTERM`
+stop and exits. Each second it checks again, and it starts the 10 seconds over if the newer
+process exits, stops naming itself in the file, or stops covering one of its listeners. It never
+exits for a process it can't verify through `/proc`, so on platforms without `/proc` it waits for
+its supervisor. A process that stops never deletes `status.json`.
 
 ---
 

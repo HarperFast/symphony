@@ -132,8 +132,6 @@ async function startNode(
 	});
 	await proxy.start();
 	t.after(() => proxy.stop());
-	// start() resolves before the listeners finish binding.
-	await sleep(50);
 	return { ...ports, socketPath, proxy, failoverRoute };
 }
 
@@ -330,11 +328,14 @@ describe('peer failover', () => {
 		const upstreamC = await startUdsUpstream(nodeC.socketPath);
 		t.after(() => upstreamC.close());
 		await markDown(nodeA);
+		// B's public listener does serve this name, from its default route (symphony#47).
+		assert.equal(await tryEcho({ port: b.publicPort }), 'ping');
+		assert.equal(otherUpstream.sources.length, 1);
 
 		assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
 		assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
 		assert.equal(upstreamC.sources.length, 2);
-		assert.equal(otherUpstream.sources.length, 0);
+		assert.equal(otherUpstream.sources.length, 1);
 		const ingressB = nodeB.proxy.metrics().listeners.find((l) => l.address === `127.0.0.1:${b.ingressPort}`)!;
 		assert.equal(count(ingressB.errorsByReason, 'no_route'), 1);
 	});

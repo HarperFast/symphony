@@ -200,7 +200,7 @@ impl SourceAllowlist {
 /// matching, so the mapped form would otherwise never match anything. One with a prefix under 96
 /// (`::ffff:10.0.0.0/8`, an IPv4 length on the mapped form) would instead be a v6 network around
 /// `::`, so it is rejected.
-fn parse_source_network(entry: &str, label: &str) -> Result<IpNetwork, String> {
+pub(crate) fn parse_source_network(entry: &str, label: &str) -> Result<IpNetwork, String> {
 	let invalid =
 		|reason: &dyn std::fmt::Display| format!("invalid {label} CIDR '{entry}': {reason}");
 	let network: IpNetwork = entry.parse().map_err(|e| invalid(&e))?;
@@ -341,13 +341,14 @@ impl RouteTable {
 		&self.failover_routes
 	}
 
+	#[cfg(test)]
 	pub fn resolve(&self, sni: Option<&str>) -> Option<&Route> {
 		self.resolve_with(sni, true)
 	}
 
-	/// `allow_default: false` is the failover ingress lookup: a peer that does not serve this name
-	/// must close before the handshake so the forwarding node tries another peer, rather than
-	/// answer with the default route's certificate.
+	/// `allow_default: false` is for lookups where only a route configured for the name may answer:
+	/// the failover ingress (a peer that does not serve this name must close before the handshake
+	/// so the forwarding node tries another peer) and the ACME http-01 proxy.
 	pub fn resolve_with(&self, sni: Option<&str>, allow_default: bool) -> Option<&Route> {
 		let default = || {
 			if allow_default {
@@ -404,6 +405,8 @@ impl RouteTable {
 				.iter()
 				.find(|(s, _)| s.as_ref() == suffix)
 				.map(|(_, r)| r)
+		} else if sni.is_empty() {
+			self.default.as_ref()
 		} else {
 			self.exact.get(sni)
 		}
@@ -576,6 +579,7 @@ pub fn build_route_table(
 	let mut dropped_wildcard: Vec<Arc<str>> = Vec::new();
 	let mut client_auth: HashMap<Arc<str>, ClientAuth> = HashMap::new();
 	let mut failover_routes: Vec<FailoverRoute> = Vec::new();
+	let mut default: Option<Route> = None;
 	let last_exact: HashMap<&str, usize> = specs
 		.iter()
 		.enumerate()
@@ -804,13 +808,14 @@ pub fn build_route_table(
 		if spec.sni.starts_with("*.") {
 			let suffix: Arc<str> = Arc::from(&spec.sni[2..]);
 			wildcard.push((suffix, route));
+		} else if spec.sni.is_empty() {
+			default = Some(route);
 		} else {
 			let key: Arc<str> = Arc::from(spec.sni.as_str());
 			exact.insert(key, route);
 		}
 	}
 
-	let default = None;
 	let mut metric_identities: Vec<_> = exact
 		.values()
 		.chain(wildcard.iter().map(|(_, route)| route))
@@ -1414,6 +1419,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		let specs = vec![
 			tls_route("api.acme.com", CERT_A, KEY_B), // KeyMismatch — dropped, no last-good
 			tls_route("*.acme.com", CERT_A, KEY_A),
+			tls_route("", CERT_A, KEY_A),
 		];
 
 		let table = build_route_table(
@@ -1438,7 +1444,10 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	// matching subdomain must not fall through to the default route either.
 	#[test]
 	fn dropped_wildcard_route_does_not_fall_through_to_default() {
-		let specs = vec![tls_route("*.acme.com", CERT_A, KEY_B)]; // KeyMismatch — dropped
+		let specs = vec![
+			tls_route("*.acme.com", CERT_A, KEY_B), // KeyMismatch — dropped
+			tls_route("", CERT_A, KEY_A),
+		];
 
 		let table = build_route_table(
 			&specs,
@@ -1452,6 +1461,79 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			table.resolve(Some("api.acme.com")).is_none(),
 			"a subdomain matching a dropped wildcard must resolve to nothing, not fall through to default"
 		);
+		assert!(table.resolve(Some("api.other.com")).is_some());
+	}
+
+	fn route_name(route: Option<&Route>) -> Option<&str> {
+		route.map(|r| r.metric_identity.route.as_ref())
+	}
+
+	// symphony#47
+	#[test]
+	fn empty_sni_route_is_the_default_for_no_sni_and_unmatched_sni() {
+		let specs = vec![
+			tls_route("api.acme.com", CERT_A, KEY_A),
+			tls_route("*.acme.com", CERT_A, KEY_A),
+			tls_route("", CERT_A, KEY_A),
+		];
+		let table = build(&specs, &ListenerTlsSpec::empty(), None);
+
+		assert_eq!(route_name(table.resolve(None)), Some(""));
+		assert_eq!(route_name(table.resolve(Some("example.org"))), Some(""));
+		assert_eq!(
+			route_name(table.resolve(Some("api.acme.com"))),
+			Some("api.acme.com")
+		);
+		assert_eq!(
+			route_name(table.resolve(Some("www.acme.com"))),
+			Some("*.acme.com")
+		);
+		assert_eq!(route_name(table.resolve(Some("a.b.acme.com"))), Some(""));
+		assert!(table.resolve_with(None, false).is_none());
+		assert!(table.resolve_with(Some("example.org"), false).is_none());
+		assert_eq!(table.route_count(), 3);
+		assert!(table
+			.metric_identities()
+			.iter()
+			.any(|identity| identity.route.as_ref() == ""));
+
+		let without = build(&specs[..2], &ListenerTlsSpec::empty(), None);
+		assert!(without.resolve(None).is_none());
+		assert!(without.resolve(Some("example.org")).is_none());
+	}
+
+	#[test]
+	fn duplicate_default_routes_resolve_last_wins() {
+		let mut first = tls_route("", CERT_A, KEY_A);
+		first.metrics_group = "first".into();
+		let mut last = tls_route("", CERT_A, KEY_A);
+		last.metrics_group = "last".into();
+		let table = build(&[first, last], &ListenerTlsSpec::empty(), None);
+		assert_eq!(
+			table.resolve(None).unwrap().metric_identity.group.as_ref(),
+			"last"
+		);
+		assert_eq!(table.route_count(), 1);
+	}
+
+	#[test]
+	fn default_route_carries_forward_only_under_the_same_client_cert_policy() {
+		let listener = ListenerTlsSpec::empty();
+		let default_config = |table: &RouteTable| {
+			Arc::as_ptr(table.resolve(None).unwrap().tls_config.as_ref().unwrap())
+		};
+		let live = build(&[tls_route("", CERT_A, KEY_A)], &listener, None);
+
+		let carried = build(&[tls_route("", CERT_A, KEY_B)], &listener, Some(&live));
+		assert_eq!(default_config(&carried), default_config(&live));
+
+		let tightened = with_client_ca(tls_route("", CERT_A, KEY_B), CERT_A, true);
+		let dropped = build(&[tightened], &listener, Some(&live));
+		assert!(dropped.resolve(None).is_none());
+		assert!(dropped.resolve(Some("example.org")).is_none());
+
+		let initial = build(&[tls_route("", CERT_A, KEY_B)], &listener, None);
+		assert!(initial.resolve(None).is_none());
 	}
 
 	// The inverse and more dangerous case: a dropped wildcard must NOT shadow a healthy, more

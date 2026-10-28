@@ -248,6 +248,9 @@ impl ProtectionState {
 
 	/// Internal: same as check() but accepts an explicit `now_ns` timestamp for testing.
 	pub(crate) fn check_at(&self, peer_ip: IpAddr, peek_info: &PeekInfo, now: u64) -> Decision {
+		// A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`. One client is one
+		// identity: CIDR matching and the per-IP state both use the IPv4 form.
+		let peer_ip = peer_ip.to_canonical();
 		let cfg = self.config.load();
 
 		// 1. Allowlist — skip all other checks; active counter is NOT incremented.
@@ -402,7 +405,7 @@ impl ProtectionState {
 	/// if an eviction ran between admission and close.
 	#[cfg(test)]
 	pub fn release(&self, peer_ip: IpAddr) {
-		if let Some(state) = self.ip_table.get(&peer_ip) {
+		if let Some(state) = self.ip_table.get(&peer_ip.to_canonical()) {
 			state.release();
 		}
 	}
@@ -685,6 +688,79 @@ mod tests {
 			.store(Arc::new(ProtectionConfig::default().precompute()));
 		assert!(matches!(state.check(peer, &no_peek()), Decision::Allow(_)));
 		state.release(peer);
+	}
+
+	fn cidrs(entries: &[&str]) -> Vec<IpNetwork> {
+		entries
+			.iter()
+			.map(|e| crate::router::parse_source_network(e, "blocklist").unwrap())
+			.collect()
+	}
+
+	#[test]
+	fn ipv4_mapped_peers_match_ipv4_cidrs() {
+		let state = ProtectionState::new(ProtectionConfig {
+			blocklist: cidrs(&["10.0.0.0/8"]),
+			allowlist: cidrs(&["10.1.0.0/16"]),
+			..Default::default()
+		});
+		assert!(matches!(
+			state.check(ip("::ffff:10.2.0.1"), &no_peek()),
+			Decision::Block(BlockReason::CidrBlocked)
+		));
+		assert!(matches!(
+			state.check(ip("::ffff:10.1.0.1"), &no_peek()),
+			Decision::AllowBypassed
+		));
+		assert!(matches!(
+			state.check(ip("::ffff:192.0.2.1"), &no_peek()),
+			Decision::Allow(_)
+		));
+	}
+
+	#[test]
+	fn ipv4_mapped_cidrs_are_stored_as_ipv4_and_ipv6_supernets_skip_ipv4_peers() {
+		assert_eq!(cidrs(&["::ffff:10.0.0.0/104"]), cidrs(&["10.0.0.0/8"]));
+		assert!(crate::router::parse_source_network("::ffff:10.0.0.0/8", "blocklist").is_err());
+
+		let state = ProtectionState::new(ProtectionConfig {
+			blocklist: cidrs(&["::/0"]),
+			..Default::default()
+		});
+		assert!(matches!(
+			state.check(ip("::ffff:10.0.0.1"), &no_peek()),
+			Decision::Allow(_)
+		));
+		assert!(matches!(
+			state.check(ip("2001:db8::1"), &no_peek()),
+			Decision::Block(BlockReason::CidrBlocked)
+		));
+	}
+
+	#[test]
+	fn ipv4_and_mapped_forms_share_rate_and_concurrency_state() {
+		let state = ProtectionState::new(ProtectionConfig {
+			rate_limit_cps: Some(1.0),
+			rate_limit_burst: Some(2.0),
+			max_concurrent_per_ip: 2,
+			..Default::default()
+		});
+		let now = now_ns();
+		let Decision::Allow(_first) = state.check_at(ip("10.0.0.1"), &no_peek(), now) else {
+			panic!("first connection should be allowed");
+		};
+		let Decision::Allow(_second) = state.check_at(ip("::ffff:10.0.0.1"), &no_peek(), now)
+		else {
+			panic!("second connection should be allowed");
+		};
+		assert_eq!(state.ip_table.len(), 1);
+		assert!(matches!(
+			state.check_at(ip("::ffff:10.0.0.1"), &no_peek(), now),
+			Decision::Block(BlockReason::RateLimited)
+		));
+		let (rate_limited, concurrency_limited, _) = state.blocked_ips_at(now);
+		assert_eq!(rate_limited, vec![ip("10.0.0.1")]);
+		assert_eq!(concurrency_limited, vec![ip("10.0.0.1")]);
 	}
 
 	#[test]

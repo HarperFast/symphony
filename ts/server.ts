@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { readFileSync, writeFileSync, renameSync, unlinkSync, watch } from 'node:fs';
-import { dirname, isAbsolute, join, basename } from 'node:path';
+import { readFileSync, readlinkSync, writeFileSync, renameSync, unlinkSync, watch } from 'node:fs';
+import { dirname, isAbsolute, join, basename, resolve } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { SymphonyProxy } from './index.js';
 import type { ProxyConfig, ListenerConfig, RouteConfig, CertConfig, MtlsConfig } from './index.js';
 import { AdminServer, type AdminConfig, type MetricsSnapshot } from './admin.js';
@@ -159,26 +160,39 @@ function portKey(listeners: { port: number }[]): string {
 		.join(',');
 }
 
-// A peer started as this user with `--config <configPath>`. On Linux the cmdline check keeps a pid the
-// kernel has recycled from counting.
-function servesConfig(pid: number, configPath: string): boolean {
+// Whether a pid is a live process started as this user with `--config <configPath>`. `verified` reads
+// its argv and working directory from /proc, which also keeps a pid the kernel has recycled from
+// counting; `unverified` is liveness alone, where there is no /proc.
+function servesConfig(pid: number, configPath: string): 'verified' | 'unverified' | 'no' {
 	try {
 		process.kill(pid, 0);
 	} catch {
-		return false;
+		return 'no';
 	}
 	let argv: string[];
+	let cwd: string;
 	try {
 		argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
+		cwd = readlinkSync(`/proc/${pid}/cwd`);
 	} catch {
-		return process.platform !== 'linux';
+		return process.platform === 'linux' ? 'no' : 'unverified';
 	}
-	return argv.some((arg, i) => (arg === '--config' || arg === '-c') && argv[i + 1] === configPath);
+	const match = argv.some(
+		(arg, i) => (arg === '--config' || arg === '-c') && i + 1 < argv.length && resolve(cwd, argv[i + 1]) === configPath
+	);
+	return match ? 'verified' : 'no';
 }
 
 interface StatusOwner {
 	pid: number;
 	startedAt: string;
+	configPath?: string;
+	/** `host:port` of every listener the owner has bound. Absent from a pre-1.5 status. */
+	listeners?: string[];
+}
+
+function endpoint(l: { host?: string; port: number }): string {
+	return `${l.host ?? '0.0.0.0'}:${l.port}`;
 }
 
 // The newest process owns status.json; pid breaks a same-millisecond tie.
@@ -188,13 +202,32 @@ function startedAfter(a: StatusOwner, b: StatusOwner): boolean {
 	return aStart > bStart || (aStart === bStart && a.pid > b.pid);
 }
 
+// Test-only overrides, bounded so a bad value can't turn a timer into a busy loop.
+function durationFromEnv(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw === undefined) return fallback;
+	const ms = Number(raw);
+	if (Number.isSafeInteger(ms) && ms >= 1 && ms <= 600_000) return ms;
+	logErr(`ignoring ${name}=${raw}: expected whole milliseconds in [1, 600000]`);
+	return fallback;
+}
+
+// status.json is read this often for the life of the process: to take it back from a dead or older
+// owner, and to notice a newer one.
+const STATUS_POLL_MS = durationFromEnv('SYMPHONY_STATUS_POLL_MS', 1_000);
 // A peer without the writeStatus guard, or one that read status.json just before this process renamed
-// over it, can overwrite the file after this write. These look again and take it back.
-const STATUS_RECHECK_MS = [1_000, 2_000, 4_000, 8_000];
+// over it, can overwrite the file after this write. These look again sooner than the poll would.
+const STATUS_RECHECK_MS = [1, 2, 4, 8].map((n) => n * STATUS_POLL_MS);
+// How long a newer process must keep status.json, while serving every listener this one serves,
+// before this one stops. host-manager SIGTERMs this process itself as soon as the successor reports,
+// and on a failed handoff reaps the successor within 5 s (SIGTERM, then SIGKILL): longer than that, so
+// a successor that is being reaped is seen to exit before this process gives up its listeners.
+const SUPERSEDE_GRACE_MS = durationFromEnv('SYMPHONY_SUPERSEDE_GRACE_MS', 10_000);
 
 interface ActiveProxy {
 	proxy: SymphonyProxy;
 	constructionSig: string;
+	endpoints: string[];
 }
 
 class ServerState {
@@ -215,11 +248,16 @@ class ServerState {
 	private debounceTimer: NodeJS.Timeout | null = null;
 	private statusRecheck: NodeJS.Timeout | null = null;
 	private yieldedTo: number | null = null;
+	// The newer owner this process will stop for, and since when it has continuously qualified.
+	private supersededBy: { pid: number; startedAt: string; since: number } | null = null;
+	private standDownBlocked: string | null = null;
+	private readonly onSuperseded: (pid: number) => void;
 	private stopping = false;
 
-	constructor(configPath: string, statusPath: string) {
+	constructor(configPath: string, statusPath: string, onSuperseded: (pid: number) => void) {
 		this.configPath = configPath;
 		this.statusPath = statusPath;
+		this.onSuperseded = onSuperseded;
 		this.baseDir = dirname(configPath);
 		this.admin = new AdminServer(() => this.metricsSnapshot(), log, logErr);
 	}
@@ -404,7 +442,7 @@ class ServerState {
 					);
 					await proxy.start();
 					if (existing) await existing.proxy.stop().catch((err) => logErr(`stopping old proxy [${key}]:`, err));
-					this.active.set(key, { proxy, constructionSig });
+					this.active.set(key, { proxy, constructionSig, endpoints: proxyConfig.listeners.map(endpoint) });
 					log(`proxy listening on ports [${key}]`);
 				}
 			} catch (err) {
@@ -442,11 +480,21 @@ class ServerState {
 
 	private readStatusOwner(): StatusOwner | null {
 		try {
-			const { pid, startedAt } = JSON.parse(readFileSync(this.statusPath, 'utf8')) ?? {};
-			return typeof pid === 'number' && typeof startedAt === 'string' ? { pid, startedAt } : null;
+			const { pid, startedAt, configPath, listeners } = JSON.parse(readFileSync(this.statusPath, 'utf8')) ?? {};
+			if (typeof pid !== 'number' || typeof startedAt !== 'string') return null;
+			return {
+				pid,
+				startedAt,
+				configPath: typeof configPath === 'string' ? configPath : undefined,
+				listeners: Array.isArray(listeners) && listeners.every((l) => typeof l === 'string') ? listeners : undefined,
+			};
 		} catch {
 			return null;
 		}
+	}
+
+	private endpoints(): string[] {
+		return [...this.active.values()].flatMap((entry) => entry.endpoints);
 	}
 
 	// During an overlapped upgrade both processes reload on the same config write. The outgoing one
@@ -455,19 +503,21 @@ class ServerState {
 	private writeStatus(): void {
 		if (this.stopping) return;
 		const owner = this.readStatusOwner();
-		if (
-			owner &&
-			owner.pid !== process.pid &&
-			startedAfter(owner, { pid: process.pid, startedAt: this.startedAt }) &&
-			servesConfig(owner.pid, this.configPath)
-		) {
+		const identity =
+			owner && owner.pid !== process.pid && startedAfter(owner, { pid: process.pid, startedAt: this.startedAt })
+				? servesConfig(owner.pid, this.configPath)
+				: 'no';
+		if (owner && identity !== 'no') {
 			if (this.yieldedTo !== owner.pid) log(`status.json belongs to newer pid ${owner.pid}; not overwriting it`);
 			this.yieldedTo = owner.pid;
+			this.considerStandingDown(owner, identity === 'verified');
 			// Keep looking: if the successor exits while this process still serves, take the file back.
-			this.recheckStatus(STATUS_RECHECK_MS.length - 1);
+			this.recheckStatus(STATUS_RECHECK_MS.length);
 			return;
 		}
 		this.yieldedTo = null;
+		this.supersededBy = null;
+		this.standDownBlocked = null;
 		const ports = [...this.active.keys()].flatMap((k) => k.split(',').map(Number));
 		const status = {
 			pid: process.pid,
@@ -476,6 +526,7 @@ class ServerState {
 			reloadedAt: this.reloadedAt,
 			configPath: this.configPath,
 			ports,
+			listeners: this.endpoints(),
 		};
 		// Atomic write (temp + rename): the status file is rewritten on every reload, and a
 		// supervisor polling it concurrently must never read a half-written document. An overlapping
@@ -492,21 +543,66 @@ class ServerState {
 			} catch {
 				// never created, or already renamed into place
 			}
+			this.recheckStatus(STATUS_RECHECK_MS.length);
 		}
+	}
+
+	// Two processes on one config both accept on the same SO_REUSEPORT ports, so the older one keeps
+	// serving a share of connections (symphony#53). It stops once a newer one has held status.json for
+	// the whole grace while verifiably serving the same config on every listener this one has. A
+	// successor that exits or stops qualifying restarts the wait, so a crashed successor never leaves
+	// nothing serving.
+	private considerStandingDown(owner: StatusOwner, verified: boolean): void {
+		const missing = owner.listeners ? this.endpoints().filter((e) => !owner.listeners!.includes(e)) : [];
+		const blocked = !verified
+			? 'its identity cannot be verified without /proc'
+			: owner.configPath !== this.configPath
+				? 'its status names a different config'
+				: !owner.listeners
+					? 'its status does not list its listeners'
+					: missing.length
+						? `it is not listening on ${missing.join(', ')}`
+						: null;
+		if (blocked) {
+			if (this.standDownBlocked !== blocked) log(`not standing down for pid ${owner.pid}: ${blocked}`);
+			this.standDownBlocked = blocked;
+			this.supersededBy = null;
+			return;
+		}
+		this.standDownBlocked = null;
+		const now = performance.now();
+		if (this.supersededBy?.pid !== owner.pid || this.supersededBy.startedAt !== owner.startedAt) {
+			this.supersededBy = { pid: owner.pid, startedAt: owner.startedAt, since: now };
+			log(
+				`pid ${owner.pid} serves this config on every listener; stopping in ${SUPERSEDE_GRACE_MS} ms unless it exits`
+			);
+			return;
+		}
+		if (now - this.supersededBy.since >= SUPERSEDE_GRACE_MS) this.onSuperseded(owner.pid);
 	}
 
 	private recheckStatus(attempt: number): void {
 		if (this.statusRecheck) clearTimeout(this.statusRecheck);
 		this.statusRecheck = null;
-		if (this.stopping || attempt >= STATUS_RECHECK_MS.length) return;
+		if (this.stopping) return;
 		this.statusRecheck = setTimeout(() => {
 			this.statusRecheck = null;
 			// Queued behind any reconcile, so a rewrite never publishes a half-applied port set.
-			void this.reloading.then(() => {
-				if (this.readStatusOwner()?.pid === process.pid) this.recheckStatus(attempt + 1);
-				else this.writeStatus();
-			});
-		}, STATUS_RECHECK_MS[attempt]);
+			void this.reloading
+				.then(() => {
+					if (this.stopping) return;
+					if (this.readStatusOwner()?.pid === process.pid) {
+						this.supersededBy = null;
+						this.recheckStatus(attempt + 1);
+					} else {
+						this.writeStatus();
+					}
+				})
+				.catch((err) => {
+					logErr('status check failed:', err);
+					this.recheckStatus(STATUS_RECHECK_MS.length);
+				});
+		}, STATUS_RECHECK_MS[attempt] ?? STATUS_POLL_MS);
 		this.statusRecheck.unref();
 	}
 
@@ -588,22 +684,14 @@ async function main(): Promise<void> {
 		process.exit(args.help ? 0 : 1);
 	}
 
-	const configPath = isAbsolute(args.config!) ? args.config! : join(process.cwd(), args.config!);
-	const statusPath = args.status
-		? isAbsolute(args.status)
-			? args.status
-			: join(process.cwd(), args.status)
-		: join(dirname(configPath), 'status.json');
-
-	const state = new ServerState(configPath, statusPath);
-	log(`symphony-server v${pkg.version} starting (pid ${process.pid})`);
-	await state.start();
+	const configPath = resolve(args.config!);
+	const statusPath = args.status ? resolve(args.status) : join(dirname(configPath), 'status.json');
 
 	let shuttingDown = false;
-	const shutdown = (sig: string) => {
+	const shutdown = (reason: string) => {
 		if (shuttingDown) return;
 		shuttingDown = true;
-		log(`received ${sig}, shutting down`);
+		log(`${reason}, shutting down`);
 		state
 			.stop()
 			.then(() => process.exit(0))
@@ -612,8 +700,12 @@ async function main(): Promise<void> {
 				process.exit(1);
 			});
 	};
-	process.on('SIGTERM', () => shutdown('SIGTERM'));
-	process.on('SIGINT', () => shutdown('SIGINT'));
+	const state = new ServerState(configPath, statusPath, (pid) => shutdown(`superseded by pid ${pid}`));
+	log(`symphony-server v${pkg.version} starting (pid ${process.pid})`);
+	await state.start();
+
+	process.on('SIGTERM', () => shutdown('received SIGTERM'));
+	process.on('SIGINT', () => shutdown('received SIGINT'));
 	process.on('SIGHUP', () => {
 		log('received SIGHUP, reloading config');
 		void state.reconcile();
