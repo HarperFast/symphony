@@ -213,11 +213,8 @@ function durationFromEnv(name: string, fallback: number): number {
 }
 
 // status.json is read this often for the life of the process: to take it back from a dead or older
-// owner, and to notice a newer one.
+// owner (including one without the writeStatus guard that overwrote it), and to notice a newer one.
 const STATUS_POLL_MS = durationFromEnv('SYMPHONY_STATUS_POLL_MS', 1_000);
-// A peer without the writeStatus guard, or one that read status.json just before this process renamed
-// over it, can overwrite the file after this write. These look again sooner than the poll would.
-const STATUS_RECHECK_MS = [1, 2, 4, 8].map((n) => n * STATUS_POLL_MS);
 // How long a newer process must keep status.json, while serving every listener this one serves,
 // before this one stops. host-manager SIGTERMs this process itself as soon as the successor reports,
 // and on a failed handoff reaps the successor within 5 s (SIGTERM, then SIGKILL): longer than that, so
@@ -248,9 +245,9 @@ class ServerState {
 	private debounceTimer: NodeJS.Timeout | null = null;
 	private statusRecheck: NodeJS.Timeout | null = null;
 	private yieldedTo: number | null = null;
-	// The newer owner this process will stop for, and since when it has continuously qualified.
 	private supersededBy: { pid: number; startedAt: string; since: number } | null = null;
 	private standDownBlocked: string | null = null;
+	private claimHeld: string | null = null;
 	private readonly onSuperseded: (pid: number) => void;
 	private stopping = false;
 
@@ -503,21 +500,35 @@ class ServerState {
 	private writeStatus(): void {
 		if (this.stopping) return;
 		const owner = this.readStatusOwner();
+		const peer = owner && owner.pid !== process.pid ? owner : null;
 		const identity =
-			owner && owner.pid !== process.pid && startedAfter(owner, { pid: process.pid, startedAt: this.startedAt })
-				? servesConfig(owner.pid, this.configPath)
+			peer && (peer.configPath === undefined || peer.configPath === this.configPath)
+				? servesConfig(peer.pid, this.configPath)
 				: 'no';
-		if (owner && identity !== 'no') {
-			if (this.yieldedTo !== owner.pid) log(`status.json belongs to newer pid ${owner.pid}; not overwriting it`);
-			this.yieldedTo = owner.pid;
-			this.considerStandingDown(owner, identity === 'verified');
+		if (peer && identity !== 'no' && startedAfter(peer, { pid: process.pid, startedAt: this.startedAt })) {
+			if (this.yieldedTo !== peer.pid) log(`status.json belongs to newer pid ${peer.pid}; not overwriting it`);
+			this.yieldedTo = peer.pid;
+			this.considerStandingDown(peer, identity === 'verified');
 			// Keep looking: if the successor exits while this process still serves, take the file back.
-			this.recheckStatus(STATUS_RECHECK_MS.length);
+			this.recheckStatus();
 			return;
 		}
 		this.yieldedTo = null;
 		this.supersededBy = null;
 		this.standDownBlocked = null;
+		// A supervisor retires the process status.json named before as soon as it names this one, so
+		// claiming it from a live owner with a listener this process lacks (a cert it could not read,
+		// say) would leave that listener with nothing serving it.
+		const endpoints = this.endpoints();
+		const uncovered = identity !== 'no' ? peer?.listeners?.filter((e) => !endpoints.includes(e)) : undefined;
+		if (uncovered?.length) {
+			const held = `pid ${peer!.pid} listens on ${uncovered.join(', ')}, which this process does not`;
+			if (this.claimHeld !== held) log(`not taking status.json: ${held}`);
+			this.claimHeld = held;
+			this.recheckStatus();
+			return;
+		}
+		this.claimHeld = null;
 		const ports = [...this.active.keys()].flatMap((k) => k.split(',').map(Number));
 		const status = {
 			pid: process.pid,
@@ -526,7 +537,7 @@ class ServerState {
 			reloadedAt: this.reloadedAt,
 			configPath: this.configPath,
 			ports,
-			listeners: this.endpoints(),
+			listeners: endpoints,
 		};
 		// Atomic write (temp + rename): the status file is rewritten on every reload, and a
 		// supervisor polling it concurrently must never read a half-written document. An overlapping
@@ -535,7 +546,6 @@ class ServerState {
 		try {
 			writeFileSync(tmp, JSON.stringify(status, null, 2));
 			renameSync(tmp, this.statusPath);
-			this.recheckStatus(0);
 		} catch (err) {
 			logErr(`could not write status ${this.statusPath}:`, (err as Error).message);
 			try {
@@ -543,8 +553,8 @@ class ServerState {
 			} catch {
 				// never created, or already renamed into place
 			}
-			this.recheckStatus(STATUS_RECHECK_MS.length);
 		}
+		this.recheckStatus();
 	}
 
 	// Two processes on one config both accept on the same SO_REUSEPORT ports, so the older one keeps
@@ -581,7 +591,7 @@ class ServerState {
 		if (now - this.supersededBy.since >= SUPERSEDE_GRACE_MS) this.onSuperseded(owner.pid);
 	}
 
-	private recheckStatus(attempt: number): void {
+	private recheckStatus(): void {
 		if (this.statusRecheck) clearTimeout(this.statusRecheck);
 		this.statusRecheck = null;
 		if (this.stopping) return;
@@ -593,16 +603,16 @@ class ServerState {
 					if (this.stopping) return;
 					if (this.readStatusOwner()?.pid === process.pid) {
 						this.supersededBy = null;
-						this.recheckStatus(attempt + 1);
+						this.recheckStatus();
 					} else {
 						this.writeStatus();
 					}
 				})
 				.catch((err) => {
 					logErr('status check failed:', err);
-					this.recheckStatus(STATUS_RECHECK_MS.length);
+					this.recheckStatus();
 				});
-		}, STATUS_RECHECK_MS[attempt] ?? STATUS_POLL_MS);
+		}, STATUS_POLL_MS);
 		this.statusRecheck.unref();
 	}
 

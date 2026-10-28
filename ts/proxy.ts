@@ -176,6 +176,7 @@ export interface SymphonyProxyEvents {
 export class SymphonyProxy extends EventEmitter {
 	private readonly _inner: SymphonyProxyWrap;
 	private _started: Promise<void> | null = null;
+	private _lifecycle: Promise<unknown> = Promise.resolve();
 
 	constructor(config: ProxyConfig) {
 		super();
@@ -266,25 +267,32 @@ export class SymphonyProxy extends EventEmitter {
 		}
 	}
 
-	/** Resolves once every listener is bound; rejects, leaving nothing listening, if any can't be. */
+	/**
+	 * Resolves once every listener is bound; rejects, leaving nothing listening, if any can't be.
+	 * Concurrent calls share one start. start() and stop() run in call order.
+	 */
 	start(): Promise<void> {
-		this._started ??= this._inner.start().then(
+		if (this._started) return this._started;
+		const bound = this._lifecycle.then(() => this._inner.start());
+		this._lifecycle = bound.catch(() => {});
+		const started: Promise<void> = bound.then(
 			() => {
-				this.emit('ready');
+				process.nextTick(() => this.emit('ready'));
 			},
 			(err: unknown) => {
-				this._started = null;
+				if (this._started === started) this._started = null;
 				throw err;
 			}
 		);
-		return this._started;
+		this._started = started;
+		return started;
 	}
 
 	async stop(timeoutMs = 100): Promise<void> {
-		// A start still binding would otherwise install its listeners after this stop ran.
-		await this._started?.catch(() => {});
-		await this._inner.stop(timeoutMs);
 		this._started = null;
+		const stopped = this._lifecycle.then(() => this._inner.stop(timeoutMs));
+		this._lifecycle = stopped.catch(() => {});
+		await stopped;
 		this.emit('close');
 	}
 

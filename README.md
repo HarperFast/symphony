@@ -252,7 +252,9 @@ wildcard route. It is never used for:
 - a [failover ingress](#peer-failover) listener, which closes an unmatched name before the handshake so the forwarding node tries its next peer;
 - an ACME challenge on an [HTTP listener](#http-listener-acme--https-redirect): only a route configured for the `Host` can answer one, so the default route's upstream can't validate certificates for names it doesn't serve.
 
-`requireSni: true` still blocks a connection with no SNI before any route is chosen.
+`requireSni: true` still blocks a connection with no SNI before any route is chosen. A `failover`
+policy on the default route is ignored (logged and counted in `failingRoutes`): peers would refuse
+every connection it forwarded.
 
 ### Suspended routes
 
@@ -978,7 +980,10 @@ A supervisor upgrades `symphony-server` by starting the new process on the same 
 `--status` paths while the old one still runs; `SO_REUSEPORT` lets both accept on the same ports.
 `status.json` names the newest live process (`pid`, `version`, `startedAt`, `configPath`, `ports`,
 and `listeners` — the `host:port` of every listener it has bound). The supervisor waits for the
-file to name the new process, then sends the old one `SIGTERM`.
+file to name the new process, then sends the old one `SIGTERM`. A new process that could not bind
+a listener the running one has (a listener cert it can't read, say) does not take the file, so a
+supervisor never retires the only process serving that listener; host-manager reads that as a
+failed upgrade and keeps the old process.
 
 If the old process is not stopped (a handoff that failed partway, or a supervisor that restarted
 during it), it stops itself: once a newer process has held `status.json` for 10 seconds, serving
@@ -987,6 +992,10 @@ stop and exits. Each second it checks again, and it starts the 10 seconds over i
 process exits, stops naming itself in the file, or stops covering one of its listeners. It never
 exits for a process it can't verify through `/proc`, so on platforms without `/proc` it waits for
 its supervisor. A process that stops never deletes `status.json`.
+
+Only a process with this behavior stops itself. A `symphony-server` from 1.4.0 or earlier that is
+already running keeps running until something stops it, so clearing out processes left over from
+earlier upgrades needs the supervisor (or an operator) to stop them once.
 
 ---
 

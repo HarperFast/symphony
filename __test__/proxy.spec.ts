@@ -401,6 +401,27 @@ describe('SymphonyProxy – start() binds every listener or none', () => {
 	});
 });
 
+describe('SymphonyProxy – start() and stop() run in call order', () => {
+	it('restarts when start() is called while a stop() is still draining', async () => {
+		const echo = await startEchoServer();
+		const port = await getFreePort();
+		const proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port }],
+			routes: [{ sni: '', upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }], terminateTls: false }],
+		});
+		try {
+			await proxy.start();
+			const stopping = proxy.stop();
+			const restarting = proxy.start();
+			await Promise.all([stopping, restarting]);
+			assert.equal((await tcpRoundTrip({ port, data: 'ping' })).toString(), 'ping');
+		} finally {
+			await proxy.stop();
+			await echo.close();
+		}
+	});
+});
+
 // symphony#47
 describe('SymphonyProxy – default route (sni: "")', () => {
 	const cert = generateSelfSignedCert('localhost');

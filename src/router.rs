@@ -652,7 +652,14 @@ pub fn build_route_table(
 
 		let previous_route = previous.and_then(|p| p.get_for_spec_sni(&spec.sni));
 		// Failover adds availability; a broken policy must not remove the route itself.
-		let failover_policy = match spec.failover.as_ref().map(FailoverSpec::parse) {
+		// A peer's failover ingress never serves its default route, so every peer would refuse it.
+		let failover_policy = match spec.failover.as_ref().map(|f| {
+			if spec.sni.is_empty() {
+				Err("failover is not supported on the default route".to_string())
+			} else {
+				f.parse()
+			}
+		}) {
 			None => None,
 			Some(Ok(policy)) => Some(policy),
 			Some(Err(e)) => {
@@ -1500,6 +1507,15 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		let without = build(&specs[..2], &ListenerTlsSpec::empty(), None);
 		assert!(without.resolve(None).is_none());
 		assert!(without.resolve(Some("example.org")).is_none());
+	}
+
+	#[test]
+	fn default_route_is_served_without_failover() {
+		let default = with_failover(tls_route("", CERT_A, KEY_A), false, "127.0.0.1");
+		let table = build(&[default], &ListenerTlsSpec::empty(), None);
+		assert!(table.resolve(None).unwrap().failover.is_none());
+		assert!(table.failover_routes().is_empty());
+		assert_eq!(table.failing_route_count(), 1);
 	}
 
 	#[test]

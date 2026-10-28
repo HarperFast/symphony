@@ -936,9 +936,7 @@ describe(
 		skip: process.platform !== 'linux' && 'standing down needs /proc to verify the successor',
 	},
 	() => {
-		// Scaled down from 1 s / 10 s. The 1/2/4/8 recheck phase is counted in polls, so it ends after
-		// 15 polls (750 ms); every test starts its successor after that, so only the standing poll can
-		// notice it.
+		// Scaled down from 1 s / 10 s.
 		const POLL_MS = 50;
 		const GRACE_MS = 1000;
 		const env = { SYMPHONY_STATUS_POLL_MS: String(POLL_MS), SYMPHONY_SUPERSEDE_GRACE_MS: String(GRACE_MS) };
@@ -1016,14 +1014,11 @@ describe(
 		const running = (server: RunningServer): boolean =>
 			server.child.exitCode === null && server.child.signalCode === null;
 		const roundTrip = (port: number) => tlsRoundTrip({ port, servername: 'localhost', data: Buffer.from('ping') });
-		// Past the incumbent's 1/2/4/8-poll recheck phase.
-		const pastRecheckPhase = () => sleep(POLL_MS * 15 + 250);
 
 		it('exits after the grace once a newer process serves the same config, leaving it status.json', async () => {
 			const setup = await writeConfig('handoff');
 			// Relative --config / -c on both sides: they still recognise each other as serving one config.
 			const incumbent = await launch(setup, { cwd: dir, configArg: 'handoff.json' });
-			await pastRecheckPhase();
 			const successor = await launch(setup, { cwd: dir, configFlag: '-c', configArg: './handoff.json' });
 			const claimedAt = Date.now();
 			assert.deepEqual(status(setup)?.listeners, [`127.0.0.1:${setup.port}`]);
@@ -1042,7 +1037,6 @@ describe(
 		it('keeps serving and takes status.json back when the successor dies during the grace', async () => {
 			const setup = await writeConfig('successor-dies');
 			const incumbent = await launch(setup);
-			await pastRecheckPhase();
 			const successor = await launch(setup);
 			await waitFor(() => incumbent.getStdout().includes(`pid ${successor.child.pid} serves this config`));
 
@@ -1058,7 +1052,6 @@ describe(
 		it('stops normally on SIGTERM during the grace', async () => {
 			const setup = await writeConfig('sigterm-in-grace');
 			const incumbent = await launch(setup);
-			await pastRecheckPhase();
 			const successor = await launch(setup);
 			await waitFor(() => incumbent.getStdout().includes(`pid ${successor.child.pid} serves this config`));
 
@@ -1073,7 +1066,6 @@ describe(
 			const setup = await writeConfig('own-config');
 			const other = await writeConfig('other-config');
 			const incumbent = await launch(setup);
-			await pastRecheckPhase();
 			const stranger = spawnServer(other.configPath, setup.statusPath, { env });
 			servers.push(stranger);
 			await waitFor(() => stranger.getStdout().includes('watching'));
@@ -1083,7 +1075,7 @@ describe(
 			assert.doesNotMatch(incumbent.getStdout(), /superseded|serves this config/);
 		});
 
-		it('keeps serving when the newer process is missing one of its listeners', async () => {
+		it('a newer process missing one of its listeners does not claim status.json from it', async () => {
 			const keyFile = path.join(dir, 'listener-key.pem');
 			fs.writeFileSync(keyFile, cert.key);
 			const secondPort = await getFreePort();
@@ -1101,16 +1093,18 @@ describe(
 			assert.equal(status(setup)?.listeners?.length, 2);
 			// The successor can't build that listener; the incumbent keeps the one it already has.
 			fs.rmSync(keyFile);
-			await pastRecheckPhase();
-			const successor = await launch(setup);
-			assert.deepEqual(status(setup)?.listeners, [`127.0.0.1:${setup.port}`]);
+			const successor = spawnServer(setup.configPath, setup.statusPath, { env });
+			servers.push(successor);
 
 			await waitFor(() =>
-				incumbent
+				successor
 					.getStdout()
-					.includes(`not standing down for pid ${successor.child.pid}: it is not listening on 127.0.0.1:${secondPort}`)
+					.includes(
+						`not taking status.json: pid ${incumbent.child.pid} listens on 127.0.0.1:${secondPort}, which this process does not`
+					)
 			);
 			await sleep(GRACE_MS * 2);
+			assert.equal(status(setup)?.pid, incumbent.child.pid, 'a supervisor never sees the successor as ready');
 			assert.ok(running(incumbent), incumbent.getStdout());
 		});
 
@@ -1132,7 +1126,6 @@ describe(
 			const setup = await writeConfig('interrupted');
 			const incumbent = await launch(setup);
 			const own = status(setup)!;
-			await pastRecheckPhase();
 			const successor = {
 				pid: startPeer(setup.configPath),
 				startedAt: new Date().toISOString(),
@@ -1152,6 +1145,26 @@ describe(
 			await waitFor(() => !running(incumbent), GRACE_MS * 3);
 			incumbent.markShutdown();
 			assert.match(incumbent.getStdout(), new RegExp(`superseded by pid ${successor.pid}`));
+		});
+
+		it('does not stand down for a newer owner that is not listening on all of its listeners', async () => {
+			const setup = await writeConfig('uncovered');
+			const incumbent = await launch(setup);
+			const successor = {
+				pid: startPeer(setup.configPath),
+				startedAt: new Date().toISOString(),
+				configPath: setup.configPath,
+				listeners: [],
+			};
+			writeConfigAtomic(setup.statusPath, successor);
+
+			await waitFor(() =>
+				incumbent
+					.getStdout()
+					.includes(`not standing down for pid ${successor.pid}: it is not listening on 127.0.0.1:${setup.port}`)
+			);
+			await sleep(GRACE_MS * 2);
+			assert.ok(running(incumbent), incumbent.getStdout());
 		});
 	}
 );

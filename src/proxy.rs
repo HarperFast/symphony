@@ -1,7 +1,7 @@
 use crate::failover::{probe_periodically, FailoverSpec};
 use crate::http_listener::spawn_http_listeners;
 use crate::ingress::IngressState;
-use crate::listener::{bind_workers, spawn_listeners};
+use crate::listener::{bind_workers, set_rlimit_nofile, spawn_listeners};
 use crate::liveness::KeepaliveConfig;
 use crate::metrics::{total_of, GlobalMetrics, ListenerMetrics};
 use crate::protection::ProtectionState;
@@ -641,24 +641,30 @@ impl SymphonyProxyWrap {
 		// Every socket is bound before any accept loop exists, so a rejected start() never served
 		// a connection and leaves nothing listening. symphony-server relies on this: a resolved
 		// start() is what lets a successor claim status.json and retire the process it replaces.
+		let mut shutdown_tx = self.shutdown_tx.lock().unwrap();
+		if shutdown_tx.is_some() {
+			return Err(napi::Error::from_reason("proxy is already started"));
+		}
+		// Each connection needs 2 fds (client + upstream), plus headroom; capped at the hard limit.
+		if let Some(max) = self.listeners.iter().map(|l| l.max_connections).max() {
+			if max > 0 {
+				set_rlimit_nofile(max as u64 * 2 + 1024)?;
+			}
+		}
 		let bound = {
 			let _runtime = self.rt_handle.enter();
 			self.listeners
 				.iter()
 				.map(|l| {
-					bind_workers(
-						l.addr,
-						self.worker_threads,
-						l.max_connections,
-						self.keepalive.as_ref(),
-					)
-					.map_err(|e| napi::Error::from_reason(format!("listener {}: {e}", l.addr)))
+					bind_workers(l.addr, self.worker_threads, self.keepalive.as_ref())
+						.map_err(|e| napi::Error::from_reason(format!("listener {}: {e}", l.addr)))
 				})
 				.collect::<Result<Vec<_>>>()?
 		};
 
 		let (tx, _) = broadcast::channel(1);
-		*self.shutdown_tx.lock().unwrap() = Some(tx.clone());
+		*shutdown_tx = Some(tx.clone());
+		drop(shutdown_tx);
 
 		for ((i, listener), sockets) in self.listeners.iter().enumerate().zip(bound) {
 			let state = &self.listener_states[i];

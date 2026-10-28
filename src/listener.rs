@@ -9,20 +9,13 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 /// Bind N sockets for one listener address with SO_REUSEPORT, so the kernel distributes
-/// connections across N accept loops (N = tokio worker threads). Called for every listener of a
-/// proxy before any accept loop starts, so a failed `start()` never served a connection. Must run
-/// inside the proxy runtime: `TcpListener::from_std` registers with its reactor.
+/// connections across N accept loops (N = tokio worker threads). Must run inside the proxy
+/// runtime: `TcpListener::from_std` registers with its reactor.
 pub fn bind_workers(
 	addr: SocketAddr,
 	workers: usize,
-	max_connections: u32,
 	keepalive: Option<&KeepaliveConfig>,
 ) -> crate::error::Result<Vec<TcpListener>> {
-	// Raise RLIMIT_NOFILE if needed. Each connection needs 2 fds (client + upstream).
-	// We attempt to set it to 2 * max_connections + 1024 headroom, capped at the hard limit.
-	if max_connections > 0 {
-		set_rlimit_nofile(max_connections as u64 * 2 + 1024)?;
-	}
 	(0..workers.max(1))
 		.map(|_| {
 			Ok(TcpListener::from_std(make_reuseport_socket(
@@ -32,7 +25,6 @@ pub fn bind_workers(
 		.collect()
 }
 
-/// Run an accept loop on each bound socket until shutdown.
 pub async fn spawn_listeners(
 	listeners: Vec<TcpListener>,
 	max_connections: u32,
