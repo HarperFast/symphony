@@ -245,9 +245,6 @@ describe('HTTP-mode listener', () => {
 	});
 });
 
-// symphony#47: a default route answers TLS connections for unknown names, but an http-01 challenge
-// for a name with no route of its own must not reach the default route's upstream, which could then
-// validate certificates for names it does not serve.
 describe('HTTP-mode listener with a default route', () => {
 	let proxyPort: number;
 	let exact: HttpEchoServer;

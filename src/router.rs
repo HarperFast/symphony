@@ -1475,7 +1475,6 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		route.map(|r| r.metric_identity.route.as_ref())
 	}
 
-	// symphony#47
 	#[test]
 	fn empty_sni_route_is_the_default_for_no_sni_and_unmatched_sni() {
 		let specs = vec![

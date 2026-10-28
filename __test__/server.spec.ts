@@ -936,7 +936,6 @@ describe(
 		skip: process.platform !== 'linux' && 'standing down needs /proc to verify the successor',
 	},
 	() => {
-		// Scaled down from 1 s / 10 s.
 		const POLL_MS = 50;
 		const GRACE_MS = 1000;
 		const env = { SYMPHONY_STATUS_POLL_MS: String(POLL_MS), SYMPHONY_SUPERSEDE_GRACE_MS: String(GRACE_MS) };
@@ -1073,6 +1072,42 @@ describe(
 			await sleep(GRACE_MS * 2);
 			assert.ok(running(incumbent), incumbent.getStdout());
 			assert.doesNotMatch(incumbent.getStdout(), /superseded|serves this config/);
+		});
+
+		it('does not stand down for a stopped successor, and takes status.json back from it', async () => {
+			const setup = await writeConfig('stopped-successor');
+			const incumbent = await launch(setup);
+			const successor = await launch(setup);
+			await waitFor(() => incumbent.getStdout().includes(`pid ${successor.child.pid} serves this config`));
+
+			successor.child.kill('SIGSTOP');
+			try {
+				await waitFor(() => status(setup)?.pid === incumbent.child.pid, GRACE_MS);
+				await sleep(GRACE_MS * 2);
+				assert.ok(running(incumbent), incumbent.getStdout());
+			} finally {
+				successor.child.kill('SIGCONT');
+			}
+		});
+
+		it('does not claim status.json from a 1.4 owner listing a port it lacks', async () => {
+			const setup = await writeConfig('legacy-owner');
+			const server = await launch(setup);
+			const legacyPeer = startPeer(setup.configPath);
+			writeConfigAtomic(setup.statusPath, {
+				pid: legacyPeer,
+				version: '1.4.0',
+				startedAt: new Date(0).toISOString(),
+				configPath: setup.configPath,
+				ports: [setup.port, 1],
+			});
+
+			await waitFor(() =>
+				server
+					.getStdout()
+					.includes(`not taking status.json: pid ${legacyPeer} listens on port 1, which this process does not`)
+			);
+			assert.equal(status(setup)?.pid, legacyPeer);
 		});
 
 		it('a newer process missing one of its listeners does not claim status.json from it', async () => {

@@ -277,7 +277,9 @@ export class SymphonyProxy extends EventEmitter {
 		this._lifecycle = bound.catch(() => {});
 		const started: Promise<void> = bound.then(
 			() => {
-				process.nextTick(() => this.emit('ready'));
+				process.nextTick(() => {
+					if (this._started === started) this.emit('ready');
+				});
 			},
 			(err: unknown) => {
 				if (this._started === started) this._started = null;

@@ -328,7 +328,7 @@ describe('peer failover', () => {
 		const upstreamC = await startUdsUpstream(nodeC.socketPath);
 		t.after(() => upstreamC.close());
 		await markDown(nodeA);
-		// B's public listener does serve this name, from its default route (symphony#47).
+		// B's public listener serves this name from its default route.
 		assert.equal(await tryEcho({ port: b.publicPort }), 'ping');
 		assert.equal(otherUpstream.sources.length, 1);
 

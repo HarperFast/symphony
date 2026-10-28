@@ -674,8 +674,6 @@ describe('Protection – fingerprint blocklist validation', () => {
 	});
 });
 
-// symphony#68: a `[::]` listener reports an IPv4 client as `::ffff:a.b.c.d`; protection must match it
-// against IPv4 entries.
 describe('Protection – IPv4 clients of a dual-stack listener', () => {
 	const cert = generateSelfSignedCert('localhost');
 	const dualStack =

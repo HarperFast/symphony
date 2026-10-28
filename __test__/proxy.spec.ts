@@ -422,7 +422,6 @@ describe('SymphonyProxy – start() and stop() run in call order', () => {
 	});
 });
 
-// symphony#47
 describe('SymphonyProxy – default route (sni: "")', () => {
 	const cert = generateSelfSignedCert('localhost');
 	const tlsCert = { certChain: cert.cert, privateKey: cert.key };

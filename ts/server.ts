@@ -160,9 +160,9 @@ function portKey(listeners: { port: number }[]): string {
 		.join(',');
 }
 
-// Whether a pid is a live process started as this user with `--config <configPath>`. `verified` reads
-// its argv and working directory from /proc, which also keeps a pid the kernel has recycled from
-// counting; `unverified` is liveness alone, where there is no /proc.
+// Whether a pid is a running process started as this user with `--config <configPath>`. `verified`
+// reads its argv, working directory and run state from /proc, which also keeps a recycled pid, a
+// stopped process or a zombie from counting; `unverified` is liveness alone, where there is no /proc.
 function servesConfig(pid: number, configPath: string): 'verified' | 'unverified' | 'no' {
 	try {
 		process.kill(pid, 0);
@@ -177,6 +177,7 @@ function servesConfig(pid: number, configPath: string): 'verified' | 'unverified
 	} catch {
 		return process.platform === 'linux' ? 'no' : 'unverified';
 	}
+	if ('TtZX'.includes(procStat(pid)?.state ?? 'X')) return 'no';
 	const match = argv.some(
 		(arg, i) => (arg === '--config' || arg === '-c') && i + 1 < argv.length && resolve(cwd, argv[i + 1]) === configPath
 	);
@@ -187,8 +188,20 @@ interface StatusOwner {
 	pid: number;
 	startedAt: string;
 	configPath?: string;
+	ports?: number[];
 	/** `host:port` of every listener the owner has bound. Absent from a pre-1.5 status. */
 	listeners?: string[];
+}
+
+// Run state and boot-relative start time (clock ticks) from /proc/<pid>/stat.
+function procStat(pid: number): { state: string; startTicks: number } | undefined {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+		const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+		return { state: fields[0], startTicks: Number(fields[19]) };
+	} catch {
+		return undefined;
+	}
 }
 
 function endpoint(l: { host?: string; port: number }): string {
@@ -212,13 +225,9 @@ function durationFromEnv(name: string, fallback: number): number {
 	return fallback;
 }
 
-// status.json is read this often for the life of the process: to take it back from a dead or older
-// owner (including one without the writeStatus guard that overwrote it), and to notice a newer one.
 const STATUS_POLL_MS = durationFromEnv('SYMPHONY_STATUS_POLL_MS', 1_000);
-// How long a newer process must keep status.json, while serving every listener this one serves,
-// before this one stops. host-manager SIGTERMs this process itself as soon as the successor reports,
-// and on a failed handoff reaps the successor within 5 s (SIGTERM, then SIGKILL): longer than that, so
-// a successor that is being reaped is seen to exit before this process gives up its listeners.
+// Longer than host-manager's reap of a failed successor (SIGTERM, then SIGKILL after 5 s), so a
+// successor being reaped is seen to exit before this process gives up its listeners.
 const SUPERSEDE_GRACE_MS = durationFromEnv('SYMPHONY_SUPERSEDE_GRACE_MS', 10_000);
 
 interface ActiveProxy {
@@ -477,12 +486,13 @@ class ServerState {
 
 	private readStatusOwner(): StatusOwner | null {
 		try {
-			const { pid, startedAt, configPath, listeners } = JSON.parse(readFileSync(this.statusPath, 'utf8')) ?? {};
+			const { pid, startedAt, configPath, ports, listeners } = JSON.parse(readFileSync(this.statusPath, 'utf8')) ?? {};
 			if (typeof pid !== 'number' || typeof startedAt !== 'string') return null;
 			return {
 				pid,
 				startedAt,
 				configPath: typeof configPath === 'string' ? configPath : undefined,
+				ports: Array.isArray(ports) && ports.every((p) => typeof p === 'number') ? ports : undefined,
 				listeners: Array.isArray(listeners) && listeners.every((l) => typeof l === 'string') ? listeners : undefined,
 			};
 		} catch {
@@ -519,9 +529,16 @@ class ServerState {
 		// A supervisor retires the process status.json named before as soon as it names this one, so
 		// claiming it from a live owner with a listener this process lacks (a cert it could not read,
 		// say) would leave that listener with nothing serving it.
+		// A 1.4.0 or earlier owner lists only port numbers.
 		const endpoints = this.endpoints();
-		const uncovered = identity !== 'no' ? peer?.listeners?.filter((e) => !endpoints.includes(e)) : undefined;
-		if (uncovered?.length) {
+		const ports = [...this.active.keys()].flatMap((k) => k.split(',').map(Number));
+		const uncovered =
+			!peer || identity === 'no'
+				? []
+				: peer.listeners
+					? peer.listeners.filter((e) => !endpoints.includes(e))
+					: (peer.ports ?? []).filter((p) => !ports.includes(p)).map((p) => `port ${p}`);
+		if (uncovered.length) {
 			const held = `pid ${peer!.pid} listens on ${uncovered.join(', ')}, which this process does not`;
 			if (this.claimHeld !== held) log(`not taking status.json: ${held}`);
 			this.claimHeld = held;
@@ -529,7 +546,6 @@ class ServerState {
 			return;
 		}
 		this.claimHeld = null;
-		const ports = [...this.active.keys()].flatMap((k) => k.split(',').map(Number));
 		const status = {
 			pid: process.pid,
 			version: pkg.version,
@@ -557,22 +573,27 @@ class ServerState {
 		this.recheckStatus();
 	}
 
-	// Two processes on one config both accept on the same SO_REUSEPORT ports, so the older one keeps
-	// serving a share of connections (symphony#53). It stops once a newer one has held status.json for
-	// the whole grace while verifiably serving the same config on every listener this one has. A
-	// successor that exits or stops qualifying restarts the wait, so a crashed successor never leaves
-	// nothing serving.
+	// symphony#53: both processes accept on the same SO_REUSEPORT ports until one exits.
 	private considerStandingDown(owner: StatusOwner, verified: boolean): void {
 		const missing = owner.listeners ? this.endpoints().filter((e) => !owner.listeners!.includes(e)) : [];
+		const ownStart = procStat(process.pid)?.startTicks;
+		const ownerStart = procStat(owner.pid)?.startTicks;
+		// startedAt is wall-clock, which a step backward can reorder; boot-relative ticks can't be.
+		const startedLater =
+			ownStart !== undefined &&
+			ownerStart !== undefined &&
+			(ownerStart > ownStart || (ownerStart === ownStart && owner.pid > process.pid));
 		const blocked = !verified
 			? 'its identity cannot be verified without /proc'
-			: owner.configPath !== this.configPath
-				? 'its status names a different config'
-				: !owner.listeners
-					? 'its status does not list its listeners'
-					: missing.length
-						? `it is not listening on ${missing.join(', ')}`
-						: null;
+			: !startedLater
+				? 'it did not start after this process'
+				: owner.configPath !== this.configPath
+					? 'its status names a different config'
+					: !owner.listeners
+						? 'its status does not list its listeners'
+						: missing.length
+							? `it is not listening on ${missing.join(', ')}`
+							: null;
 		if (blocked) {
 			if (this.standDownBlocked !== blocked) log(`not standing down for pid ${owner.pid}: ${blocked}`);
 			this.standDownBlocked = blocked;
