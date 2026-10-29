@@ -21,7 +21,6 @@ const MAX_PAYLOAD: usize = 512;
 pub const LOAD_QUERY_TLV: u8 = 0xE3;
 const MAX_QUERY_NAMES: usize = 64;
 const MAX_NAME_LEN: usize = 253;
-/// 64 TLVs of a 253-byte name and its 3-byte TLV header.
 const MAX_LOCAL_PAYLOAD: usize = MAX_QUERY_NAMES * (3 + MAX_NAME_LEN);
 const LOAD_ANSWER_MAGIC: &[u8] = b"SYMPHONY-LOAD/1\n";
 
@@ -120,7 +119,6 @@ pub async fn read_proxy_v2<S: AsyncRead + Unpin>(
 		.unwrap_or(Err(HeaderReject::Timeout))
 }
 
-/// Each with its payload length.
 enum Command {
 	Proxy(usize),
 	Local(usize),
@@ -157,7 +155,6 @@ fn parse_fixed(fixed: &[u8; 16]) -> Result<Command, HeaderReject> {
 	Ok(Command::Proxy(len))
 }
 
-/// The address block's length for a family a LOCAL header may carry (it carries no client).
 fn address_len(family: u8) -> Option<usize> {
 	match family {
 		0x00 => Some(0),

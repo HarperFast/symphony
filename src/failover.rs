@@ -482,19 +482,25 @@ impl Failover {
 		}
 	}
 
-	pub fn spill_target(&self, client: SocketAddr) -> Option<usize> {
-		let spill = self.spill.as_ref()?;
+	/// Called only for a route with `spill` (the caller branches on the `Option`), so a route
+	/// without it pays nothing more.
+	pub fn spill_target(&self, spill: &Spill, client: SocketAddr) -> Option<usize> {
 		let packed = spill.state.admission.load(Ordering::Relaxed);
-		if packed == 0 || spill_hash(client) % 1000 >= packed & 0x3FF {
-			return None;
-		}
 		let admission = Admission::unpack(packed)?;
 		let now = now_ns();
-		(now / 1_000_000 < admission.until_ms)
-			.then(|| self.peers.get(admission.target))
-			.flatten()
-			.filter(|peer| !peer.cooling_down(now))
-			.map(|_| admission.target)
+		if now / 1_000_000 >= admission.until_ms {
+			// Cleared so later connections take the first exit; a newer admission is left alone.
+			let _ = spill.state.admission.compare_exchange(
+				packed,
+				0,
+				Ordering::Relaxed,
+				Ordering::Relaxed,
+			);
+			return None;
+		}
+		let peer = self.peers.get(admission.target)?;
+		(spill_hash(client) % 1000 < admission.fraction as u64 && !peer.cooling_down(now))
+			.then_some(admission.target)
 	}
 
 	pub fn report_ttl_ms(&self) -> u64 {
@@ -515,23 +521,31 @@ impl Failover {
 		down(destination) || destination_h2.is_some_and(down)
 	}
 
-	fn candidates_for(&self, mode: ForwardMode, now: u64) -> Vec<&FailoverPeer> {
-		match mode {
-			ForwardMode::Down => self.candidates(now).1.collect(),
-			// A local fallback exists, so a peer in cooldown is never worth the wait.
-			ForwardMode::Drain => self
-				.candidates(now)
-				.1
-				.filter(|p| !p.cooling_down(now))
-				.collect(),
-			ForwardMode::Spill(i) => self
+	fn candidates_for(
+		&self,
+		mode: ForwardMode,
+		now: u64,
+	) -> (usize, impl Iterator<Item = &FailoverPeer>) {
+		if let ForwardMode::Spill(i) = mode {
+			let peer = self
 				.peers
 				.get(i)
 				.map(|p| p.as_ref())
-				.filter(|p| !p.cooling_down(now))
-				.into_iter()
-				.collect(),
+				.filter(|p| !p.cooling_down(now));
+			return (usize::from(peer.is_some()), Either::Right(peer.into_iter()));
 		}
+		// Draining has a local fallback, so a peer in cooldown is never worth the wait.
+		let drain = mode == ForwardMode::Drain;
+		let (count, rotation) = self.candidates(now);
+		let count = if drain {
+			self.peers.iter().filter(|p| !p.cooling_down(now)).count()
+		} else {
+			count
+		};
+		(
+			count,
+			Either::Left(rotation.filter(move |p| !drain || !p.cooling_down(now))),
+		)
 	}
 
 	/// Peers to try, in order, and how many: round-robin over those not cooling down; if every
@@ -554,6 +568,22 @@ impl Failover {
 			ready.max(usize::from(earliest.is_some())),
 			rotation.chain(earliest).map(|p| p.as_ref()),
 		)
+	}
+}
+
+enum Either<L, R> {
+	Left(L),
+	Right(R),
+}
+
+impl<T, L: Iterator<Item = T>, R: Iterator<Item = T>> Iterator for Either<L, R> {
+	type Item = T;
+
+	fn next(&mut self) -> Option<T> {
+		match self {
+			Either::Left(l) => l.next(),
+			Either::Right(r) => r.next(),
+		}
 	}
 }
 
@@ -595,7 +625,7 @@ pub async fn forward_to_peers(
 	if !peek.complete || peek.hello_len == 0 {
 		return match mode {
 			ForwardMode::Down => Forwarded::Done(Err(ErrorKind::UpstreamConnect)),
-			_ => Forwarded::ServeLocally(handshake),
+			_ => give_up(&failover.status),
 		};
 	}
 	let budget = match mode {
@@ -605,8 +635,8 @@ pub async fn forward_to_peers(
 		ForwardMode::Spill(_) => (handshake / 2).min(SPILL_BUDGET),
 	};
 	let deadline = started + budget;
-	let candidates = failover.candidates_for(mode, now_ns());
-	if candidates.is_empty() {
+	let (candidate_count, candidates) = failover.candidates_for(mode, now_ns());
+	if candidate_count == 0 {
 		return give_up(&failover.status);
 	}
 
@@ -626,8 +656,7 @@ pub async fn forward_to_peers(
 		_ => return give_up(&failover.status),
 	}
 
-	let candidate_count = candidates.len();
-	for (attempt, peer) in candidates.into_iter().enumerate() {
+	for (attempt, peer) in candidates.enumerate() {
 		let remaining = deadline.saturating_duration_since(Instant::now());
 		if remaining.is_zero() {
 			break;
@@ -949,7 +978,6 @@ fn control(
 	admission
 }
 
-/// The admitted share (0 when nothing is admitted) and its target.
 pub fn spill_status(failover: &Failover, now_ns: u64) -> Option<(f64, Option<SocketAddr>)> {
 	let spill = failover.spill.as_ref()?;
 	Some(match spill.state.admission(now_ns / 1_000_000) {
@@ -1005,10 +1033,9 @@ pub async fn poll_peer_loads(live: Arc<LiveRouteTable>, mut shutdown: broadcast:
 		next_tick = Instant::now()
 			+ routes
 				.iter()
-				.map(|r| r.failover.probe_interval.max(MIN_LOAD_POLL))
+				.map(|r| r.failover.probe_interval.clamp(MIN_LOAD_POLL, CONTROL_TICK))
 				.min()
-				.unwrap_or(MAX_PROBE_TICK)
-				.min(CONTROL_TICK);
+				.unwrap_or(MAX_PROBE_TICK);
 		let now = now_ns();
 
 		let mut due: HashMap<SocketAddr, (Vec<Arc<str>>, u64)> = HashMap::new();
@@ -1626,7 +1653,11 @@ mod tests {
 		let fo = spill_failover(&[("10.0.0.1", 1), ("10.0.0.2", 1)], policy());
 		let spill = fo.spill.as_ref().unwrap();
 		let client = |port: u16| SocketAddr::new("198.51.100.7".parse().unwrap(), port);
-		assert_eq!(fo.spill_target(client(1)), None, "nothing admitted");
+		assert_eq!(
+			fo.spill_target(fo.spill.as_ref().unwrap(), client(1)),
+			None,
+			"nothing admitted"
+		);
 
 		let until_ms = now_ns() / 1_000_000 + 60_000;
 		spill.state.admission.store(
@@ -1639,17 +1670,49 @@ mod tests {
 			Ordering::Relaxed,
 		);
 		let spilled = (0..10_000u16)
-			.filter(|p| fo.spill_target(client(*p)).is_some())
+			.filter(|p| {
+				fo.spill_target(fo.spill.as_ref().unwrap(), client(*p))
+					.is_some()
+			})
 			.count();
 		assert!(
 			(2_600..3_400).contains(&spilled),
 			"about 30 %, got {spilled}"
 		);
-		assert!((0..10_000u16).all(|p| fo.spill_target(client(p)).is_none_or(|t| t == 1)));
+		assert!((0..10_000u16).all(|p| fo
+			.spill_target(fo.spill.as_ref().unwrap(), client(p))
+			.is_none_or(|t| t == 1)));
+
+		let expired = Admission {
+			fraction: 1000,
+			target: 1,
+			until_ms: now_ns() / 1_000_000 - 1,
+		};
+		spill
+			.state
+			.admission
+			.store(expired.pack(), Ordering::Relaxed);
+		assert_eq!(fo.spill_target(spill, client(1)), None);
+		assert_eq!(
+			spill.state.admission.load(Ordering::Relaxed),
+			0,
+			"an expired admission is cleared for the next connection"
+		);
+		spill.state.admission.store(
+			Admission {
+				fraction: 300,
+				target: 1,
+				until_ms,
+			}
+			.pack(),
+			Ordering::Relaxed,
+		);
 
 		fo.peers[1].record_failure(PeerFailureKind::Refused, 60 * S, 60 * S, now_ns());
 		assert!(
-			(0..1_000u16).all(|p| fo.spill_target(client(p)).is_none()),
+			(0..1_000u16).all(|p| fo
+				.spill_target(fo.spill.as_ref().unwrap(), client(p))
+				.is_none()),
 			"target cooling"
 		);
 	}
@@ -1686,12 +1749,17 @@ mod tests {
 		let fo = failover(&[("10.0.0.1", 1), ("10.0.0.2", 1)]);
 		fo.peers[0].record_failure(PeerFailureKind::Refused, 50, 50, 100);
 		fo.peers[1].record_failure(PeerFailureKind::Refused, 20, 20, 100);
-		assert!(fo.candidates_for(ForwardMode::Drain, 101).is_empty());
-		assert_eq!(fo.candidates_for(ForwardMode::Spill(1), 101).len(), 0);
-		let down = fo.candidates_for(ForwardMode::Down, 101);
-		assert_eq!(down.len(), 1);
-		assert_eq!(down[0].addr.ip().to_string(), "10.0.0.2");
-		assert_eq!(fo.candidates_for(ForwardMode::Drain, 200).len(), 2);
+		let list = |mode, now| {
+			let (count, peers) = fo.candidates_for(mode, now);
+			let peers: Vec<String> = peers.map(|p| p.addr.ip().to_string()).collect();
+			assert_eq!(count, peers.len());
+			peers
+		};
+		assert!(list(ForwardMode::Drain, 101).is_empty());
+		assert!(list(ForwardMode::Spill(1), 101).is_empty());
+		assert_eq!(list(ForwardMode::Down, 101), ["10.0.0.2"]);
+		assert_eq!(list(ForwardMode::Drain, 200).len(), 2);
+		assert_eq!(list(ForwardMode::Spill(1), 200), ["10.0.0.2"]);
 	}
 
 	#[test]
@@ -1754,7 +1822,10 @@ mod tests {
 			for port in 0..N {
 				let client = SocketAddr::new("198.51.100.7".parse().unwrap(), port as u16);
 				let decision = decide(false, false, false, black_box(fo).drain, || {
-					black_box(fo).spill_target(black_box(client))
+					black_box(fo)
+						.spill
+						.as_ref()
+						.and_then(|spill| fo.spill_target(spill, black_box(client)))
 				});
 				spilled += u32::from(decision != Decision::Local);
 			}

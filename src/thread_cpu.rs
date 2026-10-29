@@ -46,7 +46,6 @@ fn clk_tck_hz() -> u64 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TaskStat {
-	/// utime + stime.
 	ticks: u64,
 	/// Start time after boot, in clock ticks. Distinguishes a reused id from the thread it named.
 	start: u64,
@@ -97,12 +96,19 @@ impl ProcFs {
 		parse_nspid(&std::fs::read_to_string(path).ok()?)
 	}
 
-	/// The process's innermost pid and a map from each thread's innermost tid to its id here.
+	/// The process's innermost pid and, for a process in a nested namespace, a map from each thread's
+	/// innermost tid to its id here.
 	fn process_view(&self, host_pid: u32) -> Option<ProcessView> {
-		let innermost_pid = *self
-			.nspid(&self.root.join(format!("{host_pid}/status")))?
-			.last()?;
+		let nspid = self.nspid(&self.root.join(format!("{host_pid}/status")))?;
+		let innermost_pid = *nspid.last()?;
 		let mut threads = HashMap::new();
+		if nspid.len() == 1 {
+			return Some(ProcessView {
+				innermost_pid,
+				nested: false,
+				threads,
+			});
+		}
 		for entry in std::fs::read_dir(self.root.join(format!("{host_pid}/task"))).ok()? {
 			let Ok(entry) = entry else { continue };
 			if let Some(ids) = self.nspid(&entry.path().join("status")) {
@@ -113,6 +119,7 @@ impl ProcFs {
 		}
 		Some(ProcessView {
 			innermost_pid,
+			nested: true,
 			threads,
 		})
 	}
@@ -120,6 +127,8 @@ impl ProcFs {
 
 struct ProcessView {
 	innermost_pid: u32,
+	/// In a PID namespace below this procfs's; otherwise `threads` is not read (ids are the same).
+	nested: bool,
 	threads: HashMap<u32, u32>,
 }
 
@@ -154,7 +163,9 @@ fn resolve(
 	};
 	// The namespace check comes first: a namespaced pid can equal the host pid by coincidence, and
 	// its tid still needs translating.
-	let host_tid = if view.innermost_pid == configured_pid {
+	let host_tid = if view.innermost_pid == configured_pid && !view.nested {
+		configured_tid
+	} else if view.innermost_pid == configured_pid {
 		match view.threads.get(&configured_tid) {
 			Some(tid) => *tid,
 			None => return Identity::Unresolved,
@@ -211,7 +222,6 @@ pub struct ThreadCpu {
 	tid: u32,
 	/// Last measured utilisation, read by `UdsBalancer::pick` as a tiebreak. 0 when unknown.
 	util_permille: AtomicU32,
-	/// Written by the sampling task (and a discovery's result).
 	state: Mutex<SampleState>,
 }
 

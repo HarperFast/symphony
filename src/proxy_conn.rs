@@ -233,7 +233,10 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 			route.suspended,
 			failover.locally_down(&route.destination, route.destination_h2.as_ref()),
 			failover.drain,
-			|| failover.spill_target(peer_addr),
+			|| {
+				let spill = failover.spill.as_ref()?;
+				failover.spill_target(spill, peer_addr)
+			},
 		);
 		match decision {
 			crate::failover::Decision::Refuse => {

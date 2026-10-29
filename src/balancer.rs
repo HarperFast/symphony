@@ -95,7 +95,6 @@ struct AffinityMap {
 pub struct UdsBalancer {
 	sockets: Vec<UdsSlot>,
 	affinity: Option<AffinityMap>,
-	/// Smoothed load of the slots' worker threads, for peer spill-over.
 	load: Arc<LoadEwma>,
 }
 
@@ -143,30 +142,37 @@ impl UdsBalancer {
 		let Some(previous) = previous else {
 			return self;
 		};
-		let mut all_match = self.sockets.len() == previous.sockets.len();
 		for slot in &mut self.sockets {
-			let Some(cpu) = &slot.cpu else {
-				all_match &= previous
-					.sockets
-					.iter()
-					.any(|p| p.path == slot.path && p.cpu.is_none());
-				continue;
-			};
+			let Some(cpu) = &slot.cpu else { continue };
 			let inherited = previous
 				.sockets
 				.iter()
 				.filter_map(|p| p.cpu.as_ref())
 				.find(|p| p.configured() == cpu.configured())
 				.cloned();
-			all_match &= inherited.is_some();
 			if let Some(inherited) = inherited {
 				slot.cpu = Some(inherited);
 			}
 		}
-		if all_match {
+		// The same slots, duplicates included: otherwise the load would keep a removed worker's share.
+		if self.slot_ids() == previous.slot_ids() {
 			self.load = previous.load.clone();
 		}
 		self
+	}
+
+	fn slot_ids(&self) -> Vec<(&str, u32, u32)> {
+		let mut ids: Vec<(&str, u32, u32)> = self
+			.sockets
+			.iter()
+			.map(|s| {
+				s.cpu
+					.as_ref()
+					.map_or((s.path.as_ref(), 0, 0), |c| c.configured())
+			})
+			.collect();
+		ids.sort_unstable();
+		ids
 	}
 
 	/// Track per-slot health for a failover route, reusing `previous`'s state for any path it
@@ -420,6 +426,13 @@ mod tests {
 			.zip(cpus(&old))
 			.all(|(a, b)| Arc::ptr_eq(a, &b)));
 		assert!(Arc::ptr_eq(&same.load, &old.load));
+
+		let duplicated =
+			monitored(&[("/a.sock", 1, 10), ("/a.sock", 1, 10)]).with_cpu_from(Some(&old));
+		assert!(
+			!Arc::ptr_eq(&duplicated.load, &old.load),
+			"[A, B] → [A, A] is not the same slots"
+		);
 
 		let restarted =
 			monitored(&[("/a.sock", 1, 10), ("/b.sock", 1, 12)]).with_cpu_from(Some(&old));
