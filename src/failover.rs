@@ -482,8 +482,7 @@ impl Failover {
 		}
 	}
 
-	/// Called only for a route with `spill` (the caller branches on the `Option`), so a route
-	/// without it pays nothing more.
+	/// The caller branches on `failover.spill` first, so a route without spill never gets here.
 	pub fn spill_target(&self, spill: &Spill, client: SocketAddr) -> Option<usize> {
 		let packed = spill.state.admission.load(Ordering::Relaxed);
 		let admission = Admission::unpack(packed)?;
