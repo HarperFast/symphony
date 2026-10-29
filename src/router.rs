@@ -301,6 +301,8 @@ pub struct RouteTable {
 	/// SNIs served without failover because their `failover` policy is invalid. Separate from
 	/// `failing_snis` so one failure's log-once state cannot silence the other's.
 	invalid_failover: HashSet<Arc<str>>,
+	/// SNIs whose failover is served without spill-over because its `spill` policy is invalid.
+	invalid_spill: HashSet<Arc<str>>,
 	/// Exact SNIs dropped with no last-good route to carry forward (a subset of `failing_snis` —
 	/// this excludes SNIs whose last-good route IS still present in `exact`/`wildcard` and
 	/// serving traffic). `resolve()` must fail closed for these rather than falling through to a
@@ -328,9 +330,28 @@ impl RouteTable {
 	}
 
 	/// Number of SNIs rejected in this table — dropped, serving a carried-forward last-good cert, or
-	/// serving without an invalid `failover` policy. Non-zero means a config needs attention.
+	/// serving without an invalid `failover` (or `failover.spill`) policy. Non-zero means a config
+	/// needs attention.
 	pub fn failing_route_count(&self) -> usize {
-		self.failing_snis.union(&self.invalid_failover).count()
+		let mut failing: HashSet<&Arc<str>> = self.failing_snis.iter().collect();
+		failing.extend(&self.invalid_failover);
+		failing.extend(&self.invalid_spill);
+		failing.len()
+	}
+
+	/// This node's load for a peer's load query: the exact route configured for `name` (never a
+	/// wildcard or the default, which a spilled connection for that name might not reach), while it
+	/// is up, not draining and measurable. `None` = do not spill this name here.
+	pub fn load_answer(&self, name: &str, now: u64) -> Option<u32> {
+		let route = self.exact.get(name).filter(|r| !r.suspended)?;
+		if let Some(failover) = &route.failover {
+			if failover.drain
+				|| failover.locally_down(&route.destination, route.destination_h2.as_ref())
+			{
+				return None;
+			}
+		}
+		route_load(&route.destination, route.destination_h2.as_ref(), now).map(|(load, _)| load)
 	}
 
 	pub fn metric_identities(&self) -> &[Arc<RouteMetricIdentity>] {
@@ -574,6 +595,7 @@ pub fn build_route_table(
 	let mut affinity_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
 	let mut failing_snis: HashSet<Arc<str>> = HashSet::new();
 	let mut invalid_failover: HashSet<Arc<str>> = HashSet::new();
+	let mut invalid_spill: HashSet<Arc<str>> = HashSet::new();
 	let mut configured_wildcards = HashSet::with_capacity(specs.len());
 	let mut dropped_exact: HashSet<Arc<str>> = HashSet::new();
 	let mut dropped_wildcard: Vec<Arc<str>> = Vec::new();
@@ -661,7 +683,37 @@ pub fn build_route_table(
 			}
 		}) {
 			None => None,
-			Some(Ok(policy)) => Some(policy),
+			Some(Ok(mut policy)) => {
+				// A wildcard's load is not each matching name's load on a peer, where an exact route
+				// can override it, so only an exact route can tell a peer which load to report.
+				let spill = spec
+					.failover
+					.as_ref()
+					.and_then(|f| f.spill.as_ref())
+					.map(|s| {
+						if spec.sni.starts_with("*.") {
+							Err("failover.spill is supported on exact-SNI routes only".to_string())
+						} else {
+							s.parse()
+						}
+					});
+				match spill {
+					None => {}
+					Some(Ok(spill)) => policy.spill = Some(spill),
+					Some(Err(e)) => {
+						let newly_failing =
+							previous.is_none_or(|p| !p.invalid_spill.contains(spec.sni.as_str()));
+						invalid_spill.insert(Arc::from(spec.sni.as_str()));
+						if newly_failing {
+							eprintln!(
+								"symphony: route '{}': {e}; serving its failover without spill-over",
+								spec.sni
+							);
+						}
+					}
+				}
+				Some(policy)
+			}
 			Some(Err(e)) => {
 				let newly_failing =
 					previous.is_none_or(|p| !p.invalid_failover.contains(spec.sni.as_str()));
@@ -842,6 +894,7 @@ pub fn build_route_table(
 		affinity_balancers,
 		failing_snis,
 		invalid_failover,
+		invalid_spill,
 		dropped_exact,
 		dropped_wildcard,
 		client_auth,
@@ -874,6 +927,26 @@ fn validate_route_protocol_declaration(spec: &RouteSpec) -> crate::error::Result
 	}
 
 	Ok(())
+}
+
+/// A route's smoothed worker-thread load in permille and the monotonic ms it is current until: the
+/// busier of its destinations, `None` unless each is a UDS set with a current load.
+pub fn route_load(
+	destination: &Destination,
+	destination_h2: Option<&Destination>,
+	now: u64,
+) -> Option<(u32, u64)> {
+	let load = |dest: &Destination| match dest {
+		Destination::UdsSet(balancer) => balancer.load().get(now),
+		Destination::Tcp(_) => None,
+	};
+	let (mut permille, mut until_ms) = load(destination)?;
+	if let Some(h2) = destination_h2 {
+		let (h2_permille, h2_until_ms) = load(h2)?;
+		permille = permille.max(h2_permille);
+		until_ms = until_ms.min(h2_until_ms);
+	}
+	Some((permille, until_ms))
 }
 
 fn retracked(dest: &Destination, track: bool) -> Destination {
@@ -1146,6 +1219,7 @@ pub async fn evict_affinity_periodically(
 #[cfg(test)]
 pub(crate) mod tests {
 	use super::*;
+	use crate::failover::SpillSpec;
 
 	// A self-signed cert (CERT_A) and its matching key (KEY_A), plus an unrelated key
 	// (KEY_B). Pairing CERT_A with KEY_B reproduces the production rustls KeyMismatch a
@@ -1695,8 +1769,69 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			probe_interval_ms: None,
 			cooldown_min_ms: None,
 			cooldown_max_ms: None,
+			spill: None,
 		});
 		spec
+	}
+
+	#[test]
+	fn spill_is_exact_sni_only_and_an_invalid_one_keeps_failover() {
+		let mut exact = with_failover(tls_route("a.example.com", CERT_A, KEY_A), false, "10.0.0.2");
+		exact.failover.as_mut().unwrap().spill = Some(SpillSpec::default());
+		let mut wildcard =
+			with_failover(tls_route("*.example.com", CERT_A, KEY_A), false, "10.0.0.2");
+		wildcard.failover.as_mut().unwrap().spill = Some(SpillSpec::default());
+		let mut invalid =
+			with_failover(tls_route("b.example.com", CERT_A, KEY_A), false, "10.0.0.2");
+		invalid.failover.as_mut().unwrap().spill = Some(SpillSpec {
+			max_fraction: Some(f64::NAN),
+			..Default::default()
+		});
+		let table = build(&[exact, wildcard, invalid], &ListenerTlsSpec::empty(), None);
+
+		let failover = |sni: &str| table.resolve(Some(sni)).unwrap().failover.clone().unwrap();
+		assert!(failover("a.example.com").spill.is_some());
+		assert!(failover("x.example.com").spill.is_none(), "wildcard");
+		assert!(failover("b.example.com").spill.is_none(), "invalid");
+		assert_eq!(table.failing_route_count(), 2);
+	}
+
+	#[test]
+	fn a_load_answer_is_given_only_for_an_exact_route_that_would_serve_a_spilled_connection() {
+		let up = with_failover(
+			tls_route("up.example.com", CERT_A, KEY_A),
+			false,
+			"10.0.0.2",
+		);
+		let draining = with_failover(
+			tls_route("drain.example.com", CERT_A, KEY_A),
+			true,
+			"10.0.0.2",
+		);
+		let table = build(
+			&[up, draining, tls_route("*.example.com", CERT_A, KEY_A)],
+			&ListenerTlsSpec::empty(),
+			None,
+		);
+		let Destination::UdsSet(balancer) =
+			&table.resolve(Some("up.example.com")).unwrap().destination
+		else {
+			panic!("expected a UDS destination");
+		};
+		assert_eq!(
+			table.load_answer("up.example.com", 0),
+			None,
+			"no measured load yet"
+		);
+		balancer.load().publish_for_test(420, 10);
+		assert_eq!(table.load_answer("up.example.com", 0), Some(420));
+		assert_eq!(table.load_answer("drain.example.com", 0), None);
+		assert_eq!(
+			table.load_answer("other.example.com", 0),
+			None,
+			"served only by the wildcard"
+		);
+		assert_eq!(table.load_answer(&"é".repeat(7), 0), None);
 	}
 
 	#[test]

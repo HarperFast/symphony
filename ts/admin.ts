@@ -146,7 +146,7 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 		out.sample(
 			'symphony_routes_failing',
 			'gauge',
-			'Routes rejected at build time (cert failure, protocol/carrier validation failure, invalid allowedSources, or duplicate wildcard) — dropped, or (cert failures only) serving a carried-forward last-good cert — plus routes serving without failover because their failover policy is invalid.',
+			'Routes rejected at build time (cert failure, protocol/carrier validation failure, invalid allowedSources, or duplicate wildcard) — dropped, or (cert failures only) serving a carried-forward last-good cert — plus routes serving without failover (or without spill-over) because their failover (or failover.spill) policy is invalid.',
 			metrics.failingRoutes,
 			proxy
 		);
@@ -228,6 +228,13 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 					reason,
 				});
 			}
+			out.sample(
+				'symphony_listener_load_queries_total',
+				'counter',
+				'Peer load queries answered on a failover ingress listener.',
+				l.loadQueries,
+				tags
+			);
 		}
 
 		for (const route of metrics.routeMetrics ?? []) {
@@ -306,15 +313,68 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 					failover.exhausted,
 					tags
 				);
+				out.sample(
+					'symphony_failover_local_fallbacks_total',
+					'counter',
+					'Draining or spilled connections served locally because no peer took them.',
+					failover.localFallbacks,
+					tags
+				);
+				const spill = failover.spill;
+				if (spill) {
+					out.sample(
+						'symphony_failover_spill_fraction',
+						'gauge',
+						'Share (0–1) of new connections a spill route is forwarding to a less-loaded peer now.',
+						spill.fraction,
+						tags
+					);
+					if (spill.localLoad !== undefined) {
+						out.sample(
+							'symphony_failover_local_load',
+							'gauge',
+							'Smoothed load (0–1) of the local worker threads of a spill route.',
+							spill.localLoad,
+							tags
+						);
+					}
+				}
 				for (const peer of failover.peers) {
 					const peerTags = { ...tags, peer: peer.peer };
 					out.sample(
 						'symphony_failover_forwarded_total',
 						'counter',
-						'Connections forwarded to a failover peer.',
+						'Connections forwarded to a failover peer while the route was down or draining.',
 						peer.forwarded,
 						peerTags
 					);
+					if (spill) {
+						out.sample(
+							'symphony_failover_spilled_total',
+							'counter',
+							'Connections spilled to a less-loaded failover peer.',
+							peer.spilled,
+							peerTags
+						);
+					}
+					if (peer.load !== undefined) {
+						out.sample(
+							'symphony_failover_peer_load',
+							'gauge',
+							'Last load (0–1) a failover peer reported for the route.',
+							peer.load,
+							peerTags
+						);
+					}
+					if (peer.rttMs !== undefined) {
+						out.sample(
+							'symphony_failover_peer_rtt_seconds',
+							'gauge',
+							'Smoothed connect time of the load query to a failover peer.',
+							peer.rttMs / 1000,
+							peerTags
+						);
+					}
 					for (const { reason, count } of peer.failuresByReason) {
 						out.sample(
 							'symphony_failover_peer_failures_total',

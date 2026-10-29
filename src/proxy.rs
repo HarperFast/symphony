@@ -1,4 +1,4 @@
-use crate::failover::{probe_periodically, FailoverSpec};
+use crate::failover::{poll_peer_loads, probe_periodically, FailoverSpec, SpillSpec};
 use crate::http_listener::spawn_http_listeners;
 use crate::ingress::IngressState;
 use crate::listener::{bind_workers, set_rlimit_nofile, spawn_listeners};
@@ -119,6 +119,23 @@ pub struct JsFailoverConfig {
 	/// Per-(route, peer) cooldown after a failed attempt, doubling per consecutive failure.
 	/// Default: { min: 5000, max: 60000 }.
 	pub peer_cooldown_ms: Option<JsPeerCooldown>,
+	/// Also forward a share of new connections while the local Harper threads are much busier
+	/// than a peer's. Exact-SNI routes only.
+	pub spill: Option<JsSpillConfig>,
+}
+
+#[napi(object)]
+pub struct JsSpillConfig {
+	/// Local load (0–1) at which spilling may start. Default: 0.75.
+	pub high_water: Option<f64>,
+	/// How far below the local load a peer must be to raise the share. Default: 0.2.
+	pub margin: Option<f64>,
+	/// Change of the share per second. Default: 0.05.
+	pub step: Option<f64>,
+	/// Largest share of new connections spilled. Default: 0.5.
+	pub max_fraction: Option<f64>,
+	/// Spill only to peers whose measured connect time is at most this. Default: no limit.
+	pub max_peer_rtt_ms: Option<f64>,
 }
 
 #[napi(object)]
@@ -263,6 +280,8 @@ pub struct JsListenerMetrics {
 	pub bytes_sent: f64,
 	pub blocked_by_reason: Vec<JsLabeledCount>,
 	pub errors_by_reason: Vec<JsLabeledCount>,
+	/// Failover ingress: peer load queries answered.
+	pub load_queries: f64,
 }
 
 #[napi(object)]
@@ -296,16 +315,36 @@ pub struct JsRouteFailoverMetrics {
 	pub replays: f64,
 	/// Connections closed after every candidate peer failed.
 	pub exhausted: f64,
+	/// Draining or spilled connections served locally because no peer took them.
+	pub local_fallbacks: f64,
+	/// Present only on routes with `spill`.
+	pub spill: Option<JsSpillMetrics>,
 	pub peers: Vec<JsFailoverPeerMetrics>,
+}
+
+#[napi(object)]
+pub struct JsSpillMetrics {
+	/// Share of new connections being spilled now (0–1); 0 when spilling is not admitted.
+	pub fraction: f64,
+	/// "host:port" of the peer receiving them.
+	pub target: Option<String>,
+	/// Smoothed load of the local worker threads (0–1); absent when not measurable.
+	pub local_load: Option<f64>,
 }
 
 #[napi(object)]
 pub struct JsFailoverPeerMetrics {
 	/// "host:port" as configured.
 	pub peer: String,
-	/// Connections handed to this peer once it answered.
+	/// Connections handed to this peer once it answered, because the route was down or draining.
 	pub forwarded: f64,
+	/// Connections spilled to this peer once it answered.
+	pub spilled: f64,
 	pub cooling_down: bool,
+	/// The peer's last load report for this route (0–1); absent when none is usable.
+	pub load: Option<f64>,
+	/// Smoothed connect time of the load query.
+	pub rtt_ms: Option<f64>,
 	/// Failed attempts by reason: refused, timeout, zero_byte_close, error.
 	pub failures_by_reason: Vec<JsLabeledCount>,
 }
@@ -725,6 +764,9 @@ impl SymphonyProxyWrap {
 			tx.subscribe(),
 		));
 
+		self.rt_handle
+			.spawn(poll_peer_loads(self.route_table.clone(), tx.subscribe()));
+
 		if let Some(interval) = self.malloc_trim_interval {
 			self.rt_handle.spawn(crate::bench_hooks::trim_periodically(
 				interval,
@@ -944,6 +986,7 @@ impl SymphonyProxyWrap {
 					bytes_sent: state.metrics.bytes_out.load(Ordering::Relaxed) as f64,
 					blocked_by_reason: labeled_counts(blocked_by_reason),
 					errors_by_reason: labeled_counts(errors_by_reason),
+					load_queries: state.metrics.load_queries.load(Ordering::Relaxed) as f64,
 				}
 			})
 			.collect();
@@ -959,6 +1002,20 @@ impl SymphonyProxyWrap {
 			let (refusing, slots) = route.slot_counts();
 			let status = &route.failover.status;
 			let now = crate::protection::now_ns();
+			let spill =
+				crate::failover::spill_status(&route.failover, now).map(|(fraction, target)| {
+					JsSpillMetrics {
+						fraction,
+						target: target.map(|addr| addr.to_string()),
+						local_load: crate::router::route_load(
+							&route.destination,
+							route.destination_h2.as_ref(),
+							now,
+						)
+						.map(|(load, _)| load as f64 / 1000.0),
+					}
+				});
+			let report_ttl_ms = route.failover.report_ttl_ms();
 			Some(JsRouteFailoverMetrics {
 				local_up: !route.locally_down(),
 				refusing_slots: refusing as f64,
@@ -966,6 +1023,8 @@ impl SymphonyProxyWrap {
 				drain: route.failover.drain,
 				replays: status.replays.load(Ordering::Relaxed) as f64,
 				exhausted: status.exhausted.load(Ordering::Relaxed) as f64,
+				local_fallbacks: status.local_fallbacks.load(Ordering::Relaxed) as f64,
+				spill,
 				peers: route
 					.failover
 					.peers
@@ -973,7 +1032,13 @@ impl SymphonyProxyWrap {
 					.map(|peer| JsFailoverPeerMetrics {
 						peer: peer.addr.to_string(),
 						forwarded: peer.forwarded.load(Ordering::Relaxed) as f64,
+						spilled: peer.spilled.load(Ordering::Relaxed) as f64,
 						cooling_down: peer.cooling_down(now),
+						load: peer
+							.report()
+							.filter(|(_, at_ms)| now / 1_000_000 < at_ms + report_ttl_ms)
+							.map(|(load, _)| load as f64 / 1000.0),
+						rtt_ms: peer.rtt().map(|rtt| rtt.as_secs_f64() * 1000.0),
 						failures_by_reason: labeled_counts(peer.failures_by_reason()),
 					})
 					.collect(),
@@ -1179,6 +1244,13 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 			probe_interval_ms: f.probe_interval_ms,
 			cooldown_min_ms: f.peer_cooldown_ms.as_ref().map(|c| c.min),
 			cooldown_max_ms: f.peer_cooldown_ms.as_ref().map(|c| c.max),
+			spill: f.spill.as_ref().map(|s| SpillSpec {
+				high_water: s.high_water,
+				margin: s.margin,
+				step: s.step,
+				max_fraction: s.max_fraction,
+				max_peer_rtt_ms: s.max_peer_rtt_ms,
+			}),
 		}),
 	};
 

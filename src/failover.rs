@@ -1,5 +1,6 @@
 //! Peer failover: while a route's local upstream is down (or the route is draining), forward its
-//! new connections, still as raw TLS, to a peer node's failover ingress listener.
+//! new connections, still as raw TLS, to a peer node's failover ingress listener. With `spill`, also
+//! forward a share of them while the local Harper threads are much busier than a peer's.
 
 use crate::balancer::SlotHealth;
 use crate::metrics::{CountingStream, ErrorKind, PeerFailureKind};
@@ -8,10 +9,11 @@ use crate::proxy_conn::{emit, forward_opaque, ConnContext, JsEvent};
 use crate::router::{Destination, LiveRouteTable, RouteMetricIdentity};
 use crate::sni::PeekInfo;
 use napi::threadsafe_function::ThreadsafeFunction;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
@@ -30,6 +32,17 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Longest the probe task sleeps, so a reload that shortens `probeIntervalMs` takes effect promptly.
 const MAX_PROBE_TICK: Duration = Duration::from_secs(1);
 const MAX_CONCURRENT_PROBES: usize = 64;
+/// While the local upstream is up, a forward that fails before the peer answers is served locally,
+/// so the attempts must leave the local handshake time to run.
+const DRAIN_BUDGET: Duration = Duration::from_secs(2);
+const SPILL_BUDGET: Duration = Duration::from_secs(1);
+/// Load queries go out at most this often, however short `probeIntervalMs` is.
+const MIN_LOAD_POLL: Duration = Duration::from_millis(100);
+const MIN_REPORT_TTL_NS: u64 = 3_000_000_000;
+/// Longest step the controller takes at once, so a stalled task cannot move the fraction in a jump.
+const MAX_CONTROL_STEP_NS: u64 = 1_000_000_000;
+const MAX_PEER_RTT_MS: f64 = 60_000.0;
+const RTT_EWMA_WEIGHT: f64 = 0.25;
 
 #[derive(Clone, Debug)]
 pub struct FailoverSpec {
@@ -38,6 +51,8 @@ pub struct FailoverSpec {
 	pub probe_interval_ms: Option<f64>,
 	pub cooldown_min_ms: Option<f64>,
 	pub cooldown_max_ms: Option<f64>,
+	/// Validated apart from the rest of the policy: an invalid `spill` disables only spill.
+	pub spill: Option<SpillSpec>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -47,6 +62,56 @@ pub struct FailoverPolicy {
 	pub probe_interval: Duration,
 	pub cooldown_min: Duration,
 	pub cooldown_max: Duration,
+	pub spill: Option<SpillPolicy>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SpillSpec {
+	pub high_water: Option<f64>,
+	pub margin: Option<f64>,
+	pub step: Option<f64>,
+	pub max_fraction: Option<f64>,
+	pub max_peer_rtt_ms: Option<f64>,
+}
+
+/// Thresholds in permille of one core per thread (`thread_cpu`'s unit); `step` in permille per second.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpillPolicy {
+	pub high_water: u32,
+	pub margin: u32,
+	pub step: f64,
+	pub max_fraction: u32,
+	pub max_peer_rtt: Option<Duration>,
+}
+
+impl SpillSpec {
+	pub fn parse(&self) -> Result<SpillPolicy, String> {
+		let fraction = |value: Option<f64>, default: f64, label: &str| {
+			let v = value.unwrap_or(default);
+			if !v.is_finite() || v <= 0.0 || v > 1.0 {
+				return Err(format!("failover.spill.{label} must be in (0, 1], got {v}"));
+			}
+			Ok(v * 1000.0)
+		};
+		let max_peer_rtt = match self.max_peer_rtt_ms {
+			None => None,
+			Some(ms) if ms.is_finite() && ms > 0.0 && ms <= MAX_PEER_RTT_MS => {
+				Some(Duration::from_secs_f64(ms / 1000.0))
+			}
+			Some(ms) => {
+				return Err(format!(
+					"failover.spill.maxPeerRttMs must be in (0, {MAX_PEER_RTT_MS}], got {ms}"
+				))
+			}
+		};
+		Ok(SpillPolicy {
+			high_water: fraction(self.high_water, 0.75, "highWater")?.round() as u32,
+			margin: fraction(self.margin, 0.20, "margin")?.round() as u32,
+			step: fraction(self.step, 0.05, "step")?,
+			max_fraction: fraction(self.max_fraction, 0.50, "maxFraction")?.round() as u32,
+			max_peer_rtt,
+		})
+	}
 }
 
 fn bounded_ms(value: Option<f64>, default: f64, min: f64, label: &str) -> Result<Duration, String> {
@@ -105,6 +170,7 @@ impl FailoverSpec {
 			probe_interval,
 			cooldown_min,
 			cooldown_max,
+			spill: None,
 		})
 	}
 }
@@ -119,8 +185,17 @@ pub struct FailoverPeer {
 	/// Consecutive failures (top 8 bits) and cooldown deadline in monotonic ns (low 56 bits), one
 	/// word so a success and a concurrent failure cannot leave a streak without its cooldown.
 	cooldown: AtomicU64,
+	/// Connections handed over because the route was down or draining.
 	pub forwarded: AtomicU64,
+	/// Connections handed over by spill-over. Disjoint from `forwarded`.
+	pub spilled: AtomicU64,
 	failures: [AtomicU64; PeerFailureKind::COUNT],
+	/// The peer's last load report for this route: permille in the low 10 bits, monotonic ms it
+	/// arrived above them; 0 = none, or the peer would not take a spilled connection. Written only
+	/// by the load poll.
+	report: AtomicU64,
+	/// Smoothed connect time of the load query, in µs; 0 = not measured.
+	rtt_us: AtomicU32,
 }
 
 impl FailoverPeer {
@@ -129,8 +204,37 @@ impl FailoverPeer {
 			addr,
 			cooldown: AtomicU64::new(0),
 			forwarded: AtomicU64::new(0),
+			spilled: AtomicU64::new(0),
 			failures: std::array::from_fn(|_| AtomicU64::new(0)),
+			report: AtomicU64::new(0),
+			rtt_us: AtomicU32::new(0),
 		}
+	}
+
+	/// `(load permille, ms received)` of the last usable report.
+	pub fn report(&self) -> Option<(u32, u64)> {
+		let packed = self.report.load(Ordering::Relaxed);
+		(packed != 0).then_some(((packed & 0x3FF) as u32, packed >> 10))
+	}
+
+	fn set_report(&self, load: Option<u32>, now_ms: u64) {
+		let packed = load.map_or(0, |l| now_ms.max(1) << 10 | l.min(1000) as u64);
+		self.report.store(packed, Ordering::Relaxed);
+	}
+
+	pub fn rtt(&self) -> Option<Duration> {
+		let us = self.rtt_us.load(Ordering::Relaxed);
+		(us != 0).then(|| Duration::from_micros(us as u64))
+	}
+
+	fn record_rtt(&self, sample: Duration) {
+		let sample = sample.as_micros().clamp(1, u32::MAX as u128) as f64;
+		let smoothed = match self.rtt_us.load(Ordering::Relaxed) {
+			0 => sample,
+			prev => prev as f64 + RTT_EWMA_WEIGHT * (sample - prev as f64),
+		};
+		self.rtt_us
+			.store(smoothed.round().max(1.0) as u32, Ordering::Relaxed);
 	}
 
 	fn cooldown_until(&self) -> u64 {
@@ -173,9 +277,8 @@ impl FailoverPeer {
 			});
 	}
 
-	fn record_success(&self) {
+	fn clear_cooldown(&self) {
 		self.cooldown.store(0, Ordering::Relaxed);
-		self.forwarded.fetch_add(1, Ordering::Relaxed);
 	}
 }
 
@@ -189,6 +292,8 @@ pub struct FailoverStatus {
 	pub replays: AtomicU64,
 	/// Connections closed because every candidate peer failed within the budget.
 	pub exhausted: AtomicU64,
+	/// Draining or spilled connections served locally because no peer took them.
+	pub local_fallbacks: AtomicU64,
 }
 
 pub struct Failover {
@@ -202,6 +307,118 @@ pub struct Failover {
 	/// balancer tracks each slot.
 	pub tcp_health: Option<Arc<SlotHealth>>,
 	pub status: Arc<FailoverStatus>,
+	pub spill: Option<Spill>,
+}
+
+pub struct Spill {
+	pub policy: SpillPolicy,
+	pub state: Arc<SpillState>,
+}
+
+#[derive(Default)]
+pub struct SpillState {
+	/// What the hot path may do: fraction permille (bits 0–9), target peer index (10–25),
+	/// monotonic ms until which it holds (26–63). 0 = spill nothing. One word, so a connection never
+	/// pairs one controller pass's fraction with another's target.
+	admission: AtomicU64,
+	/// Written only by the load poll.
+	controller: Mutex<Controller>,
+}
+
+#[derive(Default)]
+struct Controller {
+	/// Permille, moving at most `step` per second; spilling is admitted only while it is justified.
+	fraction: f64,
+	last_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Admission {
+	pub fraction: u32,
+	pub target: usize,
+	pub until_ms: u64,
+}
+
+impl Admission {
+	fn pack(self) -> u64 {
+		self.until_ms << 26 | (self.target as u64 & 0xFFFF) << 10 | self.fraction.min(1000) as u64
+	}
+
+	fn unpack(packed: u64) -> Option<Self> {
+		(packed & 0x3FF != 0).then_some(Self {
+			fraction: (packed & 0x3FF) as u32,
+			target: ((packed >> 10) & 0xFFFF) as usize,
+			until_ms: packed >> 26,
+		})
+	}
+}
+
+impl SpillState {
+	/// The admission in force at `now_ms`.
+	pub fn admission(&self, now_ms: u64) -> Option<Admission> {
+		Admission::unpack(self.admission.load(Ordering::Relaxed)).filter(|a| now_ms < a.until_ms)
+	}
+
+	fn controller(&self) -> std::sync::MutexGuard<'_, Controller> {
+		self.controller.lock().unwrap_or_else(|e| e.into_inner())
+	}
+}
+
+/// How a connection that reaches the failover decision is handled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForwardMode {
+	/// The local upstream is down: try every peer (the earliest-cooling one if all are cooling),
+	/// within the whole handshake budget; nothing to fall back to.
+	Down,
+	/// Draining while the local upstream is up: try the ready peers, fall back to local service.
+	Drain,
+	/// Spill-over to one peer, falling back to local service.
+	Spill(usize),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Decision {
+	/// An ingress connection for a route this node will not serve: close with no bytes, which
+	/// sends the forwarding node on to its next peer.
+	Refuse,
+	Forward(ForwardMode),
+	Local,
+}
+
+/// `spill` is consulted only for a client connection on a route that is up and not draining.
+pub fn decide(
+	ingress: bool,
+	suspended: bool,
+	locally_down: bool,
+	drain: bool,
+	spill: impl FnOnce() -> Option<usize>,
+) -> Decision {
+	if ingress {
+		return if locally_down || drain {
+			Decision::Refuse
+		} else {
+			Decision::Local
+		};
+	}
+	// A suspended route's destination is whatever `resolveConnection()` returns.
+	if suspended {
+		return Decision::Local;
+	}
+	if locally_down {
+		return Decision::Forward(ForwardMode::Down);
+	}
+	if drain {
+		return Decision::Forward(ForwardMode::Drain);
+	}
+	spill().map_or(Decision::Local, |peer| {
+		Decision::Forward(ForwardMode::Spill(peer))
+	})
+}
+
+fn spill_hash(client: SocketAddr) -> u64 {
+	static SALT: OnceLock<std::collections::hash_map::RandomState> = OnceLock::new();
+	SALT.get_or_init(Default::default)
+		.hash_one((client.ip(), client.port()))
 }
 
 impl Failover {
@@ -222,6 +439,27 @@ impl Failover {
 					.unwrap_or_else(|| Arc::new(FailoverPeer::new(*addr)))
 			})
 			.collect();
+		// Continued only under the same policy and peer list: a carried target index must name the
+		// same peer, and a carried fraction must have been reached under the same limits.
+		let spill = policy.spill.map(|spill_policy| {
+			let state = previous
+				.and_then(|p| p.spill.as_ref())
+				.filter(|s| {
+					s.policy == spill_policy
+						&& previous.is_some_and(|p| {
+							p.peers
+								.iter()
+								.map(|peer| peer.addr)
+								.eq(policy.peers.iter().copied())
+						})
+				})
+				.map(|s| s.state.clone())
+				.unwrap_or_default();
+			Spill {
+				policy: spill_policy,
+				state,
+			}
+		});
 		Self {
 			drain: policy.drain,
 			probe_interval: policy.probe_interval,
@@ -231,7 +469,29 @@ impl Failover {
 			cursor: AtomicUsize::new(0),
 			tcp_health,
 			status: previous.map(|p| p.status.clone()).unwrap_or_default(),
+			spill,
 		}
+	}
+
+	/// The peer this client connection spills to, if the admission in force selects it.
+	pub fn spill_target(&self, client: SocketAddr) -> Option<usize> {
+		let spill = self.spill.as_ref()?;
+		let packed = spill.state.admission.load(Ordering::Relaxed);
+		if packed == 0 || spill_hash(client) % 1000 >= packed & 0x3FF {
+			return None;
+		}
+		let admission = Admission::unpack(packed)?;
+		let now = now_ns();
+		(now / 1_000_000 < admission.until_ms)
+			.then(|| self.peers.get(admission.target))
+			.flatten()
+			.filter(|peer| !peer.cooling_down(now))
+			.map(|_| admission.target)
+	}
+
+	/// How long a peer's load report stays usable.
+	pub fn report_ttl_ms(&self) -> u64 {
+		(3 * self.probe_interval.as_nanos() as u64).max(MIN_REPORT_TTL_NS) / 1_000_000
 	}
 
 	/// True when every slot of the route's default destination, or of its h2 destination, is
@@ -246,6 +506,26 @@ impl Failover {
 			Destination::Tcp(_) => self.tcp_health.as_ref().is_some_and(|h| h.refusing()),
 		};
 		down(destination) || destination_h2.is_some_and(down)
+	}
+
+	/// The peers a connection in `mode` tries, in order.
+	fn candidates_for(&self, mode: ForwardMode, now: u64) -> Vec<&FailoverPeer> {
+		match mode {
+			ForwardMode::Down => self.candidates(now).1.collect(),
+			// A local fallback exists, so a peer in cooldown is never worth the wait.
+			ForwardMode::Drain => self
+				.candidates(now)
+				.1
+				.filter(|p| !p.cooling_down(now))
+				.collect(),
+			ForwardMode::Spill(i) => self
+				.peers
+				.get(i)
+				.map(|p| p.as_ref())
+				.filter(|p| !p.cooling_down(now))
+				.into_iter()
+				.collect(),
+		}
 	}
 
 	/// Peers to try, in order, and how many: round-robin over those not cooling down; if every
@@ -271,41 +551,75 @@ impl Failover {
 	}
 }
 
+pub enum Forwarded {
+	Done(Result<(), ErrorKind>),
+	/// No peer took the connection before answering; its bytes are untouched.
+	ServeLocally,
+}
+
 /// Forward a connection whose ClientHello has only been peeked to the route's peers. Each attempt
 /// sends a PROXY v2 header and the ClientHello, then waits for the peer's first byte before
-/// reading anything more from the client — so a peer that closes without answering received
-/// nothing a retry could duplicate, and the hello is replayed to the next one.
+/// anything is read from the client — so a peer that closes without answering received nothing a
+/// retry could duplicate, and until a peer answers, the connection can still be served locally.
+/// The first byte commits the attempt: whatever the peer does next, it is never undone.
+#[allow(clippy::too_many_arguments)]
 pub async fn forward_to_peers(
-	client: TcpStream,
+	client: &mut TcpStream,
 	peek: &PeekInfo,
 	failover: &Failover,
+	mode: ForwardMode,
 	peer_addr: SocketAddr,
 	local_addr: Option<SocketAddr>,
 	ctx: &ConnContext,
 	route: &RouteMetricIdentity,
-) -> Result<(), ErrorKind> {
+) -> Forwarded {
+	let give_up = |status: &FailoverStatus| match mode {
+		ForwardMode::Down => {
+			status.exhausted.fetch_add(1, Ordering::Relaxed);
+			Forwarded::Done(Err(ErrorKind::UpstreamConnect))
+		}
+		ForwardMode::Drain | ForwardMode::Spill(_) => {
+			status.local_fallbacks.fetch_add(1, Ordering::Relaxed);
+			Forwarded::ServeLocally
+		}
+	};
 	if !peek.complete || peek.hello_len == 0 {
-		return Err(ErrorKind::UpstreamConnect);
+		return match mode {
+			ForwardMode::Down => Forwarded::Done(Err(ErrorKind::UpstreamConnect)),
+			_ => Forwarded::ServeLocally,
+		};
 	}
-	// Every attempt shares the handshake budget the client would have had on this node.
-	let deadline = Instant::now() + ctx.handshake_timeout();
-	let mut client = CountingStream::new(client, &ctx.listener_metrics, Some(&route.counters));
+	let budget = match mode {
+		// Every attempt shares the handshake budget the client would have had on this node.
+		ForwardMode::Down => ctx.handshake_timeout(),
+		ForwardMode::Drain => ctx.handshake_timeout().min(DRAIN_BUDGET),
+		ForwardMode::Spill(_) => ctx.handshake_timeout().min(SPILL_BUDGET),
+	};
+	let deadline = Instant::now() + budget;
+	let candidates = failover.candidates_for(mode, now_ns());
+	if candidates.is_empty() {
+		return give_up(&failover.status);
+	}
 
 	// 52: a PROXY v2 header with IPv6 addresses and no TLVs, the largest this writes.
 	let mut prefix = Vec::with_capacity(52 + peek.hello_len);
-	crate::upstream::write_proxy_v2_header(&mut prefix, peer_addr, local_addr, &[])
+	if crate::upstream::write_proxy_v2_header(&mut prefix, peer_addr, local_addr, &[])
 		.await
-		.map_err(|_| ErrorKind::UpstreamConnect)?;
+		.is_err()
+	{
+		return give_up(&failover.status);
+	}
 	let header_len = prefix.len();
 	prefix.resize(header_len + peek.hello_len, 0);
-	// The bytes are already buffered (peek saw them), so this does not wait on the client.
-	match tokio::time::timeout_at(deadline, client.read_exact(&mut prefix[header_len..])).await {
-		Ok(Ok(_)) => {}
-		_ => return Err(ErrorKind::UpstreamConnect),
+	// Peeked again, not read: the bytes are already buffered (peek saw them), and they must stay
+	// where the local handshake would read them until a peer has answered.
+	match tokio::time::timeout_at(deadline, client.peek(&mut prefix[header_len..])).await {
+		Ok(Ok(n)) if n == peek.hello_len => {}
+		_ => return give_up(&failover.status),
 	}
 
-	let (candidate_count, candidates) = failover.candidates(now_ns());
-	for (attempt, peer) in candidates.enumerate() {
+	let candidate_count = candidates.len();
+	for (attempt, peer) in candidates.into_iter().enumerate() {
 		let remaining = deadline.saturating_duration_since(Instant::now());
 		if remaining.is_zero() {
 			break;
@@ -317,10 +631,23 @@ pub async fn forward_to_peers(
 		let share = remaining / candidate_count.saturating_sub(attempt).max(1) as u32;
 		match attempt_peer(peer.addr, &prefix, share).await {
 			Ok(mut upstream) => {
-				peer.record_success();
+				peer.clear_cooldown();
+				let handed = match mode {
+					ForwardMode::Spill(_) => &peer.spilled,
+					ForwardMode::Down | ForwardMode::Drain => &peer.forwarded,
+				};
+				handed.fetch_add(1, Ordering::Relaxed);
+				let mut client =
+					CountingStream::new(&mut *client, &ctx.listener_metrics, Some(&route.counters));
+				// The peer has the hello; consume it so the copy starts on the byte after it.
+				if client.read_exact(&mut prefix[header_len..]).await.is_err() {
+					return Forwarded::Done(Err(ErrorKind::Stream));
+				}
 				// The replay copy is not needed once a peer answered; do not hold it for the tunnel.
 				drop(prefix);
-				return forward_opaque(&mut client, &mut upstream, peer_addr, ctx).await;
+				return Forwarded::Done(
+					forward_opaque(&mut client, &mut upstream, peer_addr, ctx).await,
+				);
 			}
 			Err(kind) => {
 				tracing::debug!("failover to {} failed: {}", peer.addr, kind.as_str());
@@ -333,8 +660,7 @@ pub async fn forward_to_peers(
 			}
 		}
 	}
-	failover.status.exhausted.fetch_add(1, Ordering::Relaxed);
-	Err(ErrorKind::UpstreamConnect)
+	give_up(&failover.status)
 }
 
 /// Ok once the peer has sent a byte. The byte is peeked, so the copy that follows forwards it.
@@ -524,6 +850,266 @@ pub async fn probe_periodically(
 	}
 }
 
+// ── Spill-over controller and load poll ──────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Trend {
+	Rise,
+	Hold,
+	Decay,
+}
+
+/// What one controller pass sees of a peer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PeerView {
+	load: Option<u32>,
+	report_until_ms: u64,
+	cooling: bool,
+	rtt: Option<Duration>,
+}
+
+/// The least-loaded usable peer, and whether its gap to the local load justifies raising the share,
+/// holding it, or neither. `local` is `(permille, ms it is current until)`.
+fn assess(
+	policy: &SpillPolicy,
+	local: Option<(u32, u64)>,
+	peers: &[PeerView],
+	now_ms: u64,
+) -> (Trend, Option<(usize, u64)>) {
+	let Some((local, local_until_ms)) = local.filter(|(_, until)| now_ms < *until) else {
+		return (Trend::Decay, None);
+	};
+	let best = peers
+		.iter()
+		.enumerate()
+		.filter(|(_, p)| now_ms < p.report_until_ms && !p.cooling)
+		.filter(|(_, p)| {
+			policy
+				.max_peer_rtt
+				.is_none_or(|max| p.rtt.is_some_and(|rtt| rtt <= max))
+		})
+		.filter_map(|(i, p)| Some((i, p.load?, p.report_until_ms)))
+		.min_by_key(|(_, load, _)| *load);
+	let Some((target, peer_load, report_until_ms)) = best else {
+		return (Trend::Decay, None);
+	};
+	let until_ms = local_until_ms.min(report_until_ms);
+	let half = policy.margin / 2;
+	if local >= policy.high_water && peer_load + policy.margin <= local {
+		(Trend::Rise, Some((target, until_ms)))
+	} else if local + half >= policy.high_water && peer_load + half <= local {
+		(Trend::Hold, Some((target, until_ms)))
+	} else {
+		(Trend::Decay, None)
+	}
+}
+
+/// Step the controller and publish what the hot path may do. The fraction moves at most `step` per
+/// second either way; spilling stops at once when it is no longer justified (no target).
+fn control(
+	spill: &Spill,
+	local: Option<(u32, u64)>,
+	peers: &[PeerView],
+	now_ns: u64,
+) -> Option<Admission> {
+	let mut controller = spill.state.controller();
+	let elapsed = if controller.last_ns == 0 {
+		0
+	} else {
+		now_ns
+			.saturating_sub(controller.last_ns)
+			.min(MAX_CONTROL_STEP_NS)
+	};
+	controller.last_ns = now_ns;
+	let (trend, target) = assess(&spill.policy, local, peers, now_ns / 1_000_000);
+	let delta = spill.policy.step * elapsed as f64 / 1e9;
+	controller.fraction = match trend {
+		Trend::Rise => controller.fraction + delta,
+		Trend::Hold => controller.fraction,
+		Trend::Decay => controller.fraction - delta,
+	}
+	.clamp(0.0, spill.policy.max_fraction as f64);
+	let admission = target
+		.map(|(target, until_ms)| Admission {
+			fraction: controller.fraction.round() as u32,
+			target,
+			until_ms,
+		})
+		.filter(|a| a.fraction > 0);
+	spill
+		.state
+		.admission
+		.store(admission.map_or(0, Admission::pack), Ordering::Relaxed);
+	admission
+}
+
+/// The effective spill share (0 when not admitting) and its target, for metrics.
+pub fn spill_status(failover: &Failover, now_ns: u64) -> Option<(f64, Option<SocketAddr>)> {
+	let spill = failover.spill.as_ref()?;
+	Some(match spill.state.admission(now_ns / 1_000_000) {
+		Some(a) => (
+			a.fraction as f64 / 1000.0,
+			failover.peers.get(a.target).map(|p| p.addr),
+		),
+		None => (0.0, None),
+	})
+}
+
+/// Poll each spill route's peers for their load and run the spill controllers. Separate from
+/// `probe_periodically`, so a silent peer can never delay a `routeHealth` transition.
+pub async fn poll_peer_loads(live: Arc<LiveRouteTable>, mut shutdown: broadcast::Receiver<()>) {
+	type Answer = (
+		SocketAddr,
+		Vec<Arc<str>>,
+		Option<(Duration, Vec<Option<u32>>)>,
+	);
+	let mut queries: JoinSet<Answer> = JoinSet::new();
+	let mut in_flight: HashSet<SocketAddr> = HashSet::new();
+	let mut last_query: HashMap<SocketAddr, u64> = HashMap::new();
+	let mut next_tick = Instant::now();
+	loop {
+		tokio::select! {
+			_ = shutdown.recv() => return,
+			Some(done) = queries.join_next(), if !queries.is_empty() => {
+				if let Ok((addr, names, answer)) = done {
+					in_flight.remove(&addr);
+					apply_answer(&live.0.load(), addr, &names, answer);
+				}
+				continue;
+			}
+			_ = tokio::time::sleep_until(next_tick) => {}
+		}
+		let table = live.0.load_full();
+		let routes: Vec<&FailoverRoute> = table
+			.failover_routes()
+			.iter()
+			.filter(|r| r.failover.spill.is_some())
+			.collect();
+		let tick = routes
+			.iter()
+			.map(|r| r.failover.probe_interval)
+			.min()
+			.unwrap_or(MAX_PROBE_TICK)
+			.clamp(MIN_LOAD_POLL, MAX_PROBE_TICK);
+		next_tick = Instant::now() + tick;
+		let now = now_ns();
+
+		let mut due: HashMap<SocketAddr, (Vec<Arc<str>>, u64)> = HashMap::new();
+		for route in &routes {
+			let interval = route.failover.probe_interval.max(MIN_LOAD_POLL).as_nanos() as u64;
+			for peer in route.failover.peers.iter() {
+				let entry = due.entry(peer.addr).or_insert((Vec::new(), interval));
+				entry.0.push(route.identity.route.clone());
+				entry.1 = entry.1.min(interval);
+			}
+		}
+		for (addr, (names, interval)) in due {
+			let last = last_query.get(&addr).copied().unwrap_or(0);
+			if in_flight.contains(&addr) || now.saturating_sub(last) < interval - interval / 10 {
+				continue;
+			}
+			last_query.insert(addr, now);
+			in_flight.insert(addr);
+			queries.spawn(async move {
+				let answer = query_load(addr, &names).await;
+				(addr, names, answer)
+			});
+		}
+		last_query.retain(|addr, _| {
+			routes
+				.iter()
+				.any(|r| r.failover.peers.iter().any(|p| p.addr == *addr))
+		});
+
+		for route in &routes {
+			let Some(spill) = &route.failover.spill else {
+				continue;
+			};
+			let ttl_ms = route.failover.report_ttl_ms();
+			let peers: Vec<PeerView> = route
+				.failover
+				.peers
+				.iter()
+				.map(|p| {
+					let report = p.report();
+					PeerView {
+						load: report.map(|(load, _)| load),
+						report_until_ms: report.map_or(0, |(_, at)| at + ttl_ms),
+						cooling: p.cooling_down(now),
+						rtt: p.rtt(),
+					}
+				})
+				.collect();
+			let local =
+				crate::router::route_load(&route.destination, route.destination_h2.as_ref(), now);
+			control(spill, local, &peers, now);
+		}
+	}
+}
+
+fn apply_answer(
+	table: &crate::router::RouteTable,
+	addr: SocketAddr,
+	names: &[Arc<str>],
+	answer: Option<(Duration, Vec<Option<u32>>)>,
+) {
+	let now_ms = now_ns() / 1_000_000;
+	for route in table.failover_routes() {
+		if route.failover.spill.is_none() {
+			continue;
+		}
+		let Some(peer) = route.failover.peers.iter().find(|p| p.addr == addr) else {
+			continue;
+		};
+		let load = match (
+			&answer,
+			names.iter().position(|n| *n == route.identity.route),
+		) {
+			(Some((rtt, loads)), Some(i)) => {
+				peer.record_rtt(*rtt);
+				loads.get(i).copied().flatten()
+			}
+			// Not asked about in this query; its answer is still to come.
+			(Some(_), None) => continue,
+			(None, _) => None,
+		};
+		peer.set_report(load, now_ms);
+	}
+}
+
+/// One load query per chunk of names, each within `PROBE_TIMEOUT`; the connect time of the first is
+/// the RTT sample. `None` if any chunk fails.
+async fn query_load(addr: SocketAddr, names: &[Arc<str>]) -> Option<(Duration, Vec<Option<u32>>)> {
+	let mut rtt = None;
+	let mut loads = Vec::with_capacity(names.len());
+	for chunk in crate::ingress::load_query_chunks(names) {
+		let attempt = async {
+			let started = Instant::now();
+			let mut stream = TcpStream::connect(addr).await.ok()?;
+			let connect = started.elapsed();
+			let _ = stream.set_nodelay(true);
+			stream
+				.write_all(&crate::ingress::encode_load_query(chunk))
+				.await
+				.ok()?;
+			let mut answer = Vec::new();
+			(&mut stream)
+				.take(crate::ingress::max_load_answer_len(chunk.len()) as u64 + 1)
+				.read_to_end(&mut answer)
+				.await
+				.ok()?;
+			Some((
+				connect,
+				crate::ingress::parse_load_answer(&answer, chunk.len())?,
+			))
+		};
+		let (connect, chunk_loads) = timeout(PROBE_TIMEOUT, attempt).await.ok()??;
+		rtt.get_or_insert(connect);
+		loads.extend(chunk_loads);
+	}
+	Some((rtt?, loads))
+}
+
 /// Connect and close at once. Proves the socket accepts, not that the application behind it is
 /// ready.
 async fn probe(endpoint: &Endpoint) -> bool {
@@ -550,6 +1136,7 @@ mod tests {
 			probe_interval_ms: None,
 			cooldown_min_ms: Some(100.0),
 			cooldown_max_ms: Some(1_000.0),
+			spill: None,
 		}
 	}
 
@@ -605,7 +1192,7 @@ mod tests {
 		}
 		assert_eq!(until, vec![100, 200, 400, 800, 1_000, 1_000]);
 		assert!(peer.cooling_down(999 * ms));
-		peer.record_success();
+		peer.clear_cooldown();
 		assert!(!peer.cooling_down(0));
 		peer.record_failure(PeerFailureKind::Refused, 100 * ms, 1_000 * ms, 0);
 		assert_eq!(
@@ -685,7 +1272,7 @@ mod tests {
 	#[test]
 	fn a_rebuild_keeps_peer_state_for_unchanged_peers() {
 		let old = failover(&[("10.0.0.1", 1), ("10.0.0.2", 1)]);
-		old.peers[0].record_success();
+		old.peers[0].forwarded.fetch_add(1, Ordering::Relaxed);
 		old.status.replays.fetch_add(3, Ordering::Relaxed);
 		let new = Failover::new(
 			spec(&[("10.0.0.1", 1), ("10.0.0.3", 1)]).parse().unwrap(),
@@ -693,6 +1280,7 @@ mod tests {
 			None,
 		);
 		assert!(Arc::ptr_eq(&new.peers[0], &old.peers[0]));
+		assert_eq!(new.peers[0].forwarded.load(Ordering::Relaxed), 1);
 		assert_eq!(new.peers[1].forwarded.load(Ordering::Relaxed), 0);
 		assert_eq!(new.status.replays.load(Ordering::Relaxed), 3);
 	}
@@ -718,5 +1306,416 @@ mod tests {
 		);
 		assert!(health.clear_if_unchanged(health.refused_at()));
 		assert!(!fo.locally_down(&dest, None));
+	}
+
+	// ── Spill-over ──
+
+	const S: u64 = 1_000_000_000;
+
+	fn policy() -> SpillPolicy {
+		SpillSpec::default().parse().unwrap()
+	}
+
+	fn spill_failover(peers: &[(&str, u16)], spill: SpillPolicy) -> Failover {
+		let mut policy = spec(peers).parse().unwrap();
+		policy.spill = Some(spill);
+		Failover::new(policy, None, None)
+	}
+
+	fn peer(load: u32, now_ms: u64) -> PeerView {
+		PeerView {
+			load: Some(load),
+			report_until_ms: now_ms + 3_000,
+			cooling: false,
+			rtt: Some(Duration::from_millis(1)),
+		}
+	}
+
+	/// Run the controller once a second for `secs` seconds from `start`, with a fresh local load.
+	fn run(
+		spill: &Spill,
+		local: u32,
+		peers: &[PeerView],
+		start: u64,
+		secs: u64,
+	) -> Option<Admission> {
+		let mut last = None;
+		for i in 0..=secs {
+			let now = start + i * S;
+			let peers: Vec<PeerView> = peers
+				.iter()
+				.map(|p| PeerView {
+					report_until_ms: now / 1_000_000 + 3_000,
+					..*p
+				})
+				.collect();
+			last = control(spill, Some((local, now / 1_000_000 + 1_000)), &peers, now);
+		}
+		last
+	}
+
+	#[test]
+	fn spill_policy_defaults_and_bounds() {
+		let p = policy();
+		assert_eq!((p.high_water, p.margin, p.max_fraction), (750, 200, 500));
+		assert_eq!(p.step, 50.0);
+		assert_eq!(p.max_peer_rtt, None);
+		for bad in [0.0, -0.1, 1.5, f64::NAN, f64::INFINITY] {
+			for field in 0..4 {
+				let mut s = SpillSpec::default();
+				*[
+					&mut s.high_water,
+					&mut s.margin,
+					&mut s.step,
+					&mut s.max_fraction,
+				][field] = Some(bad);
+				assert!(s.parse().is_err(), "field {field} = {bad}");
+			}
+		}
+		for bad in [0.0, -1.0, 60_001.0, f64::NAN] {
+			let s = SpillSpec {
+				max_peer_rtt_ms: Some(bad),
+				..Default::default()
+			};
+			assert!(s.parse().is_err(), "maxPeerRttMs {bad}");
+		}
+		let s = SpillSpec {
+			max_peer_rtt_ms: Some(20.0),
+			..Default::default()
+		};
+		assert_eq!(
+			s.parse().unwrap().max_peer_rtt,
+			Some(Duration::from_millis(20))
+		);
+	}
+
+	#[test]
+	fn the_share_rises_under_sustained_high_load_toward_a_lower_peer_and_is_capped() {
+		let fo = spill_failover(&[("10.0.0.1", 1), ("10.0.0.2", 1)], policy());
+		let spill = fo.spill.as_ref().unwrap();
+		let peers = [peer(500, 0), peer(300, 0)];
+
+		let after_two = run(spill, 900, &peers, S, 2).unwrap();
+		assert_eq!(after_two.fraction, 100, "0.05 per second");
+		assert_eq!(after_two.target, 1, "the least-loaded peer");
+
+		let capped = run(spill, 900, &peers, 10 * S, 60).unwrap();
+		assert_eq!(capped.fraction, 500, "maxFraction");
+	}
+
+	#[test]
+	fn the_share_decays_when_load_clears_and_spilling_stops_at_once() {
+		let fo = spill_failover(&[("10.0.0.1", 1)], policy());
+		let spill = fo.spill.as_ref().unwrap();
+		run(spill, 900, &[peer(200, 0)], S, 6).unwrap();
+		assert_eq!(spill.state.controller().fraction.round(), 300.0);
+
+		// Load falls below highWater − margin/2: no admission from the first pass.
+		assert_eq!(run(spill, 600, &[peer(200, 0)], 8 * S, 0), None);
+		assert_eq!(spill.state.admission(8_000), None);
+		assert_eq!(spill.state.admission.load(Ordering::Relaxed), 0);
+		// 250 after that pass; four more seconds at 0.05/s.
+		run(spill, 600, &[peer(200, 0)], 9 * S, 3);
+		assert_eq!(
+			spill.state.controller().fraction.round(),
+			50.0,
+			"decays at step/s"
+		);
+		run(spill, 600, &[peer(200, 0)], 13 * S, 5);
+		assert_eq!(spill.state.controller().fraction, 0.0);
+	}
+
+	#[test]
+	fn nothing_spills_when_no_peer_is_below_the_margin() {
+		let fo = spill_failover(&[("10.0.0.1", 1), ("10.0.0.2", 1)], policy());
+		let spill = fo.spill.as_ref().unwrap();
+		assert_eq!(run(spill, 950, &[peer(950, 0), peer(1000, 0)], S, 30), None);
+		assert_eq!(
+			run(spill, 950, &[peer(760, 0)], 40 * S, 30),
+			None,
+			"gap under margin/2"
+		);
+		assert_eq!(spill.state.controller().fraction, 0.0);
+	}
+
+	#[test]
+	fn a_held_share_needs_half_the_margin_and_goes_with_it() {
+		let fo = spill_failover(&[("10.0.0.1", 1)], policy());
+		let spill = fo.spill.as_ref().unwrap();
+		run(spill, 900, &[peer(500, 0)], S, 4);
+		// Gap 150: under margin (200) so no rise, over margin/2 (100) so the share holds.
+		let held = run(spill, 850, &[peer(700, 0)], 6 * S, 3).unwrap();
+		assert_eq!(held.fraction, 200);
+		// Gap 50: the peer is no longer far enough below, so nothing is admitted.
+		assert_eq!(run(spill, 850, &[peer(800, 0)], 10 * S, 0), None);
+	}
+
+	#[test]
+	fn stale_reports_and_unknown_local_load_stop_spilling_at_once() {
+		let fo = spill_failover(&[("10.0.0.1", 1)], policy());
+		let spill = fo.spill.as_ref().unwrap();
+		let admitted = run(spill, 900, &[peer(200, 0)], S, 4).unwrap();
+		let now = 5 * S;
+		let now_ms = now / 1_000_000;
+		assert!(
+			admitted.until_ms <= now_ms + 1_000,
+			"expires with the local sample"
+		);
+
+		let stale = PeerView {
+			report_until_ms: now_ms,
+			..peer(200, 0)
+		};
+		assert_eq!(
+			control(spill, Some((900, now_ms + 1_000)), &[stale], now + S / 4),
+			None
+		);
+		run(spill, 900, &[peer(200, 0)], now + S / 2, 0).unwrap();
+		assert_eq!(
+			control(spill, None, &[peer(200, now_ms)], now + S),
+			None,
+			"local unknown"
+		);
+
+		// A stalled controller: the last admission expires by itself.
+		let last = run(spill, 900, &[peer(200, 0)], 7 * S, 0).unwrap();
+		assert!(spill.state.admission(last.until_ms - 1).is_some());
+		assert_eq!(spill.state.admission(last.until_ms), None);
+	}
+
+	#[test]
+	fn cooling_unmeasured_and_distant_peers_are_not_targets() {
+		let near_only = SpillPolicy {
+			max_peer_rtt: Some(Duration::from_millis(20)),
+			..policy()
+		};
+		let fo = spill_failover(
+			&[("10.0.0.1", 1), ("10.0.0.2", 1), ("10.0.0.3", 1)],
+			near_only,
+		);
+		let spill = fo.spill.as_ref().unwrap();
+		let far = PeerView {
+			rtt: Some(Duration::from_millis(80)),
+			..peer(100, 0)
+		};
+		let unmeasured = PeerView {
+			rtt: None,
+			..peer(100, 0)
+		};
+		let near = peer(400, 0);
+		assert_eq!(
+			run(spill, 900, &[far, unmeasured, near], S, 2)
+				.unwrap()
+				.target,
+			2
+		);
+		let cooling = PeerView {
+			cooling: true,
+			..near
+		};
+		assert_eq!(run(spill, 900, &[far, unmeasured, cooling], 5 * S, 0), None);
+	}
+
+	#[test]
+	fn two_nodes_with_delayed_reports_do_not_settle_into_spilling_to_each_other() {
+		let a = spill_failover(&[("10.0.0.2", 1)], policy());
+		let b = spill_failover(&[("10.0.0.1", 1)], policy());
+		let (sa, sb) = (a.spill.as_ref().unwrap(), b.spill.as_ref().unwrap());
+		// Each node's load moves with the share it spills or receives; reports lag one pass.
+		let (base_a, base_b) = (950.0, 600.0);
+		let (mut load_a, mut load_b) = (base_a, base_b);
+		let mut both_admitting = 0;
+		for i in 1..=120u64 {
+			let now = i * S;
+			let now_ms = now / 1_000_000;
+			let (report_a, report_b) = (load_a as u32, load_b as u32);
+			let adm_a = control(
+				sa,
+				Some((load_a as u32, now_ms + 1_000)),
+				&[peer(report_b, now_ms)],
+				now,
+			);
+			let adm_b = control(
+				sb,
+				Some((load_b as u32, now_ms + 1_000)),
+				&[peer(report_a, now_ms)],
+				now,
+			);
+			let fa = adm_a.map_or(0.0, |a| a.fraction as f64 / 1000.0);
+			let fb = adm_b.map_or(0.0, |a| a.fraction as f64 / 1000.0);
+			if fa > 0.0 && fb > 0.0 {
+				both_admitting += 1;
+			}
+			// Half of a spilled share's load moves to the other node.
+			load_a = base_a - 350.0 * fa + 350.0 * fb;
+			load_b = base_b + 350.0 * fa - 350.0 * fb;
+		}
+		assert_eq!(both_admitting, 0);
+		assert!(
+			load_a > load_b,
+			"A stays the busier one, so B never spills back"
+		);
+		let fa = sa.state.controller().fraction;
+		assert!(fa > 0.0 && fa <= 500.0);
+	}
+
+	#[test]
+	fn admission_round_trips_and_spill_target_follows_the_fraction() {
+		let a = Admission {
+			fraction: 1000,
+			target: 0xFFFF,
+			until_ms: (1 << 38) - 1,
+		};
+		assert_eq!(Admission::unpack(a.pack()), Some(a));
+		assert_eq!(Admission::unpack(0), None);
+
+		let fo = spill_failover(&[("10.0.0.1", 1), ("10.0.0.2", 1)], policy());
+		let spill = fo.spill.as_ref().unwrap();
+		let client = |port: u16| SocketAddr::new("198.51.100.7".parse().unwrap(), port);
+		assert_eq!(fo.spill_target(client(1)), None, "nothing admitted");
+
+		let until_ms = now_ns() / 1_000_000 + 60_000;
+		spill.state.admission.store(
+			Admission {
+				fraction: 300,
+				target: 1,
+				until_ms,
+			}
+			.pack(),
+			Ordering::Relaxed,
+		);
+		let spilled = (0..10_000u16)
+			.filter(|p| fo.spill_target(client(*p)).is_some())
+			.count();
+		assert!(
+			(2_600..3_400).contains(&spilled),
+			"about 30 %, got {spilled}"
+		);
+		assert!((0..10_000u16).all(|p| fo.spill_target(client(p)).is_none_or(|t| t == 1)));
+
+		fo.peers[1].record_failure(PeerFailureKind::Refused, 60 * S, 60 * S, now_ns());
+		assert!(
+			(0..1_000u16).all(|p| fo.spill_target(client(p)).is_none()),
+			"target cooling"
+		);
+	}
+
+	#[test]
+	fn ingress_connections_never_spill_and_drain_or_down_forward_everything() {
+		let never = || -> Option<usize> { panic!("spill consulted") };
+		assert_eq!(decide(true, false, false, false, never), Decision::Local);
+		assert_eq!(decide(true, false, true, false, never), Decision::Refuse);
+		assert_eq!(decide(true, false, false, true, never), Decision::Refuse);
+		assert_eq!(
+			decide(false, false, true, true, never),
+			Decision::Forward(ForwardMode::Down),
+			"down wins over drain: nothing to fall back to"
+		);
+		assert_eq!(
+			decide(false, false, false, true, never),
+			Decision::Forward(ForwardMode::Drain)
+		);
+		assert_eq!(
+			decide(false, true, true, true, never),
+			Decision::Local,
+			"suspended"
+		);
+		assert_eq!(
+			decide(false, false, false, false, || Some(2)),
+			Decision::Forward(ForwardMode::Spill(2))
+		);
+		assert_eq!(decide(false, false, false, false, || None), Decision::Local);
+	}
+
+	#[test]
+	fn drain_skips_cooling_peers_while_down_still_tries_the_earliest() {
+		let fo = failover(&[("10.0.0.1", 1), ("10.0.0.2", 1)]);
+		fo.peers[0].record_failure(PeerFailureKind::Refused, 50, 50, 100);
+		fo.peers[1].record_failure(PeerFailureKind::Refused, 20, 20, 100);
+		assert!(fo.candidates_for(ForwardMode::Drain, 101).is_empty());
+		assert_eq!(fo.candidates_for(ForwardMode::Spill(1), 101).len(), 0);
+		let down = fo.candidates_for(ForwardMode::Down, 101);
+		assert_eq!(down.len(), 1);
+		assert_eq!(down[0].addr.ip().to_string(), "10.0.0.2");
+		assert_eq!(fo.candidates_for(ForwardMode::Drain, 200).len(), 2);
+	}
+
+	#[test]
+	fn spill_state_carries_over_only_under_the_same_policy_and_peers() {
+		let peers = [("10.0.0.1", 1), ("10.0.0.2", 1)];
+		let old = spill_failover(&peers, policy());
+		let carry = |peers: &[(&str, u16)], spill: SpillPolicy| {
+			let mut p = spec(peers).parse().unwrap();
+			p.spill = Some(spill);
+			let new = Failover::new(p, Some(&old), None);
+			Arc::ptr_eq(
+				&new.spill.as_ref().unwrap().state,
+				&old.spill.as_ref().unwrap().state,
+			)
+		};
+		assert!(carry(&peers, policy()));
+		assert!(
+			!carry(&[("10.0.0.2", 1), ("10.0.0.1", 1)], policy()),
+			"reordered peers"
+		);
+		assert!(!carry(
+			&peers,
+			SpillPolicy {
+				max_fraction: 300,
+				..policy()
+			}
+		));
+	}
+
+	#[test]
+	fn peer_reports_and_rtt_are_kept_per_route_peer() {
+		let fo = failover(&[("10.0.0.1", 1)]);
+		let p = &fo.peers[0];
+		assert_eq!(p.report(), None);
+		p.set_report(Some(1500), 42);
+		assert_eq!(p.report(), Some((1000, 42)));
+		p.set_report(None, 43);
+		assert_eq!(p.report(), None, "unavailable is no report");
+		assert_eq!(p.rtt(), None);
+		p.record_rtt(Duration::from_millis(4));
+		p.record_rtt(Duration::from_millis(8));
+		assert_eq!(p.rtt(), Some(Duration::from_millis(5)));
+	}
+
+	/// The per-connection cost the spill decision adds:
+	/// `cargo test --release --lib -- --ignored spill_decision_cost --nocapture`.
+	#[test]
+	#[ignore]
+	fn spill_decision_cost() {
+		use std::hint::black_box;
+		const N: u32 = 20_000_000;
+		let time = |label: &str, fo: &Failover| {
+			let started = std::time::Instant::now();
+			let mut spilled = 0u32;
+			for port in 0..N {
+				let client = SocketAddr::new("198.51.100.7".parse().unwrap(), port as u16);
+				let decision = decide(false, false, false, black_box(fo).drain, || {
+					black_box(fo).spill_target(black_box(client))
+				});
+				spilled += u32::from(decision != Decision::Local);
+			}
+			let ns = started.elapsed().as_nanos() as f64 / N as f64;
+			println!("{label}: {ns:.1} ns/connection ({spilled} spilled)");
+		};
+		let plain = failover(&[("10.0.0.1", 1)]);
+		time("failover without spill", &plain);
+		let idle = spill_failover(&[("10.0.0.1", 1)], policy());
+		time("spill, nothing admitted", &idle);
+		let busy = spill_failover(&[("10.0.0.1", 1)], policy());
+		busy.spill.as_ref().unwrap().state.admission.store(
+			Admission {
+				fraction: 300,
+				target: 0,
+				until_ms: now_ns() / 1_000_000 + 3_600_000,
+			}
+			.pack(),
+			Ordering::Relaxed,
+		);
+		time("spill, 30 % admitted", &busy);
 	}
 }

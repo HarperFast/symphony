@@ -138,7 +138,12 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 			return;
 		}
 		match crate::ingress::read_proxy_v2(&mut stream, hs_timeout).await {
-			Ok(source) => peer_addr = source,
+			Ok(crate::ingress::Header::Proxy(source)) => peer_addr = source,
+			Ok(crate::ingress::Header::LoadQuery(names)) => {
+				// Boxed: its state would otherwise sit in every connection's future.
+				Box::pin(answer_load_query(stream, names, &ctx, hs_timeout)).await;
+				return;
+			}
 			Err(reject) => {
 				ctx.listener_metrics.inc_blocked(reject.into());
 				return;
@@ -223,10 +228,15 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 	// raw TLS. An ingress connection is never forwarded again: if this node cannot serve it, a
 	// close with no bytes sends the forwarding node on to its next peer.
 	if let Some(failover) = &route.failover {
-		let unavailable = failover.drain
-			|| failover.locally_down(&route.destination, route.destination_h2.as_ref());
-		if ctx.ingress.is_some() {
-			if unavailable {
+		let decision = crate::failover::decide(
+			ctx.ingress.is_some(),
+			route.suspended,
+			failover.locally_down(&route.destination, route.destination_h2.as_ref()),
+			failover.drain,
+			|| failover.spill_target(peer_addr),
+		);
+		match decision {
+			crate::failover::Decision::Refuse => {
 				inc_route_error(
 					&ctx.listener_metrics,
 					&route.metric_identity.counters,
@@ -234,22 +244,34 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 				);
 				return;
 			}
-		} else if unavailable && !route.suspended {
-			// Boxed: its state would otherwise sit in every connection's future.
-			let result = Box::pin(crate::failover::forward_to_peers(
-				stream,
-				&peek_info,
-				failover,
-				peer_addr,
-				local_addr,
-				&ctx,
-				&route.metric_identity,
-			))
-			.await;
-			if let Err(kind) = result {
-				inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, kind);
+			crate::failover::Decision::Forward(mode) => {
+				// Boxed: its state would otherwise sit in every connection's future.
+				let forwarded = Box::pin(crate::failover::forward_to_peers(
+					&mut stream,
+					&peek_info,
+					failover,
+					mode,
+					peer_addr,
+					local_addr,
+					&ctx,
+					&route.metric_identity,
+				))
+				.await;
+				match forwarded {
+					crate::failover::Forwarded::Done(Ok(())) => return,
+					crate::failover::Forwarded::Done(Err(kind)) => {
+						inc_route_error(
+							&ctx.listener_metrics,
+							&route.metric_identity.counters,
+							kind,
+						);
+						return;
+					}
+					// Untouched: no peer answered, so the local path reads the hello as usual.
+					crate::failover::Forwarded::ServeLocally => {}
+				}
 			}
-			return;
+			crate::failover::Decision::Local => {}
 		}
 	}
 	// A suspended route's destination is whatever `resolveConnection()` returns, not the one this
@@ -586,6 +608,34 @@ where
 			Err(_) => Err(ErrorKind::IdleTimeout),
 		}
 	}
+}
+
+/// Answer a peer's load query with this node's load for each name, then close.
+async fn answer_load_query(
+	mut stream: TcpStream,
+	names: Vec<Option<String>>,
+	ctx: &ConnContext,
+	limit: Duration,
+) {
+	use tokio::io::AsyncWriteExt;
+	ctx.listener_metrics.inc_load_query();
+	let answer = {
+		let table = ctx.route_table.0.load();
+		let now = crate::protection::now_ns();
+		let loads: Vec<Option<u32>> = names
+			.iter()
+			.map(|name| {
+				name.as_deref()
+					.and_then(|name| table.load_answer(name, now))
+			})
+			.collect();
+		crate::ingress::encode_load_answer(&loads)
+	};
+	let _ = timeout(limit, async {
+		stream.write_all(&answer).await?;
+		stream.shutdown().await
+	})
+	.await;
 }
 
 /// Proxy a connection already set up end to end (a failover peer that has answered): no

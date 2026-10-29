@@ -122,7 +122,7 @@ above `TCP_KEEPCNT`'s ceiling of 127.
 | `forwardFingerprint` | `'ja3' \| 'ja4' \| 'none' \| ('ja3' \| 'ja4')[]` | `'none'` | Forward the client TLS fingerprint(s) downstream. See [Forwarding the fingerprint](#forwarding-the-fingerprint-downstream). |
 | `protocol` | `'http' \| 'opaque'` | `'opaque'` | The route's application protocol. Required to be `'http'` before `sourceAddressHeader: 'xForwardedFor'` or a header-carried `forwardFingerprint` is accepted — see [Source address forwarding](#source-address-forwarding). |
 | `allowedSources` | `string[]` | — (any client) | Only clients whose TCP peer address is in one of these CIDRs reach the route. See [Per-route source allowlist](#per-route-source-allowlist). |
-| `failover` | `FailoverConfig` | — | Forward new connections to peer nodes while the local upstream is down. See [Peer failover](#peer-failover). |
+| `failover` | `FailoverConfig` | — | Forward new connections to peer nodes while the local upstream is down, and optionally a share of them while the local Harper threads are much busier than a peer's. See [Peer failover](#peer-failover) and [Spill-over](#spill-over-to-a-less-loaded-peer). |
 
 ### `Upstream`
 
@@ -465,6 +465,7 @@ routes: [{
     // drain: true,              // forward every new connection, whatever the local health
     // probeIntervalMs: 1000,
     // peerCooldownMs: { min: 5000, max: 60000 },
+    // spill: {},                // also move load to less-busy peers (see Spill-over below)
   },
 }],
 ```
@@ -481,20 +482,29 @@ socket accepts, not that the application behind it is ready.
 **How.** The connection is forwarded as raw TLS: the peer's symphony terminates it with its own copy
 of the certificate, so client certificates and ALPN are negotiated with the peer. symphony sends a
 PROXY v2 header (the real client address) and the ClientHello, then waits for the peer's first byte
-before reading anything more from the client. A peer that refuses, times out, or closes without
-sending a byte received nothing a retry could duplicate, so the same ClientHello is replayed to the
-next peer. Peers are tried round-robin, skipping peers in cooldown (per route and peer, starting at
-`min`, doubling per consecutive failure up to `max`, reset by a success), at most once each, all
-within the listener's TLS handshake timeout. If every peer is cooling down, the one whose cooldown
-ends first is tried once.
+before reading anything from the client — the ClientHello stays unread on the client socket until
+then. A peer that refuses, times out, or closes without sending a byte received nothing a retry
+could duplicate, so the same ClientHello is replayed to the next peer. The peer's first byte commits
+the connection to it; nothing after that is retried. Peers are tried round-robin, skipping peers in
+cooldown (per route and peer, starting at `min`, doubling per consecutive failure up to `max`, reset
+by a success), at most once each.
+
+- **Local upstream down:** all attempts share the listener's TLS handshake timeout. If every peer is
+  cooling down, the one whose cooldown ends first is tried once. If no peer takes the connection it
+  is closed (`exhausted`).
+- **Draining** (`drain`, local upstream up): peers in cooldown are skipped, the attempts share at most
+  2 s, and if no peer takes the connection before answering it is served by the local upstream
+  (`localFallbacks`).
 
 **The ingress listener** (`failoverIngress`) is the receiving end:
 
 - A connection from outside `trustedSources` is closed before any byte is read. An empty list
   admits nobody.
-- A PROXY v2 header is required (v1, LOCAL, malformed or slow headers are refused). Its source
-  address replaces the TCP peer address for protection, `allowedSources` and the header sent to the
-  upstream. Its TLVs are ignored.
+- A PROXY v2 header is required (v1, malformed or slow headers are refused). Its source address
+  replaces the TCP peer address for protection, `allowedSources` and the header sent to the
+  upstream. Its TLVs are ignored. A PROXY v2 **LOCAL** header is a peer's
+  [load query](#spill-over-to-a-less-loaded-peer) when it names routes, and refused
+  (`proxy_header_local`) otherwise.
 - A connection is never forwarded again, and a name with no exact or wildcard route is closed rather
   than served by a default route. If the route's local upstream is down or draining, the connection
   is closed before the handshake, which the forwarding node treats as "try the next peer".
@@ -517,11 +527,81 @@ ends first is tried once.
   restart (`symphony-server` recreates the proxy).
 
 Metrics: each failover route's `routeMetrics[].failover` carries `localUp`, refusing/total slots,
-replays, budget exhaustion and per-peer forwarded counts and failures by reason (`refused`,
-`timeout`, `zero_byte_close`, `error`; zero-valued reasons omitted). Ingress refusals are listener block reasons
-(`untrusted_source`, `proxy_header_invalid`, `proxy_header_local`, `proxy_header_v1`,
-`proxy_header_timeout`); a forwarded connection refused for a down route is the route error
-`locally_down`.
+replays, budget exhaustion (`exhausted`), `localFallbacks`, and per-peer forwarded counts and
+failures by reason (`refused`, `timeout`, `zero_byte_close`, `error`; zero-valued reasons omitted).
+Ingress refusals are listener block reasons (`untrusted_source`, `proxy_header_invalid`,
+`proxy_header_local`, `proxy_header_v1`, `proxy_header_timeout`); a forwarded connection refused
+for a down route is the route error `locally_down`.
+
+### Spill-over to a less-loaded peer
+
+DNS without load feedback (latency or geoproximity records with no health checks) keeps sending a
+busy node its full share. With `failover.spill`, a route whose local Harper threads are much busier
+than the same route's on a peer forwards a share of its **new** client connections to that peer,
+through the same forwarding path as failover, while its own upstream stays up.
+
+```typescript
+failover: {
+  peers: [{ host: '10.0.1.12', port: 9443 }, { host: '10.0.1.13', port: 9443 }],
+  spill: {
+    // highWater: 0.75,     // local load at which spilling may start
+    // margin: 0.2,         // how far below the local load a peer must be to raise the share
+    // step: 0.05,          // change of the share per second, up and down
+    // maxFraction: 0.5,    // largest share of new connections spilled
+    // maxPeerRttMs: 20,    // only peers this close (measured); default: no limit
+  },
+},
+```
+
+**Load.** A route's load is the mean CPU (0–1 of one core) of its worker threads, smoothed over about
+3 s, from the [thread CPU monitor](#thread-cpu-utilisation-monitoring) — so its UDS upstreams need
+`pid`/`tid`, and only threads tied to their socket's owner count. A route with a TCP upstream, or
+whose threads cannot be measured, never spills. With an h2 upstream set, the busier of the two
+counts. Per-thread CPU is relative to one core: if an instance runs more threads than it has CPU
+quota, it saturates below 1.0, so lower `highWater` to match.
+
+**Peer loads.** About every `probeIntervalMs` (at least 100 ms), each node sends each peer one PROXY v2
+LOCAL header on its `failoverIngress` port, naming the spill routes it shares (custom TLV `0xE3`,
+up to 64 per query). The peer answers `SYMPHONY-LOAD/1` and one line per name: its load in permille
+for the *exact* route configured for that name, or `-` when it would not take a spilled connection
+(no exact route, draining, local upstream down, or load not measurable). The connect time of the
+query is the peer's RTT. A report is usable for 3 × `probeIntervalMs` (at least 3 s). A peer that
+does not answer — including symphony 1.5.0 and earlier, which closes LOCAL headers — is never a
+target.
+
+**The rule.** Once a second the controller takes the least-loaded peer with a usable report that is
+not cooling down (and within `maxPeerRttMs`, when set), and with `L` the local load and `P` that
+peer's:
+
+| condition | share of new connections |
+| --- | --- |
+| `L ≥ highWater` and `P ≤ L − margin` | rises by `step`/s, up to `maxFraction` |
+| `L ≥ highWater − margin/2` and `P ≤ L − margin/2` | held |
+| otherwise, or `L` unknown | spilling stops at once; the share decays by `step`/s |
+
+Each new connection spills with that probability. Whatever the share, nothing spills once the local
+or peer reading behind the decision is older than its freshness window, so a stalled poll stops
+spilling by itself. Because spilling needs the peer at least `margin/2` below, two nodes reading each
+other's loads correctly cannot spill to each other at once; with delayed readings both can briefly,
+and each share then moves at most `step` per second.
+
+**What a spilled connection costs.** It is relayed through the busy node for its whole life: an extra
+network hop, and cross-region egress if the peer is far. If the peer refuses, times out, or closes
+before answering, the connection is served locally and the peer cools down. After the peer's first
+byte the connection is committed, as with failover: a peer that then fails (for example its upstream
+went down after its last report) loses that connection. Connections that arrived on an ingress
+listener never spill, and only new connections move. Where DNS steering with load feedback exists
+(Akamai GTM), it remains the better tool; spill-over complements it for spikes of a few seconds.
+
+- Exact-SNI routes only: a wildcard's load is not each matching name's load on a peer, where an
+  exact route can override it. An invalid `spill` (or one on a wildcard route) disables only
+  spill-over, counted in `failingRoutes`; down and drain failover still apply.
+- The spilled share, its target, the local load, and each peer's last report and RTT are in
+  `routeMetrics[].failover.spill` and `.peers[]` (`spilled`, `load`, `rttMs`), and on the admin
+  endpoint as `symphony_failover_spill_fraction`, `symphony_failover_local_load`,
+  `symphony_failover_spilled_total`, `symphony_failover_peer_load` and
+  `symphony_failover_peer_rtt_seconds`. Load queries answered are the listener counter
+  `loadQueries` (`symphony_listener_load_queries_total`).
 
 ---
 
@@ -816,7 +896,7 @@ const m = proxy.metrics();
 // m.suspendedResolved     — suspended connections that were resolved with a route
 // m.suspendedUnresolved   — suspended connections that timed out or were rejected
 // m.routes                — routes in the live table, including the default route
-// m.failingRoutes         — rejected cert/protocol/carrier/allowedSources routes, duplicate wildcards, or invalid failover policies
+// m.failingRoutes         — rejected cert/protocol/carrier/allowedSources routes, duplicate wildcards, or invalid failover (or failover.spill) policies
 
 // Per listener, in configuration order
 for (const l of m.listeners) {

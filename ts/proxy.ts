@@ -114,6 +114,15 @@ function toJsRoute(r: RouteConfig): JsRouteConfig {
 					drain: r.failover.drain,
 					probeIntervalMs: r.failover.probeIntervalMs,
 					peerCooldownMs: r.failover.peerCooldownMs,
+					spill: r.failover.spill
+						? {
+								highWater: r.failover.spill.highWater,
+								margin: r.failover.spill.margin,
+								step: r.failover.spill.step,
+								maxFraction: r.failover.spill.maxFraction,
+								maxPeerRttMs: r.failover.spill.maxPeerRttMs,
+							}
+						: undefined,
 				}
 			: undefined,
 	};
@@ -337,6 +346,7 @@ export class SymphonyProxy extends EventEmitter {
 				bytesSent: l.bytesSent,
 				blockedByReason: l.blockedByReason.map((c) => ({ reason: c.reason, count: c.count })),
 				errorsByReason: l.errorsByReason.map((c) => ({ reason: c.reason, count: c.count })),
+				loadQueries: l.loadQueries,
 			})),
 			routeMetrics: (m.routeMetrics ?? []).map((r) => ({
 				route: r.route,
@@ -357,10 +367,21 @@ export class SymphonyProxy extends EventEmitter {
 						drain: r.failover.drain,
 						replays: r.failover.replays,
 						exhausted: r.failover.exhausted,
+						localFallbacks: r.failover.localFallbacks,
+						...(r.failover.spill && {
+							spill: {
+								fraction: r.failover.spill.fraction,
+								...(r.failover.spill.target != null && { target: r.failover.spill.target }),
+								...(r.failover.spill.localLoad != null && { localLoad: r.failover.spill.localLoad }),
+							},
+						}),
 						peers: r.failover.peers.map((p) => ({
 							peer: p.peer,
 							forwarded: p.forwarded,
+							spilled: p.spilled,
 							coolingDown: p.coolingDown,
+							...(p.load != null && { load: p.load }),
+							...(p.rttMs != null && { rttMs: p.rttMs }),
 							failuresByReason: p.failuresByReason.map((c) => ({ reason: c.reason, count: c.count })),
 						})),
 					},

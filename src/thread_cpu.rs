@@ -317,10 +317,18 @@ pub struct LoadEwma {
 }
 
 impl LoadEwma {
-	/// Current smoothed load in permille, or `None` when no discovered thread has a fresh sample.
-	pub fn get(&self, now: u64) -> Option<u32> {
+	/// Current smoothed load in permille and the monotonic ms it is current until, or `None` when no
+	/// discovered thread has a fresh sample.
+	pub fn get(&self, now: u64) -> Option<(u32, u64)> {
 		let packed = self.published.load(Ordering::Relaxed);
-		(now / 1_000_000 < packed >> 10).then_some((packed & 0x3FF) as u32)
+		let until_ms = packed >> 10;
+		(now / 1_000_000 < until_ms).then_some(((packed & 0x3FF) as u32, until_ms))
+	}
+
+	#[cfg(test)]
+	pub fn publish_for_test(&self, permille: u32, until_ms: u64) {
+		self.published
+			.store(until_ms << 10 | permille as u64, Ordering::Relaxed);
 	}
 
 	fn update(&self, mean: Option<u32>, now: u64) {
@@ -631,16 +639,16 @@ mod tests {
 		let load = LoadEwma::default();
 		assert_eq!(load.get(0), None);
 		load.update(Some(1000), 1_000_000_000);
-		assert_eq!(load.get(1_000_000_000), Some(1000));
+		assert_eq!(load.get(1_000_000_000), Some((1000, 2_000)));
 		// One time constant at 0 moves it about 63 % of the way.
 		load.update(Some(0), 4_000_000_000);
-		assert_eq!(load.get(4_000_000_000), Some(368));
+		assert_eq!(load.get(4_000_000_000).map(|l| l.0), Some(368));
 		assert_eq!(load.get(5_000_000_000), None, "expired");
 		load.update(None, 4_250_000_000);
 		assert_eq!(load.get(4_250_000_000), None);
 		load.update(Some(200), 60_000_000_000);
 		assert_eq!(
-			load.get(60_000_000_000),
+			load.get(60_000_000_000).map(|l| l.0),
 			Some(200),
 			"restarts from the sample after a long gap"
 		);

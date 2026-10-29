@@ -423,6 +423,7 @@ describe('renderPrometheus', () => {
 								{ reason: 'no_sni', count: 0 },
 							],
 							errorsByReason: [{ reason: 'upstream_connect', count: 1 }],
+							loadQueries: 6,
 						},
 					],
 					routeMetrics: [
@@ -630,10 +631,12 @@ describe('renderPrometheus', () => {
 									drain: false,
 									replays: 3,
 									exhausted: 1,
+									localFallbacks: 4,
 									peers: [
 										{
 											peer: '10.0.0.2:9443',
 											forwarded: 5,
+											spilled: 0,
 											coolingDown: true,
 											failuresByReason: [{ reason: 'zero_byte_close', count: 2 }],
 										},
@@ -658,7 +661,55 @@ describe('renderPrometheus', () => {
 				'm'
 			)
 		);
+		assert.match(rendered, new RegExp(`^symphony_failover_local_fallbacks_total\\{${tags}\\} 4$`, 'm'));
 		assert.equal(rendered.match(/^symphony_route_local_up\{/gm)?.length, 1, 'only the failover route');
+		assert.equal(rendered.match(/^symphony_failover_spill/gm), null, 'no spill series without spill');
+		assert.equal(rendered.match(/^symphony_failover_peer_(load|rtt)/gm), null, 'nothing measured');
+		assert.match(rendered, /^symphony_listener_load_queries_total\{proxy="80,443",listener="0.0.0.0:443",mode="tls"\} 6$/m);
+	});
+
+	it('renders spill-over state, omitting what is not measured', () => {
+		const base = snapshot.proxies[0].metrics.routeMetrics[0];
+		const peer = { coolingDown: false, forwarded: 0, failuresByReason: [] };
+		const rendered = renderPrometheus({
+			...snapshot,
+			proxies: [
+				{
+					...snapshot.proxies[0],
+					metrics: {
+						...snapshot.proxies[0].metrics,
+						routeMetrics: [
+							{
+								...base,
+								route: 'app.example.com',
+								failover: {
+									localUp: true,
+									refusingSlots: 0,
+									slots: 2,
+									drain: false,
+									replays: 0,
+									exhausted: 0,
+									localFallbacks: 1,
+									spill: { fraction: 0.25, target: '10.0.0.2:9443', localLoad: 0.9 },
+									peers: [
+										{ ...peer, peer: '10.0.0.2:9443', spilled: 12, load: 0.3, rttMs: 1.5 },
+										{ ...peer, peer: '10.0.0.3:9443', spilled: 0 },
+									],
+								},
+							},
+						],
+					},
+				},
+			],
+		});
+		const tags = 'proxy="80,443",route="app.example.com",group="tenant-1"';
+		assert.match(rendered, new RegExp(`^symphony_failover_spill_fraction\\{${tags}\\} 0.25$`, 'm'));
+		assert.match(rendered, new RegExp(`^symphony_failover_local_load\\{${tags}\\} 0.9$`, 'm'));
+		assert.match(rendered, new RegExp(`^symphony_failover_spilled_total\\{${tags},peer="10.0.0.2:9443"\\} 12$`, 'm'));
+		assert.match(rendered, new RegExp(`^symphony_failover_spilled_total\\{${tags},peer="10.0.0.3:9443"\\} 0$`, 'm'));
+		assert.match(rendered, new RegExp(`^symphony_failover_peer_load\\{${tags},peer="10.0.0.2:9443"\\} 0.3$`, 'm'));
+		assert.match(rendered, new RegExp(`^symphony_failover_peer_rtt_seconds\\{${tags},peer="10.0.0.2:9443"\\} 0.0015$`, 'm'));
+		assert.equal(rendered.match(/^symphony_failover_peer_load\{/gm)?.length, 1, 'the unmeasured peer is omitted');
 	});
 });
 
