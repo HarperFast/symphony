@@ -897,10 +897,11 @@ fn assess(
 		return (Trend::Decay, None);
 	};
 	let until_ms = local_until_ms.min(report_until_ms);
-	let half = policy.margin / 2;
-	if local >= policy.high_water && peer_load + policy.margin <= local {
+	let margin = policy.margin;
+	if local >= policy.high_water && peer_load + margin <= local {
 		(Trend::Rise, Some((target, until_ms)))
-	} else if local + half >= policy.high_water && peer_load + half <= local {
+	// Doubled, so an odd margin's half is not rounded down.
+	} else if 2 * local + margin >= 2 * policy.high_water && 2 * peer_load + margin <= 2 * local {
 		(Trend::Hold, Some((target, until_ms)))
 	} else {
 		(Trend::Decay, None)
@@ -958,10 +959,11 @@ pub fn spill_status(failover: &Failover, now_ns: u64) -> Option<(f64, Option<Soc
 	})
 }
 
-/// A load query's outcome: the RTT sample, and each name's answer with the ms it arrived.
+/// A load query's outcome: the RTT sample, and each name's answer with the ms it arrived (`None`
+/// for a name whose chunk failed).
 struct LoadAnswer {
 	rtt: Duration,
-	loads: Vec<(Option<u32>, u64)>,
+	loads: Vec<Option<(Option<u32>, u64)>>,
 }
 
 /// Poll each spill route's peers for their load and run the spill controllers. Separate from
@@ -1088,14 +1090,15 @@ fn apply_answer(
 			continue;
 		};
 		peer.record_rtt(answer.rtt);
-		if let Some((load, at_ms)) = answer.loads.get(i) {
+		if let Some(Some((load, at_ms))) = answer.loads.get(i) {
 			peer.set_report(*load, *at_ms);
 		}
 	}
 }
 
 /// One load query per chunk of names, each within `PROBE_TIMEOUT`; the connect time of the first is
-/// the RTT sample. `None` if any chunk fails.
+/// the RTT sample. `None` if the first chunk fails; a later chunk's failure leaves its names
+/// unanswered and stops there.
 async fn query_load(addr: SocketAddr, names: &[Arc<str>]) -> Option<LoadAnswer> {
 	let mut rtt = None;
 	let mut loads = Vec::with_capacity(names.len());
@@ -1120,11 +1123,15 @@ async fn query_load(addr: SocketAddr, names: &[Arc<str>]) -> Option<LoadAnswer> 
 				crate::ingress::parse_load_answer(&answer, chunk.len())?,
 			))
 		};
-		let (connect, chunk_loads) = timeout(PROBE_TIMEOUT, attempt).await.ok()??;
+		let Some((connect, chunk_loads)) = timeout(PROBE_TIMEOUT, attempt).await.ok().flatten()
+		else {
+			break;
+		};
 		rtt.get_or_insert(connect);
 		let at_ms = now_ns() / 1_000_000;
-		loads.extend(chunk_loads.into_iter().map(|load| (load, at_ms)));
+		loads.extend(chunk_loads.into_iter().map(|load| Some((load, at_ms))));
 	}
+	loads.resize(names.len(), None);
 	Some(LoadAnswer { rtt: rtt?, loads })
 }
 
@@ -1471,6 +1478,26 @@ mod tests {
 		assert_eq!(held.fraction, 200);
 		// Gap 50: the peer is no longer far enough below, so nothing is admitted.
 		assert_eq!(run(spill, 850, &[peer(800, 0)], 10 * S, 0), None);
+	}
+
+	#[test]
+	fn an_odd_margin_holds_at_exactly_half_of_it() {
+		let odd = SpillPolicy {
+			margin: 3,
+			..policy()
+		};
+		let now_ms = 10_000;
+		let local = Some((900, now_ms + 1_000));
+		assert_eq!(
+			assess(&odd, local, &[peer(898, now_ms)], now_ms).0,
+			Trend::Hold,
+			"gap 2 ≥ 1.5"
+		);
+		assert_eq!(
+			assess(&odd, local, &[peer(899, now_ms)], now_ms).0,
+			Trend::Decay,
+			"gap 1 < 1.5"
+		);
 	}
 
 	#[test]

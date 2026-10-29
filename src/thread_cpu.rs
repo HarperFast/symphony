@@ -12,6 +12,7 @@
 use crate::protection::now_ns;
 use crate::router::LiveRouteTable;
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -23,8 +24,9 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const SAMPLE_VALID_NS: u64 = 1_000_000_000;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 const DISCOVERY_RETRY_NS: u64 = 5_000_000_000;
-/// A resolved slot's owner is checked again this often: another process can take over the socket
-/// path while the old thread is still alive, without the configuration changing.
+/// A resolved slot's socket file is checked this often: another process can bind the path while the
+/// old thread is still alive, without the configuration changing. Only a changed inode costs a
+/// connect, so a busy worker's accept queue is not touched to confirm what has not changed.
 const OWNER_RECHECK_NS: u64 = 30_000_000_000;
 const MAX_CONCURRENT_DISCOVERIES: usize = 64;
 const LOAD_TIME_CONSTANT_NS: f64 = 3_000_000_000.0;
@@ -144,21 +146,22 @@ fn resolve(
 	proc: &ProcFs,
 	views: &mut HashMap<u32, Option<ProcessView>>,
 ) -> Identity {
-	let Some(view) = views
-		.entry(owner)
-		.or_insert_with(|| proc.process_view(owner))
-	else {
-		return Identity::Unresolved;
-	};
 	let host_tid = if owner == configured_pid {
 		configured_tid
-	} else if view.innermost_pid == configured_pid {
+	} else {
+		let Some(view) = views
+			.entry(owner)
+			.or_insert_with(|| proc.process_view(owner))
+		else {
+			return Identity::Unresolved;
+		};
+		if view.innermost_pid != configured_pid {
+			return Identity::Literal;
+		}
 		match view.threads.get(&configured_tid) {
 			Some(tid) => *tid,
 			None => return Identity::Unresolved,
 		}
-	} else {
-		return Identity::Literal;
 	};
 	match proc.task_stat(owner, host_tid) {
 		Some(stat) => Identity::Discovered {
@@ -170,11 +173,24 @@ fn resolve(
 	}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Discovery {
+	/// The socket owner's host pid; `None` = the connect failed.
+	owner: Option<u32>,
+	/// The socket file's inode, read before connecting.
+	inode: Option<u64>,
+}
+
 struct SampleState {
 	identity: Identity,
 	next_discovery_ns: u64,
-	/// A discovery's result (`None` = the connect failed), applied by the next sampling pass.
-	discovered: Option<Option<u32>>,
+	/// A discovery's result, applied by the next sampling pass.
+	discovered: Option<Discovery>,
+	/// The socket file's inode when the identity was resolved, and when to look at it again.
+	inode: Option<u64>,
+	next_recheck_ns: u64,
+	/// Time of the latest pass, never reset: a pass older than it changes nothing.
+	last_pass_ns: u64,
 	last_ticks: u64,
 	/// Monotonic ns of the last successful read; 0 = no baseline.
 	last_ns: u64,
@@ -212,6 +228,9 @@ impl ThreadCpu {
 				identity,
 				next_discovery_ns: 0,
 				discovered: None,
+				inode: None,
+				next_recheck_ns: u64::MAX,
+				last_pass_ns: 0,
 				last_ticks: 0,
 				last_ns: 0,
 				valid_until_ns: 0,
@@ -243,8 +262,8 @@ impl ThreadCpu {
 		true
 	}
 
-	fn finish_discovery(&self, owner: Option<u32>) {
-		self.lock().discovered = Some(owner);
+	fn finish_discovery(&self, discovery: Discovery) {
+		self.lock().discovered = Some(discovery);
 	}
 
 	#[cfg(test)]
@@ -254,20 +273,27 @@ impl ThreadCpu {
 
 	fn apply_discovery(
 		&self,
-		owner: Option<u32>,
+		discovery: Discovery,
 		now: u64,
 		proc: &ProcFs,
 		views: &mut HashMap<u32, Option<ProcessView>>,
 	) {
 		let mut state = self.lock();
-		let identity = match owner {
-			Some(owner) => resolve(self.pid, self.tid, owner, proc, views),
-			None => Identity::Unresolved,
+		// A connect that fails (a full accept queue on a busy worker, say) proves nothing about who
+		// owns the socket; keep what is known and try again soon.
+		let Some(owner) = discovery.owner else {
+			state.next_discovery_ns = now.saturating_add(DISCOVERY_RETRY_NS);
+			return;
 		};
-		state.next_discovery_ns = now.saturating_add(match identity {
-			Identity::Unresolved => DISCOVERY_RETRY_NS,
-			Identity::Discovered { .. } | Identity::Literal => OWNER_RECHECK_NS,
-		});
+		let identity = resolve(self.pid, self.tid, owner, proc, views);
+		if identity == Identity::Unresolved {
+			state.next_discovery_ns = now.saturating_add(DISCOVERY_RETRY_NS);
+			state.next_recheck_ns = u64::MAX;
+		} else {
+			state.next_discovery_ns = u64::MAX;
+			state.next_recheck_ns = now.saturating_add(OWNER_RECHECK_NS);
+			state.inode = discovery.inode;
+		}
 		if identity != state.identity {
 			state.identity = identity;
 			state.last_ns = 0;
@@ -278,14 +304,21 @@ impl ThreadCpu {
 	/// `views` caches process scans for this pass, shared by every slot of a process.
 	fn sample(&self, now: u64, proc: &ProcFs, views: &mut HashMap<u32, Option<ProcessView>>) {
 		let mut state = self.lock();
-		if let Some(owner) = state.discovered.take() {
+		// A pass that started before a newer one (after a stop and restart) changes nothing.
+		if now <= state.last_pass_ns {
+			return;
+		}
+		state.last_pass_ns = now;
+		if let Some(discovery) = state.discovered.take() {
 			drop(state);
-			self.apply_discovery(owner, now, proc, views);
+			self.apply_discovery(discovery, now, proc, views);
 			state = self.lock();
 		}
-		// A pass that started before a newer one (after a stop and restart) changes nothing.
-		if now <= state.last_ns {
-			return;
+		if now >= state.next_recheck_ns {
+			state.next_recheck_ns = now.saturating_add(OWNER_RECHECK_NS);
+			if socket_inode(&self.path) != state.inode {
+				state.next_discovery_ns = now;
+			}
 		}
 		let (pid, tid, start) = match state.identity {
 			Identity::Discovered { pid, tid, start } => (pid, tid, Some(start)),
@@ -309,6 +342,7 @@ impl ThreadCpu {
 			if start.is_some() {
 				state.identity = Identity::Unresolved;
 				state.next_discovery_ns = now;
+				state.next_recheck_ns = u64::MAX;
 			}
 			return;
 		};
@@ -338,10 +372,16 @@ impl ThreadCpu {
 /// balancer's slots are unchanged.
 #[derive(Default)]
 pub struct LoadEwma {
-	/// Smoothed permille (`None` = unknown) and the time of the pass that last updated it.
-	state: Mutex<(Option<f64>, u64)>,
+	state: Mutex<EwmaState>,
 	/// Permille in the low 10 bits, monotonic ms until which it is current above them; 0 = unknown.
 	published: AtomicU64,
+}
+
+#[derive(Default)]
+struct EwmaState {
+	/// Smoothed permille and the time of the sample it last took in.
+	value: Option<(f64, u64)>,
+	last_pass_ns: u64,
 }
 
 impl LoadEwma {
@@ -361,23 +401,24 @@ impl LoadEwma {
 
 	fn update(&self, mean: Option<u32>, now: u64) {
 		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-		let (previous, at) = *state;
-		if now <= at {
+		if now <= state.last_pass_ns {
 			return;
 		}
+		state.last_pass_ns = now;
 		let Some(mean) = mean else {
-			*state = (previous, now);
 			self.published.store(0, Ordering::Relaxed);
 			return;
 		};
-		let value = match previous {
-			Some(value) if now - at < 3 * LOAD_TIME_CONSTANT_NS as u64 => {
+		// Weighted by the time since the last sample taken in, so after a gap the new mean counts
+		// for what it has been out of sight, and after a long one replaces the old value outright.
+		let value = match state.value {
+			Some((value, at)) if now - at < 3 * LOAD_TIME_CONSTANT_NS as u64 => {
 				let alpha = 1.0 - (-((now - at) as f64) / LOAD_TIME_CONSTANT_NS).exp();
 				value + alpha * (mean as f64 - value)
 			}
 			_ => mean as f64,
 		};
-		*state = (Some(value), now);
+		state.value = Some((value, now));
 		let permille = (value.round() as u64).min(1000);
 		let until_ms = (now + SAMPLE_VALID_NS) / 1_000_000;
 		self.published
@@ -414,8 +455,9 @@ pub async fn sample_periodically(live: Arc<LiveRouteTable>, mut shutdown: broadc
 			if cpu.begin_discovery(now) {
 				let cpu = cpu.clone();
 				discoveries.spawn(async move {
+					let inode = socket_inode(&cpu.path);
 					let owner = socket_owner(cpu.path.clone()).await;
-					cpu.finish_discovery(owner);
+					cpu.finish_discovery(Discovery { owner, inode });
 				});
 			}
 		}
@@ -448,6 +490,10 @@ fn sample_table(balancers: &[Arc<crate::balancer::UdsBalancer>], now: u64, proc:
 	}
 }
 
+fn socket_inode(path: &str) -> Option<u64> {
+	std::fs::metadata(path).ok().map(|m| m.ino())
+}
+
 /// Connect and close at once, keeping only the owner's credentials.
 async fn socket_owner(path: Arc<str>) -> Option<u32> {
 	let stream = tokio::time::timeout(
@@ -466,6 +512,13 @@ mod tests {
 	use super::*;
 
 	const S: u64 = 1_000_000_000;
+
+	fn found(owner: u32) -> Discovery {
+		Discovery {
+			owner: Some(owner),
+			inode: None,
+		}
+	}
 
 	fn stat_line(comm: &str, ticks: (u64, u64), start: u64) -> String {
 		// pid (comm) state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime
@@ -617,7 +670,7 @@ mod tests {
 		let proc = fake.proc();
 		let cpu = ThreadCpu::new(Arc::from("/unused.sock"), 500, 510);
 		let mut views = HashMap::new();
-		cpu.apply_discovery(Some(500), 0, &proc, &mut views);
+		cpu.apply_discovery(found(500), 0, &proc, &mut views);
 
 		let tick = clk_tck_hz();
 		cpu.sample(1_000_000_000, &proc, &mut HashMap::new());
@@ -648,7 +701,7 @@ mod tests {
 		fake.thread(42, 43, &[43], 0, 1);
 		let proc = fake.proc();
 		let cpu = ThreadCpu::new(Arc::from("/unused.sock"), 42, 43);
-		cpu.apply_discovery(Some(600), 0, &proc, &mut HashMap::new());
+		cpu.apply_discovery(found(600), 0, &proc, &mut HashMap::new());
 		cpu.sample(1_000_000_000, &proc, &mut HashMap::new());
 		fake.thread(42, 43, &[43], clk_tck_hz(), 1);
 		cpu.sample(2_000_000_000, &proc, &mut HashMap::new());
@@ -692,39 +745,58 @@ mod tests {
 	}
 
 	#[test]
-	fn a_discovery_lands_on_the_next_pass_and_resolved_owners_are_rechecked() {
+	fn a_discovery_lands_on_the_next_pass_and_a_rebound_socket_is_looked_up_again() {
 		let fake = FakeProc::new("pending");
 		fake.process(500, &[500]);
 		fake.thread(500, 510, &[510], 0, 77);
 		let proc = fake.proc();
-		let cpu = ThreadCpu::new(Arc::from("/unused.sock"), 500, 510);
+		let socket = fake.dir.join("w.sock");
+		std::fs::write(&socket, "").unwrap();
+		let cpu = ThreadCpu::new(Arc::from(socket.to_str().unwrap()), 500, 510);
 		assert!(cpu.begin_discovery(0));
 		assert!(!cpu.begin_discovery(1), "one at a time");
-		cpu.finish_discovery(Some(500));
+		cpu.finish_discovery(Discovery {
+			owner: Some(500),
+			inode: socket_inode(socket.to_str().unwrap()),
+		});
 		cpu.sample(S, &proc, &mut HashMap::new());
 		assert!(matches!(
 			cpu.lock().identity,
 			Identity::Discovered { pid: 500, .. }
 		));
-		assert!(!cpu.discovery_due(30 * S));
-		assert!(cpu.discovery_due(31 * S), "the owner is checked again");
 
-		// The same owner again keeps the baseline; a pass older than the last one changes nothing.
-		cpu.sample(2 * S, &proc, &mut HashMap::new());
-		cpu.finish_discovery(Some(500));
-		cpu.sample(3 * S, &proc, &mut HashMap::new());
-		assert_eq!(cpu.lock().last_ns, 3 * S);
-		cpu.sample(2 * S, &proc, &mut HashMap::new());
-		assert_eq!(cpu.lock().last_ns, 3 * S);
-
-		let failed = ThreadCpu::new(Arc::from("/unused.sock"), 500, 510);
-		failed.begin_discovery(0);
-		failed.finish_discovery(None);
-		failed.sample(S, &proc, &mut HashMap::new());
+		// The same socket file 30 s on: nothing to connect for.
+		cpu.sample(32 * S, &proc, &mut HashMap::new());
+		assert!(!cpu.discovery_due(32 * S));
+		// Another process binds the path: the next check sees a new inode.
+		let replaced = fake.dir.join("w.sock.new");
+		std::fs::write(&replaced, "").unwrap();
+		std::fs::rename(&replaced, &socket).unwrap();
+		cpu.sample(63 * S, &proc, &mut HashMap::new());
+		assert!(cpu.discovery_due(63 * S));
 		assert!(
-			failed.discovery_due(6 * S),
-			"a failed connect is retried after 5 s"
+			matches!(cpu.lock().identity, Identity::Discovered { .. }),
+			"sampled as before until the new owner is known"
 		);
+
+		// A connect that fails, as on a full accept queue, keeps what is known.
+		assert!(cpu.begin_discovery(63 * S));
+		cpu.finish_discovery(Discovery {
+			owner: None,
+			inode: None,
+		});
+		cpu.sample(64 * S, &proc, &mut HashMap::new());
+		assert!(matches!(cpu.lock().identity, Identity::Discovered { .. }));
+		assert!(cpu.discovery_due(69 * S), "retried after 5 s");
+
+		// A pass older than the last one changes nothing, a pending discovery included.
+		cpu.finish_discovery(found(999));
+		cpu.sample(2 * S, &proc, &mut HashMap::new());
+		assert!(matches!(
+			cpu.lock().identity,
+			Identity::Discovered { pid: 500, .. }
+		));
+		assert_eq!(cpu.lock().last_pass_ns, 64 * S);
 	}
 
 	#[test]
@@ -734,5 +806,20 @@ mod tests {
 		load.update(Some(0), S);
 		load.update(None, S);
 		assert_eq!(load.get(2 * S).map(|l| l.0), Some(800));
+	}
+
+	#[test]
+	fn passes_without_samples_do_not_hold_back_the_next_reading() {
+		let load = LoadEwma::default();
+		load.update(Some(900), S);
+		for i in 1..=40 {
+			load.update(None, S + i * S / 4);
+		}
+		load.update(Some(100), 12 * S);
+		assert_eq!(
+			load.get(12 * S).map(|l| l.0),
+			Some(100),
+			"11 s unseen: the new reading replaces the old one"
+		);
 	}
 }

@@ -229,9 +229,11 @@ symphony reads. So the ids are never trusted until tied to the socket's owner:
 - **Discovery is a background connect-and-close** (`socket_owner`, `SO_PEERCRED`), never a
   getsockopt on client connections: an idle node has no client connections, and its load is the
   one a hot peer needs to see. It runs beside sampling (results land on the next pass), never ahead
-  of it, so one slow socket cannot let every slot's load expire; resolved owners are rechecked
-  every 30 s, because another process can take over a socket path while the old thread lives on.
-  An owner that has exited, or a thread not there yet, is `Unresolved` (retried in 5 s).
+  of it, so one slow socket cannot let every slot's load expire. A resolved slot's socket inode is
+  checked every 30 s, because another process can bind the path while the old thread lives on;
+  only a changed inode costs a connect, so a busy worker's accept queue is never probed to confirm
+  nothing changed, and a failed connect keeps the known identity. An owner that has exited, or a
+  thread not there yet, is `Unresolved` (retried in 5 s).
 - **`Discovered` vs `Literal`.** Owner pid == configured pid, or the owner's last `NSpid:` entry ==
   configured pid (then each thread's last `NSpid:` entry maps to its host tid) → `Discovered`.
   Anything else is `Literal`: still read as configured for `pick()`'s tiebreak (legacy behavior),
