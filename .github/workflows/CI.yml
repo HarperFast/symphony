@@ -217,8 +217,10 @@ jobs:
       - name: Install bubblewrap
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update -q && sudo apt-get install -y --no-install-recommends bubblewrap
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --unshare-pid --dev-bind / / --proc /proc true
 
       # Linux routes all of 127.0.0.0/8 to loopback; macOS needs an alias for the second client address.
       - name: Alias 127.0.0.2 on loopback
