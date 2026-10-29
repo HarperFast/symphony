@@ -3,7 +3,8 @@
  * and a `failoverIngress` listener, and its route's upstream is a Unix socket that may be absent.
  *
  * The client connects from 127.0.0.2 (loopback on Linux) so the address the serving node's
- * upstream sees can be told apart from the forwarding node's own 127.0.0.1.
+ * upstream sees can be told apart from the forwarding node's own 127.0.0.1. macOS has that address
+ * only with an `lo0` alias, and the suites that need it skip without one.
  */
 
 import assert from 'node:assert/strict';
@@ -19,6 +20,12 @@ import { generateClientCa, generateSelfSignedCert, getFreePort, sleep } from './
 
 const SNI = 'app.test';
 const CLIENT_ADDRESS = '127.0.0.2';
+const noClientAddress =
+	process.platform !== 'linux' &&
+	!Object.values(os.networkInterfaces()).some((addrs) => addrs?.some((a) => a.address === CLIENT_ADDRESS)) &&
+	`${CLIENT_ADDRESS} is not a local address (macOS: sudo ifconfig lo0 alias ${CLIENT_ADDRESS})`;
+/** Bounds a hang (an awaited event that never fires) well below the CI job limit. */
+const SUITE_TIMEOUT_MS = 60_000;
 const { cert, key } = generateSelfSignedCert(SNI);
 const socketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-failover-'));
 let socketSeq = 0;
@@ -220,7 +227,7 @@ function connectRaw(port: number): Promise<net.Socket> {
 	});
 }
 
-describe('peer failover', () => {
+describe('peer failover', { skip: noClientAddress, timeout: SUITE_TIMEOUT_MS }, () => {
 	it('forwards to a peer while the local upstream is absent, and the peer sees the real client', async (t) => {
 		const [a, b] = await allocatePorts(2);
 		const nodeA = await startNode(t, a, { peers: [b.ingressPort] });
@@ -402,7 +409,7 @@ describe('peer failover', () => {
 	});
 });
 
-describe('failover ingress', () => {
+describe('failover ingress', { timeout: SUITE_TIMEOUT_MS }, () => {
 	it('closes an untrusted source before reading, and trustedSources hot-swaps', async (t) => {
 		const [b] = await allocatePorts(1);
 		const nodeB = await startNode(t, b, { trustedSources: ['10.0.0.0/8'] });
@@ -461,8 +468,11 @@ describe('failover ingress', () => {
 		assert.equal(await tryEcho({ port: b.ingressPort, socket: blockedSocket }), null);
 		assert.equal(await blocked, '203.0.113.66');
 
-		// The public listener sees the real 127.0.0.2, which allowedSources refuses.
-		assert.equal(await tryEcho({ port: b.publicPort }), null);
+		// The public listener sees the real 127.0.0.1, which allowedSources refuses.
+		assert.equal(
+			await tryEcho({ port: b.publicPort, socket: net.connect({ host: '127.0.0.1', port: b.publicPort }) }),
+			null
+		);
 		await sleep(50);
 		assert.equal(upstreamB.sources.length, 1);
 	});
