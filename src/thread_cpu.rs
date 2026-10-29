@@ -189,6 +189,9 @@ struct SampleState {
 	/// The socket file's inode when the identity was resolved, and when to look at it again.
 	inode: Option<u64>,
 	next_recheck_ns: u64,
+	/// The inode changed and the new owner is not known yet: the thread is still read for the
+	/// tiebreak but no longer counts as the socket's load.
+	owner_changed: bool,
 	/// Time of the latest pass, never reset: a pass older than it changes nothing.
 	last_pass_ns: u64,
 	last_ticks: u64,
@@ -230,6 +233,7 @@ impl ThreadCpu {
 				discovered: None,
 				inode: None,
 				next_recheck_ns: u64::MAX,
+				owner_changed: false,
 				last_pass_ns: 0,
 				last_ticks: 0,
 				last_ns: 0,
@@ -273,12 +277,12 @@ impl ThreadCpu {
 
 	fn apply_discovery(
 		&self,
+		state: &mut SampleState,
 		discovery: Discovery,
 		now: u64,
 		proc: &ProcFs,
 		views: &mut HashMap<u32, Option<ProcessView>>,
 	) {
-		let mut state = self.lock();
 		// A connect that fails (a full accept queue on a busy worker, say) proves nothing about who
 		// owns the socket; keep what is known and try again soon.
 		let Some(owner) = discovery.owner else {
@@ -286,6 +290,7 @@ impl ThreadCpu {
 			return;
 		};
 		let identity = resolve(self.pid, self.tid, owner, proc, views);
+		state.owner_changed = false;
 		if identity == Identity::Unresolved {
 			state.next_discovery_ns = now.saturating_add(DISCOVERY_RETRY_NS);
 			state.next_recheck_ns = u64::MAX;
@@ -310,14 +315,14 @@ impl ThreadCpu {
 		}
 		state.last_pass_ns = now;
 		if let Some(discovery) = state.discovered.take() {
-			drop(state);
-			self.apply_discovery(discovery, now, proc, views);
-			state = self.lock();
+			self.apply_discovery(&mut state, discovery, now, proc, views);
 		}
 		if now >= state.next_recheck_ns {
 			state.next_recheck_ns = now.saturating_add(OWNER_RECHECK_NS);
 			if socket_inode(&self.path) != state.inode {
 				state.next_discovery_ns = now;
+				state.owner_changed = true;
+				state.valid_until_ns = 0;
 			}
 		}
 		let (pid, tid, start) = match state.identity {
@@ -353,7 +358,7 @@ impl ThreadCpu {
 				(delta_ticks / (delta_secs * clk_tck_hz() as f64) * 1000.0).min(1000.0) as u32;
 			state.util_permille = util;
 			self.util_permille.store(util, Ordering::Relaxed);
-			if start.is_some() {
+			if start.is_some() && !state.owner_changed {
 				state.valid_until_ns = now + SAMPLE_VALID_NS;
 			}
 		}
@@ -433,6 +438,9 @@ pub async fn sample_periodically(live: Arc<LiveRouteTable>, mut shutdown: broadc
 	let proc = ProcFs::host();
 	// Dropping it at shutdown aborts the connects still running.
 	let mut discoveries = tokio::task::JoinSet::new();
+	// Where the next pass starts looking for due discoveries, so slots at the front that keep
+	// failing cannot hold every in-flight slot.
+	let mut cursor = 0usize;
 	loop {
 		tokio::select! {
 			_ = shutdown.recv() => return,
@@ -444,14 +452,17 @@ pub async fn sample_periodically(live: Arc<LiveRouteTable>, mut shutdown: broadc
 			continue;
 		}
 		let now = now_ns();
-		for cpu in table
+		let cpus: Vec<&Arc<ThreadCpu>> = table
 			.monitored_balancers
 			.iter()
 			.flat_map(|b| b.thread_cpus())
-		{
+			.collect();
+		for i in 0..cpus.len() {
 			if discoveries.len() >= MAX_CONCURRENT_DISCOVERIES {
+				cursor = (cursor + i) % cpus.len();
 				break;
 			}
+			let cpu = cpus[(cursor + i) % cpus.len()];
 			if cpu.begin_discovery(now) {
 				let cpu = cpu.clone();
 				discoveries.spawn(async move {
@@ -670,7 +681,7 @@ mod tests {
 		let proc = fake.proc();
 		let cpu = ThreadCpu::new(Arc::from("/unused.sock"), 500, 510);
 		let mut views = HashMap::new();
-		cpu.apply_discovery(found(500), 0, &proc, &mut views);
+		cpu.apply_discovery(&mut cpu.lock(), found(500), 0, &proc, &mut views);
 
 		let tick = clk_tck_hz();
 		cpu.sample(1_000_000_000, &proc, &mut HashMap::new());
@@ -701,7 +712,7 @@ mod tests {
 		fake.thread(42, 43, &[43], 0, 1);
 		let proc = fake.proc();
 		let cpu = ThreadCpu::new(Arc::from("/unused.sock"), 42, 43);
-		cpu.apply_discovery(found(600), 0, &proc, &mut HashMap::new());
+		cpu.apply_discovery(&mut cpu.lock(), found(600), 0, &proc, &mut HashMap::new());
 		cpu.sample(1_000_000_000, &proc, &mut HashMap::new());
 		fake.thread(42, 43, &[43], clk_tck_hz(), 1);
 		cpu.sample(2_000_000_000, &proc, &mut HashMap::new());
@@ -776,7 +787,12 @@ mod tests {
 		assert!(cpu.discovery_due(63 * S));
 		assert!(
 			matches!(cpu.lock().identity, Identity::Discovered { .. }),
-			"sampled as before until the new owner is known"
+			"still read for the tiebreak until the new owner is known"
+		);
+		assert_eq!(
+			cpu.load_sample(63 * S),
+			None,
+			"but no longer counted as the socket's load"
 		);
 
 		// A connect that fails, as on a full accept queue, keeps what is known.

@@ -120,8 +120,8 @@ pub async fn read_proxy_v2<S: AsyncRead + Unpin>(
 		.unwrap_or(Err(HeaderReject::Timeout))
 }
 
+/// Each with its payload length.
 enum Command {
-	/// Payload length.
 	Proxy(usize),
 	Local(usize),
 }
