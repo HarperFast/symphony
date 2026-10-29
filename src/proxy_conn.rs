@@ -609,7 +609,6 @@ where
 	}
 }
 
-/// Answer a peer's load query with this node's load for each name, then close.
 async fn answer_load_query(
 	mut stream: TcpStream,
 	names: Vec<Option<String>>,

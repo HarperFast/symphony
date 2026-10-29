@@ -429,10 +429,12 @@ fn spill_hash(client: SocketAddr) -> u64 {
 impl Failover {
 	/// `previous` is the same route's failover in the previous table, passed only when the route
 	/// keeps its metric identity, so peer counters and cooldowns continue rather than reset.
+	/// `same_load_source`: the route's load still comes from the same worker threads.
 	pub fn new(
 		policy: FailoverPolicy,
 		previous: Option<&Failover>,
 		tcp_health: Option<Arc<SlotHealth>>,
+		same_load_source: bool,
 	) -> Self {
 		let peers = policy
 			.peers
@@ -444,13 +446,15 @@ impl Failover {
 					.unwrap_or_else(|| Arc::new(FailoverPeer::new(*addr)))
 			})
 			.collect();
-		// Continued only under the same policy and peer list: a carried target index must name the
-		// same peer, and a carried fraction must have been reached under the same limits.
+		// Continued only under the same policy, peers and load source: a carried target index must
+		// name the same peer, and a carried fraction must have been reached under the same limits
+		// and for the same workers.
 		let spill = policy.spill.map(|spill_policy| {
 			let state = previous
 				.and_then(|p| p.spill.as_ref())
 				.filter(|s| {
-					s.policy == spill_policy
+					same_load_source
+						&& s.policy == spill_policy
 						&& previous.is_some_and(|p| {
 							p.peers
 								.iter()
@@ -478,7 +482,6 @@ impl Failover {
 		}
 	}
 
-	/// The peer this client connection spills to, if the admission in force selects it.
 	pub fn spill_target(&self, client: SocketAddr) -> Option<usize> {
 		let spill = self.spill.as_ref()?;
 		let packed = spill.state.admission.load(Ordering::Relaxed);
@@ -871,8 +874,7 @@ pub(crate) struct PeerView {
 	rtt: Option<Duration>,
 }
 
-/// The least-loaded usable peer, and whether its gap to the local load justifies raising the share,
-/// holding it, or neither. `local` is `(permille, ms it is current until)`.
+/// `local` is `(permille, ms it is current until)`.
 fn assess(
 	policy: &SpillPolicy,
 	local: Option<(u32, u64)>,
@@ -947,7 +949,7 @@ fn control(
 	admission
 }
 
-/// The effective spill share (0 when not admitting) and its target, for metrics.
+/// The admitted share (0 when nothing is admitted) and its target.
 pub fn spill_status(failover: &Failover, now_ns: u64) -> Option<(f64, Option<SocketAddr>)> {
 	let spill = failover.spill.as_ref()?;
 	Some(match spill.state.admission(now_ns / 1_000_000) {
@@ -1166,7 +1168,7 @@ mod tests {
 	}
 
 	fn failover(peers: &[(&str, u16)]) -> Failover {
-		Failover::new(spec(peers).parse().unwrap(), None, None)
+		Failover::new(spec(peers).parse().unwrap(), None, None, false)
 	}
 
 	#[test]
@@ -1303,6 +1305,7 @@ mod tests {
 			spec(&[("10.0.0.1", 1), ("10.0.0.3", 1)]).parse().unwrap(),
 			Some(&old),
 			None,
+			true,
 		);
 		assert!(Arc::ptr_eq(&new.peers[0], &old.peers[0]));
 		assert_eq!(new.peers[0].forwarded.load(Ordering::Relaxed), 1);
@@ -1317,6 +1320,7 @@ mod tests {
 			spec(&[("10.0.0.1", 1)]).parse().unwrap(),
 			None,
 			Some(health.clone()),
+			false,
 		);
 		let dest = Destination::Tcp("127.0.0.1:1".parse().unwrap());
 		assert!(!fo.locally_down(&dest, None));
@@ -1344,7 +1348,7 @@ mod tests {
 	fn spill_failover(peers: &[(&str, u16)], spill: SpillPolicy) -> Failover {
 		let mut policy = spec(peers).parse().unwrap();
 		policy.spill = Some(spill);
-		Failover::new(policy, None, None)
+		Failover::new(policy, None, None, false)
 	}
 
 	fn peer(load: u32, now_ms: u64) -> PeerView {
@@ -1694,18 +1698,22 @@ mod tests {
 	fn spill_state_carries_over_only_under_the_same_policy_and_peers() {
 		let peers = [("10.0.0.1", 1), ("10.0.0.2", 1)];
 		let old = spill_failover(&peers, policy());
-		let carry = |peers: &[(&str, u16)], spill: SpillPolicy| {
+		let carry = |peers: &[(&str, u16)], spill: SpillPolicy, same_load_source: bool| {
 			let mut p = spec(peers).parse().unwrap();
 			p.spill = Some(spill);
-			let new = Failover::new(p, Some(&old), None);
+			let new = Failover::new(p, Some(&old), None, same_load_source);
 			Arc::ptr_eq(
 				&new.spill.as_ref().unwrap().state,
 				&old.spill.as_ref().unwrap().state,
 			)
 		};
-		assert!(carry(&peers, policy()));
+		assert!(carry(&peers, policy(), true));
 		assert!(
-			!carry(&[("10.0.0.2", 1), ("10.0.0.1", 1)], policy()),
+			!carry(&peers, policy(), false),
+			"other workers behind the route"
+		);
+		assert!(
+			!carry(&[("10.0.0.2", 1), ("10.0.0.1", 1)], policy(), true),
 			"reordered peers"
 		);
 		assert!(!carry(
@@ -1713,7 +1721,8 @@ mod tests {
 			SpillPolicy {
 				max_fraction: 300,
 				..policy()
-			}
+			},
+			true
 		));
 	}
 

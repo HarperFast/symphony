@@ -356,6 +356,11 @@ impl UdsBalancer {
 		&self.load
 	}
 
+	/// True when both read their load from the same threads (`with_cpu_from` shared it).
+	pub fn shares_load_with(&self, other: &UdsBalancer) -> bool {
+		Arc::ptr_eq(&self.load, &other.load)
+	}
+
 	fn best_score_idx(&self) -> usize {
 		self.sockets
 			.iter()

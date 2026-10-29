@@ -146,22 +146,23 @@ fn resolve(
 	proc: &ProcFs,
 	views: &mut HashMap<u32, Option<ProcessView>>,
 ) -> Identity {
-	let host_tid = if owner == configured_pid {
-		configured_tid
-	} else {
-		let Some(view) = views
-			.entry(owner)
-			.or_insert_with(|| proc.process_view(owner))
-		else {
-			return Identity::Unresolved;
-		};
-		if view.innermost_pid != configured_pid {
-			return Identity::Literal;
-		}
+	let Some(view) = views
+		.entry(owner)
+		.or_insert_with(|| proc.process_view(owner))
+	else {
+		return Identity::Unresolved;
+	};
+	// The namespace check comes first: a namespaced pid can equal the host pid by coincidence, and
+	// its tid still needs translating.
+	let host_tid = if view.innermost_pid == configured_pid {
 		match view.threads.get(&configured_tid) {
 			Some(tid) => *tid,
 			None => return Identity::Unresolved,
 		}
+	} else if owner == configured_pid {
+		configured_tid
+	} else {
+		return Identity::Literal;
 	};
 	match proc.task_stat(owner, host_tid) {
 		Some(stat) => Identity::Discovered {
@@ -366,7 +367,6 @@ impl ThreadCpu {
 		state.last_ns = now;
 	}
 
-	/// The latest sample of a discovered identity, while it is still fresh.
 	fn load_sample(&self, now: u64) -> Option<u32> {
 		let state = self.lock();
 		(now < state.valid_until_ns).then_some(state.util_permille)
@@ -505,7 +505,6 @@ fn socket_inode(path: &str) -> Option<u64> {
 	std::fs::metadata(path).ok().map(|m| m.ino())
 }
 
-/// Connect and close at once, keeping only the owner's credentials.
 async fn socket_owner(path: Arc<str>) -> Option<u32> {
 	let stream = tokio::time::timeout(
 		DISCOVERY_TIMEOUT,
@@ -654,6 +653,21 @@ mod tests {
 		assert_eq!(
 			resolve(7, 21, 3479403, &fake.proc(), &mut views),
 			Identity::Unresolved
+		);
+	}
+
+	#[test]
+	fn a_namespaced_pid_equal_to_its_host_pid_still_has_its_tid_translated() {
+		let fake = FakeProc::new("collision");
+		fake.process(500, &[500, 500]);
+		fake.thread(500, 599, &[599, 20], 0, 8);
+		assert_eq!(
+			resolve(500, 20, 500, &fake.proc(), &mut HashMap::new()),
+			Identity::Discovered {
+				pid: 500,
+				tid: 599,
+				start: 8
+			}
 		);
 	}
 

@@ -842,7 +842,20 @@ pub fn build_route_table(
 				),
 				Destination::UdsSet(_) => None,
 			};
-			Arc::new(Failover::new(policy, previous_failover, tcp_health))
+			let same_load_source = previous_route.is_some_and(|p| {
+				same_load_source(&p.destination, &route.destination)
+					&& match (&p.destination_h2, &route.destination_h2) {
+						(None, None) => true,
+						(Some(a), Some(b)) => same_load_source(a, b),
+						_ => false,
+					}
+			});
+			Arc::new(Failover::new(
+				policy,
+				previous_failover,
+				tcp_health,
+				same_load_source,
+			))
 		});
 		if let Some(failover) = &route.failover {
 			failover_routes.push(FailoverRoute {
@@ -947,6 +960,14 @@ pub fn route_load(
 		until_ms = until_ms.min(h2_until_ms);
 	}
 	Some((permille, until_ms))
+}
+
+fn same_load_source(a: &Destination, b: &Destination) -> bool {
+	match (a, b) {
+		(Destination::UdsSet(a), Destination::UdsSet(b)) => a.shares_load_with(b),
+		(Destination::Tcp(a), Destination::Tcp(b)) => a == b,
+		_ => false,
+	}
 }
 
 fn retracked(dest: &Destination, track: bool) -> Destination {
