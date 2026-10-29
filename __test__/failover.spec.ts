@@ -170,7 +170,6 @@ function loadQuery(names: string[]): Buffer {
 	return Buffer.concat([header, tlvs]);
 }
 
-/** Everything the server sends before it closes. */
 function readToEnd(socket: net.Socket): Promise<string> {
 	return new Promise((resolve) => {
 		let data = '';

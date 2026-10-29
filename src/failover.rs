@@ -482,7 +482,6 @@ impl Failover {
 		}
 	}
 
-	/// The caller branches on `failover.spill` first, so a route without spill never gets here.
 	pub fn spill_target(&self, spill: &Spill, client: SocketAddr) -> Option<usize> {
 		let packed = spill.state.admission.load(Ordering::Relaxed);
 		let admission = Admission::unpack(packed)?;
@@ -534,22 +533,17 @@ impl Failover {
 			return (usize::from(peer.is_some()), Either::Right(peer.into_iter()));
 		}
 		// Draining has a local fallback, so a peer in cooldown is never worth the wait.
-		let drain = mode == ForwardMode::Drain;
-		let (count, rotation) = self.candidates(now);
-		let count = if drain {
-			self.peers.iter().filter(|p| !p.cooling_down(now)).count()
-		} else {
-			count
-		};
-		(
-			count,
-			Either::Left(rotation.filter(move |p| !drain || !p.cooling_down(now))),
-		)
+		let (count, rotation) = self.candidates(now, mode != ForwardMode::Drain);
+		(count, Either::Left(rotation))
 	}
 
 	/// Peers to try, in order, and how many: round-robin over those not cooling down; if every
-	/// peer is cooling down, only the one whose cooldown ends first.
-	fn candidates(&self, now: u64) -> (usize, impl Iterator<Item = &FailoverPeer>) {
+	/// peer is cooling down and `wait_for_cooldown` is set, only the one whose cooldown ends first.
+	fn candidates(
+		&self,
+		now: u64,
+		wait_for_cooldown: bool,
+	) -> (usize, impl Iterator<Item = &FailoverPeer>) {
 		let count = self.peers.len();
 		let start = if count == 1 {
 			0
@@ -557,7 +551,7 @@ impl Failover {
 			self.cursor.fetch_add(1, Ordering::Relaxed) % count
 		};
 		let ready = self.peers.iter().filter(|p| !p.cooling_down(now)).count();
-		let earliest = (ready == 0)
+		let earliest = (ready == 0 && wait_for_cooldown)
 			.then(|| self.peers.iter().min_by_key(|p| p.cooldown_until()))
 			.flatten();
 		let rotation = (0..count)
@@ -938,8 +932,8 @@ fn assess(
 	}
 }
 
-/// Step the controller and publish what the hot path may do. The fraction moves at most `step` per
-/// second either way; spilling stops at once when it is no longer justified (no target).
+/// The fraction moves at most `step` per second either way; spilling stops at once when it is no
+/// longer justified (no target).
 fn control(
 	spill: &Spill,
 	local: Option<(u32, u64)>,
@@ -995,8 +989,8 @@ struct LoadAnswer {
 	loads: Vec<Option<(Option<u32>, u64)>>,
 }
 
-/// Poll each spill route's peers for their load and run the spill controllers. Separate from
-/// `probe_periodically`, so a silent peer can never delay a `routeHealth` transition.
+/// Also runs the spill controllers. Separate from `probe_periodically`, so a silent peer can never
+/// delay a `routeHealth` transition.
 pub async fn poll_peer_loads(live: Arc<LiveRouteTable>, mut shutdown: broadcast::Receiver<()>) {
 	type Done = (SocketAddr, Vec<Arc<str>>, Option<LoadAnswer>);
 	let mut queries: JoinSet<Done> = JoinSet::new();
@@ -1298,17 +1292,17 @@ mod tests {
 			c
 		};
 		assert_eq!(
-			addrs(fo.candidates(0)),
+			addrs(fo.candidates(0, true)),
 			["10.0.0.1", "10.0.0.2", "10.0.0.3"]
 		);
 		assert_eq!(
-			addrs(fo.candidates(0)),
+			addrs(fo.candidates(0, true)),
 			["10.0.0.2", "10.0.0.3", "10.0.0.1"]
 		);
 
 		fo.peers[2].record_failure(PeerFailureKind::Refused, 10, 10, 100);
-		assert_eq!(addrs(fo.candidates(105)), ["10.0.0.1", "10.0.0.2"]);
-		assert_eq!(addrs(fo.candidates(110)).len(), 3, "cooldown over");
+		assert_eq!(addrs(fo.candidates(105, true)), ["10.0.0.1", "10.0.0.2"]);
+		assert_eq!(addrs(fo.candidates(110, true)).len(), 3, "cooldown over");
 	}
 
 	#[test]
@@ -1316,7 +1310,7 @@ mod tests {
 		let fo = failover(&[("10.0.0.1", 1), ("10.0.0.2", 1)]);
 		fo.peers[0].record_failure(PeerFailureKind::Refused, 50, 50, 100);
 		fo.peers[1].record_failure(PeerFailureKind::Refused, 20, 20, 100);
-		let (count, c) = fo.candidates(101);
+		let (count, c) = fo.candidates(101, true);
 		let c: Vec<_> = c.collect();
 		assert_eq!((count, c.len()), (1, 1));
 		assert_eq!(c[0].addr.ip().to_string(), "10.0.0.2");

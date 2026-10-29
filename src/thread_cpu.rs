@@ -441,9 +441,8 @@ impl LoadEwma {
 	}
 }
 
-/// Discover, sample and smooth every monitored slot of the live table, every 250 ms. Discovery
-/// connects run beside the sampling, never ahead of it: one slow socket must not leave every other
-/// slot's load to expire.
+/// Discovery connects run beside the sampling, never ahead of it: one slow socket must not leave
+/// every other slot's load to expire.
 pub async fn sample_periodically(live: Arc<LiveRouteTable>, mut shutdown: broadcast::Receiver<()>) {
 	let proc = ProcFs::host();
 	// Dropping it at shutdown aborts the connects still running.
