@@ -70,6 +70,7 @@ TCP accept (SO_REUSEPORT per worker thread)
 | `src/router.rs` | RouteTable (exact + wildcard HashMap); ArcSwap hot-swap |
 | `src/upstream.rs` | UpstreamStream enum (Tcp/Uds); connect(); TCP_NODELAY; PROXY v1/v2 header encoders; HTTP header injection (XFF, X-JA3/X-JA4) |
 | `src/balancer.rs` | UdsBalancer: AtomicU32 least-connections; IP affinity DashMap; per-slot `SlotHealth` (failover routes only) |
+| `src/thread_cpu.rs` | Worker-thread CPU per UDS slot: socket-owner discovery (`SO_PEERCRED` + `NSpid`), validated sampling, the smoothed balancer load |
 | `src/failover.rs` | Peer failover: policy parsing, per-(route, peer) cooldown, `forward_to_peers`, the recovery probe + `routeHealth` |
 | `src/ingress.rs` | Failover ingress listener: `trustedSources` gate and the PROXY v2 reader |
 | `src/tls.rs` | rustls ServerConfig builder; SHA-256 deduplication cache |
@@ -185,6 +186,25 @@ hand over the TLS session), and it lets the peer terminate and verify client cer
   through `ArcSwap`, validated with the rest of `updateConfig` before anything is stored.
 - **The probe task is the only writer of `reported_down`**, so each transition emits one
   `routeHealth`. It dedups endpoints across routes, runs probes concurrently, and stops on shutdown.
+
+### Worker-thread CPU identity (`thread_cpu.rs`)
+A slot's configured `pid`/`tid` are whatever the upstream reported, and Harper in a container
+reports its own namespace's ids, which name nothing (or something else) in the host `/proc`
+symphony reads. So the ids are never trusted until tied to the socket's owner:
+
+- **Discovery is a background connect-and-close** (`socket_owner`, `SO_PEERCRED`), never a
+  getsockopt on client connections: an idle node has no client connections, and its load is the
+  one a hot peer needs to see.
+- **`Discovered` vs `Literal`.** Owner pid == configured pid, or the owner's last `NSpid:` entry ==
+  configured pid (then each thread's last `NSpid:` entry maps to its host tid) → `Discovered`.
+  Anything else is `Literal`: still read as configured for `pick()`'s tiebreak (legacy behavior),
+  but never counted as load, because a mismatch means the ids may name an unrelated thread.
+- **A sample is evidence only while fresh, and never survives its thread.** A failed read or a
+  changed thread start time zeroes `util_permille` and sends a discovered slot back to discovery;
+  load counts only samples under a second old. The old code kept the last value forever.
+- `ThreadCpu` and `LoadEwma` are shared across rebuilds by `(path, pid, tid)` (`with_cpu_from`),
+  like `SlotHealth`, so a reload neither repeats discovery nor restarts the smoothed load.
+- `/proc` work runs on `spawn_blocking`, one `task/` scan per owner process per pass.
 
 ### ArcSwap for RouteTable
 `ArcSwap<RouteTable>` gives us a pointer-swap on writes (single atomic store) and a single `load()` on reads — no lock contention on the hot path. With ≤100 routes, rebuilding the full table on `updateConfig` costs ~microseconds (Arc pointer clones only). A partial-update scheme would be more complex without meaningful benefit.

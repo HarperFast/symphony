@@ -708,25 +708,10 @@ impl SymphonyProxyWrap {
 			}
 		}
 
-		// Spawn a background task that samples /proc/{pid}/task/{tid}/stat every
-		// 250 ms for UDS upstreams that have pid/tid configured.  This is a no-op
-		// loop iteration when no routes have such upstreams.
-		let monitor_table = self.route_table.clone();
-		let mut monitor_rx = tx.subscribe();
-		self.rt_handle.spawn(async move {
-			let interval = Duration::from_millis(250);
-			loop {
-				tokio::select! {
-					_ = monitor_rx.recv() => break,
-					_ = tokio::time::sleep(interval) => {
-						let table = monitor_table.0.load();
-						for balancer in &table.monitored_balancers {
-							balancer.update_cpu_stats();
-						}
-					}
-				}
-			}
-		});
+		self.rt_handle.spawn(crate::thread_cpu::sample_periodically(
+			self.route_table.clone(),
+			tx.subscribe(),
+		));
 
 		self.rt_handle.spawn(evict_affinity_periodically(
 			self.route_table.clone(),

@@ -1,7 +1,8 @@
+use crate::thread_cpu::{LoadEwma, ThreadCpu};
 use dashmap::DashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn now_ns() -> u64 {
@@ -9,36 +10,6 @@ fn now_ns() -> u64 {
 		.duration_since(UNIX_EPOCH)
 		.unwrap_or(Duration::ZERO)
 		.as_nanos() as u64
-}
-
-/// Cached value of sysconf(_SC_CLK_TCK) — usually 100 on Linux.
-fn clk_tck_hz() -> u64 {
-	static CLK_TCK: OnceLock<u64> = OnceLock::new();
-	*CLK_TCK.get_or_init(|| {
-		let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-		if v > 0 {
-			v as u64
-		} else {
-			100
-		}
-	})
-}
-
-/// Read the combined utime+stime (in clock ticks) for a specific thread
-/// from `/proc/{pid}/task/{tid}/stat`.
-/// Returns `None` on any parse or I/O error (process gone, non-Linux, etc.).
-fn read_thread_cpu_ticks(pid: u32, tid: u32) -> Option<u64> {
-	let content = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")).ok()?;
-	// The comm field (field 2) is wrapped in parentheses and may itself contain
-	// '(' or ')' — find the *last* ')' to locate the end of the comm field.
-	let rparen = content.rfind(')')?;
-	let after_comm = content[rparen + 1..].trim_start();
-	let fields: Vec<&str> = after_comm.split_whitespace().collect();
-	// After comm: state(0) ppid(1) pgrp(2) sess(3) tty(4) tpgid(5) flags(6)
-	//   minflt(7) cminflt(8) majflt(9) cmajflt(10) utime(11) stime(12) …
-	let utime: u64 = fields.get(11)?.parse().ok()?;
-	let stime: u64 = fields.get(12)?.parse().ok()?;
-	Some(utime + stime)
 }
 
 // ── Public slot specification ─────────────────────────────────────────────────
@@ -94,16 +65,9 @@ struct UdsSlot {
 	/// `Some` only on a failover route's balancer: refusing slots are skipped by `pick()` and
 	/// cleared by the failover probe. Without a probe a skipped slot would never be re-tested.
 	health: Option<Arc<SlotHealth>>,
-	// CPU monitoring — all zero / None when pid/tid absent.
-	pid: Option<u32>,
-	tid: Option<u32>,
-	/// Measured CPU utilisation in permille (0–1000 = 0–100 %).
-	/// Updated by `update_cpu_stats()`; default 0 → pure least-connections.
-	cpu_util_permille: AtomicU32,
-	/// utime+stime (clock ticks) at the time of the last sample.
-	last_cpu_ticks: AtomicU64,
-	/// Wall-clock nanoseconds at the time of the last sample (0 = never sampled).
-	last_sample_ns: AtomicU64,
+	/// `Some` when the slot names its worker thread (`pid` and `tid`). `None` → CPU score 0, pure
+	/// least-connections.
+	cpu: Option<Arc<ThreadCpu>>,
 }
 
 impl UdsSlot {
@@ -114,7 +78,7 @@ impl UdsSlot {
 	/// Combined selection score: active connections dominate; CPU is a tiebreaker.
 	fn score(&self) -> u64 {
 		self.active.load(Ordering::Relaxed) as u64 * 1000
-			+ self.cpu_util_permille.load(Ordering::Relaxed) as u64
+			+ self.cpu.as_ref().map_or(0, |c| c.util_permille() as u64)
 	}
 }
 
@@ -131,21 +95,28 @@ struct AffinityMap {
 pub struct UdsBalancer {
 	sockets: Vec<UdsSlot>,
 	affinity: Option<AffinityMap>,
+	/// Smoothed load of the slots' worker threads, for peer spill-over.
+	load: Arc<LoadEwma>,
 }
 
 impl UdsBalancer {
 	pub fn new(slots: Vec<UdsSlotSpec>, ip_affinity: bool, affinity_ttl_ms: u64) -> Self {
 		let sockets = slots
 			.into_iter()
-			.map(|s| UdsSlot {
-				path: Arc::from(s.path.as_str()),
-				active: AtomicU32::new(0),
-				health: None,
-				pid: s.pid,
-				tid: s.tid,
-				cpu_util_permille: AtomicU32::new(0),
-				last_cpu_ticks: AtomicU64::new(0),
-				last_sample_ns: AtomicU64::new(0),
+			.map(|s| {
+				let path: Arc<str> = Arc::from(s.path.as_str());
+				let cpu = match (s.pid, s.tid) {
+					(Some(pid), Some(tid)) => {
+						Some(Arc::new(ThreadCpu::new(path.clone(), pid, tid)))
+					}
+					_ => None,
+				};
+				UdsSlot {
+					path,
+					active: AtomicU32::new(0),
+					health: None,
+					cpu,
+				}
 			})
 			.collect();
 
@@ -158,7 +129,44 @@ impl UdsBalancer {
 			None
 		};
 
-		Self { sockets, affinity }
+		Self {
+			sockets,
+			affinity,
+			load: Arc::default(),
+		}
+	}
+
+	/// Continue `previous`'s CPU sampling for each slot whose path and configured ids it shares, and
+	/// its smoothed load when every slot matches, so a rebuild neither repeats discovery nor
+	/// restarts the load from nothing.
+	pub fn with_cpu_from(mut self, previous: Option<&UdsBalancer>) -> Self {
+		let Some(previous) = previous else {
+			return self;
+		};
+		let mut all_match = self.sockets.len() == previous.sockets.len();
+		for slot in &mut self.sockets {
+			let Some(cpu) = &slot.cpu else {
+				all_match &= previous
+					.sockets
+					.iter()
+					.any(|p| p.path == slot.path && p.cpu.is_none());
+				continue;
+			};
+			let inherited = previous
+				.sockets
+				.iter()
+				.filter_map(|p| p.cpu.as_ref())
+				.find(|p| p.configured() == cpu.configured())
+				.cloned();
+			all_match &= inherited.is_some();
+			if let Some(inherited) = inherited {
+				slot.cpu = Some(inherited);
+			}
+		}
+		if all_match {
+			self.load = previous.load.clone();
+		}
+		self
 	}
 
 	/// Track per-slot health for a failover route, reusing `previous`'s state for any path it
@@ -184,15 +192,15 @@ impl UdsBalancer {
 			.iter()
 			.map(|s| UdsSlotSpec {
 				path: s.path.to_string(),
-				pid: s.pid,
-				tid: s.tid,
+				pid: s.cpu.as_ref().map(|c| c.configured().1),
+				tid: s.cpu.as_ref().map(|c| c.configured().2),
 			})
 			.collect();
 		let (ip_affinity, ttl_ms) = self
 			.affinity
 			.as_ref()
 			.map_or((false, 0), |a| (true, a.ttl_ns / 1_000_000));
-		let balancer = UdsBalancer::new(slots, ip_affinity, ttl_ms);
+		let balancer = UdsBalancer::new(slots, ip_affinity, ttl_ms).with_cpu_from(Some(self));
 		if track {
 			balancer.with_health(Some(self))
 		} else {
@@ -337,43 +345,15 @@ impl UdsBalancer {
 
 	/// Returns true if any slot has a pid/tid configured for CPU monitoring.
 	pub fn has_monitored_slots(&self) -> bool {
-		self.sockets.iter().any(|s| s.pid.is_some())
+		self.sockets.iter().any(|s| s.cpu.is_some())
 	}
 
-	/// Read `/proc/{pid}/task/{tid}/stat` for each configured slot and update
-	/// `cpu_util_permille`. Called periodically by the background monitor task.
-	/// Slots without pid/tid, or where the read fails, are left unchanged (0).
-	pub fn update_cpu_stats(&self) {
-		let now_ns = now_ns();
-		let clk_tck = clk_tck_hz() as f64;
+	pub fn thread_cpus(&self) -> impl Iterator<Item = &Arc<ThreadCpu>> {
+		self.sockets.iter().filter_map(|s| s.cpu.as_ref())
+	}
 
-		for slot in &self.sockets {
-			let (Some(pid), Some(tid)) = (slot.pid, slot.tid) else {
-				continue;
-			};
-			let Some(ticks) = read_thread_cpu_ticks(pid, tid) else {
-				continue;
-			};
-
-			let last_ticks = slot.last_cpu_ticks.load(Ordering::Relaxed);
-			let last_ns = slot.last_sample_ns.load(Ordering::Relaxed);
-
-			if last_ns > 0 {
-				let delta_ticks = ticks.saturating_sub(last_ticks) as f64;
-				let delta_secs = now_ns.saturating_sub(last_ns) as f64 / 1_000_000_000.0;
-				// util_fraction = delta_ticks / (delta_secs * clk_tck)
-				// util_permille = util_fraction * 1000, capped at 1000 (= 100 %)
-				let util = if delta_secs > 0.0 {
-					(delta_ticks / (delta_secs * clk_tck) * 1000.0).min(1000.0) as u32
-				} else {
-					0
-				};
-				slot.cpu_util_permille.store(util, Ordering::Relaxed);
-			}
-
-			slot.last_cpu_ticks.store(ticks, Ordering::Relaxed);
-			slot.last_sample_ns.store(now_ns, Ordering::Relaxed);
-		}
+	pub fn load(&self) -> &LoadEwma {
+		&self.load
 	}
 
 	fn best_score_idx(&self) -> usize {
@@ -408,6 +388,50 @@ impl Drop for BalancerGuard {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn monitored(slots: &[(&str, u32, u32)]) -> UdsBalancer {
+		UdsBalancer::new(
+			slots
+				.iter()
+				.map(|(path, pid, tid)| UdsSlotSpec {
+					path: path.to_string(),
+					pid: Some(*pid),
+					tid: Some(*tid),
+				})
+				.collect(),
+			false,
+			0,
+		)
+	}
+
+	#[test]
+	fn a_rebuild_continues_cpu_sampling_for_unchanged_slots() {
+		let old = monitored(&[("/a.sock", 1, 10), ("/b.sock", 1, 11)]);
+		let cpus = |b: &UdsBalancer| b.thread_cpus().cloned().collect::<Vec<_>>();
+
+		let same = monitored(&[("/a.sock", 1, 10), ("/b.sock", 1, 11)]).with_cpu_from(Some(&old));
+		assert!(cpus(&same)
+			.iter()
+			.zip(cpus(&old))
+			.all(|(a, b)| Arc::ptr_eq(a, &b)));
+		assert!(Arc::ptr_eq(&same.load, &old.load));
+
+		let restarted =
+			monitored(&[("/a.sock", 1, 10), ("/b.sock", 1, 12)]).with_cpu_from(Some(&old));
+		assert!(Arc::ptr_eq(&cpus(&restarted)[0], &cpus(&old)[0]));
+		assert!(
+			!Arc::ptr_eq(&cpus(&restarted)[1], &cpus(&old)[1]),
+			"a new tid is a new thread"
+		);
+		assert!(
+			!Arc::ptr_eq(&restarted.load, &old.load),
+			"a changed slot set starts its load over"
+		);
+
+		let retracked = old.retracked(true);
+		assert!(Arc::ptr_eq(&retracked.load, &old.load));
+		assert!(Arc::ptr_eq(&cpus(&retracked)[1], &cpus(&old)[1]));
+	}
 
 	#[test]
 	fn evict_affinity_drops_only_entries_past_their_ttl() {

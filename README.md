@@ -361,7 +361,9 @@ upstreams: [
 ]
 ```
 
-Symphony samples `/proc/{pid}/task/{tid}/stat` every 250 ms and computes the thread's CPU utilisation over the interval. Sockets without `pid`/`tid` keep a CPU score of 0 and fall back to pure least-connections. Sampling stops gracefully when `pid` is gone (process exit, crash) — those slots simply keep their last measured value.
+Symphony samples `/proc/{pid}/task/{tid}/stat` every 250 ms and computes the thread's CPU utilisation over the interval. Sockets without `pid`/`tid` keep a CPU score of 0 and fall back to pure least-connections. A thread that can no longer be read (process exit, crash) scores 0 until it is found again; symphony never keeps a value for a thread that is gone.
+
+`pid`/`tid` may be the ids the worker sees in its own PID namespace, as Harper in a container reports them (`process.pid` and `gettid()`). Before sampling a socket, symphony connects to it once and closes at once, reads the listening process's host pid from the socket credentials (`SO_PEERCRED`), and, when that process's `NSpid:` shows the configured `pid` as its namespaced pid, maps the configured `tid` to the host thread the same way. The thread's start time is recorded with it, so a reused id is detected on the next sample and the socket is looked up again. Configured ids that do not name the socket's owner at all are still sampled as given, for socket selection only; they never count toward a route's load (see [spill-over](#spill-over-to-a-less-loaded-peer)).
 
 ---
 

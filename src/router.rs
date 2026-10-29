@@ -681,11 +681,12 @@ pub fn build_route_table(
 		// Isolate per-route failures: a single route whose cert can't be built (e.g. a
 		// rotated key no longer matching an inlined chain → rustls KeyMismatch) must not
 		// abort the whole table and take every other tenant on the port down with it.
-		let health = failover_policy.is_some().then_some(HealthTracking {
+		let inherit = Inherit {
 			previous: previous_route,
-		});
+			track_health: failover_policy.is_some(),
+		};
 		let mut carried = false;
-		let mut route = match build_route(spec, listener_tls, cache, health) {
+		let mut route = match build_route(spec, listener_tls, cache, inherit) {
 			Ok(route) => route,
 			Err(e) => {
 				// Log only on the good→bad transition: a persistently-broken cert would
@@ -891,18 +892,19 @@ fn tracks_health_as(route: &Route, tracked: bool) -> bool {
 		})
 }
 
-/// Per-slot health tracking for a failover route's balancers, inheriting the state of the route
-/// it replaces.
+/// What a route's balancers carry over from the route they replace: CPU sampling always, slot
+/// health when the route has failover.
 #[derive(Clone, Copy)]
-struct HealthTracking<'a> {
+struct Inherit<'a> {
 	previous: Option<&'a Route>,
+	track_health: bool,
 }
 
 fn build_route(
 	spec: &RouteSpec,
 	listener_tls: &ListenerTlsSpec,
 	cache: &mut TlsConfigCache,
-	health: Option<HealthTracking>,
+	inherit: Inherit,
 ) -> crate::error::Result<Route> {
 	let tls_config = if spec.terminate_tls {
 		let cert_pem = spec
@@ -941,7 +943,7 @@ fn build_route(
 		None
 	};
 
-	let (destination, destination_h2) = build_destinations(spec, health)?;
+	let (destination, destination_h2) = build_destinations(spec, inherit)?;
 
 	// Header injection cannot apply to h2 frames; PROXY protocol rides before the
 	// preface and works for both protocols. Any route that can carry h2 to an
@@ -1002,7 +1004,7 @@ fn build_route(
 /// that negotiated h2 in ALPN.
 fn build_destinations(
 	spec: &RouteSpec,
-	health: Option<HealthTracking>,
+	inherit: Inherit,
 ) -> crate::error::Result<(Destination, Option<Destination>)> {
 	// Suspended routes or routes with no upstreams use a placeholder TCP dest
 	// that is replaced by resolveConnection() before any data flows.
@@ -1022,29 +1024,32 @@ fn build_destinations(
 		)));
 	}
 
-	let previous_balancer = |pick: fn(&Route) -> Option<&Destination>| {
-		health.map(|h| match h.previous.and_then(pick) {
+	let previous_balancer =
+		|pick: fn(&Route) -> Option<&Destination>| match inherit.previous.and_then(pick) {
 			Some(Destination::UdsSet(balancer)) => Some(balancer.as_ref()),
 			_ => None,
-		})
-	};
-	let destination =
-		build_destination_for(&h1_specs, previous_balancer(|r| Some(&r.destination)))?;
+		};
+	let destination = build_destination_for(
+		&h1_specs,
+		previous_balancer(|r| Some(&r.destination)),
+		inherit.track_health,
+	)?;
 	let destination_h2 = if h2_specs.is_empty() {
 		None
 	} else {
 		Some(build_destination_for(
 			&h2_specs,
 			previous_balancer(|r| r.destination_h2.as_ref()),
+			inherit.track_health,
 		)?)
 	};
 	Ok((destination, destination_h2))
 }
 
-/// `health`: `Some` to track per-slot health, inheriting it from the given previous balancer.
 fn build_destination_for(
 	upstreams: &[&UpstreamSpec],
-	health: Option<Option<&UdsBalancer>>,
+	previous: Option<&UdsBalancer>,
+	track_health: bool,
 ) -> crate::error::Result<Destination> {
 	let first = upstreams
 		.first()
@@ -1083,10 +1088,12 @@ fn build_destination_for(
 					affinity_ttl_ms = *ttl;
 				}
 			}
-			let balancer = UdsBalancer::new(slots, ip_affinity, affinity_ttl_ms);
-			Ok(Destination::UdsSet(Arc::new(match health {
-				Some(previous) => balancer.with_health(previous),
-				None => balancer,
+			let balancer =
+				UdsBalancer::new(slots, ip_affinity, affinity_ttl_ms).with_cpu_from(previous);
+			Ok(Destination::UdsSet(Arc::new(if track_health {
+				balancer.with_health(previous)
+			} else {
+				balancer
 			})))
 		}
 	}

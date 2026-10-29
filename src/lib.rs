@@ -20,6 +20,7 @@ mod proxy_conn;
 mod router;
 mod sni;
 mod suspended;
+mod thread_cpu;
 mod tls;
 mod upstream;
 
