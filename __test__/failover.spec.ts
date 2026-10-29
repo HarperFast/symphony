@@ -186,7 +186,8 @@ function readToEnd(socket: net.Socket): Promise<string> {
  * queries too, as symphony 1.5.0 does.
  */
 async function startFakePeer(t: TestContext, mode: 'answering' | 'legacy') {
-	const seen = { queries: 0, forwarded: 0 };
+	/** `answer` is what an answering peer reports for every name: a permille, or `-`. */
+	const seen = { queries: 0, forwarded: 0, answer: '0' };
 	const server = net.createServer((socket) => {
 		socket.on('error', () => {});
 		let buffered = Buffer.alloc(0);
@@ -205,7 +206,7 @@ async function startFakePeer(t: TestContext, mode: 'answering' | 'legacy') {
 			for (let at = 16; at < 16 + len; at += 3 + buffered.readUInt16BE(at + 1)) {
 				if (buffered[at] === 0xe3) names++;
 			}
-			socket.end('SYMPHONY-LOAD/1\n' + '0\n'.repeat(names));
+			socket.end('SYMPHONY-LOAD/1\n' + `${seen.answer}\n`.repeat(names));
 		});
 	});
 	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -217,6 +218,7 @@ interface NodeOptions {
 	peers?: number[];
 	drain?: boolean;
 	spill?: SpillConfig;
+	probeIntervalMs?: number;
 	/** An upstream started before the node, whose worker thread is the route's CPU sample. */
 	upstream?: WorkerUpstream;
 	mtls?: MtlsConfig;
@@ -259,7 +261,7 @@ async function startNode(
 			? {
 					peers: opts.peers.map((port) => ({ host: '127.0.0.1', port })),
 					drain: opts.drain,
-					probeIntervalMs: 50,
+					probeIntervalMs: opts.probeIntervalMs ?? 50,
 					peerCooldownMs: { min: 200, max: 1000 },
 					spill: opts.spill,
 					...overrides,
@@ -611,6 +613,26 @@ describe(
 			assert.equal(fromB.peers[0].spilled, 0);
 			assert.ok(ingressMetrics(nodeB).loadQueries > 0);
 			assert.ok(ingressMetrics(nodeA).loadQueries > 0);
+		});
+
+		it('at the default poll interval the share holds steadily, and stops as soon as the peer reports it is unavailable', async (t) => {
+			const [a] = await allocatePorts(1);
+			const peer = await startFakePeer(t, 'answering');
+			const hot = await startWorkerUpstream(t, { busy: true });
+			const nodeA = await startNode(t, a, { peers: [peer.port], spill, probeIntervalMs: 1000, upstream: hot });
+			await waitFor(() => (routeMetrics(nodeA).failover!.spill?.fraction ?? 0) >= 0.5, 15_000);
+
+			// Sampled across more than one poll: the admission is renewed before it expires.
+			for (let i = 0; i < 60; i++) {
+				assert.equal(routeMetrics(nodeA).failover!.spill!.fraction, 0.5, `sample ${i}`);
+				await sleep(25);
+			}
+
+			peer.seen.answer = '-';
+			const queries = peer.seen.queries;
+			await waitFor(() => peer.seen.queries > queries, 3000);
+			await waitFor(() => routeMetrics(nodeA).failover!.spill!.fraction === 0, 200);
+			assert.equal(routeMetrics(nodeA).failover!.peers[0].load, undefined);
 		});
 
 		it('a spilled connection whose peer closes without answering is served locally', async (t) => {

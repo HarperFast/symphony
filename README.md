@@ -363,7 +363,7 @@ upstreams: [
 
 Symphony samples `/proc/{pid}/task/{tid}/stat` every 250 ms and computes the thread's CPU utilisation over the interval. Sockets without `pid`/`tid` keep a CPU score of 0 and fall back to pure least-connections. A thread that can no longer be read (process exit, crash) scores 0 until it is found again; symphony never keeps a value for a thread that is gone.
 
-`pid`/`tid` may be the ids the worker sees in its own PID namespace, as Harper in a container reports them (`process.pid` and `gettid()`). Before sampling a socket, symphony connects to it once and closes at once, reads the listening process's host pid from the socket credentials (`SO_PEERCRED`), and, when that process's `NSpid:` shows the configured `pid` as its namespaced pid, maps the configured `tid` to the host thread the same way. The thread's start time is recorded with it, so a reused id is detected on the next sample and the socket is looked up again. Configured ids that do not name the socket's owner at all are still sampled as given, for socket selection only; they never count toward a route's load (see [spill-over](#spill-over-to-a-less-loaded-peer)).
+`pid`/`tid` may be the ids the worker sees in its own PID namespace, as Harper in a container reports them (`process.pid` and `gettid()`). Before sampling a socket, symphony connects to it and closes at once, reads the listening process's host pid from the socket credentials (`SO_PEERCRED`), and, when that process's `NSpid:` shows the configured `pid` as its namespaced pid, maps the configured `tid` to the host thread the same way. It repeats that check every 30 s (every 5 s while unresolved, as around a restart), in the background so sampling never waits on it. The thread's start time is recorded with it, so a reused id is detected on the next sample and the socket is looked up again. Configured ids that do not name the socket's owner at all are still sampled as given, for socket selection only; they never count toward a route's load (see [spill-over](#spill-over-to-a-less-loaded-peer)).
 
 ---
 
@@ -493,8 +493,8 @@ by a success), at most once each.
   cooling down, the one whose cooldown ends first is tried once. If no peer takes the connection it
   is closed (`exhausted`).
 - **Draining** (`drain`, local upstream up): peers in cooldown are skipped, the attempts share at most
-  2 s, and if no peer takes the connection before answering it is served by the local upstream
-  (`localFallbacks`).
+  half the handshake timeout (and at most 2 s), and if no peer takes the connection before answering
+  it is served by the local upstream with what is left of the handshake timeout (`localFallbacks`).
 
 **The ingress listener** (`failoverIngress`) is the receiving end:
 
@@ -565,13 +565,13 @@ LOCAL header on its `failoverIngress` port, naming the spill routes it shares (c
 up to 64 per query). The peer answers `SYMPHONY-LOAD/1` and one line per name: its load in permille
 for the *exact* route configured for that name, or `-` when it would not take a spilled connection
 (no exact route, draining, local upstream down, or load not measurable). The connect time of the
-query is the peer's RTT. A report is usable for 3 × `probeIntervalMs` (at least 3 s). A peer that
-does not answer — including symphony 1.5.0 and earlier, which closes LOCAL headers — is never a
-target.
+query is the peer's RTT. A report is usable for 3 × `probeIntervalMs` (at least 3 s); a failed
+query leaves it to expire, while an answer of `-` clears it at once. A peer that does not answer —
+including symphony 1.5.0 and earlier, which closes LOCAL headers — is never a target.
 
-**The rule.** Once a second the controller takes the least-loaded peer with a usable report that is
-not cooling down (and within `maxPeerRttMs`, when set), and with `L` the local load and `P` that
-peer's:
+**The rule.** Every 250 ms, and after each answer, the controller takes the least-loaded peer with a
+usable report that is not cooling down (and within `maxPeerRttMs`, when set), and with `L` the local
+load and `P` that peer's:
 
 | condition | share of new connections |
 | --- | --- |
@@ -587,7 +587,8 @@ and each share then moves at most `step` per second.
 
 **What a spilled connection costs.** It is relayed through the busy node for its whole life: an extra
 network hop, and cross-region egress if the peer is far. If the peer refuses, times out, or closes
-before answering, the connection is served locally and the peer cools down. After the peer's first
+before answering (within half the handshake timeout, at most 1 s), the connection is served locally
+with what is left of the handshake timeout, and the peer cools down. After the peer's first
 byte the connection is committed, as with failover: a peer that then fails (for example its upstream
 went down after its last report) loses that connection. Connections that arrived on an ingress
 listener never spill, and only new connections move. Where DNS steering with load feedback exists

@@ -201,8 +201,10 @@ destinations (`router::route_load`, the busier of h1/h2); peers' loads come from
 query (TLV `0xE3` per route name) on their `failoverIngress`, answered by `RouteTable::load_answer`.
 
 - **Admission is published, never computed, on the hot path.** `poll_peer_loads` (its own task, not
-  `probe_periodically`, so a blackholed peer cannot delay `routeHealth`) runs `control()` and stores
-  one `AtomicU64` (fraction, target index, expiry). `spill_target` is one load, a hash of the
+  `probe_periodically`, so a blackholed peer cannot delay `routeHealth`) runs `control()` every
+  `CONTROL_TICK` (250 ms, well under a local sample's 1 s validity, so the admission is renewed
+  before it expires) and after each answer, and stores one `AtomicU64` (fraction, target index,
+  expiry). `spill_target` is one load, a hash of the
   client address and port, and the target's cooldown check — nothing else on the connection path.
 - **Spilling stops at once; the share moves gradually.** `assess()` names a target only when the
   local load and the target's report justify rise or hold (`P ≤ L − margin/2`); otherwise no
@@ -226,7 +228,10 @@ symphony reads. So the ids are never trusted until tied to the socket's owner:
 
 - **Discovery is a background connect-and-close** (`socket_owner`, `SO_PEERCRED`), never a
   getsockopt on client connections: an idle node has no client connections, and its load is the
-  one a hot peer needs to see.
+  one a hot peer needs to see. It runs beside sampling (results land on the next pass), never ahead
+  of it, so one slow socket cannot let every slot's load expire; resolved owners are rechecked
+  every 30 s, because another process can take over a socket path while the old thread lives on.
+  An owner that has exited, or a thread not there yet, is `Unresolved` (retried in 5 s).
 - **`Discovered` vs `Literal`.** Owner pid == configured pid, or the owner's last `NSpid:` entry ==
   configured pid (then each thread's last `NSpid:` entry maps to its host tid) → `Discovered`.
   Anything else is `Literal`: still read as configured for `pick()`'s tiebreak (legacy behavior),

@@ -23,9 +23,9 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const SAMPLE_VALID_NS: u64 = 1_000_000_000;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 const DISCOVERY_RETRY_NS: u64 = 5_000_000_000;
-/// A slot whose configured ids did not name its socket's owner is checked again this often, since
-/// the owner can be replaced without the configuration changing.
-const LITERAL_RECHECK_NS: u64 = 30_000_000_000;
+/// A resolved slot's owner is checked again this often: another process can take over the socket
+/// path while the old thread is still alive, without the configuration changing.
+const OWNER_RECHECK_NS: u64 = 30_000_000_000;
 const MAX_CONCURRENT_DISCOVERIES: usize = 64;
 const LOAD_TIME_CONSTANT_NS: f64 = 3_000_000_000.0;
 
@@ -44,7 +44,7 @@ fn clk_tck_hz() -> u64 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TaskStat {
-	/// utime + stime, in clock ticks.
+	/// utime + stime.
 	ticks: u64,
 	/// Start time after boot, in clock ticks. Distinguishes a reused id from the thread it named.
 	start: u64,
@@ -134,7 +134,9 @@ enum Identity {
 	Literal,
 }
 
-/// Decide what the configured ids name, given the socket owner's host pid.
+/// Decide what the configured ids name, given the socket owner's host pid. `Unresolved` (retry
+/// soon) when the owner has exited or its thread is not there yet, as around a restart; `Literal`
+/// only when a live owner's pid is not the configured one in any namespace.
 fn resolve(
 	configured_pid: u32,
 	configured_tid: u32,
@@ -142,36 +144,37 @@ fn resolve(
 	proc: &ProcFs,
 	views: &mut HashMap<u32, Option<ProcessView>>,
 ) -> Identity {
-	if owner == configured_pid {
-		return match proc.task_stat(owner, configured_tid) {
-			Some(stat) => Identity::Discovered {
-				pid: owner,
-				tid: configured_tid,
-				start: stat.start,
-			},
-			None => Identity::Literal,
-		};
-	}
-	let view = views
+	let Some(view) = views
 		.entry(owner)
-		.or_insert_with(|| proc.process_view(owner));
-	let host_tid = view
-		.as_ref()
-		.filter(|v| v.innermost_pid == configured_pid)
-		.and_then(|v| v.threads.get(&configured_tid).copied());
-	match host_tid.and_then(|tid| Some((tid, proc.task_stat(owner, tid)?))) {
-		Some((tid, stat)) => Identity::Discovered {
+		.or_insert_with(|| proc.process_view(owner))
+	else {
+		return Identity::Unresolved;
+	};
+	let host_tid = if owner == configured_pid {
+		configured_tid
+	} else if view.innermost_pid == configured_pid {
+		match view.threads.get(&configured_tid) {
+			Some(tid) => *tid,
+			None => return Identity::Unresolved,
+		}
+	} else {
+		return Identity::Literal;
+	};
+	match proc.task_stat(owner, host_tid) {
+		Some(stat) => Identity::Discovered {
 			pid: owner,
-			tid,
+			tid: host_tid,
 			start: stat.start,
 		},
-		None => Identity::Literal,
+		None => Identity::Unresolved,
 	}
 }
 
 struct SampleState {
 	identity: Identity,
 	next_discovery_ns: u64,
+	/// A discovery's result (`None` = the connect failed), applied by the next sampling pass.
+	discovered: Option<Option<u32>>,
 	last_ticks: u64,
 	/// Monotonic ns of the last successful read; 0 = no baseline.
 	last_ns: u64,
@@ -188,7 +191,7 @@ pub struct ThreadCpu {
 	tid: u32,
 	/// Last measured utilisation, read by `UdsBalancer::pick` as a tiebreak. 0 when unknown.
 	util_permille: AtomicU32,
-	/// Written only by the sampling task.
+	/// Written by the sampling task (and a discovery's result).
 	state: Mutex<SampleState>,
 }
 
@@ -208,6 +211,7 @@ impl ThreadCpu {
 			state: Mutex::new(SampleState {
 				identity,
 				next_discovery_ns: 0,
+				discovered: None,
 				last_ticks: 0,
 				last_ns: 0,
 				valid_until_ns: 0,
@@ -228,11 +232,24 @@ impl ThreadCpu {
 		self.state.lock().unwrap_or_else(|e| e.into_inner())
 	}
 
+	/// Claims a due discovery. Until its result is applied the next one is a retry interval away, so
+	/// a discovery that never finishes (aborted at shutdown) is simply tried again.
+	fn begin_discovery(&self, now: u64) -> bool {
+		let mut state = self.lock();
+		if !cfg!(target_os = "linux") || now < state.next_discovery_ns {
+			return false;
+		}
+		state.next_discovery_ns = now.saturating_add(DISCOVERY_RETRY_NS);
+		true
+	}
+
+	fn finish_discovery(&self, owner: Option<u32>) {
+		self.lock().discovered = Some(owner);
+	}
+
+	#[cfg(test)]
 	fn discovery_due(&self, now: u64) -> bool {
-		let state = self.lock();
-		matches!(state.identity, Identity::Unresolved | Identity::Literal)
-			&& cfg!(target_os = "linux")
-			&& now >= state.next_discovery_ns
+		now >= self.lock().next_discovery_ns
 	}
 
 	fn apply_discovery(
@@ -248,8 +265,8 @@ impl ThreadCpu {
 			None => Identity::Unresolved,
 		};
 		state.next_discovery_ns = now.saturating_add(match identity {
-			Identity::Literal => LITERAL_RECHECK_NS,
-			_ => DISCOVERY_RETRY_NS,
+			Identity::Unresolved => DISCOVERY_RETRY_NS,
+			Identity::Discovered { .. } | Identity::Literal => OWNER_RECHECK_NS,
 		});
 		if identity != state.identity {
 			state.identity = identity;
@@ -258,8 +275,18 @@ impl ThreadCpu {
 		}
 	}
 
-	fn sample(&self, now: u64, proc: &ProcFs) {
+	/// `views` caches process scans for this pass, shared by every slot of a process.
+	fn sample(&self, now: u64, proc: &ProcFs, views: &mut HashMap<u32, Option<ProcessView>>) {
 		let mut state = self.lock();
+		if let Some(owner) = state.discovered.take() {
+			drop(state);
+			self.apply_discovery(owner, now, proc, views);
+			state = self.lock();
+		}
+		// A pass that started before a newer one (after a stop and restart) changes nothing.
+		if now <= state.last_ns {
+			return;
+		}
 		let (pid, tid, start) = match state.identity {
 			Identity::Discovered { pid, tid, start } => (pid, tid, Some(start)),
 			Identity::Literal => (self.pid, self.tid, None),
@@ -285,7 +312,7 @@ impl ThreadCpu {
 			}
 			return;
 		};
-		if state.last_ns > 0 && now > state.last_ns {
+		if state.last_ns > 0 {
 			let delta_ticks = stat.ticks.saturating_sub(state.last_ticks) as f64;
 			let delta_secs = (now - state.last_ns) as f64 / 1e9;
 			let util =
@@ -311,7 +338,8 @@ impl ThreadCpu {
 /// balancer's slots are unchanged.
 #[derive(Default)]
 pub struct LoadEwma {
-	state: Mutex<Option<(f64, u64)>>,
+	/// Smoothed permille (`None` = unknown) and the time of the pass that last updated it.
+	state: Mutex<(Option<f64>, u64)>,
 	/// Permille in the low 10 bits, monotonic ms until which it is current above them; 0 = unknown.
 	published: AtomicU64,
 }
@@ -333,18 +361,23 @@ impl LoadEwma {
 
 	fn update(&self, mean: Option<u32>, now: u64) {
 		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+		let (previous, at) = *state;
+		if now <= at {
+			return;
+		}
 		let Some(mean) = mean else {
+			*state = (previous, now);
 			self.published.store(0, Ordering::Relaxed);
 			return;
 		};
-		let value = match *state {
-			Some((value, at)) if now.saturating_sub(at) < 3 * LOAD_TIME_CONSTANT_NS as u64 => {
+		let value = match previous {
+			Some(value) if now - at < 3 * LOAD_TIME_CONSTANT_NS as u64 => {
 				let alpha = 1.0 - (-((now - at) as f64) / LOAD_TIME_CONSTANT_NS).exp();
 				value + alpha * (mean as f64 - value)
 			}
 			_ => mean as f64,
 		};
-		*state = Some((value, now));
+		*state = (Some(value), now);
 		let permille = (value.round() as u64).min(1000);
 		let until_ms = (now + SAMPLE_VALID_NS) / 1_000_000;
 		self.published
@@ -352,49 +385,58 @@ impl LoadEwma {
 	}
 }
 
-/// Discover, sample and smooth every monitored slot of the live table, every 250 ms.
+/// Discover, sample and smooth every monitored slot of the live table, every 250 ms. Discovery
+/// connects run beside the sampling, never ahead of it: one slow socket must not leave every other
+/// slot's load to expire.
 pub async fn sample_periodically(live: Arc<LiveRouteTable>, mut shutdown: broadcast::Receiver<()>) {
 	let proc = ProcFs::host();
+	// Dropping it at shutdown aborts the connects still running.
+	let mut discoveries = tokio::task::JoinSet::new();
 	loop {
 		tokio::select! {
 			_ = shutdown.recv() => return,
 			_ = tokio::time::sleep(SAMPLE_INTERVAL) => {}
 		}
+		while discoveries.try_join_next().is_some() {}
 		let table = live.0.load_full();
 		if table.monitored_balancers.is_empty() {
 			continue;
 		}
 		let now = now_ns();
-		let due: Vec<Arc<ThreadCpu>> = table
+		for cpu in table
 			.monitored_balancers
 			.iter()
 			.flat_map(|b| b.thread_cpus())
-			.filter(|cpu| cpu.discovery_due(now))
-			.cloned()
-			.collect();
-		let owners = tokio::select! {
-			_ = shutdown.recv() => return,
-			owners = discover_owners(&due) => owners,
-		};
+		{
+			if discoveries.len() >= MAX_CONCURRENT_DISCOVERIES {
+				break;
+			}
+			if cpu.begin_discovery(now) {
+				let cpu = cpu.clone();
+				discoveries.spawn(async move {
+					let owner = socket_owner(cpu.path.clone()).await;
+					cpu.finish_discovery(owner);
+				});
+			}
+		}
 		let proc = proc.clone();
 		let pass = tokio::task::spawn_blocking(move || {
-			let now = now_ns();
-			let mut views = HashMap::new();
-			for (cpu, owner) in due.iter().zip(owners) {
-				cpu.apply_discovery(owner, now, &proc, &mut views);
-			}
-			sample_table(&table.monitored_balancers, now, &proc);
+			sample_table(&table.monitored_balancers, now_ns(), &proc)
 		});
-		let _ = pass.await;
+		tokio::select! {
+			_ = shutdown.recv() => return,
+			_ = pass => {}
+		}
 	}
 }
 
 fn sample_table(balancers: &[Arc<crate::balancer::UdsBalancer>], now: u64, proc: &ProcFs) {
+	let mut views = HashMap::new();
 	for balancer in balancers {
 		let mut sum = 0u64;
 		let mut count = 0u64;
 		for cpu in balancer.thread_cpus() {
-			cpu.sample(now, proc);
+			cpu.sample(now, proc, &mut views);
 			if let Some(util) = cpu.load_sample(now) {
 				sum += util as u64;
 				count += 1;
@@ -406,29 +448,7 @@ fn sample_table(balancers: &[Arc<crate::balancer::UdsBalancer>], now: u64, proc:
 	}
 }
 
-/// The host pid of each slot's socket owner, or `None` where the connect failed.
-async fn discover_owners(cpus: &[Arc<ThreadCpu>]) -> Vec<Option<u32>> {
-	let mut owners = vec![None; cpus.len()];
-	let mut connects = tokio::task::JoinSet::new();
-	let mut collect = |done: Option<Result<(usize, Option<u32>), _>>| {
-		if let Some(Ok((i, owner))) = done {
-			owners[i] = owner;
-		}
-	};
-	for (i, cpu) in cpus.iter().enumerate() {
-		if connects.len() >= MAX_CONCURRENT_DISCOVERIES {
-			collect(connects.join_next().await);
-		}
-		let path = cpu.path.clone();
-		connects.spawn(async move { (i, socket_owner(path).await) });
-	}
-	while let Some(done) = connects.join_next().await {
-		collect(Some(done));
-	}
-	owners
-}
-
-/// Connect and close at once, as the failover probe does, keeping only the owner's credentials.
+/// Connect and close at once, keeping only the owner's credentials.
 async fn socket_owner(path: Arc<str>) -> Option<u32> {
 	let stream = tokio::time::timeout(
 		DISCOVERY_TIMEOUT,
@@ -444,6 +464,8 @@ async fn socket_owner(path: Arc<str>) -> Option<u32> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	const S: u64 = 1_000_000_000;
 
 	fn stat_line(comm: &str, ticks: (u64, u64), start: u64) -> String {
 		// pid (comm) state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime
@@ -543,8 +565,8 @@ mod tests {
 		);
 		assert_eq!(
 			resolve(500, 999, 500, &fake.proc(), &mut views),
-			Identity::Literal,
-			"a tid that is not a thread of the owner"
+			Identity::Unresolved,
+			"a tid that is not (yet) a thread of the owner is looked up again soon"
 		);
 	}
 
@@ -567,7 +589,7 @@ mod tests {
 		assert_eq!(views.len(), 1, "one scan per process");
 		assert_eq!(
 			resolve(7, 21, 3479403, &fake.proc(), &mut views),
-			Identity::Literal
+			Identity::Unresolved
 		);
 	}
 
@@ -582,8 +604,8 @@ mod tests {
 		);
 		assert_eq!(
 			resolve(42, 43, 601, &fake.proc(), &mut views),
-			Identity::Literal,
-			"owner gone"
+			Identity::Unresolved,
+			"owner gone, as during a restart: looked up again soon"
 		);
 	}
 
@@ -598,17 +620,17 @@ mod tests {
 		cpu.apply_discovery(Some(500), 0, &proc, &mut views);
 
 		let tick = clk_tck_hz();
-		cpu.sample(1_000_000_000, &proc);
+		cpu.sample(1_000_000_000, &proc, &mut HashMap::new());
 		assert_eq!(cpu.load_sample(1_000_000_000), None, "a baseline only");
 		fake.thread(500, 510, &[510], 100 + tick / 2, 77);
-		cpu.sample(2_000_000_000, &proc);
+		cpu.sample(2_000_000_000, &proc, &mut HashMap::new());
 		assert_eq!(cpu.util_permille(), 500);
 		assert_eq!(cpu.load_sample(2_000_000_000), Some(500));
 		assert_eq!(cpu.load_sample(3_000_000_000), None, "stale");
 
 		// The thread exits and its tid is reused by a thread started later.
 		fake.thread(500, 510, &[510], 5, 99);
-		cpu.sample(2_250_000_000, &proc);
+		cpu.sample(2_250_000_000, &proc, &mut HashMap::new());
 		assert_eq!(
 			cpu.util_permille(),
 			0,
@@ -627,9 +649,9 @@ mod tests {
 		let proc = fake.proc();
 		let cpu = ThreadCpu::new(Arc::from("/unused.sock"), 42, 43);
 		cpu.apply_discovery(Some(600), 0, &proc, &mut HashMap::new());
-		cpu.sample(1_000_000_000, &proc);
+		cpu.sample(1_000_000_000, &proc, &mut HashMap::new());
 		fake.thread(42, 43, &[43], clk_tck_hz(), 1);
-		cpu.sample(2_000_000_000, &proc);
+		cpu.sample(2_000_000_000, &proc, &mut HashMap::new());
 		assert_eq!(cpu.util_permille(), 1000, "still read for the tiebreak");
 		assert_eq!(cpu.load_sample(2_000_000_000), None);
 	}
@@ -661,12 +683,56 @@ mod tests {
 		std::fs::create_dir_all(&dir).unwrap();
 		let path = dir.join("w.sock");
 		let _listener = tokio::net::UnixListener::bind(&path).unwrap();
-		let owners = discover_owners(&[
-			Arc::new(ThreadCpu::new(Arc::from(path.to_str().unwrap()), 1, 1)),
-			Arc::new(ThreadCpu::new(Arc::from("/nonexistent/x.sock"), 1, 1)),
-		])
-		.await;
-		assert_eq!(owners, vec![Some(std::process::id()), None]);
+		assert_eq!(
+			socket_owner(Arc::from(path.to_str().unwrap())).await,
+			Some(std::process::id())
+		);
+		assert_eq!(socket_owner(Arc::from("/nonexistent/x.sock")).await, None);
 		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn a_discovery_lands_on_the_next_pass_and_resolved_owners_are_rechecked() {
+		let fake = FakeProc::new("pending");
+		fake.process(500, &[500]);
+		fake.thread(500, 510, &[510], 0, 77);
+		let proc = fake.proc();
+		let cpu = ThreadCpu::new(Arc::from("/unused.sock"), 500, 510);
+		assert!(cpu.begin_discovery(0));
+		assert!(!cpu.begin_discovery(1), "one at a time");
+		cpu.finish_discovery(Some(500));
+		cpu.sample(S, &proc, &mut HashMap::new());
+		assert!(matches!(
+			cpu.lock().identity,
+			Identity::Discovered { pid: 500, .. }
+		));
+		assert!(!cpu.discovery_due(30 * S));
+		assert!(cpu.discovery_due(31 * S), "the owner is checked again");
+
+		// The same owner again keeps the baseline; a pass older than the last one changes nothing.
+		cpu.sample(2 * S, &proc, &mut HashMap::new());
+		cpu.finish_discovery(Some(500));
+		cpu.sample(3 * S, &proc, &mut HashMap::new());
+		assert_eq!(cpu.lock().last_ns, 3 * S);
+		cpu.sample(2 * S, &proc, &mut HashMap::new());
+		assert_eq!(cpu.lock().last_ns, 3 * S);
+
+		let failed = ThreadCpu::new(Arc::from("/unused.sock"), 500, 510);
+		failed.begin_discovery(0);
+		failed.finish_discovery(None);
+		failed.sample(S, &proc, &mut HashMap::new());
+		assert!(
+			failed.discovery_due(6 * S),
+			"a failed connect is retried after 5 s"
+		);
+	}
+
+	#[test]
+	fn a_stale_pass_does_not_move_the_load() {
+		let load = LoadEwma::default();
+		load.update(Some(800), 2 * S);
+		load.update(Some(0), S);
+		load.update(None, S);
+		assert_eq!(load.get(2 * S).map(|l| l.0), Some(800));
 	}
 }

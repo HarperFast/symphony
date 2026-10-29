@@ -9,7 +9,7 @@ use crate::proxy_conn::{emit, forward_opaque, ConnContext, JsEvent};
 use crate::router::{Destination, LiveRouteTable, RouteMetricIdentity};
 use crate::sni::PeekInfo;
 use napi::threadsafe_function::ThreadsafeFunction;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -32,12 +32,15 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Longest the probe task sleeps, so a reload that shortens `probeIntervalMs` takes effect promptly.
 const MAX_PROBE_TICK: Duration = Duration::from_secs(1);
 const MAX_CONCURRENT_PROBES: usize = 64;
-/// While the local upstream is up, a forward that fails before the peer answers is served locally,
-/// so the attempts must leave the local handshake time to run.
+/// While the local upstream is up, a forward no peer answers is served locally with what is left
+/// of the handshake timeout, so the attempts take at most half of it, and at most this.
 const DRAIN_BUDGET: Duration = Duration::from_secs(2);
 const SPILL_BUDGET: Duration = Duration::from_secs(1);
 /// Load queries go out at most this often, however short `probeIntervalMs` is.
 const MIN_LOAD_POLL: Duration = Duration::from_millis(100);
+/// The controller runs at least this often: under a local sample's validity (1 s) by a margin, so
+/// the admission it publishes is renewed before it expires.
+const CONTROL_TICK: Duration = Duration::from_millis(250);
 const MIN_REPORT_TTL_NS: u64 = 3_000_000_000;
 /// Longest step the controller takes at once, so a stalled task cannot move the fraction in a jump.
 const MAX_CONTROL_STEP_NS: u64 = 1_000_000_000;
@@ -86,10 +89,14 @@ pub struct SpillPolicy {
 
 impl SpillSpec {
 	pub fn parse(&self) -> Result<SpillPolicy, String> {
-		let fraction = |value: Option<f64>, default: f64, label: &str| {
+		// Thresholds are compared in whole permille; a value that rounds below `min` would compare
+		// as 0 (a zero hold margin lets two equally loaded nodes spill to each other).
+		let fraction = |value: Option<f64>, default: f64, min: f64, label: &str| {
 			let v = value.unwrap_or(default);
-			if !v.is_finite() || v <= 0.0 || v > 1.0 {
-				return Err(format!("failover.spill.{label} must be in (0, 1], got {v}"));
+			if !v.is_finite() || v < min || v > 1.0 {
+				return Err(format!(
+					"failover.spill.{label} must be between {min} and 1, got {v}"
+				));
 			}
 			Ok(v * 1000.0)
 		};
@@ -105,10 +112,10 @@ impl SpillSpec {
 			}
 		};
 		Ok(SpillPolicy {
-			high_water: fraction(self.high_water, 0.75, "highWater")?.round() as u32,
-			margin: fraction(self.margin, 0.20, "margin")?.round() as u32,
-			step: fraction(self.step, 0.05, "step")?,
-			max_fraction: fraction(self.max_fraction, 0.50, "maxFraction")?.round() as u32,
+			high_water: fraction(self.high_water, 0.75, 0.001, "highWater")?.round() as u32,
+			margin: fraction(self.margin, 0.20, 0.002, "margin")?.round() as u32,
+			step: fraction(self.step, 0.05, 0.001, "step")?,
+			max_fraction: fraction(self.max_fraction, 0.50, 0.001, "maxFraction")?.round() as u32,
 			max_peer_rtt,
 		})
 	}
@@ -354,7 +361,6 @@ impl Admission {
 }
 
 impl SpillState {
-	/// The admission in force at `now_ms`.
 	pub fn admission(&self, now_ms: u64) -> Option<Admission> {
 		Admission::unpack(self.admission.load(Ordering::Relaxed)).filter(|a| now_ms < a.until_ms)
 	}
@@ -364,7 +370,6 @@ impl SpillState {
 	}
 }
 
-/// How a connection that reaches the failover decision is handled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForwardMode {
 	/// The local upstream is down: try every peer (the earliest-cooling one if all are cooling),
@@ -489,7 +494,6 @@ impl Failover {
 			.map(|_| admission.target)
 	}
 
-	/// How long a peer's load report stays usable.
 	pub fn report_ttl_ms(&self) -> u64 {
 		(3 * self.probe_interval.as_nanos() as u64).max(MIN_REPORT_TTL_NS) / 1_000_000
 	}
@@ -508,7 +512,6 @@ impl Failover {
 		down(destination) || destination_h2.is_some_and(down)
 	}
 
-	/// The peers a connection in `mode` tries, in order.
 	fn candidates_for(&self, mode: ForwardMode, now: u64) -> Vec<&FailoverPeer> {
 		match mode {
 			ForwardMode::Down => self.candidates(now).1.collect(),
@@ -553,8 +556,9 @@ impl Failover {
 
 pub enum Forwarded {
 	Done(Result<(), ErrorKind>),
-	/// No peer took the connection before answering; its bytes are untouched.
-	ServeLocally,
+	/// No peer took the connection before answering; its bytes are untouched. Carries what is
+	/// left of the handshake timeout for the local handshake.
+	ServeLocally(Duration),
 }
 
 /// Forward a connection whose ClientHello has only been peeked to the route's peers. Each attempt
@@ -573,6 +577,8 @@ pub async fn forward_to_peers(
 	ctx: &ConnContext,
 	route: &RouteMetricIdentity,
 ) -> Forwarded {
+	let started = Instant::now();
+	let handshake = ctx.handshake_timeout();
 	let give_up = |status: &FailoverStatus| match mode {
 		ForwardMode::Down => {
 			status.exhausted.fetch_add(1, Ordering::Relaxed);
@@ -580,22 +586,22 @@ pub async fn forward_to_peers(
 		}
 		ForwardMode::Drain | ForwardMode::Spill(_) => {
 			status.local_fallbacks.fetch_add(1, Ordering::Relaxed);
-			Forwarded::ServeLocally
+			Forwarded::ServeLocally(handshake.saturating_sub(started.elapsed()))
 		}
 	};
 	if !peek.complete || peek.hello_len == 0 {
 		return match mode {
 			ForwardMode::Down => Forwarded::Done(Err(ErrorKind::UpstreamConnect)),
-			_ => Forwarded::ServeLocally,
+			_ => Forwarded::ServeLocally(handshake),
 		};
 	}
 	let budget = match mode {
 		// Every attempt shares the handshake budget the client would have had on this node.
-		ForwardMode::Down => ctx.handshake_timeout(),
-		ForwardMode::Drain => ctx.handshake_timeout().min(DRAIN_BUDGET),
-		ForwardMode::Spill(_) => ctx.handshake_timeout().min(SPILL_BUDGET),
+		ForwardMode::Down => handshake,
+		ForwardMode::Drain => (handshake / 2).min(DRAIN_BUDGET),
+		ForwardMode::Spill(_) => (handshake / 2).min(SPILL_BUDGET),
 	};
-	let deadline = Instant::now() + budget;
+	let deadline = started + budget;
 	let candidates = failover.candidates_for(mode, now_ns());
 	if candidates.is_empty() {
 		return give_up(&failover.status);
@@ -611,8 +617,7 @@ pub async fn forward_to_peers(
 	}
 	let header_len = prefix.len();
 	prefix.resize(header_len + peek.hello_len, 0);
-	// Peeked again, not read: the bytes are already buffered (peek saw them), and they must stay
-	// where the local handshake would read them until a peer has answered.
+	// Peeked, not read: until a peer answers, the local handshake may still need them.
 	match tokio::time::timeout_at(deadline, client.peek(&mut prefix[header_len..])).await {
 		Ok(Ok(n)) if n == peek.hello_len => {}
 		_ => return give_up(&failover.status),
@@ -639,7 +644,6 @@ pub async fn forward_to_peers(
 				handed.fetch_add(1, Ordering::Relaxed);
 				let mut client =
 					CountingStream::new(&mut *client, &ctx.listener_metrics, Some(&route.counters));
-				// The peer has the hello; consume it so the copy starts on the byte after it.
 				if client.read_exact(&mut prefix[header_len..]).await.is_err() {
 					return Forwarded::Done(Err(ErrorKind::Stream));
 				}
@@ -859,7 +863,6 @@ enum Trend {
 	Decay,
 }
 
-/// What one controller pass sees of a peer.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PeerView {
 	load: Option<u32>,
@@ -955,26 +958,36 @@ pub fn spill_status(failover: &Failover, now_ns: u64) -> Option<(f64, Option<Soc
 	})
 }
 
+/// A load query's outcome: the RTT sample, and each name's answer with the ms it arrived.
+struct LoadAnswer {
+	rtt: Duration,
+	loads: Vec<(Option<u32>, u64)>,
+}
+
 /// Poll each spill route's peers for their load and run the spill controllers. Separate from
 /// `probe_periodically`, so a silent peer can never delay a `routeHealth` transition.
 pub async fn poll_peer_loads(live: Arc<LiveRouteTable>, mut shutdown: broadcast::Receiver<()>) {
-	type Answer = (
-		SocketAddr,
-		Vec<Arc<str>>,
-		Option<(Duration, Vec<Option<u32>>)>,
-	);
-	let mut queries: JoinSet<Answer> = JoinSet::new();
-	let mut in_flight: HashSet<SocketAddr> = HashSet::new();
+	type Done = (SocketAddr, Vec<Arc<str>>, Option<LoadAnswer>);
+	let mut queries: JoinSet<Done> = JoinSet::new();
+	let mut in_flight: HashMap<tokio::task::Id, SocketAddr> = HashMap::new();
 	let mut last_query: HashMap<SocketAddr, u64> = HashMap::new();
 	let mut next_tick = Instant::now();
 	loop {
 		tokio::select! {
 			_ = shutdown.recv() => return,
-			Some(done) = queries.join_next(), if !queries.is_empty() => {
-				if let Ok((addr, names, answer)) = done {
-					in_flight.remove(&addr);
-					apply_answer(&live.0.load(), addr, &names, answer);
+			Some(done) = queries.join_next_with_id(), if !queries.is_empty() => {
+				let table = live.0.load();
+				match done {
+					Ok((id, (addr, names, answer))) => {
+						in_flight.remove(&id);
+						apply_answer(&table, addr, &names, answer);
+					}
+					Err(e) => {
+						in_flight.remove(&e.id());
+					}
 				}
+				// A report that just changed (a peer now draining or busy) takes effect now.
+				control_all(&table, now_ns());
 				continue;
 			}
 			_ = tokio::time::sleep_until(next_tick) => {}
@@ -985,13 +998,13 @@ pub async fn poll_peer_loads(live: Arc<LiveRouteTable>, mut shutdown: broadcast:
 			.iter()
 			.filter(|r| r.failover.spill.is_some())
 			.collect();
-		let tick = routes
-			.iter()
-			.map(|r| r.failover.probe_interval)
-			.min()
-			.unwrap_or(MAX_PROBE_TICK)
-			.clamp(MIN_LOAD_POLL, MAX_PROBE_TICK);
-		next_tick = Instant::now() + tick;
+		next_tick = Instant::now()
+			+ routes
+				.iter()
+				.map(|r| r.failover.probe_interval.max(MIN_LOAD_POLL))
+				.min()
+				.unwrap_or(MAX_PROBE_TICK)
+				.min(CONTROL_TICK);
 		let now = now_ns();
 
 		let mut due: HashMap<SocketAddr, (Vec<Arc<str>>, u64)> = HashMap::new();
@@ -1005,55 +1018,65 @@ pub async fn poll_peer_loads(live: Arc<LiveRouteTable>, mut shutdown: broadcast:
 		}
 		for (addr, (names, interval)) in due {
 			let last = last_query.get(&addr).copied().unwrap_or(0);
-			if in_flight.contains(&addr) || now.saturating_sub(last) < interval - interval / 10 {
+			if in_flight.len() >= MAX_CONCURRENT_PROBES
+				|| in_flight.values().any(|a| *a == addr)
+				|| now.saturating_sub(last) < interval - interval / 10
+			{
 				continue;
 			}
 			last_query.insert(addr, now);
-			in_flight.insert(addr);
-			queries.spawn(async move {
+			let task = queries.spawn(async move {
 				let answer = query_load(addr, &names).await;
 				(addr, names, answer)
 			});
+			in_flight.insert(task.id(), addr);
 		}
 		last_query.retain(|addr, _| {
 			routes
 				.iter()
 				.any(|r| r.failover.peers.iter().any(|p| p.addr == *addr))
 		});
-
-		for route in &routes {
-			let Some(spill) = &route.failover.spill else {
-				continue;
-			};
-			let ttl_ms = route.failover.report_ttl_ms();
-			let peers: Vec<PeerView> = route
-				.failover
-				.peers
-				.iter()
-				.map(|p| {
-					let report = p.report();
-					PeerView {
-						load: report.map(|(load, _)| load),
-						report_until_ms: report.map_or(0, |(_, at)| at + ttl_ms),
-						cooling: p.cooling_down(now),
-						rtt: p.rtt(),
-					}
-				})
-				.collect();
-			let local =
-				crate::router::route_load(&route.destination, route.destination_h2.as_ref(), now);
-			control(spill, local, &peers, now);
-		}
+		control_all(&table, now);
 	}
 }
 
+fn control_all(table: &crate::router::RouteTable, now: u64) {
+	for route in table.failover_routes() {
+		let Some(spill) = &route.failover.spill else {
+			continue;
+		};
+		let ttl_ms = route.failover.report_ttl_ms();
+		let peers: Vec<PeerView> = route
+			.failover
+			.peers
+			.iter()
+			.map(|p| {
+				let report = p.report();
+				PeerView {
+					load: report.map(|(load, _)| load),
+					report_until_ms: report.map_or(0, |(_, at)| at + ttl_ms),
+					cooling: p.cooling_down(now),
+					rtt: p.rtt(),
+				}
+			})
+			.collect();
+		let local =
+			crate::router::route_load(&route.destination, route.destination_h2.as_ref(), now);
+		control(spill, local, &peers, now);
+	}
+}
+
+/// A failed query leaves each report to expire on its own, so one missed poll does not drop a
+/// still-fresh reading; an answer of `-` clears it at once.
 fn apply_answer(
 	table: &crate::router::RouteTable,
 	addr: SocketAddr,
 	names: &[Arc<str>],
-	answer: Option<(Duration, Vec<Option<u32>>)>,
+	answer: Option<LoadAnswer>,
 ) {
-	let now_ms = now_ns() / 1_000_000;
+	let Some(answer) = answer else {
+		return;
+	};
 	for route in table.failover_routes() {
 		if route.failover.spill.is_none() {
 			continue;
@@ -1061,25 +1084,19 @@ fn apply_answer(
 		let Some(peer) = route.failover.peers.iter().find(|p| p.addr == addr) else {
 			continue;
 		};
-		let load = match (
-			&answer,
-			names.iter().position(|n| *n == route.identity.route),
-		) {
-			(Some((rtt, loads)), Some(i)) => {
-				peer.record_rtt(*rtt);
-				loads.get(i).copied().flatten()
-			}
-			// Not asked about in this query; its answer is still to come.
-			(Some(_), None) => continue,
-			(None, _) => None,
+		let Some(i) = names.iter().position(|n| *n == route.identity.route) else {
+			continue;
 		};
-		peer.set_report(load, now_ms);
+		peer.record_rtt(answer.rtt);
+		if let Some((load, at_ms)) = answer.loads.get(i) {
+			peer.set_report(*load, *at_ms);
+		}
 	}
 }
 
 /// One load query per chunk of names, each within `PROBE_TIMEOUT`; the connect time of the first is
 /// the RTT sample. `None` if any chunk fails.
-async fn query_load(addr: SocketAddr, names: &[Arc<str>]) -> Option<(Duration, Vec<Option<u32>>)> {
+async fn query_load(addr: SocketAddr, names: &[Arc<str>]) -> Option<LoadAnswer> {
 	let mut rtt = None;
 	let mut loads = Vec::with_capacity(names.len());
 	for chunk in crate::ingress::load_query_chunks(names) {
@@ -1105,9 +1122,10 @@ async fn query_load(addr: SocketAddr, names: &[Arc<str>]) -> Option<(Duration, V
 		};
 		let (connect, chunk_loads) = timeout(PROBE_TIMEOUT, attempt).await.ok()??;
 		rtt.get_or_insert(connect);
-		loads.extend(chunk_loads);
+		let at_ms = now_ns() / 1_000_000;
+		loads.extend(chunk_loads.into_iter().map(|load| (load, at_ms)));
 	}
-	Some((rtt?, loads))
+	Some(LoadAnswer { rtt: rtt?, loads })
 }
 
 /// Connect and close at once. Proves the socket accepts, not that the application behind it is
@@ -1360,7 +1378,7 @@ mod tests {
 		assert_eq!((p.high_water, p.margin, p.max_fraction), (750, 200, 500));
 		assert_eq!(p.step, 50.0);
 		assert_eq!(p.max_peer_rtt, None);
-		for bad in [0.0, -0.1, 1.5, f64::NAN, f64::INFINITY] {
+		for bad in [0.0, 0.0004, -0.1, 1.5, f64::NAN, f64::INFINITY] {
 			for field in 0..4 {
 				let mut s = SpillSpec::default();
 				*[
@@ -1379,6 +1397,11 @@ mod tests {
 			};
 			assert!(s.parse().is_err(), "maxPeerRttMs {bad}");
 		}
+		let half_margin_rounds_to_zero = SpillSpec {
+			margin: Some(0.001),
+			..Default::default()
+		};
+		assert!(half_margin_rounds_to_zero.parse().is_err());
 		let s = SpillSpec {
 			max_peer_rtt_ms: Some(20.0),
 			..Default::default()

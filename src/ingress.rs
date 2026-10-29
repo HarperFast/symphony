@@ -167,8 +167,8 @@ fn address_len(family: u8) -> Option<usize> {
 	}
 }
 
-/// The route names of a LOCAL header's `LOAD_QUERY_TLV`s, in order. No names is a plain LOCAL
-/// (a health check), rejected as before.
+/// The route names of a LOCAL header's `LOAD_QUERY_TLV`s, in order. A LOCAL without names is the
+/// spec's health check, which this listener does not serve.
 fn parse_load_query(family: u8, payload: &[u8]) -> Result<Vec<Option<String>>, HeaderReject> {
 	let mut tlvs = &payload[address_len(family).ok_or(HeaderReject::Invalid)?..];
 	let mut names = Vec::new();

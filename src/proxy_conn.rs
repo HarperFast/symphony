@@ -128,7 +128,7 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 		listener: ctx.listener_metrics.clone(),
 		ip_state: None,
 	};
-	let hs_timeout = ctx.handshake_timeout();
+	let mut hs_timeout = ctx.handshake_timeout();
 
 	// ── 0b. Failover ingress: the real TCP peer must be trusted before any byte is read, and
 	// the client address it asserts replaces it for everything that follows.
@@ -267,8 +267,7 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 						);
 						return;
 					}
-					// Untouched: no peer answered, so the local path reads the hello as usual.
-					crate::failover::Forwarded::ServeLocally => {}
+					crate::failover::Forwarded::ServeLocally(left) => hs_timeout = left,
 				}
 			}
 			crate::failover::Decision::Local => {}
