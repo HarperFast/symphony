@@ -218,7 +218,7 @@ query (TLV `0xE3` per route name) on their `failoverIngress`, answered by `Route
   already carries by address.
 - **Counters stay disjoint:** a spilled connection increments `spilled`, a failover one `forwarded`;
   `clear_cooldown` is health only.
-- The receiver bounds a query itself (≤ 64 names, ≤ 16 KiB, valid DNS names, else `-` or close), and
+- The receiver bounds a query itself (≤ 64 names, ≤ 16 KiB, names of 1–253 bytes of UTF-8, else `-` or close), and
   `trusts()` still runs before any byte is read.
 
 ### Worker-thread CPU identity (`thread_cpu.rs`)

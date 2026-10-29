@@ -48,8 +48,8 @@ impl IngressState {
 pub enum Header {
 	/// A forwarded client connection, from this source address.
 	Proxy(SocketAddr),
-	/// A peer's load query: one entry per name asked about, `None` for a name that is not a valid
-	/// DNS name (answered as not available).
+	/// A peer's load query: one entry per name asked about, `None` for one that cannot be a
+	/// configured route name (answered as not available).
 	LoadQuery(Vec<Option<String>>),
 }
 
@@ -189,13 +189,13 @@ fn parse_load_query(family: u8, payload: &[u8]) -> Result<Vec<Option<String>>, H
 	Ok(names)
 }
 
-/// A route name as a load query may ask about: an exact DNS name, ASCII letters, digits, `-` and `.`.
+/// Any configured SNI may be asked about (it is looked up exactly, never matched by slicing), so
+/// only the length and UTF-8 are checked.
 fn valid_name(value: &[u8]) -> Option<&str> {
-	let valid = (1..=MAX_NAME_LEN).contains(&value.len())
-		&& value
-			.iter()
-			.all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'.');
-	valid.then(|| std::str::from_utf8(value).ok()).flatten()
+	(1..=MAX_NAME_LEN)
+		.contains(&value.len())
+		.then(|| std::str::from_utf8(value).ok())
+		.flatten()
 }
 
 /// Route names grouped into queries that each fit the receiver's bounds. A name the receiver would
@@ -451,9 +451,15 @@ mod tests {
 		);
 		assert_eq!(input, b"ignored", "only the header is consumed");
 
-		// Other TLVs are skipped; a name that is not a DNS name keeps its place, unanswerable.
+		// Other TLVs are skipped; a name that cannot be a route keeps its place, unanswerable.
 		let mut tlvs = vec![0x02, 0, 3, b'x', b'y', b'z'];
-		for name in [&b"ok.test"[..], "é.test".as_bytes(), b"a b", b""] {
+		for name in [
+			&b"ok.test"[..],
+			b"tenant_a.test",
+			"é.test".as_bytes(),
+			b"\xFF",
+			b"",
+		] {
 			tlvs.push(LOAD_QUERY_TLV);
 			tlvs.extend_from_slice(&(name.len() as u16).to_be_bytes());
 			tlvs.extend_from_slice(name);
@@ -466,7 +472,8 @@ mod tests {
 			read_header(&local).await,
 			Ok(Header::LoadQuery(vec![
 				Some("ok.test".into()),
-				None,
+				Some("tenant_a.test".into()),
+				Some("é.test".into()),
 				None,
 				None
 			]))
