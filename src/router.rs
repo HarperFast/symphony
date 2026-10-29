@@ -273,14 +273,14 @@ impl RouteMetricIdentity {
 /// True when `sni` matches exactly one left-most label against `suffix` (a wildcard's stored
 /// suffix, without the `*.` prefix) — e.g. "foo.example.com" matches suffix "example.com" but
 /// "a.b.example.com" does not.
+/// Compares bytes: a client SNI may be any UTF-8, and a `&str` slice off a char boundary panics.
 fn wildcard_suffix_matches(sni: &str, suffix: &str) -> bool {
+	let (sni, suffix) = (sni.as_bytes(), suffix.as_bytes());
 	if sni.len() <= suffix.len() + 1 {
 		return false;
 	}
 	let dot_pos = sni.len() - suffix.len() - 1;
-	let rest = &sni[sni.len() - suffix.len()..];
-	let prefix = &sni[..dot_pos];
-	!prefix.contains('.') && rest == suffix && sni.as_bytes()[dot_pos] == b'.'
+	sni[dot_pos] == b'.' && &sni[dot_pos + 1..] == suffix && !sni[..dot_pos].contains(&b'.')
 }
 
 pub struct RouteTable {
@@ -1415,6 +1415,26 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			table.resolve(Some("bad.example.com")).is_none(),
 			"the unbuildable route must be absent (no default fallback)"
 		);
+	}
+
+	#[test]
+	fn non_ascii_sni_is_matched_against_a_wildcard_without_panicking() {
+		assert!(!wildcard_suffix_matches(&"é".repeat(7), "example.com"));
+		assert!(!wildcard_suffix_matches("ééé.éexample.com", "example.com"));
+		assert!(wildcard_suffix_matches("é.example.com", "example.com"));
+		assert!(wildcard_suffix_matches("foo.example.com", "example.com"));
+		assert!(!wildcard_suffix_matches("a.b.example.com", "example.com"));
+		assert!(!wildcard_suffix_matches("fooexample.com", "example.com"));
+		assert!(!wildcard_suffix_matches(".example.com", "example.com"));
+
+		let table = build_route_table(
+			&[tls_route("*.example.com", CERT_A, KEY_A)],
+			&ListenerTlsSpec::empty(),
+			None,
+			&mut TlsConfigCache::new(),
+		)
+		.expect("build");
+		assert!(table.resolve(Some(&"é".repeat(7))).is_none());
 	}
 
 	// A dropped route must fail closed, not silently fall through to a broader wildcard: it was
