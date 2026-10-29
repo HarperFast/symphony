@@ -6,9 +6,18 @@
  */
 
 import assert from 'node:assert/strict';
+import * as net from 'node:net';
 import { after, before, describe, it } from 'node:test';
 import { SymphonyProxy } from '../ts/proxy.js';
-import { generateSelfSignedCert, getFreePort, startEchoServer, tlsRoundTrip, tlsAlpn, sleep } from './util.js';
+import {
+	generateSelfSignedCert,
+	getFreePort,
+	startEchoServer,
+	tcpRoundTrip,
+	tlsRoundTrip,
+	tlsAlpn,
+	sleep,
+} from './util.js';
 
 describe('SymphonyProxy – TLS termination', () => {
 	const cert = generateSelfSignedCert('localhost');
@@ -348,5 +357,138 @@ describe('SymphonyProxy – updateConfig atomicity (routes + protection)', () =>
 			Buffer.from('after-atomic-fail'),
 			'old route must still serve after failed combined update',
 		);
+	});
+});
+
+describe('SymphonyProxy – start() binds every listener or none', () => {
+	const connects = (port: number) =>
+		new Promise<boolean>((resolve) => {
+			const socket = net.createConnection({ port, host: '127.0.0.1' }, () => {
+				socket.destroy();
+				resolve(true);
+			});
+			socket.on('error', () => resolve(false));
+		});
+
+	it('rejects when one listener cannot bind, leaving the others closed, and can be retried', async () => {
+		const echo = await startEchoServer();
+		const freePort = await getFreePort();
+		// Bound without SO_REUSEPORT, so symphony's bind on the same address fails.
+		const blocker = net.createServer();
+		await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve));
+		const busyPort = (blocker.address() as net.AddressInfo).port;
+		const proxy = new SymphonyProxy({
+			listeners: [
+				{ host: '127.0.0.1', port: freePort },
+				{ host: '127.0.0.1', port: busyPort, mode: 'http' },
+			],
+			routes: [{ sni: '', upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }], terminateTls: false }],
+		});
+		try {
+			await assert.rejects(proxy.start(), new RegExp(`listener 127\\.0\\.0\\.1:${busyPort}`));
+			assert.equal(await connects(freePort), false, 'the listener that could bind must not be left open');
+
+			await new Promise<void>((resolve) => blocker.close(() => resolve()));
+			const first = proxy.start();
+			assert.equal(proxy.start(), first, 'concurrent callers share one start');
+			await first;
+			assert.equal((await tcpRoundTrip({ port: freePort, data: 'ping' })).toString(), 'ping');
+		} finally {
+			blocker.close();
+			await proxy.stop();
+			await echo.close();
+		}
+	});
+});
+
+describe('SymphonyProxy – start() and stop() run in call order', () => {
+	it('restarts when start() is called while a stop() is still draining', async () => {
+		const echo = await startEchoServer();
+		const port = await getFreePort();
+		const proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port }],
+			routes: [{ sni: '', upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }], terminateTls: false }],
+		});
+		try {
+			await proxy.start();
+			const stopping = proxy.stop();
+			const restarting = proxy.start();
+			await Promise.all([stopping, restarting]);
+			assert.equal((await tcpRoundTrip({ port, data: 'ping' })).toString(), 'ping');
+		} finally {
+			await proxy.stop();
+			await echo.close();
+		}
+	});
+});
+
+describe('SymphonyProxy – default route (sni: "")', () => {
+	const cert = generateSelfSignedCert('localhost');
+	const tlsCert = { certChain: cert.cert, privateKey: cert.key };
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	const proxies: SymphonyProxy[] = [];
+
+	before(async () => {
+		echo = await startEchoServer();
+	});
+
+	after(async () => {
+		for (const proxy of proxies) await proxy.stop();
+		await echo.close();
+	});
+
+	async function startProxy(config: ConstructorParameters<typeof SymphonyProxy>[0]): Promise<SymphonyProxy> {
+		const proxy = new SymphonyProxy(config);
+		proxies.push(proxy);
+		await proxy.start();
+		return proxy;
+	}
+
+	const upstreams = () => [{ kind: 'tcp' as const, host: '127.0.0.1', port: echo.port }];
+	const connections = (proxy: SymphonyProxy, route: string) =>
+		proxy.metrics().routeMetrics.find((r) => r.route === route)?.connections;
+	const count = (counts: { reason: string; count: number }[], reason: string) =>
+		counts.find((c) => c.reason === reason)?.count ?? 0;
+
+	it('serves TLS clients with no SNI, or an SNI no route matches, from the default route', async () => {
+		const port = await getFreePort();
+		const proxy = await startProxy({
+			listeners: [{ host: '127.0.0.1', port }],
+			routes: [
+				{ sni: 'localhost', upstreams: upstreams(), terminateTls: true, cert: tlsCert },
+				{ sni: '', upstreams: upstreams(), terminateTls: true, cert: tlsCert },
+			],
+		});
+
+		assert.equal((await tlsRoundTrip({ port, servername: '', data: 'no-sni' })).toString(), 'no-sni');
+		assert.equal((await tlsRoundTrip({ port, servername: 'unknown.example', data: 'other' })).toString(), 'other');
+		assert.equal((await tlsRoundTrip({ port, servername: 'localhost', data: 'exact' })).toString(), 'exact');
+
+		assert.equal(connections(proxy, ''), 2);
+		assert.equal(connections(proxy, 'localhost'), 1);
+		assert.equal(proxy.metrics().routes, 2);
+	});
+
+	it('passes a client that sends no ClientHello through a passthrough default route', async () => {
+		const port = await getFreePort();
+		const proxy = await startProxy({
+			listeners: [{ host: '127.0.0.1', port }],
+			routes: [{ sni: '', upstreams: upstreams(), terminateTls: false }],
+		});
+
+		assert.equal((await tcpRoundTrip({ port, data: 'plain tcp' })).toString(), 'plain tcp');
+		assert.equal(count(proxy.metrics().listeners[0].errorsByReason, 'no_route'), 0);
+	});
+
+	it('still blocks a client with no SNI as no_sni under requireSni', async () => {
+		const port = await getFreePort();
+		const proxy = await startProxy({
+			listeners: [{ host: '127.0.0.1', port, protection: { requireSni: true } }],
+			routes: [{ sni: '', upstreams: upstreams(), terminateTls: false }],
+		});
+
+		const reply = await tcpRoundTrip({ port, data: 'plain tcp' }).catch(() => Buffer.alloc(0));
+		assert.equal(reply.length, 0);
+		assert.equal(count(proxy.metrics().listeners[0].blockedByReason, 'no_sni'), 1);
 	});
 });

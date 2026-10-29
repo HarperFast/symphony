@@ -244,3 +244,48 @@ describe('HTTP-mode listener', () => {
 		assert.doesNotMatch(response, /\r\nEvil:/);
 	});
 });
+
+describe('HTTP-mode listener with a default route', () => {
+	let proxyPort: number;
+	let exact: HttpEchoServer;
+	let fallback: HttpEchoServer;
+	let proxy: SymphonyProxy;
+
+	before(async () => {
+		proxyPort = await getFreePort();
+		exact = await startHttpEchoServer('exact-token');
+		fallback = await startHttpEchoServer('default-token');
+		proxy = new SymphonyProxy({
+			listeners: [{ host: '127.0.0.1', port: proxyPort, mode: 'http' }],
+			routes: [
+				{ sni: 'example.com', upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: exact.port }], terminateTls: false },
+				{ sni: '', upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: fallback.port }], terminateTls: false },
+			],
+		});
+		await proxy.start();
+	});
+
+	after(async () => {
+		await proxy.stop();
+		await exact.close();
+		await fallback.close();
+	});
+
+	it('returns 404 for an ACME request for an unknown host instead of using the default route', async () => {
+		const response = await rawHttp(
+			proxyPort,
+			'GET /.well-known/acme-challenge/x HTTP/1.1\r\nHost: nowhere.example.net\r\nConnection: close\r\n\r\n'
+		);
+		assert.match(response, /^HTTP\/1\.1 404 Not Found\r\n/);
+		assert.equal(fallback.requests.length, 0);
+	});
+
+	it('still proxies an ACME request for a host with its own route', async () => {
+		const response = await rawHttp(
+			proxyPort,
+			'GET /.well-known/acme-challenge/x HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'
+		);
+		assert.match(response, /exact-token$/);
+		assert.equal(fallback.requests.length, 0);
+	});
+});

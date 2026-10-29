@@ -16,7 +16,6 @@
 use crate::http_proxy::{
 	host_header, read_http_headers, request_target, strip_body_framing, with_connection_close,
 };
-use crate::listener::{make_reuseport_socket, set_rlimit_nofile};
 use crate::liveness::arm_accepted;
 use crate::metrics::{
 	inc_route_blocked, inc_route_error, BlockKind, CountingStream, ErrorKind, RouteActiveGuard,
@@ -43,40 +42,28 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Same SO_REUSEPORT fanout as the TLS listener.
 pub async fn spawn_http_listeners(
-	addr: SocketAddr,
-	workers: usize,
+	listeners: Vec<TcpListener>,
 	max_connections: u32,
 	ctx: Arc<ConnContext>,
 	mut shutdown_rx: broadcast::Receiver<()>,
-) -> crate::error::Result<()> {
-	let workers = workers.max(1);
-
-	if max_connections > 0 {
-		set_rlimit_nofile(max_connections as u64 * 2 + 1024)?;
-	}
-
-	let mut handles = Vec::with_capacity(workers);
-
-	for _ in 0..workers {
-		let socket = make_reuseport_socket(addr, ctx.keepalive.as_ref())?;
-		let listener = TcpListener::from_std(socket)?;
-		let ctx2 = ctx.clone();
-		let max_conn = max_connections;
-		let srx = shutdown_rx.resubscribe();
-
-		let handle = tokio::spawn(async move {
-			accept_loop(listener, max_conn, ctx2, srx).await;
-		});
-		handles.push(handle);
-	}
+) {
+	let handles: Vec<_> = listeners
+		.into_iter()
+		.map(|listener| {
+			tokio::spawn(accept_loop(
+				listener,
+				max_connections,
+				ctx.clone(),
+				shutdown_rx.resubscribe(),
+			))
+		})
+		.collect();
 
 	let _ = shutdown_rx.recv().await;
 
 	for h in handles {
 		h.abort();
 	}
-
-	Ok(())
 }
 
 async fn accept_loop(
@@ -206,7 +193,9 @@ async fn proxy_acme(
 	ctx: &ConnContext,
 ) {
 	let table = ctx.route_table.0.load();
-	let Some(route) = table.resolve(Some(host)).cloned() else {
+	// Never the default route: it would answer http-01 challenges for every name pointed at this
+	// host, letting its upstream validate certificates for names it does not serve.
+	let Some(route) = table.resolve_with(Some(host), false).cloned() else {
 		// No matching route — answer 404 so the ACME client gets a definitive answer
 		// rather than a hung connection.
 		let _ = write_simple_response(

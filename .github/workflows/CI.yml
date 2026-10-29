@@ -212,6 +212,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Linux routes all of 127.0.0.0/8 to loopback; macOS needs an alias for the second client address.
+      - name: Alias 127.0.0.2 on loopback
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
+
       - name: Run tests
         run: npm test
 

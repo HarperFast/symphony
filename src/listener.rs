@@ -8,38 +8,40 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
-/// Spawn N accept loops for a single logical listener address,
-/// using SO_REUSEPORT so the kernel distributes connections across them.
-/// N = number of tokio worker threads (passed in as `workers`).
-pub async fn spawn_listeners(
+/// Bind N sockets for one listener address with SO_REUSEPORT, so the kernel distributes
+/// connections across N accept loops (N = tokio worker threads). Must run inside the proxy
+/// runtime: `TcpListener::from_std` registers with its reactor.
+pub fn bind_workers(
 	addr: SocketAddr,
 	workers: usize,
+	keepalive: Option<&KeepaliveConfig>,
+) -> crate::error::Result<Vec<TcpListener>> {
+	(0..workers.max(1))
+		.map(|_| {
+			Ok(TcpListener::from_std(make_reuseport_socket(
+				addr, keepalive,
+			)?)?)
+		})
+		.collect()
+}
+
+pub async fn spawn_listeners(
+	listeners: Vec<TcpListener>,
 	max_connections: u32,
 	ctx: Arc<ConnContext>,
 	mut shutdown_rx: broadcast::Receiver<()>,
-) -> crate::error::Result<()> {
-	let workers = workers.max(1);
-
-	// Raise RLIMIT_NOFILE if needed. Each connection needs 2 fds (client + upstream).
-	// We attempt to set it to 2 * max_connections + 1024 headroom, capped at the hard limit.
-	if max_connections > 0 {
-		set_rlimit_nofile(max_connections as u64 * 2 + 1024)?;
-	}
-
-	let mut handles = Vec::with_capacity(workers);
-
-	for _ in 0..workers {
-		let socket = make_reuseport_socket(addr, ctx.keepalive.as_ref())?;
-		let listener = TcpListener::from_std(socket)?;
-		let ctx2 = ctx.clone();
-		let max_conn = max_connections;
-		let srx = shutdown_rx.resubscribe();
-
-		let handle = tokio::spawn(async move {
-			accept_loop(listener, max_conn, ctx2, srx).await;
-		});
-		handles.push(handle);
-	}
+) {
+	let handles: Vec<_> = listeners
+		.into_iter()
+		.map(|listener| {
+			tokio::spawn(accept_loop(
+				listener,
+				max_connections,
+				ctx.clone(),
+				shutdown_rx.resubscribe(),
+			))
+		})
+		.collect();
 
 	// Wait for shutdown signal
 	let _ = shutdown_rx.recv().await;
@@ -48,8 +50,6 @@ pub async fn spawn_listeners(
 	for h in handles {
 		h.abort();
 	}
-
-	Ok(())
 }
 
 async fn accept_loop(

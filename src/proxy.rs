@@ -1,7 +1,7 @@
 use crate::failover::{probe_periodically, FailoverSpec};
 use crate::http_listener::spawn_http_listeners;
 use crate::ingress::IngressState;
-use crate::listener::spawn_listeners;
+use crate::listener::{bind_workers, set_rlimit_nofile, spawn_listeners};
 use crate::liveness::KeepaliveConfig;
 use crate::metrics::{total_of, GlobalMetrics, ListenerMetrics};
 use crate::protection::ProtectionState;
@@ -9,13 +9,12 @@ use crate::proxy_conn::{
 	ConnContext, JsEvent, DEFAULT_COPY_BUFFER_SIZE, MAX_COPY_BUFFER_SIZE, MIN_COPY_BUFFER_SIZE,
 };
 use crate::router::{
-	build_route_table, evict_affinity_periodically, requires_http_protocol, ForwardFingerprint,
-	ListenerTlsSpec, LiveRouteTable, RouteMetricIdentity, RouteProtocol, RouteSpec,
-	SourceAddressMode, SourceAllowlist, UpstreamSpec,
+	build_route_table, evict_affinity_periodically, parse_source_network, requires_http_protocol,
+	ForwardFingerprint, ListenerTlsSpec, LiveRouteTable, RouteMetricIdentity, RouteProtocol,
+	RouteSpec, SourceAddressMode, SourceAllowlist, UpstreamSpec,
 };
 use crate::suspended::{build_resolved_route, ResolveSpec, ResolveUpstream, SuspendedRegistry};
 use crate::tls::TlsConfigCache;
-use ipnetwork::IpNetwork;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunction;
 use std::net::SocketAddr;
@@ -639,10 +638,34 @@ impl SymphonyProxyWrap {
 
 	#[napi]
 	pub async fn start(&self) -> Result<()> {
-		let (tx, _) = broadcast::channel(1);
-		*self.shutdown_tx.lock().unwrap() = Some(tx.clone());
+		// Every socket is bound before any accept loop exists: symphony-server publishes status.json,
+		// which lets it retire the process it replaces, only once start() has resolved.
+		let mut shutdown_tx = self.shutdown_tx.lock().unwrap();
+		if shutdown_tx.is_some() {
+			return Err(napi::Error::from_reason("proxy is already started"));
+		}
+		// Each connection needs 2 fds (client + upstream), plus headroom; capped at the hard limit.
+		if let Some(max) = self.listeners.iter().map(|l| l.max_connections).max() {
+			if max > 0 {
+				set_rlimit_nofile(max as u64 * 2 + 1024)?;
+			}
+		}
+		let bound = {
+			let _runtime = self.rt_handle.enter();
+			self.listeners
+				.iter()
+				.map(|l| {
+					bind_workers(l.addr, self.worker_threads, self.keepalive.as_ref())
+						.map_err(|e| napi::Error::from_reason(format!("listener {}: {e}", l.addr)))
+				})
+				.collect::<Result<Vec<_>>>()?
+		};
 
-		for (i, listener) in self.listeners.iter().enumerate() {
+		let (tx, _) = broadcast::channel(1);
+		*shutdown_tx = Some(tx.clone());
+		drop(shutdown_tx);
+
+		for ((i, listener), sockets) in self.listeners.iter().enumerate().zip(bound) {
 			let state = &self.listener_states[i];
 			// Use the TLS handshake timeout as the upstream connect timeout when
 			// protection is configured; otherwise fall back to 30 s.
@@ -671,22 +694,18 @@ impl SymphonyProxyWrap {
 			});
 
 			let max_conn = listener.max_connections;
-			let workers = self.worker_threads;
-			let addr = listener.addr;
-			let mode = listener.mode;
 			let rx = tx.subscribe();
 
-			self.rt_handle.spawn(async move {
-				let result = match mode {
-					ListenerMode::Tls => spawn_listeners(addr, workers, max_conn, ctx, rx).await,
-					ListenerMode::Http => {
-						spawn_http_listeners(addr, workers, max_conn, ctx, rx).await
-					}
-				};
-				if let Err(e) = result {
-					tracing::error!("listener {addr} failed: {e}");
+			match listener.mode {
+				ListenerMode::Tls => {
+					self.rt_handle
+						.spawn(spawn_listeners(sockets, max_conn, ctx, rx));
 				}
-			});
+				ListenerMode::Http => {
+					self.rt_handle
+						.spawn(spawn_http_listeners(sockets, max_conn, ctx, rx));
+				}
+			}
 		}
 
 		// Spawn a background task that samples /proc/{pid}/task/{tid}/stat every
@@ -1432,10 +1451,7 @@ fn parse_protection_config(
 		.as_deref()
 		.unwrap_or(&[])
 		.iter()
-		.map(|s| {
-			s.parse::<IpNetwork>()
-				.map_err(|e| napi::Error::from_reason(format!("invalid allowlist CIDR '{s}': {e}")))
-		})
+		.map(|s| parse_source_network(s, "allowlist").map_err(napi::Error::from_reason))
 		.collect::<Result<Vec<_>>>()?;
 
 	cfg.blocklist = prot
@@ -1443,10 +1459,7 @@ fn parse_protection_config(
 		.as_deref()
 		.unwrap_or(&[])
 		.iter()
-		.map(|s| {
-			s.parse::<IpNetwork>()
-				.map_err(|e| napi::Error::from_reason(format!("invalid blocklist CIDR '{s}': {e}")))
-		})
+		.map(|s| parse_source_network(s, "blocklist").map_err(napi::Error::from_reason))
 		.collect::<Result<Vec<_>>>()?;
 
 	Ok(cfg.precompute())

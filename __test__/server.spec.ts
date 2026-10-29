@@ -45,13 +45,21 @@ interface RunningServer {
 	markShutdown: () => void;
 }
 
-function spawnServer(configPath: string, statusPath?: string): RunningServer {
+function spawnServer(
+	configPath: string,
+	statusPath?: string,
+	opts: { env?: NodeJS.ProcessEnv; cwd?: string; configFlag?: string } = {}
+): RunningServer {
 	let stdout = '';
 	let stderr = '';
 	let shuttingDown = false;
-	const args = [SERVER_JS, '--config', configPath];
+	const args = [SERVER_JS, opts.configFlag ?? '--config', configPath];
 	if (statusPath) args.push('--status', statusPath);
-	const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+	const child = spawn(process.execPath, args, {
+		stdio: ['ignore', 'pipe', 'pipe'],
+		env: { ...process.env, ...opts.env },
+		cwd: opts.cwd,
+	});
 	child.stdout?.on('data', (d) => (stdout += d.toString()));
 	child.stderr?.on('data', (d) => (stderr += d.toString()));
 	child.on('exit', (code, sig) => {
@@ -921,3 +929,277 @@ describe('symphony-server (status.json ownership guard)', () => {
 		);
 	});
 });
+
+describe(
+	'symphony-server (an older process stands down for a newer one on the same config)',
+	{
+		skip: process.platform !== 'linux' && 'standing down needs /proc to verify the successor',
+	},
+	() => {
+		const POLL_MS = 50;
+		const GRACE_MS = 1000;
+		const env = { SYMPHONY_STATUS_POLL_MS: String(POLL_MS), SYMPHONY_SUPERSEDE_GRACE_MS: String(GRACE_MS) };
+		const cert = generateSelfSignedCert('localhost');
+		let dir: string;
+		let echo: Awaited<ReturnType<typeof startEchoServer>>;
+		const servers: RunningServer[] = [];
+		const peers: ChildProcess[] = [];
+
+		before(async () => {
+			dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-stand-down-'));
+			echo = await startEchoServer();
+		});
+
+		after(async () => {
+			for (const server of servers) await killServer(server);
+			for (const peer of peers) peer.kill('SIGKILL');
+			await echo.close().catch(() => {});
+			fs.rmSync(dir, { recursive: true, force: true });
+		});
+
+		interface Setup {
+			name: string;
+			configPath: string;
+			statusPath: string;
+			port: number;
+		}
+
+		async function writeConfig(name: string, extraProxies: unknown[] = []): Promise<Setup> {
+			const configPath = path.join(dir, `${name}.json`);
+			const statusPath = path.join(dir, `${name}-status.json`);
+			const port = await getFreePort();
+			writeConfigAtomic(configPath, {
+				version: 1,
+				proxies: [
+					{
+						listeners: [{ host: '127.0.0.1', port }],
+						routes: [
+							{
+								sni: 'localhost',
+								upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+								terminateTls: true,
+								cert: { certChain: cert.cert, privateKey: cert.key },
+							},
+						],
+					},
+					...extraProxies,
+				],
+			});
+			return { name, configPath, statusPath, port };
+		}
+
+		async function launch(
+			setup: Setup,
+			opts: { cwd?: string; configFlag?: string; configArg?: string } = {}
+		): Promise<RunningServer> {
+			const server = spawnServer(opts.configArg ?? setup.configPath, setup.statusPath, {
+				env,
+				cwd: opts.cwd,
+				configFlag: opts.configFlag,
+			});
+			servers.push(server);
+			await waitFor(() => status(setup)?.pid === server.child.pid);
+			await waitFor(() => server.getStdout().includes('watching'));
+			return server;
+		}
+
+		const status = (setup: Setup): { pid: number; listeners?: string[] } | null => {
+			try {
+				return JSON.parse(fs.readFileSync(setup.statusPath, 'utf8'));
+			} catch {
+				return null;
+			}
+		};
+		const running = (server: RunningServer): boolean =>
+			server.child.exitCode === null && server.child.signalCode === null;
+		const roundTrip = (port: number) => tlsRoundTrip({ port, servername: 'localhost', data: Buffer.from('ping') });
+
+		it('exits after the grace once a newer process serves the same config, leaving it status.json', async () => {
+			const setup = await writeConfig('handoff');
+			// Relative --config / -c on both sides: they still recognise each other as serving one config.
+			const incumbent = await launch(setup, { cwd: dir, configArg: 'handoff.json' });
+			const successor = await launch(setup, { cwd: dir, configFlag: '-c', configArg: './handoff.json' });
+			const claimedAt = Date.now();
+			assert.deepEqual(status(setup)?.listeners, [`127.0.0.1:${setup.port}`]);
+
+			await waitFor(() => !running(incumbent), GRACE_MS * 5);
+			const elapsed = Date.now() - claimedAt;
+			assert.ok(elapsed >= GRACE_MS - POLL_MS, `stood down after ${elapsed} ms, before the ${GRACE_MS} ms grace`);
+			incumbent.markShutdown();
+			assert.equal(incumbent.child.exitCode, 0);
+			assert.match(incumbent.getStdout(), new RegExp(`superseded by pid ${successor.child.pid}, shutting down`));
+			assert.equal(status(setup)?.pid, successor.child.pid, 'the retiring process leaves status.json alone');
+			assert.equal((await roundTrip(setup.port)).toString(), 'ping', 'the successor serves the port');
+			assert.ok(running(successor));
+		});
+
+		it('keeps serving and takes status.json back when the successor dies during the grace', async () => {
+			const setup = await writeConfig('successor-dies');
+			const incumbent = await launch(setup);
+			const successor = await launch(setup);
+			await waitFor(() => incumbent.getStdout().includes(`pid ${successor.child.pid} serves this config`));
+
+			successor.markShutdown();
+			successor.child.kill('SIGKILL');
+
+			await waitFor(() => status(setup)?.pid === incumbent.child.pid, GRACE_MS);
+			await sleep(GRACE_MS * 2);
+			assert.ok(running(incumbent), incumbent.getStdout());
+			assert.equal((await roundTrip(setup.port)).toString(), 'ping');
+		});
+
+		it('stops normally on SIGTERM during the grace', async () => {
+			const setup = await writeConfig('sigterm-in-grace');
+			const incumbent = await launch(setup);
+			const successor = await launch(setup);
+			await waitFor(() => incumbent.getStdout().includes(`pid ${successor.child.pid} serves this config`));
+
+			await killServer(incumbent);
+			assert.equal(incumbent.child.exitCode, 0);
+			assert.match(incumbent.getStdout(), /received SIGTERM, shutting down/);
+			assert.doesNotMatch(incumbent.getStdout(), /superseded/);
+			assert.equal(status(setup)?.pid, successor.child.pid);
+		});
+
+		it('ignores a newer process serving a different config through the same status file', async () => {
+			const setup = await writeConfig('own-config');
+			const other = await writeConfig('other-config');
+			const incumbent = await launch(setup);
+			const stranger = spawnServer(other.configPath, setup.statusPath, { env });
+			servers.push(stranger);
+			await waitFor(() => stranger.getStdout().includes('watching'));
+
+			await sleep(GRACE_MS * 2);
+			assert.ok(running(incumbent), incumbent.getStdout());
+			assert.doesNotMatch(incumbent.getStdout(), /superseded|serves this config/);
+		});
+
+		it('does not stand down for a stopped successor, and takes status.json back from it', async () => {
+			const setup = await writeConfig('stopped-successor');
+			const incumbent = await launch(setup);
+			const successor = await launch(setup);
+			await waitFor(() => incumbent.getStdout().includes(`pid ${successor.child.pid} serves this config`));
+
+			successor.child.kill('SIGSTOP');
+			try {
+				await waitFor(() => status(setup)?.pid === incumbent.child.pid, GRACE_MS);
+				await sleep(GRACE_MS * 2);
+				assert.ok(running(incumbent), incumbent.getStdout());
+			} finally {
+				successor.child.kill('SIGCONT');
+			}
+		});
+
+		it('does not claim status.json from a 1.4 owner listing a port it lacks', async () => {
+			const setup = await writeConfig('legacy-owner');
+			const server = await launch(setup);
+			const legacyPeer = startPeer(setup.configPath);
+			writeConfigAtomic(setup.statusPath, {
+				pid: legacyPeer,
+				version: '1.4.0',
+				startedAt: new Date(0).toISOString(),
+				configPath: setup.configPath,
+				ports: [setup.port, 1],
+			});
+
+			await waitFor(() =>
+				server
+					.getStdout()
+					.includes(`not taking status.json: pid ${legacyPeer} listens on port 1, which this process does not`)
+			);
+			assert.equal(status(setup)?.pid, legacyPeer);
+		});
+
+		it('a newer process missing one of its listeners does not claim status.json from it', async () => {
+			const keyFile = path.join(dir, 'listener-key.pem');
+			fs.writeFileSync(keyFile, cert.key);
+			const secondPort = await getFreePort();
+			const setup = await writeConfig('partial', [
+				{
+					listeners: [
+						{ host: '127.0.0.1', port: secondPort, defaultCert: { certChain: cert.cert, privateKeyFile: keyFile } },
+					],
+					routes: [
+						{ sni: 'localhost', upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }], terminateTls: true },
+					],
+				},
+			]);
+			const incumbent = await launch(setup);
+			assert.equal(status(setup)?.listeners?.length, 2);
+			// The successor can't build that listener; the incumbent keeps the one it already has.
+			fs.rmSync(keyFile);
+			const successor = spawnServer(setup.configPath, setup.statusPath, { env });
+			servers.push(successor);
+
+			await waitFor(() =>
+				successor
+					.getStdout()
+					.includes(
+						`not taking status.json: pid ${incumbent.child.pid} listens on 127.0.0.1:${secondPort}, which this process does not`
+					)
+			);
+			await sleep(GRACE_MS * 2);
+			assert.equal(status(setup)?.pid, incumbent.child.pid, 'a supervisor never sees the successor as ready');
+			assert.ok(running(incumbent), incumbent.getStdout());
+		});
+
+		// A live process started with `--config <configPath>` that publishes a qualifying status, so the
+		// test controls exactly when the file names it.
+		function startPeer(configPath: string): number {
+			const peer = spawn(
+				process.execPath,
+				['-e', 'setInterval(() => {}, 1 << 30)', 'symphony-peer', '--config', configPath],
+				{
+					stdio: 'ignore',
+				}
+			);
+			peers.push(peer);
+			return peer.pid!;
+		}
+
+		it('restarts the grace when status.json comes back to it in between', async () => {
+			const setup = await writeConfig('interrupted');
+			const incumbent = await launch(setup);
+			const own = status(setup)!;
+			const successor = {
+				pid: startPeer(setup.configPath),
+				startedAt: new Date().toISOString(),
+				configPath: setup.configPath,
+				listeners: own.listeners,
+			};
+
+			writeConfigAtomic(setup.statusPath, successor);
+			await waitFor(() => incumbent.getStdout().includes(`pid ${successor.pid} serves this config`));
+			await sleep(GRACE_MS * 0.6);
+			writeConfigAtomic(setup.statusPath, own);
+			await sleep(POLL_MS * 4);
+			writeConfigAtomic(setup.statusPath, successor);
+			await sleep(GRACE_MS * 0.6);
+			assert.ok(running(incumbent), 'the two tenures together exceed the grace, but neither alone does');
+
+			await waitFor(() => !running(incumbent), GRACE_MS * 3);
+			incumbent.markShutdown();
+			assert.match(incumbent.getStdout(), new RegExp(`superseded by pid ${successor.pid}`));
+		});
+
+		it('does not stand down for a newer owner that is not listening on all of its listeners', async () => {
+			const setup = await writeConfig('uncovered');
+			const incumbent = await launch(setup);
+			const successor = {
+				pid: startPeer(setup.configPath),
+				startedAt: new Date().toISOString(),
+				configPath: setup.configPath,
+				listeners: [],
+			};
+			writeConfigAtomic(setup.statusPath, successor);
+
+			await waitFor(() =>
+				incumbent
+					.getStdout()
+					.includes(`not standing down for pid ${successor.pid}: it is not listening on 127.0.0.1:${setup.port}`)
+			);
+			await sleep(GRACE_MS * 2);
+			assert.ok(running(incumbent), incumbent.getStdout());
+		});
+	}
+);
