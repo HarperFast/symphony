@@ -41,12 +41,14 @@ The server also **watches the cert/key files referenced by the config** (grouped
 
 ```
 TCP accept (SO_REUSEPORT per worker thread)
-  └─ [ingress.rs  failoverIngress only: trustedSources gate, read PROXY v2 → peer addr]
+  └─ [ingress.rs  failoverIngress only: trustedSources gate, read PROXY v2 → peer addr
+                  (a LOCAL header naming routes is a peer load query: answered, closed)]
   └─ sni.rs       peek() — MSG_PEEK ClientHello (reassembled when fragmented) → PeekInfo { sni, ja3, ja4, complete }
   └─ protection.rs check() → Block (emit 'blocked', drop) | Allow
   └─ router.rs    RouteTable.resolve(sni) → Route
   └─ route.allowed_sources.permits(peer) → 'source_not_allowed' block | continue
-  └─ [failover.rs route down or draining → forward_to_peers (raw TLS) | ingress: close]
+  └─ [failover.rs decide(): down / draining / spill admitted → forward_to_peers (raw TLS;
+                  drain + spill fall back here if no peer answers) | ingress: close]
   └─ [suspended.rs  register, emit 'suspended', await oneshot]
   └─ tls.rs       TlsAcceptor::accept() with handshake timeout (if terminate_tls)
   └─ upstream.rs  connect(Destination, peer_ip) → UpstreamStream
@@ -70,8 +72,9 @@ TCP accept (SO_REUSEPORT per worker thread)
 | `src/router.rs` | RouteTable (exact + wildcard HashMap); ArcSwap hot-swap |
 | `src/upstream.rs` | UpstreamStream enum (Tcp/Uds); connect(); TCP_NODELAY; PROXY v1/v2 header encoders; HTTP header injection (XFF, X-JA3/X-JA4) |
 | `src/balancer.rs` | UdsBalancer: AtomicU32 least-connections; IP affinity DashMap; per-slot `SlotHealth` (failover routes only) |
-| `src/failover.rs` | Peer failover: policy parsing, per-(route, peer) cooldown, `forward_to_peers`, the recovery probe + `routeHealth` |
-| `src/ingress.rs` | Failover ingress listener: `trustedSources` gate and the PROXY v2 reader |
+| `src/thread_cpu.rs` | Worker-thread CPU per UDS slot: socket-owner discovery (`SO_PEERCRED` + `NSpid`), validated sampling, the smoothed balancer load |
+| `src/failover.rs` | Peer failover: policy parsing, per-(route, peer) cooldown, `decide`/`forward_to_peers`, the recovery probe + `routeHealth`, the spill controller + peer load poll |
+| `src/ingress.rs` | Failover ingress listener: `trustedSources` gate, the PROXY v2 reader, the load-query wire format |
 | `src/tls.rs` | rustls ServerConfig builder; SHA-256 deduplication cache |
 | `src/mtls.rs` | SymphonyClientVerifier wrapping WebPkiClientVerifier |
 | `src/proxy_conn.rs` | Per-connection handler: the full 7-step flow |
@@ -153,11 +156,11 @@ to a peer's `failoverIngress` listener while its local upstream is down or `drai
 because the decision has to precede the handshake (the local connect happens after it, too late to
 hand over the TLS session), and it lets the peer terminate and verify client certs itself.
 
-- **Nothing past the ClientHello reaches a peer that may be retried.** `forward_to_peers` reads
+- **Nothing past the ClientHello reaches a peer that may be retried.** `forward_to_peers` peeks
   exactly `PeekInfo::hello_len` wire bytes (through the end of the record that completes the hello,
   never the reassembled buffer), sends PROXY v2 + hello, and `peek`s for the peer's first byte
-  before reading the client again. Once a peer byte has arrived the attempt is committed: no retry
-  after that, and the byte reaches the client through the ordinary copy.
+  before reading the client at all. Once a peer byte has arrived the attempt is committed: the hello
+  is consumed, no retry after that, and the byte reaches the client through the ordinary copy.
   An incomplete peek is never forwarded. rustls early data is not enabled anywhere; keep it so.
 - **Health is opt-in.** Only a failover route's balancer gets `SlotHealth` (`with_health`), because
   only the probe clears it; an untracked balancer that skipped a refusing slot would never re-test it.
@@ -185,6 +188,62 @@ hand over the TLS session), and it lets the peer terminate and verify client cer
   through `ArcSwap`, validated with the rest of `updateConfig` before anything is stored.
 - **The probe task is the only writer of `reported_down`**, so each transition emits one
   `routeHealth`. It dedups endpoints across routes, runs probes concurrently, and stops on shutdown.
+- **Drain and spill fall back to local service; down does not.** Because the hello stays unread
+  until a peer commits, a drain or spill attempt that no peer answers returns `ServeLocally` with
+  the socket untouched; drain skips cooling peers and caps its attempts at 2 s so the local
+  handshake still has time. A locally-down route has nothing to fall back to and closes
+  (`exhausted`), as before.
+
+### Spill-over (`failover.spill`)
+symphony#73. A failover route moves a share of new client connections to the least-loaded peer
+while its own Harper threads are much busier. Load = `thread_cpu::LoadEwma` of the route's
+destinations (`router::route_load`, the busier of h1/h2); peers' loads come from a PROXY v2 LOCAL
+query (TLV `0xE3` per route name) on their `failoverIngress`, answered by `RouteTable::load_answer`.
+
+- **Admission is published, never computed, on the hot path.** `poll_peer_loads` (its own task, not
+  `probe_periodically`, so a blackholed peer cannot delay `routeHealth`) runs `control()` every
+  `CONTROL_TICK` (250 ms, well under a local sample's 1 s validity, so the admission is renewed
+  before it expires) and after each answer, and stores one `AtomicU64` (fraction, target index,
+  expiry). `spill_target` is one load, a hash of the
+  client address and port, and the target's cooldown check — nothing else on the connection path.
+- **Spilling stops at once; the share moves gradually.** `assess()` names a target only when the
+  local load and the target's report justify rise or hold (`P ≤ L − margin/2`); otherwise no
+  admission is published while the internal fraction decays at `step`/s. The expiry is the earlier
+  of the local sample's and the report's freshness, so a stalled controller stops spilling by itself.
+- **A load answer is for the exact route only** (`exact` map; never a wildcard or the default), and
+  `-` while draining, locally down or unmeasured. Spill itself is rejected on wildcard routes:
+  a wildcard's load is not each name's load on a peer, where an exact route can override it.
+- **Spill state carries across a reload only under the same policy and peer list** (`Failover::new`):
+  a carried target index must name the same peer. Peer reports live on `FailoverPeer`, which
+  already carries by address.
+- **Counters stay disjoint:** a spilled connection increments `spilled`, a failover one `forwarded`;
+  `clear_cooldown` is health only.
+- The receiver bounds a query itself (≤ 64 names, ≤ 16 KiB, names of 1–253 bytes of UTF-8, else `-` or close), and
+  `trusts()` still runs before any byte is read.
+
+### Worker-thread CPU identity (`thread_cpu.rs`)
+A slot's configured `pid`/`tid` are whatever the upstream reported, and Harper in a container
+reports its own namespace's ids, which name nothing (or something else) in the host `/proc`
+symphony reads. So the ids are never trusted until tied to the socket's owner:
+
+- **Discovery is a background connect-and-close** (`socket_owner`, `SO_PEERCRED`), never a
+  getsockopt on client connections: an idle node has no client connections, and its load is the
+  one a hot peer needs to see. It runs beside sampling (results land on the next pass), never ahead
+  of it, so one slow socket cannot let every slot's load expire. A resolved slot's socket inode is
+  checked every 30 s, because another process can bind the path while the old thread lives on;
+  only a changed inode costs a connect, so a busy worker's accept queue is never probed to confirm
+  nothing changed, and a failed connect keeps the known identity. An owner that has exited, or a
+  thread not there yet, is `Unresolved` (retried in 5 s).
+- **`Discovered` vs `Literal`.** Owner pid == configured pid, or the owner's last `NSpid:` entry ==
+  configured pid (then each thread's last `NSpid:` entry maps to its host tid) → `Discovered`.
+  Anything else is `Literal`: still read as configured for `pick()`'s tiebreak (legacy behavior),
+  but never counted as load, because a mismatch means the ids may name an unrelated thread.
+- **A sample is evidence only while fresh, and never survives its thread.** A failed read or a
+  changed thread start time zeroes `util_permille` and sends a discovered slot back to discovery;
+  load counts only samples under a second old. The old code kept the last value forever.
+- `ThreadCpu` and `LoadEwma` are shared across rebuilds by `(path, pid, tid)` (`with_cpu_from`),
+  like `SlotHealth`, so a reload neither repeats discovery nor restarts the smoothed load.
+- `/proc` work runs on `spawn_blocking`, one `task/` scan per owner process per pass.
 
 ### ArcSwap for RouteTable
 `ArcSwap<RouteTable>` gives us a pointer-swap on writes (single atomic store) and a single `load()` on reads — no lock contention on the hot path. With ≤100 routes, rebuilding the full table on `updateConfig` costs ~microseconds (Arc pointer clones only). A partial-update scheme would be more complex without meaningful benefit.
@@ -328,7 +387,7 @@ instead.
 - **`suspended.spec.ts`** — hold → resolve → proxy, hold → null → close, hold → timeout → drop
 - **`mtls.spec.ts`** — mTLS termination + PROXY v2 TLV forwarding of the client cert chain (0xE2, SSL TLV 0x20); skips without openssl
 - **`metrics.spec.ts`** — per-listener breakdown and byte counting, `renderPrometheus` output shape, the admin endpoint over UDS + TCP, and stale-socket reclaim after a `SIGKILL`
-- **`failover.spec.ts`** — peer failover across two or three proxies in one process (UDS upstreams that record the PROXY v1 source); the client binds 127.0.0.2 so the forwarded client address differs from the forwarding node's (macOS has it only through an `lo0` alias, which CI adds; without one the suite skips). A route learns it is down only by losing one connection (`markDown`), as in production
+- **`failover.spec.ts`** — peer failover across two or three proxies in one process (UDS upstreams that record the PROXY v1 source); the client binds 127.0.0.2 so the forwarded client address differs from the forwarding node's (macOS has it only through an `lo0` alias, which CI adds; without one the suite skips). A route learns it is down only by losing one connection (`markDown`), as in production. Spill-over tests (Linux) serve the upstream from a child process whose busy main thread is the slot's `pid`/`tid`, so the load is real thread CPU; the PID-namespace case runs that child under `bwrap --unshare-pid` (CI installs bubblewrap) and skips without it
 - **`liveness.spec.ts`** — the half-close bound over a real passthrough proxy. Its client uses `allowHalfOpen: true` (otherwise Node answers the proxy's FIN with its own and there is no half-close to bound) and a synthetic `clientHello()` from `util.ts` (otherwise `peek()` blocks for its 5s reassembly timeout and a no-SNI connection resolves to no route)
 
 The Rust toolchain is pinned to `1.94.1` in `rust-toolchain.toml`. Ensure rustup's

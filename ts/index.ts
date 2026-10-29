@@ -28,6 +28,8 @@ export type {
 	FailoverIngressConfig,
 	RouteFailoverMetrics,
 	FailoverPeerMetrics,
+	SpillConfig,
+	SpillMetrics,
 } from './types.js';
 // `renderPrometheus` and the standalone server's snapshot shape are deliberately NOT exported
 // from the package root. They are an implementation detail of the symphony-server admin

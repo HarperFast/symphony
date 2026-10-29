@@ -218,6 +218,30 @@ export interface FailoverConfig {
 	 * `max`; one success resets it. Per (route, peer). Default: `{ min: 5000, max: 60000 }`.
 	 */
 	peerCooldownMs?: { min: number; max: number };
+	/**
+	 * While the local upstream is up, also forward a share of new connections to the least-loaded
+	 * peer when this route's Harper threads are much busier than the same route's on that peer.
+	 * Loads come from each node's worker-thread CPU (UDS upstreams with `pid`/`tid`) and are
+	 * exchanged over the peers' `failoverIngress` listeners. Exact-SNI routes only; an invalid
+	 * policy disables only spill-over (counted in `failingRoutes`). `{}` enables the defaults.
+	 */
+	spill?: SpillConfig;
+}
+
+export interface SpillConfig {
+	/** Local load (0–1, mean of the worker threads' CPU) at which spilling may start. Default: 0.75. */
+	highWater?: number;
+	/**
+	 * How far below the local load (0–1) the target peer must report to raise the share; it is held
+	 * while the gap is at least half this. Default: 0.2.
+	 */
+	margin?: number;
+	/** Change of the spilled share per second, up and down. Default: 0.05. */
+	step?: number;
+	/** Largest share (0–1) of new connections spilled. Default: 0.5. */
+	maxFraction?: number;
+	/** Spill only to peers whose measured connect time is at most this many ms. Default: no limit. */
+	maxPeerRttMs?: number;
 }
 
 export interface FailoverIngressConfig {
@@ -459,6 +483,8 @@ export interface ListenerMetrics {
 	bytesSent: number;
 	blockedByReason: LabeledCount[];
 	errorsByReason: LabeledCount[];
+	/** Failover ingress: peer load queries answered. */
+	loadQueries: number;
 }
 
 export interface RouteMetrics {
@@ -491,15 +517,34 @@ export interface RouteFailoverMetrics {
 	replays: number;
 	/** Connections closed after every candidate peer failed. */
 	exhausted: number;
+	/** Draining or spilled connections served locally because no peer took them. */
+	localFallbacks: number;
+	/** Present only on routes with `spill`. */
+	spill?: SpillMetrics;
 	peers: FailoverPeerMetrics[];
+}
+
+export interface SpillMetrics {
+	/** Share (0–1) of new connections being spilled now; 0 when spilling is not admitted. */
+	fraction: number;
+	/** "host:port" of the peer receiving them. */
+	target?: string;
+	/** Smoothed load (0–1) of the local worker threads; absent when not measurable. */
+	localLoad?: number;
 }
 
 export interface FailoverPeerMetrics {
 	/** "host:port" */
 	peer: string;
-	/** Connections handed to this peer once it answered (its first byte arrived). */
+	/** Connections handed to this peer, because the route was down or draining, once it answered (its first byte arrived). */
 	forwarded: number;
+	/** Connections spilled to this peer once it answered. */
+	spilled: number;
 	coolingDown: boolean;
+	/** The peer's last load report (0–1) for this route; absent when none is usable. */
+	load?: number;
+	/** Smoothed connect time of the load query to this peer. */
+	rttMs?: number;
 	/** Failed attempts by reason (`refused`, `timeout`, `zero_byte_close`, `error`); zero-valued reasons are omitted. */
 	failuresByReason: LabeledCount[];
 }
@@ -520,7 +565,8 @@ export interface ProxyMetrics {
 	/**
 	 * Routes rejected at build time — a cert failure, protocol/carrier validation failure, invalid
 	 * `allowedSources`, or duplicate wildcard — either dropped, or (cert failures only) serving a carried-forward
-	 * last-good cert — plus routes serving without failover because their `failover` policy is invalid.
+	 * last-good cert — plus routes serving without failover (or without spill-over) because their `failover`
+	 * (or `failover.spill`) policy is invalid.
 	 */
 	failingRoutes: number;
 	/** Per-listener breakdown, in configuration order. */

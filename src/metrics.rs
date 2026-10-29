@@ -44,7 +44,7 @@ labeled_enum!(BlockKind {
 	UntrustedSource => "untrusted_source",
 	/// Failover ingress: the PROXY v2 header was malformed, oversized, or not TCP over IPv4/IPv6.
 	ProxyHeaderInvalid => "proxy_header_invalid",
-	/// Failover ingress: a PROXY v2 LOCAL command, which carries no client address.
+	/// Failover ingress: a PROXY v2 LOCAL command that is not a load query (no route names).
 	ProxyHeaderLocal => "proxy_header_local",
 	/// Failover ingress: a PROXY v1 (text) header; only v2 is accepted.
 	ProxyHeaderV1 => "proxy_header_v1",
@@ -148,6 +148,8 @@ pub struct ListenerMetrics {
 	pub bytes_in: AtomicU64,
 	/// Bytes written to clients on this listener (upstream → client). Same framing as `bytes_in`.
 	pub bytes_out: AtomicU64,
+	/// Failover ingress: peer load queries answered.
+	pub load_queries: AtomicU64,
 	blocked_by_kind: [AtomicU64; BlockKind::COUNT],
 	errors_by_kind: [AtomicU64; ErrorKind::COUNT],
 }
@@ -160,6 +162,7 @@ impl Default for ListenerMetrics {
 			total_accepted: AtomicU64::new(0),
 			bytes_in: AtomicU64::new(0),
 			bytes_out: AtomicU64::new(0),
+			load_queries: AtomicU64::new(0),
 			blocked_by_kind: std::array::from_fn(|_| AtomicU64::new(0)),
 			errors_by_kind: std::array::from_fn(|_| AtomicU64::new(0)),
 		}
@@ -178,6 +181,10 @@ impl ListenerMetrics {
 
 	pub fn inc_half_closed(&self) {
 		self.half_closed_connections.fetch_add(1, Ordering::Relaxed);
+	}
+
+	pub fn inc_load_query(&self) {
+		self.load_queries.fetch_add(1, Ordering::Relaxed);
 	}
 
 	pub fn dec_half_closed(&self) {

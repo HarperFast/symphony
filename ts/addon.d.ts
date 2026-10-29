@@ -97,6 +97,23 @@ export interface JsFailoverConfig {
    * Default: { min: 5000, max: 60000 }.
    */
   peerCooldownMs?: JsPeerCooldown
+  /**
+   * Also forward a share of new connections while the local Harper threads are much busier
+   * than a peer's. Exact-SNI routes only.
+   */
+  spill?: JsSpillConfig
+}
+export interface JsSpillConfig {
+  /** Local load (0–1) at which spilling may start. Default: 0.75. */
+  highWater?: number
+  /** How far below the local load a peer must be to raise the share. Default: 0.2. */
+  margin?: number
+  /** Change of the share per second. Default: 0.05. */
+  step?: number
+  /** Largest share of new connections spilled. Default: 0.5. */
+  maxFraction?: number
+  /** Spill only to peers whose measured connect time is at most this. Default: no limit. */
+  maxPeerRttMs?: number
 }
 export interface JsFailoverIngressConfig {
   /** CIDRs of the peer nodes. Only they may connect, and an empty list admits nobody. */
@@ -227,6 +244,8 @@ export interface JsListenerMetrics {
   bytesSent: number
   blockedByReason: Array<JsLabeledCount>
   errorsByReason: Array<JsLabeledCount>
+  /** Failover ingress: peer load queries answered. */
+  loadQueries: number
 }
 export interface JsRouteMetrics {
   /** Configured exact SNI or wildcard pattern, never the client-provided hostname. */
@@ -256,14 +275,32 @@ export interface JsRouteFailoverMetrics {
   replays: number
   /** Connections closed after every candidate peer failed. */
   exhausted: number
+  /** Draining or spilled connections served locally because no peer took them. */
+  localFallbacks: number
+  /** Present only on routes with `spill`. */
+  spill?: JsSpillMetrics
   peers: Array<JsFailoverPeerMetrics>
+}
+export interface JsSpillMetrics {
+  /** Share of new connections being spilled now (0–1); 0 when spilling is not admitted. */
+  fraction: number
+  /** "host:port" of the peer receiving them. */
+  target?: string
+  /** Smoothed load of the local worker threads (0–1); absent when not measurable. */
+  localLoad?: number
 }
 export interface JsFailoverPeerMetrics {
   /** "host:port" as configured. */
   peer: string
-  /** Connections handed to this peer once it answered. */
+  /** Connections handed to this peer once it answered, because the route was down or draining. */
   forwarded: number
+  /** Connections spilled to this peer once it answered. */
+  spilled: number
   coolingDown: boolean
+  /** The peer's last load report for this route (0–1); absent when none is usable. */
+  load?: number
+  /** Smoothed connect time of the load query. */
+  rttMs?: number
   /** Failed attempts by reason: refused, timeout, zero_byte_close, error. */
   failuresByReason: Array<JsLabeledCount>
 }
