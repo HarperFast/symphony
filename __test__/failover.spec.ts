@@ -24,7 +24,6 @@ const noClientAddress =
 	process.platform !== 'linux' &&
 	!Object.values(os.networkInterfaces()).some((addrs) => addrs?.some((a) => a.address === CLIENT_ADDRESS)) &&
 	`${CLIENT_ADDRESS} is not a local address (macOS: sudo ifconfig lo0 alias ${CLIENT_ADDRESS})`;
-/** Bounds a hang (an awaited event that never fires) well below the CI job limit. */
 const SUITE_TIMEOUT_MS = 60_000;
 const { cert, key } = generateSelfSignedCert(SNI);
 const socketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-failover-'));

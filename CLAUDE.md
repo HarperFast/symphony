@@ -328,7 +328,7 @@ instead.
 - **`suspended.spec.ts`** — hold → resolve → proxy, hold → null → close, hold → timeout → drop
 - **`mtls.spec.ts`** — mTLS termination + PROXY v2 TLV forwarding of the client cert chain (0xE2, SSL TLV 0x20); skips without openssl
 - **`metrics.spec.ts`** — per-listener breakdown and byte counting, `renderPrometheus` output shape, the admin endpoint over UDS + TCP, and stale-socket reclaim after a `SIGKILL`
-- **`failover.spec.ts`** — peer failover across two or three proxies in one process (UDS upstreams that record the PROXY v1 source); the client binds 127.0.0.2 so the forwarded client address differs from the forwarding node's. A route learns it is down only by losing one connection (`markDown`), as in production
+- **`failover.spec.ts`** — peer failover across two or three proxies in one process (UDS upstreams that record the PROXY v1 source); the client binds 127.0.0.2 so the forwarded client address differs from the forwarding node's (macOS has it only through an `lo0` alias, which CI adds; without one the suite skips). A route learns it is down only by losing one connection (`markDown`), as in production
 - **`liveness.spec.ts`** — the half-close bound over a real passthrough proxy. Its client uses `allowHalfOpen: true` (otherwise Node answers the proxy's FIN with its own and there is no half-close to bound) and a synthetic `clientHello()` from `util.ts` (otherwise `peek()` blocks for its 5s reassembly timeout and a no-SNI connection resolves to no route)
 
 The Rust toolchain is pinned to `1.94.1` in `rust-toolchain.toml`. Ensure rustup's
