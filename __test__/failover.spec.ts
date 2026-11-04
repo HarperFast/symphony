@@ -392,6 +392,40 @@ describe('peer failover', { skip: noClientAddress, timeout: SUITE_TIMEOUT_MS }, 
 		assert.equal(failover.peers[0].forwarded, 1);
 	});
 
+	it(
+		'forwards to a peer while a TCP upstream is unreachable',
+		{ skip: process.platform !== 'linux' && 'needs Linux to make a TCP connect fail as unreachable' },
+		async (t) => {
+			const [a, b] = await allocatePorts(2);
+			const nodeA = await startNode(t, a, {
+				routes: [
+					{
+						sni: SNI,
+						upstreams: [{ kind: 'tcp', host: '255.255.255.255', port: 9 }],
+						terminateTls: false,
+						failover: {
+							peers: [{ host: '127.0.0.1', port: b.ingressPort }],
+							probeIntervalMs: 50,
+							peerCooldownMs: { min: 200, max: 1000 },
+						},
+					},
+				],
+			});
+			const nodeB = await startNode(t, b, { peers: [a.ingressPort] });
+			const upstreamB = await startUdsUpstream(nodeB.socketPath);
+			t.after(() => upstreamB.close());
+
+			await markDown(nodeA);
+			assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
+			assert.deepEqual(upstreamB.sources, [CLIENT_ADDRESS]);
+
+			const failover = routeMetrics(nodeA).failover!;
+			assert.equal(failover.localUp, false);
+			assert.equal(failover.refusingSlots, 1);
+			assert.equal(failover.peers[0].forwarded, 1);
+		}
+	);
+
 	it('returns new connections to the local upstream once the probe sees it back', async (t) => {
 		const [a, b] = await allocatePorts(2);
 		const nodeA = await startNode(t, a, { peers: [b.ingressPort] });
