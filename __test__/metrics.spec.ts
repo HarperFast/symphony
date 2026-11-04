@@ -943,9 +943,9 @@ describe('symphony-server admin endpoint (config generation)', () => {
 	});
 
 	after(async () => {
-		child.kill('SIGKILL');
-		await echo.close().catch(() => {});
-		fs.rmSync(dir, { recursive: true, force: true });
+		child?.kill('SIGKILL');
+		await echo?.close().catch(() => {});
+		if (dir) fs.rmSync(dir, { recursive: true, force: true });
 	});
 
 	it('serves the fields status.json has, as JSON and as Prometheus samples', async () => {

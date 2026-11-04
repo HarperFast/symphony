@@ -1222,8 +1222,8 @@ describe('symphony-server (config generation)', () => {
 	after(async () => {
 		for (const peer of peers) peer.kill('SIGKILL');
 		await Promise.all(servers.map(killServer));
-		await echo.close().catch(() => {});
-		fs.rmSync(dir, { recursive: true, force: true });
+		await echo?.close().catch(() => {});
+		if (dir) fs.rmSync(dir, { recursive: true, force: true });
 	});
 
 	// Inline certs, so a cert watcher only runs where a test references a file.
