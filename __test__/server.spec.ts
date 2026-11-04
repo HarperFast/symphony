@@ -1404,6 +1404,34 @@ describe('symphony-server (config generation)', () => {
 		assert.deepEqual(status().failedGeneration, { generation: 'g1', ports: [low, high] });
 	});
 
+	it('keeps a running proxy when the entry moving it to a new port-set is skipped', async () => {
+		const [kept, added] = [await getFreePort(), await getFreePort()].sort((a, b) => a - b);
+		const moved = (listener: object) => ({
+			...entry(kept),
+			listeners: [
+				{ host: '127.0.0.1', port: kept },
+				{ host: '127.0.0.1', port: added, ...listener },
+			],
+		});
+		const { apply } = await boot('moved', { generation: 'g1', proxies: [entry(kept)] });
+
+		const absent = path.join(dir, 'absent.pem');
+		const failed = await apply({
+			generation: 'g2',
+			proxies: [moved({ defaultCert: { certChain: cert.cert, privateKeyFile: absent } })],
+		});
+		assert.equal(failed.appliedGeneration, 'g1');
+		assert.deepEqual(failed.failedGeneration, { generation: 'g2', ports: [kept, added] });
+		assert.deepEqual(failed.ports, [kept]);
+		assert.equal(await reaches(kept), true);
+
+		const applied = await apply({ generation: 'g3', proxies: [moved({})] });
+		assert.equal(applied.appliedGeneration, 'g3');
+		assert.deepEqual(applied.ports, [kept, added], 'the replaced proxy is gone once its replacement applies');
+		assert.equal(await reaches(kept), true);
+		assert.equal(await reaches(added), true);
+	});
+
 	it('reports a listener that cannot bind', async () => {
 		const held = await getFreePort();
 		const blocker = net.createServer();

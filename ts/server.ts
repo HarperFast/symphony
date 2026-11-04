@@ -162,7 +162,6 @@ function portKey(listeners: { port: number }[]): string {
 		.join(',');
 }
 
-// False for an entry that can't be matched to a running proxy, because its listeners don't name its port-set.
 function namesPortSet(spec: FileProxyConfig): boolean {
 	return (
 		Array.isArray(spec?.listeners) &&
@@ -496,10 +495,13 @@ class ServerState {
 			}
 		}
 
-		// Drop proxies whose port-set is no longer in the config. An entry that names no port-set could
-		// be meant for any of them, so its config removes none.
+		// Drop proxies whose port-set is no longer in the config, unless a skipped entry may be what
+		// replaces them, which would leave the port with nothing serving it. An entry that names no
+		// port-set could be meant for any of them; one that shares a port is meant for that proxy.
+		const skippedPorts = new Set(listenerPorts(failed));
 		for (const [key, entry] of this.active) {
-			if (!seen.has(key) && !unidentifiedEntry) {
+			const replacementSkipped = unidentifiedEntry || key.split(',').some((port) => skippedPorts.has(Number(port)));
+			if (!seen.has(key) && !replacementSkipped) {
 				await entry.proxy.stop().catch((err) => logErr(`stopping removed proxy [${key}]:`, err));
 				this.active.delete(key);
 				log(`proxy on ports [${key}] removed`);
