@@ -4,7 +4,7 @@ import { dirname, isAbsolute, join, basename, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { SymphonyProxy } from './index.js';
 import type { ProxyConfig, ListenerConfig, RouteConfig, CertConfig, MtlsConfig } from './index.js';
-import { AdminServer, type AdminConfig, type MetricsSnapshot } from './admin.js';
+import { AdminServer, type AdminConfig, type FailedGeneration, type MetricsSnapshot } from './admin.js';
 
 // package.json sits at the package root, which is 1 level above dist/server.js (production
 // layout) or 2 levels above dist-test/ts/server.js (test layout) — try both, like loadAddon.
@@ -62,6 +62,8 @@ interface FileProxyConfig {
 
 interface ConfigFile {
 	version?: number;
+	/** Opaque writer-set identity of this config, reported back as `appliedGeneration`/`failedGeneration`. */
+	generation?: string;
 	/** Optional read-only metrics/health endpoint. Omit to expose nothing. */
 	admin?: AdminConfig;
 	proxies: FileProxyConfig[];
@@ -160,6 +162,12 @@ function portKey(listeners: { port: number }[]): string {
 		.join(',');
 }
 
+// Tolerates the malformed entries a skipped proxy can be.
+function listenerPorts(specs: FileProxyConfig[]): number[] {
+	const ports = specs.flatMap((spec) => (Array.isArray(spec?.listeners) ? spec.listeners.map((l) => l?.port) : []));
+	return [...new Set(ports.filter((p) => typeof p === 'number'))].sort((a, b) => a - b);
+}
+
 // Whether a pid is a running process started as this user with `--config <configPath>`. `verified`
 // reads its argv, working directory and run state from /proc, which also keeps a recycled pid, a
 // stopped process or a zombie from counting; `unverified` is liveness alone, where there is no /proc.
@@ -244,6 +252,9 @@ class ServerState {
 	private readonly admin: AdminServer;
 	private startedAt = '';
 	private reloadedAt = '';
+	private appliedGeneration: string | undefined;
+	private failedGeneration: FailedGeneration | undefined;
+	private statusWriteFailed = false;
 	private reloading: Promise<void> = Promise.resolve();
 	private watcher: ReturnType<typeof watch> | null = null;
 	// Cert/key files referenced by the current config, watched for rotation. Keyed by
@@ -276,6 +287,8 @@ class ServerState {
 			version: pkg.version,
 			startedAt: this.startedAt,
 			reloadedAt: this.reloadedAt,
+			appliedGeneration: this.appliedGeneration,
+			failedGeneration: this.failedGeneration,
 			proxies: [...this.active].map(([ports, entry]) => ({ ports, metrics: entry.proxy.metrics() })),
 		};
 	}
@@ -293,6 +306,11 @@ class ServerState {
 			if (!parsed || !Array.isArray(parsed.proxies)) {
 				logErr('config has no "proxies" array — ignoring');
 				return null;
+			}
+			// Costs only the acknowledgement: the routes still apply, and the writer sees none.
+			if (parsed.generation !== undefined && (typeof parsed.generation !== 'string' || !parsed.generation)) {
+				logErr('config "generation" is not a non-empty string — ignoring the generation');
+				parsed.generation = undefined;
 			}
 			return parsed;
 		} catch (err) {
@@ -386,7 +404,15 @@ class ServerState {
 		if (!config) return;
 
 		const seen = new Set<string>();
+		const failed: FileProxyConfig[] = [];
+		let unidentifiedEntry = false;
 		for (const spec of config.proxies) {
+			if (!Array.isArray(spec?.listeners) || !spec.listeners.every(Boolean)) {
+				logErr('skipping a proxy entry without a valid "listeners" array');
+				failed.push(spec);
+				unidentifiedEntry = true;
+				continue;
+			}
 			const key = portKey(spec.listeners);
 			seen.add(key);
 			const existing = this.active.get(key);
@@ -452,6 +478,7 @@ class ServerState {
 					log(`proxy listening on ports [${key}]`);
 				}
 			} catch (err) {
+				failed.push(spec);
 				logErr(
 					`failed to (re)configure proxy [${key}] — skipping, leaving any running listener in place:`,
 					(err as Error).message
@@ -459,28 +486,48 @@ class ServerState {
 			}
 		}
 
-		// Drop proxies whose port-set is no longer in the config.
+		// Drop proxies whose port-set is no longer in the config. An entry that names no port-set could
+		// be meant for any of them, so its config removes none.
 		for (const [key, entry] of this.active) {
-			if (!seen.has(key)) {
+			if (!seen.has(key) && !unidentifiedEntry) {
 				await entry.proxy.stop().catch((err) => logErr(`stopping removed proxy [${key}]:`, err));
 				this.active.delete(key);
 				log(`proxy on ports [${key}] removed`);
 			}
 		}
 
-		// Re-derive which cert/key files to watch from the config we just applied, so a
-		// renewal on disk (no config.json write) triggers a reconcile and live reload.
-		this.updateCertWatchers(config);
+		// Neither step below is part of applying the config, so neither may stop this reconcile
+		// reporting what it applied.
+		try {
+			// Re-derive which cert/key files to watch from the config we just applied, so a
+			// renewal on disk (no config.json write) triggers a reconcile and live reload.
+			this.updateCertWatchers(config);
+		} catch (err) {
+			logErr('cert watcher update failed:', (err as Error).message);
+		}
 
-		// Rebinds only if the admin block changed. Never throws — the endpoint is
-		// observability, and losing it must not abort a reconcile that already applied routes.
-		const admin = config.admin && {
-			...config.admin,
-			socketPath: config.admin.socketPath ? resolvePath(config.admin.socketPath, this.baseDir) : undefined,
-		};
-		await this.admin.update(admin).catch((err) => logErr('admin endpoint update failed:', (err as Error).message));
+		try {
+			// Rebinds only if the admin block changed. The endpoint is observability, and losing it
+			// must not abort a reconcile that already applied routes.
+			const admin = config.admin && {
+				...config.admin,
+				socketPath: config.admin.socketPath ? resolvePath(config.admin.socketPath, this.baseDir) : undefined,
+			};
+			await this.admin.update(admin);
+		} catch (err) {
+			logErr('admin endpoint update failed:', (err as Error).message);
+		}
 
 		this.reloadedAt = new Date().toISOString();
+		if (config.generation === undefined) {
+			this.appliedGeneration = undefined;
+			this.failedGeneration = undefined;
+		} else if (failed.length) {
+			this.failedGeneration = { generation: config.generation, ports: listenerPorts(failed) };
+		} else {
+			this.appliedGeneration = config.generation;
+			this.failedGeneration = undefined;
+		}
 		this.writeStatus();
 	}
 
@@ -551,6 +598,8 @@ class ServerState {
 			version: pkg.version,
 			startedAt: this.startedAt,
 			reloadedAt: this.reloadedAt,
+			appliedGeneration: this.appliedGeneration,
+			failedGeneration: this.failedGeneration,
 			configPath: this.configPath,
 			ports,
 			listeners: endpoints,
@@ -562,8 +611,10 @@ class ServerState {
 		try {
 			writeFileSync(tmp, JSON.stringify(status, null, 2));
 			renameSync(tmp, this.statusPath);
+			this.statusWriteFailed = false;
 		} catch (err) {
-			logErr(`could not write status ${this.statusPath}:`, (err as Error).message);
+			if (!this.statusWriteFailed) logErr(`could not write status ${this.statusPath}:`, (err as Error).message);
+			this.statusWriteFailed = true;
 			try {
 				unlinkSync(tmp);
 			} catch {
@@ -621,7 +672,8 @@ class ServerState {
 			void this.reloading
 				.then(() => {
 					if (this.stopping) return;
-					if (this.readStatusOwner()?.pid === process.pid) {
+					// The file naming this process doesn't make it current if the last write failed.
+					if (!this.statusWriteFailed && this.readStatusOwner()?.pid === process.pid) {
 						this.supersededBy = null;
 						this.recheckStatus();
 					} else {

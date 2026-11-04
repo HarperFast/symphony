@@ -21,6 +21,12 @@ For consumers that want symphony as its own OS process rather than embedded in t
 
 Not covered, by decision: a successor that is running but wedged still qualifies — `SO_REUSEPORT` gives no per-process way to probe it, and host-manager's own SIGTERM handoff trusts the same status file. The last check is the tick that calls `onSuperseded`: a successor that dies during the stop itself (admin close, pending reconcile, 100 ms per proxy) is not re-checked, and the supervisor's health poll respawns. `PR_SET_PDEATHSIG` is deliberately not used: dying with host-manager would cut all traffic on every host-manager restart.
 
+**`appliedGeneration` comes only from the config object its own reconcile read (symphony#75).** Re-reading the file at status time would report a config no proxy has seen. Three things keep the field true:
+
+- **Reconciles never overlap.** `reconcile()` chains every `doReconcile` on `this.reloading`, which is the whole reason an older reconcile cannot finish after a newer one, so there is no ordering check. The first generation test in `server.spec.ts` parks `SymphonyProxy.start` through a `--require` preload, with the event loop free, to pin this.
+- **Nothing between reading the config and committing the fields may throw**, or a reconcile that skipped a proxy reports nothing. A malformed entry is a skip (its config removes no running proxy, because it names no port-set), and the cert-watcher and admin updates are guarded separately.
+- **A failed status write is retried.** `statusWriteFailed` makes `recheckStatus` write again instead of trusting a file that names this process but holds the previous reconcile.
+
 ### Admin/metrics endpoint (`ts/admin.ts`)
 
 An optional `admin` block in the config file (`{ socketPath?, socketMode?, port?, host? }`) makes `symphony-server` expose `GET /metrics` (Prometheus text), `/metrics.json`, and `/health` over a Unix socket, a loopback TCP port, or both. It exists because an out-of-process symphony has no reachable napi `metrics()` — the endpoint is the only export path for that deployment.
