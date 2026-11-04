@@ -24,7 +24,7 @@ Not covered, by decision: a successor that is running but wedged still qualifies
 **`appliedGeneration` comes only from the config object its own reconcile read (symphony#75).** Re-reading the file at status time would report a config no proxy has seen. Three things keep the field true:
 
 - **Reconciles never overlap.** `reconcile()` chains every `doReconcile` on `this.reloading`, which is the whole reason an older reconcile cannot finish after a newer one, so there is no ordering check. The first generation test in `server.spec.ts` parks `SymphonyProxy.start` through a `--require` preload, with the event loop free, to pin this.
-- **Nothing between reading the config and committing the fields may throw**, or a reconcile that skipped a proxy reports nothing. A malformed entry is a skip (its config removes no running proxy, because it names no port-set), and the cert-watcher and admin updates are guarded separately.
+- **Nothing between reading the config and committing the fields may throw**, or a reconcile that skipped a proxy reports nothing. An entry that doesn't name its port-set is a skip (`namesPortSet`; its config removes no running proxy, because it could be any of them), `collectCertFiles` tolerates whatever the loop skipped, and the admin update is guarded.
 - **A failed status write is retried.** `statusWriteFailed` makes `recheckStatus` write again instead of trusting a file that names this process but holds the previous reconcile.
 
 ### Admin/metrics endpoint (`ts/admin.ts`)

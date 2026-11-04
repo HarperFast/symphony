@@ -162,7 +162,15 @@ function portKey(listeners: { port: number }[]): string {
 		.join(',');
 }
 
-// Tolerates the malformed entries a skipped proxy can be.
+// False for an entry that can't be matched to a running proxy, because its listeners don't name its port-set.
+function namesPortSet(spec: FileProxyConfig): boolean {
+	return (
+		Array.isArray(spec?.listeners) &&
+		spec.listeners.length > 0 &&
+		spec.listeners.every((l) => typeof l?.port === 'number')
+	);
+}
+
 function listenerPorts(specs: FileProxyConfig[]): number[] {
 	const ports = specs.flatMap((spec) => (Array.isArray(spec?.listeners) ? spec.listeners.map((l) => l?.port) : []));
 	return [...new Set(ports.filter((p) => typeof p === 'number'))].sort((a, b) => a - b);
@@ -308,8 +316,8 @@ class ServerState {
 				return null;
 			}
 			// Costs only the acknowledgement: the routes still apply, and the writer sees none.
-			if (parsed.generation !== undefined && (typeof parsed.generation !== 'string' || !parsed.generation)) {
-				logErr('config "generation" is not a non-empty string — ignoring the generation');
+			if (parsed.generation !== undefined && typeof parsed.generation !== 'string') {
+				logErr('config "generation" is not a string — ignoring the generation');
 				parsed.generation = undefined;
 			}
 			return parsed;
@@ -340,20 +348,22 @@ class ServerState {
 	private collectCertFiles(config: ConfigFile): Map<string, Set<string>> {
 		const byDir = new Map<string, Set<string>>();
 		const add = (p: string | undefined): void => {
-			if (!p) return;
+			if (typeof p !== 'string' || !p) return;
 			const abs = resolvePath(p, this.baseDir);
 			const dir = dirname(abs);
 			let set = byDir.get(dir);
 			if (!set) byDir.set(dir, (set = new Set<string>()));
 			set.add(basename(abs));
 		};
-		for (const proxy of config.proxies) {
-			for (const l of proxy.listeners ?? []) {
+		// The whole config, including what the reconcile skipped: a skipped proxy's cert appearing is what retries it.
+		const entries = <T>(list: T[] | undefined): T[] => (Array.isArray(list) ? list.filter(Boolean) : []);
+		for (const proxy of entries(config.proxies)) {
+			for (const l of entries(proxy.listeners)) {
 				add(l.defaultCert?.certChainFile);
 				add(l.defaultCert?.privateKeyFile);
 				add(l.mtls?.clientCaCertFile);
 			}
-			for (const r of proxy.routes ?? []) {
+			for (const r of entries(proxy.routes)) {
 				add(r.cert?.certChainFile);
 				add(r.cert?.privateKeyFile);
 				add(r.mtls?.clientCaCertFile);
@@ -407,8 +417,8 @@ class ServerState {
 		const failed: FileProxyConfig[] = [];
 		let unidentifiedEntry = false;
 		for (const spec of config.proxies) {
-			if (!Array.isArray(spec?.listeners) || !spec.listeners.every(Boolean)) {
-				logErr('skipping a proxy entry without a valid "listeners" array');
+			if (!namesPortSet(spec)) {
+				logErr('skipping a proxy entry whose "listeners" do not name its ports');
 				failed.push(spec);
 				unidentifiedEntry = true;
 				continue;
@@ -496,15 +506,9 @@ class ServerState {
 			}
 		}
 
-		// Neither step below is part of applying the config, so neither may stop this reconcile
-		// reporting what it applied.
-		try {
-			// Re-derive which cert/key files to watch from the config we just applied, so a
-			// renewal on disk (no config.json write) triggers a reconcile and live reload.
-			this.updateCertWatchers(config);
-		} catch (err) {
-			logErr('cert watcher update failed:', (err as Error).message);
-		}
+		// Re-derive which cert/key files to watch from the config we just applied, so a
+		// renewal on disk (no config.json write) triggers a reconcile and live reload.
+		this.updateCertWatchers(config);
 
 		try {
 			// Rebinds only if the admin block changed. The endpoint is observability, and losing it
@@ -672,7 +676,6 @@ class ServerState {
 			void this.reloading
 				.then(() => {
 					if (this.stopping) return;
-					// The file naming this process doesn't make it current if the last write failed.
 					if (!this.statusWriteFailed && this.readStatusOwner()?.pid === process.pid) {
 						this.supersededBy = null;
 						this.recheckStatus();

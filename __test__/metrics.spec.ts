@@ -569,7 +569,8 @@ describe('renderPrometheus', () => {
 		assert.ok(rendered.includes('symphony_config_applied_generation_info{generation="g\\"1"} 1'));
 		assert.ok(rendered.includes('symphony_config_failed_generation_info{generation="g\\\\2",ports="80,443"} 1'));
 
-		const appliedOnly = renderPrometheus({ ...snapshot, appliedGeneration: 'g1' });
+		const appliedOnly = renderPrometheus({ ...snapshot, appliedGeneration: '' });
+		assert.ok(appliedOnly.includes('symphony_config_applied_generation_info{generation=""} 1'));
 		assert.ok(!appliedOnly.includes('symphony_config_failed_generation_info'));
 	});
 

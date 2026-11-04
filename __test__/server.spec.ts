@@ -1251,7 +1251,6 @@ describe('symphony-server (config generation)', () => {
 		await waitFor(() => fs.existsSync(statusPath));
 		await waitFor(() => server.getStdout().includes('watching'));
 		const status = () => JSON.parse(fs.readFileSync(statusPath, 'utf8'));
-		// Writes a config and waits for the reconcile of it to publish, whatever it reports.
 		const apply = async (next: unknown) => {
 			const { reloadedAt } = status();
 			writeConfigAtomic(configPath, next);
@@ -1436,21 +1435,28 @@ describe('symphony-server (config generation)', () => {
 		assert.equal(applied.failedGeneration, undefined);
 	});
 
-	it('reports a malformed entry as a skip and removes no running proxy on its account', async () => {
+	it('reports an entry that names no port-set as a skip, and removes no running proxy on its account', async () => {
 		const [named, unnamed] = [await getFreePort(), await getFreePort()];
 		const { apply } = await boot('malformed', {
 			generation: 'g1',
 			proxies: [entry(named, { upstream: deadPort }), entry(unnamed)],
 		});
 
-		for (const [generation, malformed] of [
-			['g2', { routes: [] }],
-			['g3', null],
-			['g4', { listeners: [null], routes: [] }],
-		] as const) {
+		const malformedEntries: [unknown, number[]][] = [
+			[{ routes: [] }, []],
+			[null, []],
+			[{ listeners: 17, routes: [] }, []],
+			[{ listeners: [], routes: [] }, []],
+			[{ listeners: [null], routes: [] }, []],
+			[{ listeners: [{ host: '127.0.0.1' }], routes: [] }, []],
+			[{ listeners: [{ host: '127.0.0.1', port: String(unnamed) }], routes: [] }, []],
+			[{ listeners: [{ port: unnamed }, { host: '127.0.0.1' }], routes: [] }, [unnamed]],
+		];
+		for (const [i, [malformed, ports]] of malformedEntries.entries()) {
+			const generation = `bad-${i}`;
 			const failed = await apply({ generation, proxies: [malformed, entry(named)] });
-			assert.equal(failed.appliedGeneration, 'g1');
-			assert.deepEqual(failed.failedGeneration, { generation, ports: [] });
+			assert.equal(failed.appliedGeneration, 'g1', generation);
+			assert.deepEqual(failed.failedGeneration, { generation, ports }, generation);
 			assert.equal(await reaches(named), true, 'a well-formed entry still applies');
 			assert.equal(await reaches(unnamed), true, 'a running proxy the malformed entry may have meant stays up');
 		}
@@ -1460,7 +1466,23 @@ describe('symphony-server (config generation)', () => {
 		assert.equal(await reaches(unnamed), false, 'removal resumes once every entry names its ports');
 	});
 
-	it('still reports when a path outside the per-proxy guard is unusable', async () => {
+	it('retries a skipped proxy when its cert appears, beside an entry that can never apply', async () => {
+		const skipped = await getFreePort();
+		const certDir = path.join(dir, 'watched-certs');
+		fs.mkdirSync(certDir);
+		const keyFile = path.join(certDir, 'key.pem');
+		const { status } = await boot('watched', {
+			generation: 'g1',
+			proxies: [null, entry(skipped, { listener: { defaultCert: { certChain: cert.cert, privateKeyFile: keyFile } } })],
+		});
+		assert.deepEqual(status().failedGeneration, { generation: 'g1', ports: [skipped] });
+
+		fs.writeFileSync(keyFile, cert.key);
+		await waitFor(() => status().failedGeneration.ports.length === 0, 8000);
+		assert.equal(await reaches(skipped), true);
+	});
+
+	it('still reports beside an unusable cert path and admin socket path', async () => {
 		const [healthy, skipped] = [await getFreePort(), await getFreePort()];
 		const { server, apply } = await boot('bad-paths', { generation: 'g1', proxies: [entry(healthy), entry(skipped)] });
 
@@ -1473,8 +1495,8 @@ describe('symphony-server (config generation)', () => {
 			],
 		});
 		assert.deepEqual(failed.failedGeneration, { generation: 'g2', ports: [skipped] });
-		assert.match(server.getStderr(), /cert watcher update failed/);
 		assert.match(server.getStderr(), /admin endpoint update failed/);
+		assert.doesNotMatch(server.getStderr(), /reconcile failed/);
 	});
 
 	it('leaves status.json as it was without a generation, and clears both fields when one is dropped', async () => {
@@ -1501,14 +1523,22 @@ describe('symphony-server (config generation)', () => {
 		});
 
 		let upstream = deadPort;
-		for (const generation of [7, '', null, { nested: true }]) {
+		for (const generation of [7, null, { nested: true }]) {
 			upstream = upstream === deadPort ? echo.port : deadPort;
 			const status = await apply({ generation, proxies: [entry(port, { upstream })] });
 			assert.equal('appliedGeneration' in status, false, `generation ${JSON.stringify(generation)}`);
 			assert.equal('failedGeneration' in status, false, `generation ${JSON.stringify(generation)}`);
 			assert.equal(await reaches(port), upstream === echo.port, `generation ${JSON.stringify(generation)}`);
 		}
-		assert.match(server.getStderr(), /"generation" is not a non-empty string/);
+		assert.match(server.getStderr(), /"generation" is not a string/);
+	});
+
+	it('reports an empty string like any other generation', async () => {
+		const port = await getFreePort();
+		const { status, apply } = await boot('empty-string', { generation: '', proxies: [entry(port)] });
+		assert.equal(status().appliedGeneration, '');
+		assert.equal((await apply({ generation: 'g2', proxies: [entry(port)] })).appliedGeneration, 'g2');
+		assert.equal((await apply({ generation: '', proxies: [entry(port)] })).appliedGeneration, '');
 	});
 
 	it('applies a generation with no proxies at all', async () => {

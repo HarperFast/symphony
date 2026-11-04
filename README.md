@@ -1102,10 +1102,10 @@ read, or whether it applied. To find out, set a top-level `generation` in the co
 { "version": 1, "generation": "4172", "proxies": [ ... ] }
 ```
 
-`generation` is an opaque, non-empty string the writer chooses: a counter or a hash of the content.
-Use a new value whenever the content changes, because symphony compares nothing and orders nothing;
-it only reports back the string it read. A value that isn't a non-empty string is logged and treated
-as no generation, and the rest of the config still applies.
+`generation` is an opaque string the writer chooses: a counter or a hash of the content. Use a new
+value whenever the content changes, because symphony compares nothing and orders nothing; it only
+reports back the string it read. A value that isn't a string is logged and treated as no generation,
+and the rest of the config still applies.
 
 Each reload then writes these to `status.json`:
 
@@ -1126,8 +1126,9 @@ A writer waiting for generation `G` reads them like this:
   say) skipped a proxy. `appliedGeneration` is still true, since the skipped proxy keeps `G`'s routes.
 - **An entry applies or doesn't as a whole.** A route whose cert can't be built is isolated inside its
   proxy and doesn't count as a skip. `failingRoutes` reports it.
-- **An entry with no valid `listeners` array is a skip with no ports.** It names no port-set, so it
-  could be meant for any running proxy, and a reload of that config removes none of them.
+- **An entry whose `listeners` don't name its ports is a skip.** That is a missing or empty array, or
+  a listener with no numeric port. It can't be matched to a running proxy, so a reload of that config
+  removes no proxy, and `ports` lists only the ports it did name.
 - **A config that can't be read changes nothing.** An unreadable file, invalid JSON or a missing
   `proxies` array leaves `status.json` as it was, so a writer sees "not applied yet".
 - **Without a `generation` neither field appears.** Dropping it from the config removes both.
