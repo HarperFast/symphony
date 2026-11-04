@@ -1129,6 +1129,10 @@ A writer waiting for generation `G` reads them like this:
 - **An entry whose `listeners` don't name its ports is a skip.** That is a missing or empty array, or
   a listener with no numeric port. It can't be matched to a running proxy, so a reload of that config
   removes no proxy, and `ports` lists only the ports it did name.
+- **A running proxy stays while a skipped entry may replace it.** That is any proxy sharing a port with
+  a skipped entry, so moving a port to a new entry under a bad cert doesn't take the port down. If a
+  config splits one proxy into two and only one applies, the port that applied is served by both the
+  old and the new proxy until the other applies, and `status.json` lists it twice.
 - **A config that can't be read changes nothing.** An unreadable file, invalid JSON or a missing
   `proxies` array leaves `status.json` as it was, so a writer sees "not applied yet".
 - **Without a `generation` neither field appears.** Dropping it from the config removes both.
