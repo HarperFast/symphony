@@ -1024,6 +1024,17 @@ listeners in that proxy; Host Manager uses one proxy per external port, so its e
 label keeps route traffic separated by port. Route error samples appear only after a reason is
 non-zero.
 
+With a `generation` in the config ([Knowing which config `symphony-server` applied](#knowing-which-config-symphony-server-applied)),
+`/metrics.json` adds `appliedGeneration` and `failedGeneration`, and `/metrics` adds:
+
+```
+symphony_config_applied_generation_info{generation="4171"} 1
+symphony_config_failed_generation_info{generation="4172",ports="8443,9443"} 1
+```
+
+Each appears only while its field is set. A generation can only be a label, so each new value starts
+a new series: change it when the config changes, not on a timer.
+
 The endpoint is strictly read-only and best-effort: it never blocks proxying, and a bind failure
 is logged and retried every 5s rather than aborting startup. That matters during a version
 upgrade, where the incumbent still holds the socket while the replacement is already serving
@@ -1079,6 +1090,56 @@ its supervisor. A process that stops never deletes `status.json`.
 Only a process with this behavior stops itself. A `symphony-server` from 1.4.0 or earlier that is
 already running keeps running until something stops it, so clearing out processes left over from
 earlier upgrades needs the supervisor (or an operator) to stop them once.
+
+---
+
+## Knowing which config `symphony-server` applied
+
+`reloadedAt` in `status.json` says when a reload finished. It does not say which config that reload
+read, or whether it applied. To find out, set a top-level `generation` in the config:
+
+```json
+{ "version": 1, "generation": "4172", "proxies": [ ... ] }
+```
+
+`generation` is an opaque string the writer chooses: a counter or a hash of the content. Use a new
+value whenever the content changes, because symphony compares nothing and orders nothing; it only
+reports back the string it read. A value that isn't a string is logged and treated as no generation,
+and the rest of the config still applies.
+
+Each reload then writes these to `status.json`:
+
+| Field | Meaning |
+|---|---|
+| `appliedGeneration` | The generation of the last config in which every proxy entry applied. It comes from the config that reload read, so a reload that read the previous config and finishes after a new write reports the previous generation. |
+| `failedGeneration` | `{ generation, ports }`, present when the last reload skipped a proxy entry: the generation it read and the sorted listener ports of what it skipped. The next reload that applies every entry removes it. |
+
+A writer waiting for generation `G` reads them like this:
+
+| `status.json` shows | Meaning |
+|---|---|
+| `appliedGeneration` is `G` | Every proxy entry applied `G`. |
+| `failedGeneration.generation` is `G`, and `appliedGeneration` is not | `G` applied with errors. The listed ports keep what they were serving; every other entry has `G`. Nothing retries until the next reload (a config write, a change to a referenced cert file, or `SIGHUP`). |
+| Neither is `G` | Not applied yet. A symphony older than this feature always reads this way, so never treat a missing field as applied. |
+
+- **Both fields can name `G`.** `G` applied, then a later reload of the same config (a rotated cert,
+  say) skipped a proxy. `appliedGeneration` is still true, since the skipped proxy keeps `G`'s routes.
+- **An entry applies or doesn't as a whole.** A route whose cert can't be built is isolated inside its
+  proxy and doesn't count as a skip. `failingRoutes` reports it.
+- **An entry whose `listeners` don't name its ports is a skip.** That is a missing or empty array, or
+  a listener with no numeric port. It can't be matched to a running proxy, so a reload of that config
+  removes no proxy, and `ports` lists only the ports it did name.
+- **A running proxy stays while a skipped entry may replace it.** That is any proxy sharing a port with
+  a skipped entry, so moving a port to a new entry under a bad cert doesn't take the port down. If a
+  config splits one proxy into two and only one applies, the port that applied is served by both the
+  old and the new proxy until the other applies, and `status.json` lists it twice.
+- **A config that can't be read changes nothing.** An unreadable file, invalid JSON or a missing
+  `proxies` array leaves `status.json` as it was, so a writer sees "not applied yet".
+- **Without a `generation` neither field appears.** Dropping it from the config removes both.
+- **The fields describe the process `status.json` names, in memory.** A new process reports what its
+  own first reload did. `/metrics.json` and the `symphony_config_*_generation_info` samples carry the
+  same fields for the process that answered, which can be the outgoing one during an upgrade, so
+  compare `pid`.
 
 ---
 

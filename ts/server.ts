@@ -4,7 +4,7 @@ import { dirname, isAbsolute, join, basename, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { SymphonyProxy } from './index.js';
 import type { ProxyConfig, ListenerConfig, RouteConfig, CertConfig, MtlsConfig } from './index.js';
-import { AdminServer, type AdminConfig, type MetricsSnapshot } from './admin.js';
+import { AdminServer, type AdminConfig, type FailedGeneration, type MetricsSnapshot } from './admin.js';
 
 // package.json sits at the package root, which is 1 level above dist/server.js (production
 // layout) or 2 levels above dist-test/ts/server.js (test layout) — try both, like loadAddon.
@@ -62,6 +62,8 @@ interface FileProxyConfig {
 
 interface ConfigFile {
 	version?: number;
+	/** Opaque writer-set identity of this config, reported back as `appliedGeneration`/`failedGeneration`. */
+	generation?: string;
 	/** Optional read-only metrics/health endpoint. Omit to expose nothing. */
 	admin?: AdminConfig;
 	proxies: FileProxyConfig[];
@@ -160,6 +162,19 @@ function portKey(listeners: { port: number }[]): string {
 		.join(',');
 }
 
+function namesPortSet(spec: FileProxyConfig): boolean {
+	return (
+		Array.isArray(spec?.listeners) &&
+		spec.listeners.length > 0 &&
+		spec.listeners.every((l) => typeof l?.port === 'number')
+	);
+}
+
+function listenerPorts(specs: FileProxyConfig[]): number[] {
+	const ports = specs.flatMap((spec) => (Array.isArray(spec?.listeners) ? spec.listeners.map((l) => l?.port) : []));
+	return [...new Set(ports.filter((p) => typeof p === 'number'))].sort((a, b) => a - b);
+}
+
 // Whether a pid is a running process started as this user with `--config <configPath>`. `verified`
 // reads its argv, working directory and run state from /proc, which also keeps a recycled pid, a
 // stopped process or a zombie from counting; `unverified` is liveness alone, where there is no /proc.
@@ -244,6 +259,9 @@ class ServerState {
 	private readonly admin: AdminServer;
 	private startedAt = '';
 	private reloadedAt = '';
+	private appliedGeneration: string | undefined;
+	private failedGeneration: FailedGeneration | undefined;
+	private statusWriteFailed = false;
 	private reloading: Promise<void> = Promise.resolve();
 	private watcher: ReturnType<typeof watch> | null = null;
 	// Cert/key files referenced by the current config, watched for rotation. Keyed by
@@ -276,6 +294,8 @@ class ServerState {
 			version: pkg.version,
 			startedAt: this.startedAt,
 			reloadedAt: this.reloadedAt,
+			appliedGeneration: this.appliedGeneration,
+			failedGeneration: this.failedGeneration,
 			proxies: [...this.active].map(([ports, entry]) => ({ ports, metrics: entry.proxy.metrics() })),
 		};
 	}
@@ -293,6 +313,11 @@ class ServerState {
 			if (!parsed || !Array.isArray(parsed.proxies)) {
 				logErr('config has no "proxies" array — ignoring');
 				return null;
+			}
+			// Costs only the acknowledgement: the routes still apply, and the writer sees none.
+			if (parsed.generation !== undefined && typeof parsed.generation !== 'string') {
+				logErr('config "generation" is not a string — ignoring the generation');
+				parsed.generation = undefined;
 			}
 			return parsed;
 		} catch (err) {
@@ -322,20 +347,22 @@ class ServerState {
 	private collectCertFiles(config: ConfigFile): Map<string, Set<string>> {
 		const byDir = new Map<string, Set<string>>();
 		const add = (p: string | undefined): void => {
-			if (!p) return;
+			if (typeof p !== 'string' || !p) return;
 			const abs = resolvePath(p, this.baseDir);
 			const dir = dirname(abs);
 			let set = byDir.get(dir);
 			if (!set) byDir.set(dir, (set = new Set<string>()));
 			set.add(basename(abs));
 		};
-		for (const proxy of config.proxies) {
-			for (const l of proxy.listeners ?? []) {
+		// The whole config, including what the reconcile skipped: a skipped proxy's cert appearing is what retries it.
+		const entries = <T>(list: T[] | undefined): T[] => (Array.isArray(list) ? list.filter(Boolean) : []);
+		for (const proxy of entries(config.proxies)) {
+			for (const l of entries(proxy.listeners)) {
 				add(l.defaultCert?.certChainFile);
 				add(l.defaultCert?.privateKeyFile);
 				add(l.mtls?.clientCaCertFile);
 			}
-			for (const r of proxy.routes ?? []) {
+			for (const r of entries(proxy.routes)) {
 				add(r.cert?.certChainFile);
 				add(r.cert?.privateKeyFile);
 				add(r.mtls?.clientCaCertFile);
@@ -386,7 +413,15 @@ class ServerState {
 		if (!config) return;
 
 		const seen = new Set<string>();
+		const failed: FileProxyConfig[] = [];
+		let unidentifiedEntry = false;
 		for (const spec of config.proxies) {
+			if (!namesPortSet(spec)) {
+				logErr('skipping a proxy entry whose "listeners" do not name its ports');
+				failed.push(spec);
+				unidentifiedEntry = true;
+				continue;
+			}
 			const key = portKey(spec.listeners);
 			seen.add(key);
 			const existing = this.active.get(key);
@@ -452,6 +487,7 @@ class ServerState {
 					log(`proxy listening on ports [${key}]`);
 				}
 			} catch (err) {
+				failed.push(spec);
 				logErr(
 					`failed to (re)configure proxy [${key}] — skipping, leaving any running listener in place:`,
 					(err as Error).message
@@ -459,9 +495,13 @@ class ServerState {
 			}
 		}
 
-		// Drop proxies whose port-set is no longer in the config.
+		// Drop proxies whose port-set is no longer in the config, unless a skipped entry may be what
+		// replaces them, which would leave the port with nothing serving it. An entry that names no
+		// port-set could be meant for any of them; one that shares a port is meant for that proxy.
+		const skippedPorts = new Set(listenerPorts(failed));
 		for (const [key, entry] of this.active) {
-			if (!seen.has(key)) {
+			const replacementSkipped = unidentifiedEntry || key.split(',').some((port) => skippedPorts.has(Number(port)));
+			if (!seen.has(key) && !replacementSkipped) {
 				await entry.proxy.stop().catch((err) => logErr(`stopping removed proxy [${key}]:`, err));
 				this.active.delete(key);
 				log(`proxy on ports [${key}] removed`);
@@ -472,15 +512,28 @@ class ServerState {
 		// renewal on disk (no config.json write) triggers a reconcile and live reload.
 		this.updateCertWatchers(config);
 
-		// Rebinds only if the admin block changed. Never throws — the endpoint is
-		// observability, and losing it must not abort a reconcile that already applied routes.
-		const admin = config.admin && {
-			...config.admin,
-			socketPath: config.admin.socketPath ? resolvePath(config.admin.socketPath, this.baseDir) : undefined,
-		};
-		await this.admin.update(admin).catch((err) => logErr('admin endpoint update failed:', (err as Error).message));
+		try {
+			// Rebinds only if the admin block changed. The endpoint is observability, and losing it
+			// must not abort a reconcile that already applied routes.
+			const admin = config.admin && {
+				...config.admin,
+				socketPath: config.admin.socketPath ? resolvePath(config.admin.socketPath, this.baseDir) : undefined,
+			};
+			await this.admin.update(admin);
+		} catch (err) {
+			logErr('admin endpoint update failed:', (err as Error).message);
+		}
 
 		this.reloadedAt = new Date().toISOString();
+		if (config.generation === undefined) {
+			this.appliedGeneration = undefined;
+			this.failedGeneration = undefined;
+		} else if (failed.length) {
+			this.failedGeneration = { generation: config.generation, ports: listenerPorts(failed) };
+		} else {
+			this.appliedGeneration = config.generation;
+			this.failedGeneration = undefined;
+		}
 		this.writeStatus();
 	}
 
@@ -551,6 +604,8 @@ class ServerState {
 			version: pkg.version,
 			startedAt: this.startedAt,
 			reloadedAt: this.reloadedAt,
+			appliedGeneration: this.appliedGeneration,
+			failedGeneration: this.failedGeneration,
 			configPath: this.configPath,
 			ports,
 			listeners: endpoints,
@@ -562,8 +617,10 @@ class ServerState {
 		try {
 			writeFileSync(tmp, JSON.stringify(status, null, 2));
 			renameSync(tmp, this.statusPath);
+			this.statusWriteFailed = false;
 		} catch (err) {
-			logErr(`could not write status ${this.statusPath}:`, (err as Error).message);
+			if (!this.statusWriteFailed) logErr(`could not write status ${this.statusPath}:`, (err as Error).message);
+			this.statusWriteFailed = true;
 			try {
 				unlinkSync(tmp);
 			} catch {
@@ -621,7 +678,7 @@ class ServerState {
 			void this.reloading
 				.then(() => {
 					if (this.stopping) return;
-					if (this.readStatusOwner()?.pid === process.pid) {
+					if (!this.statusWriteFailed && this.readStatusOwner()?.pid === process.pid) {
 						this.supersededBy = null;
 						this.recheckStatus();
 					} else {

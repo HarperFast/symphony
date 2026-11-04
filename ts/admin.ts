@@ -45,11 +45,20 @@ export interface ProxySnapshot {
 	metrics: ProxyMetrics;
 }
 
+/** The generation of a config whose last reconcile skipped a proxy, and the skipped listener ports. */
+export interface FailedGeneration {
+	generation: string;
+	ports: number[];
+}
+
 export interface MetricsSnapshot {
 	pid: number;
 	version: string;
 	startedAt: string;
 	reloadedAt: string;
+	/** The generation of the last config every proxy applied. */
+	appliedGeneration?: string;
+	failedGeneration?: FailedGeneration;
 	proxies: ProxySnapshot[];
 }
 
@@ -129,9 +138,27 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 	out.sample(
 		'symphony_config_reload_time_seconds',
 		'gauge',
-		'Unix time of the last successful config reconcile.',
+		'Unix time the last config reconcile finished, including one that skipped a proxy.',
 		Date.parse(snapshot.reloadedAt) / 1000
 	);
+	if (snapshot.appliedGeneration !== undefined) {
+		out.sample(
+			'symphony_config_applied_generation_info',
+			'gauge',
+			'Always 1; the label carries the generation of the last config every proxy applied.',
+			1,
+			{ generation: snapshot.appliedGeneration }
+		);
+	}
+	if (snapshot.failedGeneration) {
+		out.sample(
+			'symphony_config_failed_generation_info',
+			'gauge',
+			'Always 1; the labels carry the generation of a config whose last reconcile skipped a proxy, and the skipped listener ports.',
+			1,
+			{ generation: snapshot.failedGeneration.generation, ports: snapshot.failedGeneration.ports.join(',') }
+		);
+	}
 
 	for (const { ports, metrics } of snapshot.proxies) {
 		const proxy = { proxy: ports };

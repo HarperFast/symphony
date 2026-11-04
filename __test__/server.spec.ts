@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import { spawn, ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { generateClientCa, generateSelfSignedCert, getFreePort, startEchoServer, tlsRoundTrip, sleep } from './util.js';
@@ -1203,3 +1204,484 @@ describe(
 		});
 	}
 );
+
+describe('symphony-server (config generation)', () => {
+	const cert = generateSelfSignedCert('localhost');
+	let dir: string;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	let deadPort: number;
+	const servers: RunningServer[] = [];
+	const peers: ChildProcess[] = [];
+
+	before(async () => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-generation-'));
+		echo = await startEchoServer();
+		deadPort = await getFreePort();
+	});
+
+	after(async () => {
+		for (const peer of peers) peer.kill('SIGKILL');
+		await Promise.all(servers.map(killServer));
+		await echo?.close().catch(() => {});
+		if (dir) fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	// Inline certs, so a cert watcher only runs where a test references a file.
+	function entry(port: number, opts: { upstream?: number; listener?: object; proxy?: object } = {}): object {
+		return {
+			listeners: [{ host: '127.0.0.1', port, ...opts.listener }],
+			routes: [
+				{
+					sni: 'localhost',
+					upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: opts.upstream ?? echo.port }],
+					terminateTls: true,
+					cert: { certChain: cert.cert, privateKey: cert.key },
+				},
+			],
+			...opts.proxy,
+		};
+	}
+
+	async function boot(name: string, config: unknown, env?: NodeJS.ProcessEnv) {
+		const configPath = path.join(dir, `${name}.json`);
+		const statusPath = path.join(dir, `${name}-status.json`);
+		writeConfigAtomic(configPath, config);
+		const server = spawnServer(configPath, statusPath, { env });
+		servers.push(server);
+		await waitFor(() => fs.existsSync(statusPath));
+		await waitFor(() => server.getStdout().includes('watching'));
+		const status = () => JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+		const apply = async (next: unknown) => {
+			const { reloadedAt } = status();
+			writeConfigAtomic(configPath, next);
+			await waitFor(() => status().reloadedAt !== reloadedAt, 5000, 20);
+			return status();
+		};
+		return { server, configPath, statusPath, status, apply };
+	}
+
+	function reaches(port: number): Promise<boolean> {
+		const data = Buffer.from('ping');
+		return tlsRoundTrip({ port, servername: 'localhost', caCert: cert.cert, data, rejectUnauthorized: true }).then(
+			(reply) => reply.equals(data),
+			() => false
+		);
+	}
+
+	it('reports the config a reconcile read when it finishes after a newer write, and holds the newer one back', async () => {
+		// Parks each SymphonyProxy.start() behind a file while leaving the event loop free, so a
+		// reconcile that overlapped this one would reach start() rather than wait in the chain.
+		const gate = path.join(dir, 'gate');
+		fs.mkdirSync(gate);
+		const preload = path.join(gate, 'preload.js');
+		fs.writeFileSync(
+			preload,
+			`const fs = require('node:fs');
+			const { SymphonyProxy } = require(${JSON.stringify(path.join(__dirname, '..', 'ts', 'proxy.js'))});
+			const gate = ${JSON.stringify(gate)};
+			const { start } = SymphonyProxy.prototype;
+			let calls = 0;
+			SymphonyProxy.prototype.start = async function () {
+				if (fs.existsSync(gate + '/armed')) {
+					const call = ++calls;
+					fs.writeFileSync(gate + '/entered-' + call, '');
+					while (!fs.existsSync(gate + '/release-' + call)) await new Promise((r) => setTimeout(r, 10));
+				}
+				return start.apply(this);
+			};`
+		);
+		const entered = (call: number) => fs.existsSync(path.join(gate, `entered-${call}`));
+		const release = (call: number) => fs.writeFileSync(path.join(gate, `release-${call}`), '');
+
+		const port = await getFreePort();
+		// A construction-frozen setting changes each time, so every reconcile recreates and reaches start().
+		const config = (generation: string, readBufferSize: number) => ({
+			generation,
+			proxies: [entry(port, { proxy: { readBufferSize } })],
+		});
+		const { server, configPath, status } = await boot('gate', config('boot', 16384), {
+			NODE_OPTIONS: `--require ${preload}`,
+		});
+		fs.writeFileSync(path.join(gate, 'armed'), '');
+
+		writeConfigAtomic(configPath, config('read', 32768));
+		await waitFor(() => entered(1));
+
+		writeConfigAtomic(configPath, config('written', 65536));
+		const writtenAt = Date.now();
+		server.child.kill('SIGHUP');
+		await sleep(500); // past the watcher's debounce too
+		assert.equal(entered(2), false, 'a reconcile started while another was running');
+		assert.equal(status().appliedGeneration, 'boot');
+
+		release(1);
+		await waitFor(() => status().appliedGeneration !== 'boot');
+		const acknowledged = status();
+		assert.equal(acknowledged.appliedGeneration, 'read');
+		assert.ok(
+			Date.parse(acknowledged.reloadedAt) >= writtenAt,
+			'reloadedAt alone would read as acknowledging the write'
+		);
+
+		await waitFor(() => entered(2));
+		assert.equal(status().appliedGeneration, 'read');
+		release(2);
+		await waitFor(() => status().appliedGeneration === 'written');
+	});
+
+	it('keeps appliedGeneration when a proxy is skipped, reports its ports, and clears once it applies', async () => {
+		const [healthy, skipped] = [await getFreePort(), await getFreePort()];
+		const certDir = path.join(dir, 'skipped-certs');
+		fs.mkdirSync(certDir);
+		const keyFile = path.join(certDir, 'key.pem');
+		const { status, apply } = await boot('skipped', {
+			generation: 'g1',
+			proxies: [entry(healthy, { upstream: deadPort }), entry(skipped)],
+		});
+		assert.equal(status().appliedGeneration, 'g1');
+		assert.equal(status().failedGeneration, undefined);
+		assert.equal(await reaches(healthy), false);
+
+		const before = status();
+		const g2 = {
+			generation: 'g2',
+			proxies: [
+				entry(healthy),
+				entry(skipped, { listener: { defaultCert: { certChain: cert.cert, privateKeyFile: keyFile } } }),
+			],
+		};
+		const failed = await apply(g2);
+		assert.equal(failed.appliedGeneration, 'g1');
+		assert.deepEqual(failed.failedGeneration, { generation: 'g2', ports: [skipped] });
+		assert.notEqual(failed.reloadedAt, before.reloadedAt);
+		assert.equal(await reaches(healthy), true, 'the other proxy takes the new config');
+		assert.equal(await reaches(skipped), true, 'the skipped proxy keeps serving');
+
+		// Same generation, no config write: the key file appearing is what triggers the retry.
+		fs.writeFileSync(keyFile, cert.key);
+		await waitFor(() => status().appliedGeneration === 'g2', 8000);
+		assert.equal(status().failedGeneration, undefined);
+
+		const reappliedAfterFailure = await apply({ generation: 'g3', proxies: g2.proxies });
+		assert.equal(reappliedAfterFailure.appliedGeneration, 'g3');
+	});
+
+	it('names one generation in both fields when a reconcile re-reads an applied config and a proxy fails', async () => {
+		const port = await getFreePort();
+		const certDir = path.join(dir, 'reread-certs');
+		fs.mkdirSync(certDir);
+		const keyFile = path.join(certDir, 'key.pem');
+		fs.writeFileSync(keyFile, cert.key);
+		const { status } = await boot('reread', {
+			generation: 'g1',
+			proxies: [entry(port, { listener: { defaultCert: { certChain: cert.cert, privateKeyFile: keyFile } } })],
+		});
+		assert.equal(status().appliedGeneration, 'g1');
+
+		fs.rmSync(keyFile);
+		await waitFor(() => status().failedGeneration !== undefined, 8000);
+		assert.equal(status().appliedGeneration, 'g1');
+		assert.deepEqual(status().failedGeneration, { generation: 'g1', ports: [port] });
+	});
+
+	it('reports every skipped port once, in order', async () => {
+		const [low, high] = [await getFreePort(), await getFreePort()].sort((a, b) => a - b);
+		const unreadable = { defaultCert: { certChain: cert.cert, privateKeyFile: path.join(dir, 'absent.pem') } };
+		const { status } = await boot('ports', {
+			generation: 'g1',
+			proxies: [
+				{
+					...entry(high),
+					listeners: [
+						{ host: '127.0.0.1', port: high, ...unreadable },
+						{ host: '127.0.0.2', port: high, ...unreadable },
+					],
+				},
+				entry(low, { listener: unreadable }),
+			],
+		});
+		assert.equal(status().appliedGeneration, undefined, 'nothing has been applied yet');
+		assert.deepEqual(status().failedGeneration, { generation: 'g1', ports: [low, high] });
+	});
+
+	it('keeps a running proxy when the entry moving it to a new port-set is skipped', async () => {
+		const [kept, added] = [await getFreePort(), await getFreePort()].sort((a, b) => a - b);
+		const moved = (listener: object) => ({
+			...entry(kept),
+			listeners: [
+				{ host: '127.0.0.1', port: kept },
+				{ host: '127.0.0.1', port: added, ...listener },
+			],
+		});
+		const { apply } = await boot('moved', { generation: 'g1', proxies: [entry(kept)] });
+
+		const absent = path.join(dir, 'absent.pem');
+		const failed = await apply({
+			generation: 'g2',
+			proxies: [moved({ defaultCert: { certChain: cert.cert, privateKeyFile: absent } })],
+		});
+		assert.equal(failed.appliedGeneration, 'g1');
+		assert.deepEqual(failed.failedGeneration, { generation: 'g2', ports: [kept, added] });
+		assert.deepEqual(failed.ports, [kept]);
+		assert.equal(await reaches(kept), true);
+
+		const applied = await apply({ generation: 'g3', proxies: [moved({})] });
+		assert.equal(applied.appliedGeneration, 'g3');
+		assert.deepEqual(applied.ports, [kept, added], 'the replaced proxy is gone once its replacement applies');
+		assert.equal(await reaches(kept), true);
+		assert.equal(await reaches(added), true);
+	});
+
+	it('reports a listener that cannot bind', async () => {
+		const held = await getFreePort();
+		const blocker = net.createServer();
+		await new Promise<void>((resolve) => blocker.listen(held, '127.0.0.1', resolve));
+		const proxyPort = await getFreePort();
+		const { server, status, apply } = await boot('bind', { generation: 'g1', proxies: [entry(proxyPort)] });
+
+		const failed = await apply({ generation: 'g2', proxies: [entry(proxyPort), entry(held)] });
+		assert.equal(failed.appliedGeneration, 'g1');
+		assert.deepEqual(failed.failedGeneration, { generation: 'g2', ports: [held] });
+
+		await new Promise((resolve) => blocker.close(resolve));
+		server.child.kill('SIGHUP');
+		await waitFor(() => status().appliedGeneration === 'g2');
+		assert.equal(status().failedGeneration, undefined);
+	});
+
+	it('reports a hot swap the proxy rejects', async () => {
+		const port = await getFreePort();
+		const protection = (ja3Blocklist: string[]) => ({ listener: { protection: { ja3Blocklist } } });
+		const { apply } = await boot('hot-swap', { generation: 'g1', proxies: [entry(port, protection([]))] });
+
+		const failed = await apply({ generation: 'g2', proxies: [entry(port, protection(['not-a-fingerprint']))] });
+		assert.equal(failed.appliedGeneration, 'g1');
+		assert.deepEqual(failed.failedGeneration, { generation: 'g2', ports: [port] });
+
+		const applied = await apply({ generation: 'g3', proxies: [entry(port, protection([]))] });
+		assert.equal(applied.appliedGeneration, 'g3');
+		assert.equal(applied.failedGeneration, undefined);
+	});
+
+	it('reports an entry that names no port-set as a skip, and removes no running proxy on its account', async () => {
+		const [named, unnamed] = [await getFreePort(), await getFreePort()];
+		const { apply } = await boot('malformed', {
+			generation: 'g1',
+			proxies: [entry(named, { upstream: deadPort }), entry(unnamed)],
+		});
+
+		const malformedEntries: [unknown, number[]][] = [
+			[{ routes: [] }, []],
+			[null, []],
+			[{ listeners: 17, routes: [] }, []],
+			[{ listeners: [], routes: [] }, []],
+			[{ listeners: [null], routes: [] }, []],
+			[{ listeners: [{ host: '127.0.0.1' }], routes: [] }, []],
+			[{ listeners: [{ host: '127.0.0.1', port: String(unnamed) }], routes: [] }, []],
+			[{ listeners: [{ port: unnamed }, { host: '127.0.0.1' }], routes: [] }, [unnamed]],
+		];
+		for (const [i, [malformed, ports]] of malformedEntries.entries()) {
+			const generation = `bad-${i}`;
+			const failed = await apply({ generation, proxies: [malformed, entry(named)] });
+			assert.equal(failed.appliedGeneration, 'g1', generation);
+			assert.deepEqual(failed.failedGeneration, { generation, ports }, generation);
+			assert.equal(await reaches(named), true, 'a well-formed entry still applies');
+			assert.equal(await reaches(unnamed), true, 'a running proxy the malformed entry may have meant stays up');
+		}
+
+		const applied = await apply({ generation: 'g5', proxies: [entry(named)] });
+		assert.equal(applied.appliedGeneration, 'g5');
+		assert.equal(await reaches(unnamed), false, 'removal resumes once every entry names its ports');
+	});
+
+	it('retries a skipped proxy when its cert appears, beside an entry that can never apply', async () => {
+		const skipped = await getFreePort();
+		const certDir = path.join(dir, 'watched-certs');
+		fs.mkdirSync(certDir);
+		const keyFile = path.join(certDir, 'key.pem');
+		const { status } = await boot('watched', {
+			generation: 'g1',
+			proxies: [null, entry(skipped, { listener: { defaultCert: { certChain: cert.cert, privateKeyFile: keyFile } } })],
+		});
+		assert.deepEqual(status().failedGeneration, { generation: 'g1', ports: [skipped] });
+
+		fs.writeFileSync(keyFile, cert.key);
+		await waitFor(() => status().failedGeneration.ports.length === 0, 8000);
+		assert.equal(await reaches(skipped), true);
+	});
+
+	it('still reports beside an unusable cert path and admin socket path', async () => {
+		const [healthy, skipped] = [await getFreePort(), await getFreePort()];
+		const { server, apply } = await boot('bad-paths', { generation: 'g1', proxies: [entry(healthy), entry(skipped)] });
+
+		const failed = await apply({
+			generation: 'g2',
+			admin: { socketPath: 17 },
+			proxies: [
+				entry(healthy),
+				entry(skipped, { listener: { defaultCert: { certChainFile: 17, privateKey: cert.key } } }),
+			],
+		});
+		assert.deepEqual(failed.failedGeneration, { generation: 'g2', ports: [skipped] });
+		assert.match(server.getStderr(), /admin endpoint update failed/);
+		assert.doesNotMatch(server.getStderr(), /reconcile failed/);
+	});
+
+	it('leaves status.json as it was without a generation, and clears both fields when one is dropped', async () => {
+		const port = await getFreePort();
+		const bareKeys = ['configPath', 'listeners', 'pid', 'ports', 'reloadedAt', 'startedAt', 'version'];
+		const { status, apply } = await boot('none', { proxies: [entry(port)] });
+		assert.deepEqual(Object.keys(status()).sort(), bareKeys);
+
+		assert.equal((await apply({ generation: 'g1', proxies: [entry(port)] })).appliedGeneration, 'g1');
+
+		const absent = path.join(dir, 'absent.pem');
+		const unreadable = { listener: { defaultCert: { certChain: cert.cert, privateKeyFile: absent } } };
+		const failed = await apply({ generation: 'g2', proxies: [entry(port), entry(await getFreePort(), unreadable)] });
+		assert.notEqual(failed.failedGeneration, undefined);
+
+		assert.deepEqual(Object.keys(await apply({ proxies: [entry(port)] })).sort(), bareKeys);
+	});
+
+	it('treats an unusable generation as none, and still applies the config', async () => {
+		const port = await getFreePort();
+		const { server, apply } = await boot('unusable', {
+			generation: 'g1',
+			proxies: [entry(port, { upstream: deadPort })],
+		});
+
+		let upstream = deadPort;
+		for (const generation of [7, null, { nested: true }]) {
+			upstream = upstream === deadPort ? echo.port : deadPort;
+			const status = await apply({ generation, proxies: [entry(port, { upstream })] });
+			assert.equal('appliedGeneration' in status, false, `generation ${JSON.stringify(generation)}`);
+			assert.equal('failedGeneration' in status, false, `generation ${JSON.stringify(generation)}`);
+			assert.equal(await reaches(port), upstream === echo.port, `generation ${JSON.stringify(generation)}`);
+		}
+		assert.match(server.getStderr(), /"generation" is not a string/);
+	});
+
+	it('reports an empty string like any other generation', async () => {
+		const port = await getFreePort();
+		const { status, apply } = await boot('empty-string', { generation: '', proxies: [entry(port)] });
+		assert.equal(status().appliedGeneration, '');
+		assert.equal((await apply({ generation: 'g2', proxies: [entry(port)] })).appliedGeneration, 'g2');
+		assert.equal((await apply({ generation: '', proxies: [entry(port)] })).appliedGeneration, '');
+	});
+
+	it('applies a generation with no proxies at all', async () => {
+		const port = await getFreePort();
+		const { apply } = await boot('empty', { generation: 'g1', proxies: [entry(port)] });
+		const applied = await apply({ generation: 'g2', proxies: [] });
+		assert.equal(applied.appliedGeneration, 'g2');
+		assert.deepEqual(applied.ports, []);
+	});
+
+	it('moves neither field when no config could be read', async () => {
+		const port = await getFreePort();
+		const absent = path.join(dir, 'absent.pem');
+		const unreadable = { listener: { defaultCert: { certChain: cert.cert, privateKeyFile: absent } } };
+		const { server, configPath, status, apply } = await boot('unread', { generation: 'g1', proxies: [entry(port)] });
+		await apply({ generation: 'g2', proxies: [entry(port), entry(await getFreePort(), unreadable)] });
+		const before = status();
+		assert.equal(before.appliedGeneration, 'g1');
+		assert.equal(before.failedGeneration.generation, 'g2');
+
+		fs.writeFileSync(configPath, '{"generation": "g3", ');
+		await waitFor(() => server.getStderr().includes('config is not valid JSON'));
+		assert.deepEqual(status(), before);
+
+		writeConfigAtomic(configPath, { generation: 'g3', proxies: 'none' });
+		await waitFor(() => server.getStderr().includes('config has no "proxies" array'));
+		assert.deepEqual(status(), before);
+	});
+
+	it('publishes a status write that failed, without another reconcile', async () => {
+		const port = await getFreePort();
+		const { server, statusPath, status, configPath } = await boot(
+			'write-failure',
+			{ generation: 'g1', proxies: [entry(port)] },
+			{ SYMPHONY_STATUS_POLL_MS: '50' }
+		);
+		const tmp = `${statusPath}.${server.child.pid}.tmp`;
+		fs.mkdirSync(tmp); // the writer's temp path, so its write fails and the previous document stays
+
+		writeConfigAtomic(configPath, { generation: 'g2', proxies: [entry(port)] });
+		await waitFor(() => server.getStderr().includes('could not write status'));
+		assert.equal(status().appliedGeneration, 'g1');
+
+		fs.rmdirSync(tmp);
+		await waitFor(() => status().appliedGeneration === 'g2');
+	});
+
+	it('publishes the generation it applied while yielded once it takes status.json back', async () => {
+		const port = await getFreePort();
+		const { server, configPath, statusPath, status } = await boot(
+			'yield',
+			{ generation: 'g1', proxies: [entry(port)] },
+			{ SYMPHONY_STATUS_POLL_MS: '50' }
+		);
+		const script = 'setInterval(() => {}, 1 << 30)';
+		const peer = spawn(process.execPath, ['-e', script, 'symphony-peer', '--config', configPath], { stdio: 'ignore' });
+		peers.push(peer);
+		writeConfigAtomic(statusPath, { pid: peer.pid, startedAt: new Date().toISOString() });
+
+		writeConfigAtomic(configPath, { generation: 'g2', proxies: [entry(port)] });
+		await waitFor(() => server.getStdout().includes(`status.json belongs to newer pid ${peer.pid}`));
+		await sleep(500); // past the debounce, so the reconcile of g2 has run while yielded
+		assert.equal(status().pid, peer.pid);
+		assert.equal(status().appliedGeneration, undefined);
+
+		peer.kill('SIGKILL');
+		await waitFor(() => status().pid === server.child.pid);
+		assert.equal(status().appliedGeneration, 'g2');
+	});
+
+	it('a generation acknowledged with a drain means new connections already go to the peer', async () => {
+		const hits = { local: 0, peer: 0 };
+		const upstream = (name: keyof typeof hits) => {
+			const server = net.createServer((socket) => {
+				hits[name]++;
+				socket.pipe(socket);
+			});
+			return new Promise<net.Server>((resolve) => server.listen(0, '127.0.0.1', () => resolve(server)));
+		};
+		const local = await upstream('local');
+		const remote = await upstream('peer');
+		const portOf = (server: net.Server) => (server.address() as net.AddressInfo).port;
+		const [publicPort, ingressPort] = [await getFreePort(), await getFreePort()];
+		const config = (generation: string, drain: boolean) => ({
+			generation,
+			proxies: [
+				{
+					listeners: [{ host: '127.0.0.1', port: publicPort }],
+					routes: [
+						{
+							sni: 'localhost',
+							upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: portOf(local) }],
+							terminateTls: true,
+							cert: { certChain: cert.cert, privateKey: cert.key },
+							failover: { peers: [{ host: '127.0.0.1', port: ingressPort }], drain },
+						},
+					],
+				},
+				entry(ingressPort, {
+					upstream: portOf(remote),
+					listener: { failoverIngress: { trustedSources: ['127.0.0.1/32'] } },
+				}),
+			],
+		});
+		const { apply } = await boot('drain', config('serving', false));
+		try {
+			assert.equal(await reaches(publicPort), true);
+			assert.deepEqual(hits, { local: 1, peer: 0 });
+
+			assert.equal((await apply(config('draining', true))).appliedGeneration, 'draining');
+			assert.equal(await reaches(publicPort), true);
+			assert.deepEqual(hits, { local: 1, peer: 1 });
+		} finally {
+			local.close();
+			remote.close();
+		}
+	});
+});

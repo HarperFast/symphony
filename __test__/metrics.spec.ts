@@ -558,6 +558,22 @@ describe('renderPrometheus', () => {
 		assert.ok(lines.includes(`symphony_config_reload_time_seconds ${Date.parse(snapshot.reloadedAt) / 1000}`));
 	});
 
+	it('carries config generations in labels, only when there are any', () => {
+		assert.ok(!lines.some((line) => line.includes('generation')));
+
+		const rendered = renderPrometheus({
+			...snapshot,
+			appliedGeneration: 'g"1',
+			failedGeneration: { generation: 'g\\2', ports: [80, 443] },
+		}).split('\n');
+		assert.ok(rendered.includes('symphony_config_applied_generation_info{generation="g\\"1"} 1'));
+		assert.ok(rendered.includes('symphony_config_failed_generation_info{generation="g\\\\2",ports="80,443"} 1'));
+
+		const appliedOnly = renderPrometheus({ ...snapshot, appliedGeneration: '' });
+		assert.ok(appliedOnly.includes('symphony_config_applied_generation_info{generation=""} 1'));
+		assert.ok(!appliedOnly.includes('symphony_config_failed_generation_info'));
+	});
+
 	it('escapes label values', () => {
 		const escaped = renderPrometheus({
 			...snapshot,
@@ -868,6 +884,95 @@ describe('symphony-server admin endpoint', () => {
 			(err: NodeJS.ErrnoException) => err.code === 'ECONNREFUSED',
 			'a dead endpoint must refuse connections, not hang or answer'
 		);
+	});
+});
+
+describe('symphony-server admin endpoint (config generation)', () => {
+	const cert = generateSelfSignedCert('localhost');
+	let dir: string;
+	let configPath: string;
+	let statusPath: string;
+	let adminPort: number;
+	let healthyPort: number;
+	let skippedPort: number;
+	let echo: Awaited<ReturnType<typeof startEchoServer>>;
+	let child: ChildProcess;
+
+	const proxyEntry = (port: number, keyFile?: string) => ({
+		listeners: [
+			{
+				host: '127.0.0.1',
+				port,
+				defaultCert: keyFile ? { certChain: cert.cert, privateKeyFile: keyFile } : undefined,
+			},
+		],
+		routes: [
+			{
+				sni: 'localhost',
+				upstreams: [{ kind: 'tcp', host: '127.0.0.1', port: echo.port }],
+				terminateTls: true,
+				cert: { certChain: cert.cert, privateKey: cert.key },
+			},
+		],
+	});
+	const writeConfig = (generation: string, keyFile?: string) => {
+		const tmp = `${configPath}.tmp`;
+		fs.writeFileSync(
+			tmp,
+			JSON.stringify({
+				generation,
+				admin: { port: adminPort, host: '127.0.0.1' },
+				proxies: [proxyEntry(healthyPort), proxyEntry(skippedPort, keyFile)],
+			})
+		);
+		fs.renameSync(tmp, configPath);
+	};
+	const snapshot = async () => JSON.parse((await get({ port: adminPort }, '/metrics.json')).body) as MetricsSnapshot;
+
+	before(async () => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'symphony-metrics-generation-'));
+		configPath = path.join(dir, 'config.json');
+		statusPath = path.join(dir, 'status.json');
+		echo = await startEchoServer();
+		adminPort = await getFreePort();
+		healthyPort = await getFreePort();
+		skippedPort = await getFreePort();
+		writeConfig('g1');
+		child = spawn(process.execPath, [SERVER_JS, '--config', configPath], { stdio: 'ignore' });
+		await waitFor(() => fs.existsSync(statusPath), 8000);
+	});
+
+	after(async () => {
+		child?.kill('SIGKILL');
+		await echo?.close().catch(() => {});
+		if (dir) fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it('serves the fields status.json has, as JSON and as Prometheus samples', async () => {
+		await waitFor(async () => (await snapshot().catch(() => null))?.appliedGeneration === 'g1', 8000);
+		assert.equal((await snapshot()).failedGeneration, undefined);
+		const applied = (await get({ port: adminPort }, '/metrics')).body;
+		assert.ok(applied.includes('symphony_config_applied_generation_info{generation="g1"} 1'));
+		assert.ok(!applied.includes('symphony_config_failed_generation_info'));
+
+		writeConfig('g2', path.join(dir, 'absent.pem'));
+		await waitFor(async () => (await snapshot()).failedGeneration !== undefined, 8000);
+		const failed = await snapshot();
+		assert.equal(failed.appliedGeneration, 'g1');
+		assert.deepEqual(failed.failedGeneration, { generation: 'g2', ports: [skippedPort] });
+		const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+		assert.equal(status.appliedGeneration, failed.appliedGeneration);
+		assert.deepEqual(status.failedGeneration, failed.failedGeneration);
+		const prometheus = (await get({ port: adminPort }, '/metrics')).body;
+		assert.ok(prometheus.includes('symphony_config_applied_generation_info{generation="g1"} 1'));
+		assert.ok(
+			prometheus.includes(`symphony_config_failed_generation_info{generation="g2",ports="${skippedPort}"} 1`)
+		);
+
+		writeConfig('g3');
+		await waitFor(async () => (await snapshot()).appliedGeneration === 'g3', 8000);
+		assert.equal((await snapshot()).failedGeneration, undefined);
+		assert.ok(!(await get({ port: adminPort }, '/metrics')).body.includes('symphony_config_failed_generation_info'));
 	});
 });
 
