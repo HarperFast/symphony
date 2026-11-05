@@ -58,6 +58,7 @@ TCP accept (SO_REUSEPORT per worker thread)
   └─ [suspended.rs  register, emit 'suspended', await oneshot]
   └─ tls.rs       TlsAcceptor::accept() with handshake timeout (if terminate_tls)
   └─ upstream.rs  connect(Destination, peer_ip) → UpstreamStream
+                  [passthrough failover route on a client listener: failure → forward_to_peers (Down)]
   └─ tokio::io::copy_bidirectional_with_sizes wrapped in idle_timeout
        (per-direction buffers from readBufferSize / client|upstreamReadBufferSize)
        (both halves wrapped in liveness::Watched, raced against the half-close bound)
@@ -199,6 +200,14 @@ hand over the TLS session), and it lets the peer terminate and verify client cer
   the socket untouched; drain skips cooling peers and caps its attempts at 2 s so the local
   handshake still has time. A locally-down route has nothing to fall back to and closes
   (`exhausted`), as before.
+- **A failed local connect forwards only where nothing has been read (symphony#79).** That is a
+  passthrough route on a client listener, not suspended. A TLS-terminating route connects after its
+  handshake has consumed the hello. The connect runs in `handle`, not `proxy_raw`, so the state it needs
+  is gone by the tunnel. It is capped at half of `hs_timeout` because `upstream_connect_timeout` is at
+  least the handshake timeout at startup (`proxy.rs`), so uncapped it leaves peers nothing, and only this
+  branch is capped. `upstream_connect` is counted before the forward because a tunnel can outlast many
+  scrapes, and an exhausted forward's `UpstreamConnect` is not counted again. After a drain or spill
+  fallback it still tries `Down`, since spill tried one peer and drain skipped the cooling ones.
 
 ### Spill-over (`failover.spill`)
 symphony#73. A failover route moves a share of new client connections to the least-loaded peer
@@ -393,7 +402,7 @@ instead.
 - **`suspended.spec.ts`** — hold → resolve → proxy, hold → null → close, hold → timeout → drop
 - **`mtls.spec.ts`** — mTLS termination + PROXY v2 TLV forwarding of the client cert chain (0xE2, SSL TLV 0x20); skips without openssl
 - **`metrics.spec.ts`** — per-listener breakdown and byte counting, `renderPrometheus` output shape, the admin endpoint over UDS + TCP, and stale-socket reclaim after a `SIGKILL`
-- **`failover.spec.ts`** — peer failover across two or three proxies in one process (UDS upstreams that record the PROXY v1 source); the client binds 127.0.0.2 so the forwarded client address differs from the forwarding node's (macOS has it only through an `lo0` alias, which CI adds; without one the suite skips). A route learns it is down only by losing one connection (`markDown`), as in production. The unreachable-TCP-upstream case (Linux only) points a passthrough route at `255.255.255.255`, which Linux fails with `ENETUNREACH` at once. Spill-over tests (Linux) serve the upstream from a child process whose busy main thread is the slot's `pid`/`tid`, so the load is real thread CPU; the PID-namespace case runs that child under `bwrap --unshare-pid` (CI installs bubblewrap) and skips without it
+- **`failover.spec.ts`** — peer failover across two or three proxies in one process (UDS upstreams that record the PROXY v1 source); the client binds 127.0.0.2 so the forwarded client address differs from the forwarding node's (macOS has it only through an `lo0` alias, which CI adds; without one the suite skips). A TLS-terminating route learns it is down only by losing one connection (`markDown`), as in production; a passthrough route forwards that connection instead. The hanging-connect cases (Linux) use a TCP port whose accept queue is full (`startHangingUpstream`). The unreachable-TCP-upstream case (Linux only) points a passthrough route at `255.255.255.255`, which Linux fails with `ENETUNREACH` at once. Spill-over tests (Linux) serve the upstream from a child process whose busy main thread is the slot's `pid`/`tid`, so the load is real thread CPU; the PID-namespace case runs that child under `bwrap --unshare-pid` (CI installs bubblewrap) and skips without it
 - **`liveness.spec.ts`** — the half-close bound over a real passthrough proxy. Its client uses `allowHalfOpen: true` (otherwise Node answers the proxy's FIN with its own and there is no half-close to bound) and a synthetic `clientHello()` from `util.ts` (otherwise `peek()` blocks for its 5s reassembly timeout and a no-SNI connection resolves to no route)
 
 The Rust toolchain is pinned to `1.94.1` in `rust-toolchain.toml`. Ensure rustup's
