@@ -474,8 +474,10 @@ routes: [{
 `allowedSources` and the route rate limit, and before the TLS handshake: if the route has `failover`,
 is not suspended, and either `drain` is set or every slot of its local upstream (or of its h2
 upstream) is refusing connections. A slot is marked refusing when a connect to it is refused, finds
-no socket file, finds its accept queue full, or times out. A background probe connects to each refusing slot every
-`probeIntervalMs` and closes at once; a successful connect clears the slot. A `routeHealth` event
+no socket file, finds its accept queue full, times out, or finds its host or network unreachable or
+down (`EHOSTUNREACH`, `ENETUNREACH`, `ENETDOWN`, `EHOSTDOWN`; a TCP connect to a stopped container's
+bridge address fails this way after a few seconds of unanswered ARP). A background probe connects
+to each refusing slot every `probeIntervalMs` and closes at once; a successful connect clears the slot. A `routeHealth` event
 (`{ route, metricsGroup, status: 'up' | 'down' }`) reports each transition. A connect proves the
 socket accepts, not that the application behind it is ready.
 

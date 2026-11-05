@@ -55,8 +55,13 @@ fn connect_timed_out() -> std::io::Error {
 }
 
 /// The failures that say "nothing is accepting here": a stopped listener, a socket file that is
-/// gone, a listener that cannot take the connection in time — or, for a Unix socket, a full accept
-/// queue, which a non-blocking connect reports at once as `WouldBlock` instead of waiting.
+/// gone, a listener that cannot take the connection in time, an unreachable or down host or
+/// network — or, for a Unix socket, a full accept queue, which a non-blocking connect reports at
+/// once as `WouldBlock` instead of waiting.
+///
+/// Unreachable counts because a stopped container's bridge address never refuses; the connect
+/// fails only once ARP gives up. macOS and BSD report that as `EHOSTDOWN`, which std leaves
+/// uncategorized.
 pub fn is_refusal(e: &std::io::Error) -> bool {
 	matches!(
 		e.kind(),
@@ -64,7 +69,10 @@ pub fn is_refusal(e: &std::io::Error) -> bool {
 			| std::io::ErrorKind::NotFound
 			| std::io::ErrorKind::TimedOut
 			| std::io::ErrorKind::WouldBlock
-	)
+			| std::io::ErrorKind::HostUnreachable
+			| std::io::ErrorKind::NetworkUnreachable
+			| std::io::ErrorKind::NetworkDown
+	) || e.raw_os_error() == Some(libc::EHOSTDOWN)
 }
 
 /// Connect to the picked slot; on a refusal try each remaining slot once, best score first, all
@@ -403,6 +411,39 @@ mod tests {
 			.is_ok());
 		assert!(!health.refusing());
 		drop(listener);
+	}
+
+	#[test]
+	fn an_unreachable_host_or_network_is_a_refusal() {
+		for errno in [
+			libc::EHOSTUNREACH,
+			libc::ENETUNREACH,
+			libc::ENETDOWN,
+			libc::EHOSTDOWN,
+		] {
+			assert!(
+				is_refusal(&std::io::Error::from_raw_os_error(errno)),
+				"errno {errno}"
+			);
+		}
+		assert!(!is_refusal(&std::io::Error::from_raw_os_error(
+			libc::ECONNRESET
+		)));
+	}
+
+	/// Linux fails a TCP connect to the broadcast address with `ENETUNREACH` at once.
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn an_unreachable_tcp_destination_marks_its_health() {
+		let dest = Destination::Tcp("255.255.255.255:9".parse().unwrap());
+		let health = SlotHealth::default();
+		let err = match connect(&dest, None, Duration::from_secs(1), Some(&health)).await {
+			Err(crate::error::SymphonyError::Io(e)) => e,
+			Err(e) => panic!("expected an io error, got {e}"),
+			Ok(_) => panic!("connected to the broadcast address"),
+		};
+		assert_eq!(err.kind(), std::io::ErrorKind::NetworkUnreachable);
+		assert!(health.refusing());
 	}
 
 	// A JA3-shaped value (32 hex chars) for TLV assertions.
