@@ -156,8 +156,19 @@ jobs:
       - name: Move artifacts into npm/ packages
         run: npx napi artifacts --dir artifacts --dist npm
 
+      # A run step's PATH lacks node_modules/.bin, so a bare `tsc` uses whatever the runner image ships; it
+      # stopped shipping one, and the masked failure published 1.7.0 without dist/.
       - name: Compile TypeScript
-        run: tsc -p tsconfig.json || true
+        run: npx tsc -p tsconfig.json
+
+      - name: Check every bin file exists
+        run: |
+          node -e "
+            const fs = require('fs');
+            const { bin = {} } = JSON.parse(fs.readFileSync('./package.json', 'utf8'));
+            const missing = Object.values(bin).filter((file) => !fs.existsSync(file));
+            if (missing.length) throw new Error('missing bin files: ' + missing.join(', '));
+          "
 
       - name: Set optionalDependencies in package.json
         run: |
