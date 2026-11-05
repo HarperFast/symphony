@@ -278,9 +278,14 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 		}
 	}
 	// A suspended route's destination is whatever `resolveConnection()` returns, not the one this
-	// health describes.
-	let local_failover = route.failover.as_deref().filter(|_| !route.suspended);
-	let tcp_health = local_failover.and_then(|f| f.tcp_health.as_deref());
+	// health describes. An ingress connection tracks health but never goes on to a peer.
+	let (tcp_health, peers) = match route.failover.as_deref().filter(|_| !route.suspended) {
+		Some(failover) => (
+			failover.tcp_health.as_deref(),
+			ctx.ingress.is_none().then_some(failover),
+		),
+		None => (None, None),
+	};
 
 	// ── 4. Suspended route handling ───────────────────────────────────────────
 	let effective_route: EffectiveRoute = if route.suspended {
@@ -424,9 +429,7 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 		// Passthrough — proxy raw TCP. The client has only been peeked, so a peer can still take it
 		// if the local connect fails. The connect timeout is at least the handshake timeout unless a
 		// reload raised that, so a connect left to run it out would leave the peers no time.
-		let peers = local_failover
-			.filter(|_| ctx.ingress.is_none())
-			.map(move |failover| (failover, Instant::now() + hs_timeout));
+		let peers = peers.map(move |failover| (failover, Instant::now() + hs_timeout));
 		let connect_timeout = match peers {
 			Some(_) => ctx.upstream_connect_timeout.min(hs_timeout / 2),
 			None => ctx.upstream_connect_timeout,

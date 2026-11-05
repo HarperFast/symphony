@@ -116,7 +116,6 @@ const noPidNamespace =
 		? 'thread CPU is read from Linux /proc'
 		: spawnSync(BWRAP[0], [...BWRAP.slice(1), 'true']).status !== 0 && 'bwrap cannot create a PID namespace here';
 
-/** Listens with a one-entry backlog, then blocks its event loop so it never accepts. */
 const NON_ACCEPTING_LISTENER = `
 const fs = require('node:fs');
 require('node:net').createServer().listen({ port: 0, host: '127.0.0.1', backlog: 1 }, function () {
@@ -260,6 +259,7 @@ async function startFakePeer(t: TestContext, mode: 'answering' | 'legacy' | 'sil
 			if (buffered.length < 16) return;
 			if (buffered[12] !== 0x20) {
 				seen.forwarded++;
+				socket.removeAllListeners('data');
 				if (mode === 'commits') socket.end('x');
 				else if (mode !== 'silent') socket.destroy();
 				return;
