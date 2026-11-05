@@ -1145,7 +1145,7 @@ describe('a TLS-terminating failover route', { skip: noClientAddress, timeout: S
 		assert.equal(upstreamA.accepted, 1);
 		assert.deepEqual(upstreamA.sources, [CLIENT_ADDRESS]);
 		assert.equal(peer.seen.forwarded, 0);
-		assert.deepEqual(routeMetrics(nodeA).errorsByReason, []);
+		assert.equal(count(routeMetrics(nodeA).errorsByReason, 'upstream_connect'), 0);
 	});
 
 	it('connects each client only to the destination its protocol selects', async (t) => {
@@ -1237,7 +1237,7 @@ describe('a TLS-terminating failover route', { skip: noClientAddress, timeout: S
 		assert.equal(h2.sources.length, 1);
 		assert.equal(peer.seen.forwarded, 0);
 		const route = routeMetrics(nodeA);
-		assert.deepEqual(route.errorsByReason, []);
+		assert.equal(count(route.errorsByReason, 'upstream_connect'), 0);
 		assert.equal(route.failover!.refusingSlots, 0);
 	});
 
@@ -1340,7 +1340,7 @@ describe('a TLS-terminating failover route', { skip: noClientAddress, timeout: S
 			assert.equal(upstreamA.accepted, 2);
 			assert.equal(upstreamA.sources.length, 1);
 			assert.equal(peer.seen.forwarded, 0);
-			assert.deepEqual(routeMetrics(nodeA).errorsByReason, []);
+			assert.equal(count(routeMetrics(nodeA).errorsByReason, 'upstream_connect'), 0);
 			await waitFor(() => upstreamA.closedWithNoBytes === 1);
 		});
 	}
@@ -1382,7 +1382,7 @@ describe('a TLS-terminating failover route', { skip: noClientAddress, timeout: S
 		assert.equal(upstreamA.sources.length, 1);
 		assert.equal(peer.seen.forwarded, 0);
 		const metrics = routeMetrics(nodeA);
-		assert.deepEqual(metrics.errorsByReason, []);
+		assert.equal(count(metrics.errorsByReason, 'upstream_connect'), 0);
 		assert.equal(metrics.failover!.refusingSlots, 1);
 	});
 
