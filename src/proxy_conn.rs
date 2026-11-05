@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 use tokio_rustls::TlsAcceptor;
 
 /// Default per-direction copy buffer. Matches what `tokio::io::copy_bidirectional` uses
@@ -254,6 +254,7 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 					&peek_info,
 					failover,
 					mode,
+					hs_timeout,
 					peer_addr,
 					local_addr,
 					&ctx,
@@ -278,11 +279,8 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 	}
 	// A suspended route's destination is whatever `resolveConnection()` returns, not the one this
 	// health describes.
-	let tcp_health = route
-		.failover
-		.as_ref()
-		.filter(|_| !route.suspended)
-		.and_then(|f| f.tcp_health.as_deref());
+	let local_failover = route.failover.as_deref().filter(|_| !route.suspended);
+	let tcp_health = local_failover.and_then(|f| f.tcp_health.as_deref());
 
 	// ── 4. Suspended route handling ───────────────────────────────────────────
 	let effective_route: EffectiveRoute = if route.suspended {
@@ -423,16 +421,58 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 			return;
 		}
 	} else {
-		// Passthrough — proxy raw TCP
-		proxy_raw(
-			stream,
+		// Passthrough — proxy raw TCP. The client has only been peeked, so a peer can still take it
+		// if the local connect fails. The connect timeout is at least the handshake timeout unless a
+		// reload raised that, so a connect left to run it out would leave the peers no time.
+		let peers = local_failover
+			.filter(|_| ctx.ingress.is_none())
+			.map(move |failover| (failover, Instant::now() + hs_timeout));
+		let connect_timeout = match peers {
+			Some(_) => ctx.upstream_connect_timeout.min(hs_timeout / 2),
+			None => ctx.upstream_connect_timeout,
+		};
+		let Ok(mut upstream) = upstream::connect(
 			&effective_route.destination,
+			Some(peer_ip),
+			connect_timeout,
 			tcp_health,
-			sf,
-			&ctx,
-			&route.metric_identity,
 		)
 		.await
+		.map_err(|e| tracing::debug!("upstream connect failed for {peer_ip}: {e}")) else {
+			// Counted now: a forwarded tunnel can outlast many scrapes.
+			inc_route_error(
+				&ctx.listener_metrics,
+				&route.metric_identity.counters,
+				ErrorKind::UpstreamConnect,
+			);
+			let Some((failover, deadline)) = peers else {
+				return;
+			};
+			// Boxed: its state would otherwise sit in every connection's future.
+			let forwarded = Box::pin(crate::failover::forward_to_peers(
+				&mut stream,
+				&peek_info,
+				failover,
+				crate::failover::ForwardMode::Down,
+				deadline.saturating_duration_since(Instant::now()),
+				peer_addr,
+				local_addr,
+				&ctx,
+				&route.metric_identity,
+			))
+			.await;
+			match forwarded {
+				// An exhausted forward is the failure just counted, not a second one.
+				crate::failover::Forwarded::Done(Err(ErrorKind::UpstreamConnect))
+				| crate::failover::Forwarded::Done(Ok(()))
+				| crate::failover::Forwarded::ServeLocally(_) => {}
+				crate::failover::Forwarded::Done(Err(kind)) => {
+					inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, kind)
+				}
+			}
+			return;
+		};
+		proxy_raw(stream, &mut upstream, sf, &ctx, &route.metric_identity).await
 	};
 
 	if let Err(kind) = upstream_result {
@@ -508,30 +548,17 @@ async fn proxy_via_tls(
 
 async fn proxy_raw(
 	client: TcpStream,
-	dest: &Destination,
-	tcp_health: Option<&SlotHealth>,
+	upstream: &mut UpstreamStream,
 	sf: SourceForwarding<'_>,
 	ctx: &ConnContext,
 	route_metrics: &RouteMetricIdentity,
 ) -> std::result::Result<(), ErrorKind> {
-	let mut upstream = upstream::connect(
-		dest,
-		Some(sf.peer_addr.ip()),
-		ctx.upstream_connect_timeout,
-		tcp_health,
-	)
-	.await
-	.map_err(|e| {
-		tracing::debug!("upstream connect failed for {}: {e}", sf.peer_addr.ip());
-		ErrorKind::UpstreamConnect
-	})?;
-
 	let mut client =
 		CountingStream::new(client, &ctx.listener_metrics, Some(&route_metrics.counters));
 
 	// Passthrough forwards raw TLS bytes — never a plaintext HTTP/1 stream, so header injection
 	// is disabled (only PROXY protocol carriers apply here).
-	match &mut upstream {
+	match upstream {
 		UpstreamStream::Tcp(ref mut up) => forward(&mut client, up, &sf, false, ctx).await,
 		UpstreamStream::Uds { ref mut stream, .. } => {
 			forward(&mut client, stream, &sf, false, ctx).await

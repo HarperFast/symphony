@@ -373,7 +373,7 @@ impl SpillState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForwardMode {
 	/// The local upstream is down: try every peer (the earliest-cooling one if all are cooling),
-	/// within the whole handshake budget; nothing to fall back to.
+	/// within all that is left of the handshake timeout; nothing to fall back to.
 	Down,
 	/// Draining while the local upstream is up: try the ready peers, fall back to local service.
 	Drain,
@@ -592,19 +592,21 @@ pub enum Forwarded {
 /// anything is read from the client — so a peer that closes without answering received nothing a
 /// retry could duplicate, and until a peer answers, the connection can still be served locally.
 /// The first byte commits the attempt: whatever the peer does next, it is never undone.
+///
+/// `handshake` is what is left of the connection's handshake timeout.
 #[allow(clippy::too_many_arguments)]
 pub async fn forward_to_peers(
 	client: &mut TcpStream,
 	peek: &PeekInfo,
 	failover: &Failover,
 	mode: ForwardMode,
+	handshake: Duration,
 	peer_addr: SocketAddr,
 	local_addr: Option<SocketAddr>,
 	ctx: &ConnContext,
 	route: &RouteMetricIdentity,
 ) -> Forwarded {
 	let started = Instant::now();
-	let handshake = ctx.handshake_timeout();
 	let give_up = |status: &FailoverStatus| match mode {
 		ForwardMode::Down => {
 			status.exhausted.fetch_add(1, Ordering::Relaxed);

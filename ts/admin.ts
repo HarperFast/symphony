@@ -250,10 +250,13 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 				);
 			}
 			for (const { reason, count } of l.errorsByReason) {
-				out.sample('symphony_listener_errors_total', 'counter', 'Connections that failed, by reason.', count, {
-					...tags,
-					reason,
-				});
+				out.sample(
+					'symphony_listener_errors_total',
+					'counter',
+					'Connection failures by reason. upstream_connect includes local connects a failover peer then served.',
+					count,
+					{ ...tags, reason }
+				);
 			}
 			out.sample(
 				'symphony_listener_load_queries_total',
@@ -305,10 +308,13 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 				);
 			}
 			for (const { reason, count } of route.errorsByReason) {
-				out.sample('symphony_route_errors_total', 'counter', 'Post-route connection failures by reason.', count, {
-					...tags,
-					reason,
-				});
+				out.sample(
+					'symphony_route_errors_total',
+					'counter',
+					'Post-route connection failures by reason. upstream_connect includes local connects a failover peer then served.',
+					count,
+					{ ...tags, reason }
+				);
 			}
 			const failover = route.failover;
 			if (failover) {
