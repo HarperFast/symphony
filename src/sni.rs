@@ -40,6 +40,7 @@ pub struct PeekInfo {
 	/// the ClientHello; 0 unless `complete`. Reading exactly this many bytes consumes the hello and
 	/// leaves any later record (early data included) unread.
 	pub hello_len: usize,
+	pub offers_h2: bool,
 }
 
 /// Result of scanning as many buffered TLS records as are available for a ClientHello.
@@ -188,6 +189,7 @@ fn parse_client_hello(buf: &[u8]) -> PeekInfo {
 	let sni = extract_sni(hello.extensions);
 	let ja3 = compute_ja3(hello.legacy_version, hello.cipher_suites, hello.extensions);
 	let ja4 = compute_ja4(hello.legacy_version, hello.cipher_suites, hello.extensions);
+	let offers_h2 = alpn_offers_h2(hello.extensions);
 	// `complete` is set by the caller (`peek`) from the reassembly result — a direct parse
 	// here makes no claim about whether the buffer held the whole hello.
 	PeekInfo {
@@ -196,6 +198,7 @@ fn parse_client_hello(buf: &[u8]) -> PeekInfo {
 		ja4,
 		complete: false,
 		hello_len: 0,
+		offers_h2,
 	}
 }
 
@@ -323,6 +326,38 @@ impl<'a> Parser<'a> {
 			extensions,
 		})
 	}
+}
+
+// ── ALPN offer ────────────────────────────────────────────────────────────────
+
+fn alpn_offers_h2(extensions: &[u8]) -> bool {
+	let mut p = Parser::new(extensions);
+	while let (Some(ext_type), Some(ext_len)) = (p.read_u16(), p.read_u16()) {
+		let Some(ext_data) = p.read_bytes(ext_len as usize) else {
+			return false;
+		};
+		if ext_type != 0x0010 {
+			continue;
+		}
+		// protocol_name_list_len(2) + [proto_len(1) + proto]*
+		let mut data = Parser::new(ext_data);
+		let Some(list) = data
+			.read_u16()
+			.and_then(|list_len| data.read_bytes(list_len as usize))
+		else {
+			return false;
+		};
+		let mut protocols = Parser::new(list);
+		while let Some(len) = protocols.read_u8() {
+			match protocols.read_bytes(len as usize) {
+				Some(b"h2") => return true,
+				Some(_) => {}
+				None => return false,
+			}
+		}
+		return false;
+	}
+	false
 }
 
 // ── SNI extraction ────────────────────────────────────────────────────────────
@@ -917,6 +952,50 @@ mod tests {
 			"extension count should be 04 (incl SNI+ALPN): {}",
 			info.ja4
 		);
+	}
+
+	#[test]
+	fn the_alpn_offer_is_read_wherever_h2_sits() {
+		let offers = |protos: &[&[u8]]| {
+			parse_client_hello(&make_client_hello(
+				0x0303,
+				&[0x1301],
+				&[make_alpn_ext(protos)],
+			))
+			.offers_h2
+		};
+		assert!(offers(&[b"h2"]));
+		assert!(offers(&[b"h2", b"http/1.1"]));
+		assert!(offers(&[b"http/1.1", b"h2"]));
+		assert!(!offers(&[b"http/1.1"]));
+		assert!(!offers(&[b"h2c"]));
+		assert!(!offers(&[]));
+		assert!(!parse_client_hello(&make_client_hello(0x0303, &[0x1301], &[])).offers_h2);
+	}
+
+	#[test]
+	fn a_malformed_alpn_offer_is_no_offer() {
+		let offers = |data: &[u8]| {
+			parse_client_hello(&make_client_hello(
+				0x0303,
+				&[0x1301],
+				&[make_extension(0x0010, data)],
+			))
+			.offers_h2
+		};
+		assert!(!offers(&[]), "no list length");
+		assert!(!offers(&[0x00]), "half a list length");
+		assert!(!offers(&[0x00, 0x03, 0x09, b'h', b'2']), "entry overruns");
+		assert!(!offers(&[0x00, 0x09, 0x02, b'h', b'2']), "list overruns");
+		assert!(
+			!offers(&[0x00, 0x03, 0x02, b'h', b'3', 0x02, b'h', b'2']),
+			"h2 only past the declared list"
+		);
+		assert!(
+			offers(&[0x00, 0x04, 0x00, 0x02, b'h', b'2']),
+			"an empty name is skipped; rustls rejects the hello itself"
+		);
+		assert!(!alpn_offers_h2(&[0x00, 0x10, 0x00, 0x09, 0x00, 0x03]));
 	}
 
 	#[test]

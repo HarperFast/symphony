@@ -56,9 +56,11 @@ TCP accept (SO_REUSEPORT per worker thread)
   └─ [failover.rs decide(): down / draining / spill admitted → forward_to_peers (raw TLS;
                   drain + spill fall back here if no peer answers) | ingress: close]
   └─ [suspended.rs  register, emit 'suspended', await oneshot]
+  └─ [failover route on a client listener, complete hello: upstream.rs connect() now;
+                  failure → forward_to_peers (Down)]
   └─ tls.rs       TlsAcceptor::accept() with handshake timeout (if terminate_tls)
-  └─ upstream.rs  connect(Destination, peer_ip) → UpstreamStream
-                  [passthrough failover route on a client listener: failure → forward_to_peers (Down)]
+  └─ upstream.rs  connect(Destination, peer_ip) → UpstreamStream, unless already connected
+                  to the destination the negotiated ALPN selects
   └─ tokio::io::copy_bidirectional_with_sizes wrapped in idle_timeout
        (per-direction buffers from readBufferSize / client|upstreamReadBufferSize)
        (both halves wrapped in liveness::Watched, raced against the half-close bound)
@@ -219,14 +221,35 @@ hand over the TLS session), and it lets the peer terminate and verify client cer
   the socket untouched; drain skips cooling peers and caps its attempts at 2 s so the local
   handshake still has time. A locally-down route has nothing to fall back to and closes
   (`exhausted`), as before.
-- **A failed local connect forwards only where nothing has been read (symphony#79).** That is a
-  passthrough route on a client listener, not suspended. A TLS-terminating route connects after its
-  handshake has consumed the hello. The connect runs in `handle`, not `proxy_raw`, so the state it needs
-  is gone by the tunnel. It is capped at half of `hs_timeout` because `upstream_connect_timeout` is at
-  least the handshake timeout at startup (`proxy.rs`), so uncapped it leaves peers nothing, and only this
-  branch is capped. `upstream_connect` is counted before the forward because a tunnel can outlast many
-  scrapes, and an exhausted forward's `UpstreamConnect` is not counted again. After a drain or spill
-  fallback it still tries `Down`, since spill tried one peer and drain skipped the cooling ones.
+- **A failed local connect forwards only where nothing has been read (symphony#79, #83).**
+  `connect_or_forward` runs while the hello is unread, for any failover route on a client listener, not
+  suspended. It runs in `handle`, not `proxy_raw`, so the state it needs is gone by the tunnel. It is
+  capped at half of `hs_timeout` because `upstream_connect_timeout` is at least the handshake timeout at
+  startup (`proxy.rs`), so uncapped it leaves peers nothing, and only this connect is capped.
+  `upstream_connect` is counted before the forward because a tunnel can outlast many scrapes, and an
+  exhausted forward's `UpstreamConnect` is not counted again. After a drain or spill fallback it still
+  tries `Down`, since spill tried one peer and drain skipped the cooling ones.
+- **A TLS-terminating route holds that connection across its handshake (symphony#83).** Six things
+  keep it correct:
+  - **Only a complete hello connects early.** `forward_to_peers` refuses an incomplete one, so an early
+    connect there could only lose a connection the handshake-first path would serve.
+  - **A route requiring a client certificate never connects early** (`Route::requires_client_cert`). A
+    client with no certificate could otherwise hold upstream sockets before it authenticates, where
+    today it cannot reach the upstream at all. Such a route loses the connection that finds its upstream
+    dead.
+  - **The negotiated ALPN decides the destination; `predicts_h2` only chooses what to connect early.**
+    rustls takes the first server protocol the client offered, and reads the offer from the hello after
+    a retry, while only the first hello is peeked. A client changing its offer across a retry lands on
+    the mismatch branch, which no stock client reaches, so no test does.
+  - **Nothing is written upstream until the handshake completes.** The PROXY header carries TLS facts
+    and is written in `forward`, so a failed handshake is a close with zero bytes.
+  - **`UpstreamStream::closed` replaces a connection that died during the handshake.** Harper destroys a
+    socket that sends nothing for 10 s (`withProxyProtocol`, `enableProxyProtocol`), so with a longer
+    `tlsHandshakeTimeoutMs` a slow client would otherwise always land on a closed upstream. It reads the
+    reactor's read-closed readiness, not the socket: a peek cannot see a close behind unread data, and
+    readiness costs no syscall. A half-close counts too; its replacement behaves as a fresh connect would.
+  - **The one `Option<UpstreamStream>` in `handle` is what both paths use**, and `proxy_via_tls` borrows
+    it like `proxy_raw`, so the future stores it once.
 
 ### Spill-over (`failover.spill`)
 symphony#73. A failover route moves a share of new client connections to the least-loaded peer
@@ -414,14 +437,14 @@ without `Buffer`, like `JsProtectionConfig`, already have `#[test]` coverage) wi
 `#[test]`s, and exercise the `Buffer`-holding structs through the JS integration suite below
 instead.
 
-- **`util.ts`** — self-signed cert generation via `openssl` (or a fallback baked-in cert if openssl is unavailable), free-port helper, echo servers, TLS/TCP round-trip helpers
+- **`util.ts`** — self-signed cert generation via `openssl` (or a fallback baked-in cert if openssl is unavailable), free-port helper, echo servers, TLS/TCP round-trip helpers, a relay that slows a TLS handshake
 - **`proxy.spec.ts`** — TLS termination, wildcard SNI routing, `updateConfig` hot-swap, all-or-nothing `start()`, the default route
 - **`protection.spec.ts`** — rate limit token bucket exhaustion, CIDR blocklist in `blockedIps()`, IPv4 clients of a `[::]` listener (skips where `net.ipv6.bindv6only=1`)
 - **`server.spec.ts`** — the `symphony-server` bin as real processes: reloads, cert-file watching, `status.json` ownership, and an older process standing down (short `SYMPHONY_STATUS_POLL_MS` / `SYMPHONY_SUPERSEDE_GRACE_MS`, test-only env overrides)
 - **`suspended.spec.ts`** — hold → resolve → proxy, hold → null → close, hold → timeout → drop
 - **`mtls.spec.ts`** — mTLS termination + PROXY v2 TLV forwarding of the client cert chain (0xE2, SSL TLV 0x20); skips without openssl
 - **`metrics.spec.ts`** — per-listener breakdown and byte counting, `renderPrometheus` output shape, the admin endpoint over UDS + TCP, and stale-socket reclaim after a `SIGKILL`
-- **`failover.spec.ts`** — peer failover across two or three proxies in one process (UDS upstreams that record the PROXY v1 source); the client binds 127.0.0.2 so the forwarded client address differs from the forwarding node's (macOS has it only through an `lo0` alias, which CI adds; without one the suite skips). A TLS-terminating route learns it is down only by losing one connection (`markDown`), as in production; a passthrough route forwards that connection instead. Upstreams that accept before they serve use `startClosingUpstream` and `startDockerProxy`, which closes with the client's bytes unread, as docker-proxy does. The hanging-connect cases (Linux) use a TCP port whose accept queue is full (`startHangingUpstream`). The unreachable-TCP-upstream case (Linux only) points a passthrough route at `255.255.255.255`, which Linux fails with `ENETUNREACH` at once. Spill-over tests (Linux) serve the upstream from a child process whose busy main thread is the slot's `pid`/`tid`, so the load is real thread CPU; the PID-namespace case runs that child under `bwrap --unshare-pid` (CI installs bubblewrap) and skips without it
+- **`failover.spec.ts`** — peer failover across two or three proxies in one process (UDS upstreams that record the PROXY v1 source and count what they accept); the client binds 127.0.0.2 so the forwarded client address differs from the forwarding node's (macOS has it only through an `lo0` alias, which CI adds; without one the suite skips). `markDown` drives a route down through its ingress listener, where a TLS-terminating route still connects after the handshake and never forwards, so no peer's counters move. The first-connection cases run for both passthrough and TLS-terminating routes. Upstreams that accept before they serve use `startClosingUpstream` and `startDockerProxy`, which closes with the client's bytes unread, as docker-proxy does. The hanging-connect cases (Linux) use a TCP port whose accept queue is full (`startHangingUpstream`). The unreachable-TCP-upstream case (Linux only) points a passthrough route at `255.255.255.255`, which Linux fails with `ENETUNREACH` at once. Spill-over tests (Linux) serve the upstream from a child process whose busy main thread is the slot's `pid`/`tid`, so the load is real thread CPU; the PID-namespace case runs that child under `bwrap --unshare-pid` (CI installs bubblewrap) and skips without it
 - **`liveness.spec.ts`** — the half-close bound over a real passthrough proxy. Its client uses `allowHalfOpen: true` (otherwise Node answers the proxy's FIN with its own and there is no half-close to bound) and a synthetic `clientHello()` from `util.ts` (otherwise `peek()` blocks for its 5s reassembly timeout and a no-SNI connection resolves to no route)
 
 The Rust toolchain is pinned to `1.94.1` in `rust-toolchain.toml`. Ensure rustup's

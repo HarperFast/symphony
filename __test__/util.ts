@@ -566,3 +566,44 @@ function u16(n: number): Buffer {
 function u24(n: number): Buffer {
 	return Buffer.from([(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff]);
 }
+
+/**
+ * Relays to `host:port`, holding everything after the client's first chunk, its ClientHello, for
+ * `delayMs`, so a TLS handshake through it takes that long.
+ */
+export async function startSlowRelay(
+	host: string,
+	port: number,
+	delayMs: number
+): Promise<{ port: number; close(): Promise<void> }> {
+	const sockets = new Set<net.Socket>();
+	const server = net.createServer((client) => {
+		const upstream = net.connect({ host, port });
+		for (const [socket, other] of [
+			[client, upstream],
+			[upstream, client],
+		]) {
+			sockets.add(socket);
+			socket.on('error', () => {});
+			socket.on('close', () => {
+				sockets.delete(socket);
+				other.destroy();
+			});
+		}
+		upstream.pipe(client);
+		let first = true;
+		client.on('data', (chunk: Buffer) => {
+			if (first) upstream.write(chunk);
+			else setTimeout(() => upstream.write(chunk), delayMs).unref();
+			first = false;
+		});
+	});
+	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+	return {
+		port: (server.address() as net.AddressInfo).port,
+		close: () => {
+			for (const socket of sockets) socket.destroy();
+			return new Promise<void>((resolve) => server.close(() => resolve()));
+		},
+	};
+}

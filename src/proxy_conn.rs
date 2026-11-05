@@ -1,4 +1,5 @@
 use crate::balancer::SlotHealth;
+use crate::failover::Failover;
 use crate::ingress::IngressState;
 use crate::liveness::{HalfCloseWatch, KeepaliveConfig, Watched};
 use crate::metrics::{
@@ -10,7 +11,7 @@ use crate::router::{
 	Destination, ForwardFingerprint, LiveRouteTable, RouteMetricIdentity, RouteProtocol,
 	SourceAddressMode,
 };
-use crate::sni;
+use crate::sni::{self, PeekInfo};
 use crate::suspended::SuspendedRegistry;
 use crate::upstream::{self, UpstreamStream};
 use napi::threadsafe_function::ThreadsafeFunction;
@@ -288,7 +289,7 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 	};
 
 	// ── 4. Suspended route handling ───────────────────────────────────────────
-	let effective_route: EffectiveRoute = if route.suspended {
+	let mut effective_route: EffectiveRoute = if route.suspended {
 		ctx.global_metrics.inc_suspended();
 		let (id, rx) = ctx.suspended_registry.register();
 
@@ -366,8 +367,37 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 		peer_addr,
 		local_addr,
 	};
+	// One handshake timeout covers the local connect and whatever follows it. The connect timeout
+	// is at least the handshake timeout unless a reload raised that, so a connect left to run it out
+	// would leave nothing.
+	let peers = peers.map(move |failover| (failover, Instant::now() + hs_timeout));
 	let upstream_result = if effective_route.terminate_tls {
-		if let Some(tls_cfg) = effective_route.tls_config {
+		if let Some(tls_cfg) = effective_route.tls_config.take() {
+			let predicted_h2 = predicts_h2(&tls_cfg, peek_info.offers_h2);
+			let mut upstream: Option<UpstreamStream> = None;
+			// Connected while the hello is unread, so a peer can still take the connection. An
+			// incomplete hello can't be forwarded, so connecting early could only lose a connection
+			// the handshake-first path would serve. A route requiring a client certificate lets no
+			// client reach its upstream before the certificate is verified.
+			if let Some(peers) = peers.filter(|_| peek_info.complete && !route.requires_client_cert)
+			{
+				upstream = connect_or_forward(
+					&mut stream,
+					effective_route.destination_for(predicted_h2),
+					tcp_health,
+					Some(peers),
+					hs_timeout,
+					&peek_info,
+					&sf,
+					&ctx,
+					&route.metric_identity,
+				)
+				.await;
+				if upstream.is_none() {
+					return;
+				}
+				hs_timeout = peers.1.saturating_duration_since(Instant::now());
+			}
 			let acceptor = TlsAcceptor::from(tls_cfg);
 			// By reference: binding or passing the stream by value would leave a dead copy of it
 			// in the connection's future.
@@ -381,22 +411,35 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 					// Route by negotiated protocol: h2 connections go to the route's
 					// h2-marked upstreams (e.g. Harper's `-h2.sock` mirror) when present.
 					let negotiated_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
-					let destination = match &effective_route.destination_h2 {
-						Some(dest) if negotiated_h2 => dest,
-						_ => &effective_route.destination,
-					};
+					let destination = effective_route.destination_for(negotiated_h2);
+					// Dropped before connecting, so its balancer guard does not weigh on the pick.
+					if upstream.as_ref().is_some_and(|connected| {
+						!std::ptr::eq(effective_route.destination_for(predicted_h2), destination)
+							|| connected.closed()
+					}) {
+						upstream = None;
+					}
+					if upstream.is_none() {
+						upstream = upstream::connect(
+							destination,
+							Some(peer_ip),
+							ctx.upstream_connect_timeout,
+							tcp_health,
+						)
+						.await
+						.map_err(|e| tracing::debug!("upstream connect failed for {peer_ip}: {e}"))
+						.ok();
+					}
 					// Header injection (XFF / X-JA3) never touches an h2 stream: forward()
 					// gates it on the route's declared protocol (RouteProtocol::Http) plus
 					// the negotiated ALPN, covering static and suspended-route configs alike.
-					proxy_via_tls(
-						tls_stream,
-						destination,
-						tcp_health,
-						sf,
-						&ctx,
-						&route.metric_identity,
-					)
-					.await
+					match &mut upstream {
+						Some(upstream) => {
+							proxy_via_tls(tls_stream, upstream, sf, &ctx, &route.metric_identity)
+								.await
+						}
+						None => Err(ErrorKind::UpstreamConnect),
+					}
 				}
 				Ok(Err(e)) => {
 					tracing::debug!("TLS handshake error from {peer_ip}: {e}");
@@ -426,53 +469,20 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 			return;
 		}
 	} else {
-		// Passthrough — proxy raw TCP. The client has only been peeked, so a peer can still take it
-		// if the local connect fails. The connect timeout is at least the handshake timeout unless a
-		// reload raised that, so a connect left to run it out would leave the peers no time.
-		let peers = peers.map(move |failover| (failover, Instant::now() + hs_timeout));
-		let connect_timeout = match peers {
-			Some(_) => ctx.upstream_connect_timeout.min(hs_timeout / 2),
-			None => ctx.upstream_connect_timeout,
-		};
-		let Ok(mut upstream) = upstream::connect(
+		// Passthrough — proxy raw TCP.
+		let Some(mut upstream) = connect_or_forward(
+			&mut stream,
 			&effective_route.destination,
-			Some(peer_ip),
-			connect_timeout,
 			tcp_health,
+			peers,
+			hs_timeout,
+			&peek_info,
+			&sf,
+			&ctx,
+			&route.metric_identity,
 		)
 		.await
-		.map_err(|e| tracing::debug!("upstream connect failed for {peer_ip}: {e}")) else {
-			// Counted now: a forwarded tunnel can outlast many scrapes.
-			inc_route_error(
-				&ctx.listener_metrics,
-				&route.metric_identity.counters,
-				ErrorKind::UpstreamConnect,
-			);
-			let Some((failover, deadline)) = peers else {
-				return;
-			};
-			// Boxed: its state would otherwise sit in every connection's future.
-			let forwarded = Box::pin(crate::failover::forward_to_peers(
-				&mut stream,
-				&peek_info,
-				failover,
-				crate::failover::ForwardMode::Down,
-				deadline.saturating_duration_since(Instant::now()),
-				peer_addr,
-				local_addr,
-				&ctx,
-				&route.metric_identity,
-			))
-			.await;
-			match forwarded {
-				// An exhausted forward is the failure just counted, not a second one.
-				crate::failover::Forwarded::Done(Err(ErrorKind::UpstreamConnect))
-				| crate::failover::Forwarded::Done(Ok(()))
-				| crate::failover::Forwarded::ServeLocally(_) => {}
-				crate::failover::Forwarded::Done(Err(kind)) => {
-					inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, kind)
-				}
-			}
+		else {
 			return;
 		};
 		proxy_raw(stream, &mut upstream, sf, &ctx, &route.metric_identity).await
@@ -484,6 +494,68 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 }
 
 // ── Proxy helpers ─────────────────────────────────────────────────────────────
+
+/// rustls negotiates the first of the server's protocols that the client offered, so h2 when it
+/// leads the server's list and is offered. With no server list it negotiates nothing.
+fn predicts_h2(config: &rustls::ServerConfig, offers_h2: bool) -> bool {
+	offers_h2 && config.alpn_protocols.first().is_some_and(|p| p == b"h2")
+}
+
+/// Connect to the local upstream of a connection whose hello is still unread. `None` means the
+/// connection is finished and any failure counted: with `peers`, a failed connect sends it to them.
+/// `peers` carries the deadline shared with `hs_timeout`, what is left of the handshake timeout.
+#[allow(clippy::too_many_arguments)]
+async fn connect_or_forward(
+	client: &mut TcpStream,
+	destination: &Destination,
+	tcp_health: Option<&SlotHealth>,
+	peers: Option<(&Failover, Instant)>,
+	hs_timeout: Duration,
+	peek: &PeekInfo,
+	sf: &SourceForwarding<'_>,
+	ctx: &ConnContext,
+	route_metrics: &RouteMetricIdentity,
+) -> Option<UpstreamStream> {
+	let peer_ip = sf.peer_addr.ip();
+	let connect_timeout = match peers {
+		Some(_) => ctx.upstream_connect_timeout.min(hs_timeout / 2),
+		None => ctx.upstream_connect_timeout,
+	};
+	match upstream::connect(destination, Some(peer_ip), connect_timeout, tcp_health).await {
+		Ok(upstream) => return Some(upstream),
+		Err(e) => tracing::debug!("upstream connect failed for {peer_ip}: {e}"),
+	}
+	// Counted now: a forwarded tunnel can outlast many scrapes.
+	inc_route_error(
+		&ctx.listener_metrics,
+		&route_metrics.counters,
+		ErrorKind::UpstreamConnect,
+	);
+	let (failover, deadline) = peers?;
+	// Boxed: its state would otherwise sit in every connection's future.
+	let forwarded = Box::pin(crate::failover::forward_to_peers(
+		client,
+		peek,
+		failover,
+		crate::failover::ForwardMode::Down,
+		deadline.saturating_duration_since(Instant::now()),
+		sf.peer_addr,
+		sf.local_addr,
+		ctx,
+		route_metrics,
+	))
+	.await;
+	match forwarded {
+		// An exhausted forward is the failure just counted, not a second one.
+		crate::failover::Forwarded::Done(Err(ErrorKind::UpstreamConnect))
+		| crate::failover::Forwarded::Done(Ok(()))
+		| crate::failover::Forwarded::ServeLocally(_) => {}
+		crate::failover::Forwarded::Done(Err(kind)) => {
+			inc_route_error(&ctx.listener_metrics, &route_metrics.counters, kind)
+		}
+	}
+	None
+}
 
 fn tls_accept<IO>(
 	acceptor: &TlsAcceptor,
@@ -501,8 +573,7 @@ where
 
 async fn proxy_via_tls(
 	client: &mut tokio_rustls::server::TlsStream<TcpStream>,
-	dest: &Destination,
-	tcp_health: Option<&SlotHealth>,
+	upstream: &mut UpstreamStream,
 	sf: SourceForwarding<'_>,
 	ctx: &ConnContext,
 	route_metrics: &RouteMetricIdentity,
@@ -526,22 +597,10 @@ async fn proxy_via_tls(
 	let negotiated_h2 = client.get_ref().1.alpn_protocol() == Some(b"h2".as_ref());
 	let l7_http1 = eligible_for_header_rewriting(sf.protocol, negotiated_h2);
 
-	let mut upstream = upstream::connect(
-		dest,
-		Some(sf.peer_addr.ip()),
-		ctx.upstream_connect_timeout,
-		tcp_health,
-	)
-	.await
-	.map_err(|e| {
-		tracing::debug!("upstream connect failed for {}: {e}", sf.peer_addr.ip());
-		ErrorKind::UpstreamConnect
-	})?;
-
 	let mut client =
 		CountingStream::new(client, &ctx.listener_metrics, Some(&route_metrics.counters));
 
-	match &mut upstream {
+	match upstream {
 		UpstreamStream::Tcp(ref mut up) => forward(&mut client, up, &sf, l7_http1, ctx).await,
 		UpstreamStream::Uds { ref mut stream, .. } => {
 			forward(&mut client, stream, &sf, l7_http1, ctx).await
@@ -955,6 +1014,15 @@ struct EffectiveRoute {
 	protocol: RouteProtocol,
 }
 
+impl EffectiveRoute {
+	fn destination_for(&self, h2: bool) -> &Destination {
+		match &self.destination_h2 {
+			Some(dest) if h2 => dest,
+			_ => &self.destination,
+		}
+	}
+}
+
 struct ActiveGuard {
 	global: Arc<GlobalMetrics>,
 	listener: Arc<ListenerMetrics>,
@@ -989,7 +1057,7 @@ mod tests {
 	use std::pin::Pin;
 	use std::sync::Mutex;
 	use std::task::{Context, Poll};
-	use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+	use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 	/// A stream that records the capacity of every `ReadBuf` the copy loop hands it. The recorded
 	/// capacity IS the configured buffer size for that direction, so it distinguishes "the size
@@ -1200,6 +1268,155 @@ mod tests {
 			default > 48 * 1024,
 			"rustls' 64 KiB default accepted only {default} bytes"
 		);
+	}
+
+	const H2: &[u8] = b"h2";
+	const H1: &[u8] = b"http/1.1";
+
+	fn cert_spec() -> crate::tls::CertSpec {
+		use crate::router::tests::{CERT_A, KEY_A};
+		crate::tls::CertSpec {
+			cert_chain_pem: CERT_A.to_vec(),
+			private_key_pem: zeroize::Zeroizing::new(KEY_A.to_vec()),
+		}
+	}
+
+	fn client_config(
+		versions: &[&'static rustls::SupportedProtocolVersion],
+		kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup>,
+		offer: &[&[u8]],
+	) -> Arc<rustls::ClientConfig> {
+		let provider = Arc::new(rustls::crypto::CryptoProvider {
+			kx_groups,
+			..rustls::crypto::ring::default_provider()
+		});
+		let mut config = rustls::ClientConfig::builder_with_provider(provider.clone())
+			.with_protocol_versions(versions)
+			.unwrap()
+			.dangerous()
+			.with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+			.with_no_client_auth();
+		config.alpn_protocols = offer.iter().map(|p| p.to_vec()).collect();
+		Arc::new(config)
+	}
+
+	async fn predict_and_negotiate(
+		server: Arc<rustls::ServerConfig>,
+		client: Arc<rustls::ClientConfig>,
+	) -> (bool, bool, rustls::HandshakeKind) {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let client_io = TcpStream::connect(listener.local_addr().unwrap())
+			.await
+			.unwrap();
+		let (server_io, _) = listener.accept().await.unwrap();
+		let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+		let connector = tokio_rustls::TlsConnector::from(client);
+		let accepting = async {
+			let peek = sni::peek(&server_io).await;
+			assert!(peek.complete);
+			let predicted = predicts_h2(&server, peek.offers_h2);
+			let tls = TlsAcceptor::from(server.clone())
+				.accept(server_io)
+				.await
+				.unwrap();
+			(predicted, tls)
+		};
+		let (client, (predicted, mut tls)) =
+			tokio::join!(connector.connect(name, client_io), accepting);
+		// A client stores a TLS 1.3 ticket only when it reads what follows the handshake.
+		tls.write_all(b"x").await.unwrap();
+		tls.flush().await.unwrap();
+		client.unwrap().read_exact(&mut [0u8; 1]).await.unwrap();
+		let connection = tls.get_ref().1;
+		(
+			predicted,
+			connection.alpn_protocol() == Some(H2),
+			connection.handshake_kind().unwrap(),
+		)
+	}
+
+	fn ring_kx() -> Vec<&'static dyn rustls::crypto::SupportedKxGroup> {
+		rustls::crypto::ring::default_provider().kx_groups
+	}
+
+	#[tokio::test]
+	async fn the_prediction_matches_what_rustls_negotiates() {
+		use rustls::version::{TLS12, TLS13};
+		let offers: [&[&[u8]]; 5] = [&[], &[H2], &[H1], &[H2, H1], &[H1, H2]];
+		for http2 in [false, true] {
+			let server = crate::tls::TlsConfigCache::new()
+				.get_or_build(&cert_spec(), None, http2)
+				.unwrap();
+			for version in [&TLS12, &TLS13] {
+				for offer in offers {
+					let client = client_config(&[version], ring_kx(), offer);
+					let (predicted, negotiated, _) =
+						predict_and_negotiate(server.clone(), client).await;
+					assert_eq!(
+						negotiated,
+						http2 && offer.contains(&H2),
+						"the case itself: http2={http2} offer={offer:?}"
+					);
+					assert_eq!(
+						predicted, negotiated,
+						"http2={http2} {version:?} offer={offer:?}"
+					);
+				}
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn the_prediction_holds_on_a_resumed_session() {
+		use rustls::version::{TLS12, TLS13};
+		let server = crate::tls::TlsConfigCache::new()
+			.get_or_build(&cert_spec(), None, true)
+			.unwrap();
+		for version in [&TLS12, &TLS13] {
+			let client = client_config(&[version], ring_kx(), &[H1, H2]);
+			predict_and_negotiate(server.clone(), client.clone()).await;
+			let (predicted, negotiated, kind) = predict_and_negotiate(server.clone(), client).await;
+			assert_eq!(kind, rustls::HandshakeKind::Resumed, "{version:?}");
+			assert!(predicted && negotiated, "{version:?}");
+		}
+	}
+
+	/// The hello after a retry repeats the offer. The first hello is the one peeked; rustls reads
+	/// ALPN from the second.
+	#[tokio::test]
+	async fn the_prediction_holds_across_a_hello_retry() {
+		use rustls::crypto::ring::kx_group::{SECP256R1, X25519};
+		let (certs, key) = {
+			let spec = cert_spec();
+			(
+				rustls_pemfile::certs(&mut spec.cert_chain_pem.as_slice())
+					.collect::<Result<Vec<_>, _>>()
+					.unwrap(),
+				rustls_pemfile::private_key(&mut spec.private_key_pem.as_slice())
+					.unwrap()
+					.unwrap(),
+			)
+		};
+		let mut server =
+			rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::CryptoProvider {
+				kx_groups: vec![X25519],
+				..rustls::crypto::ring::default_provider()
+			}))
+			.with_safe_default_protocol_versions()
+			.unwrap()
+			.with_no_client_auth()
+			.with_single_cert(certs, key)
+			.unwrap();
+		server.alpn_protocols = vec![H2.to_vec(), H1.to_vec()];
+		// The client's first key share is a group this server lacks, which forces the retry.
+		let client = client_config(
+			&[&rustls::version::TLS13],
+			vec![SECP256R1, X25519],
+			&[H1, H2],
+		);
+		let (predicted, negotiated, kind) = predict_and_negotiate(Arc::new(server), client).await;
+		assert_eq!(kind, rustls::HandshakeKind::FullWithHelloRetryRequest);
+		assert!(predicted && negotiated);
 	}
 
 	// Direct coverage of the runtime gate itself, independent of the construction-time

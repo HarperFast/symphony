@@ -12,11 +12,13 @@
  * The `harper` npm package is resolved automatically by @harperfast/integration-testing.
  */
 
-import { suite, test, before, after } from 'node:test';
-import { ok } from 'node:assert';
+import { suite, test, before, after, type TestContext } from 'node:test';
+import { equal, ok } from 'node:assert';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { request } from 'node:https';
+import { connect as connectTcp } from 'node:net';
+import { connect as connectTls, type TLSSocket } from 'node:tls';
 import { parse } from 'yaml';
 import {
 	createHarperContext,
@@ -27,6 +29,8 @@ import {
 	type StartedHarperTestContext,
 } from '@harperfast/integration-testing';
 import { SymphonyProxy } from '../ts/proxy.js';
+import type { ProtectionConfig, RouteConfig } from '../ts/types.js';
+import { clientHello, getFreePort, sleep, startSlowRelay } from './util.js';
 
 // Resolve the harper CLI script path.
 // Priority:
@@ -59,6 +63,43 @@ suite('Symphony UDS proxy – Harper integration', () => {
 	let requestPort: number;
 	let sniHostname: string;
 	let caCert: string;
+	let route: RouteConfig;
+
+	/** A route that connects to Harper before its handshake. Its one peer refuses, so only Harper can serve it. */
+	async function startFailoverProxy(t: TestContext, protection?: ProtectionConfig) {
+		const port = await getFreePort();
+		const failoverProxy = new SymphonyProxy({
+			listeners: [{ host: symphonyHost, port, protection }],
+			routes: [{ ...route, failover: { peers: [{ host: '127.0.0.1', port: await getFreePort() }] } }],
+		});
+		await failoverProxy.start();
+		t.after(() => failoverProxy.stop(1000));
+		return { port, proxy: failoverProxy };
+	}
+
+	function httpStatus(socket: TLSSocket): Promise<number> {
+		return new Promise((resolve, reject) => {
+			let response = '';
+			socket.on('secureConnect', () =>
+				socket.write(`GET / HTTP/1.1\r\nHost: ${sniHostname}\r\nConnection: close\r\n\r\n`)
+			);
+			socket.on('data', (chunk: Buffer) => {
+				response += chunk.toString();
+				const status = /^HTTP\/1\.1 (\d+)/.exec(response);
+				if (status) {
+					socket.destroy();
+					resolve(Number(status[1]));
+				}
+			});
+			socket.on('error', reject);
+			socket.on('close', () => reject(new Error(`closed after ${JSON.stringify(response)}`)));
+		});
+	}
+
+	function errorCount(failoverProxy: SymphonyProxy, reason: string): number {
+		const metrics = failoverProxy.metrics().routeMetrics.find((r) => r.route === sniHostname)!;
+		return metrics.errorsByReason.find((c) => c.reason === reason)?.count ?? 0;
+	}
 
 	before(async () => {
 		harperCtx = await startHarper(createHarperContext('symphony-uds-proxy'), {
@@ -109,19 +150,18 @@ suite('Symphony UDS proxy – Harper integration', () => {
 		// Acquire a dedicated loopback address for symphony to listen on
 		symphonyHost = await getNextAvailableLoopbackAddress();
 
+		route = {
+			sni: sniHostname,
+			upstreams,
+			terminateTls: true,
+			cert: {
+				certChain: cert.certificate as string,
+				privateKey: readFileSync(cert.privateKeyFile as string, 'utf8'),
+			},
+		};
 		proxy = new SymphonyProxy({
 			listeners: [{ host: symphonyHost, port: requestPort }],
-			routes: [
-				{
-					sni: sniHostname,
-					upstreams,
-					terminateTls: true,
-					cert: {
-						certChain: cert.certificate as string,
-						privateKey: readFileSync(cert.privateKeyFile as string, 'utf8'),
-					},
-				},
-			],
+			routes: [route],
 		});
 
 		await proxy.start();
@@ -190,5 +230,41 @@ suite('Symphony UDS proxy – Harper integration', () => {
 				`Request ${i} should return a valid HTTP status, got ${status}`,
 			);
 		}
+	});
+
+	test('a failover route keeps serving after handshakes that closed connections it made to Harper', async (t) => {
+		const { port, proxy: failoverProxy } = await startFailoverProxy(t);
+		const aborted = 20;
+		for (let i = 0; i < aborted; i++) {
+			const socket = connectTcp({ host: symphonyHost, port });
+			socket.on('error', () => {});
+			socket.write(clientHello(sniHostname));
+			await sleep(10);
+			socket.destroy();
+		}
+		for (let i = 0; i < 200 && errorCount(failoverProxy, 'tls_handshake') < aborted; i++) await sleep(25);
+		equal(errorCount(failoverProxy, 'tls_handshake'), aborted);
+
+		const status = await httpStatus(
+			connectTls({ host: symphonyHost, port, servername: sniHostname, ca: caCert })
+		);
+		ok(status >= 200 && status < 500, `got ${status}`);
+		equal(errorCount(failoverProxy, 'upstream_connect'), 0);
+	});
+
+	test('a failover route replaces the connection Harper closes during a handshake past its 10 s limit', async (t) => {
+		const { port, proxy: failoverProxy } = await startFailoverProxy(t, { tlsHandshakeTimeoutMs: 20_000 });
+		const relay = await startSlowRelay(symphonyHost, port, 11_000);
+		t.after(() => relay.close());
+
+		const status = await httpStatus(
+			connectTls({
+				socket: connectTcp({ host: '127.0.0.1', port: relay.port }),
+				servername: sniHostname,
+				ca: caCert,
+			})
+		);
+		ok(status >= 200 && status < 500, `got ${status}`);
+		equal(errorCount(failoverProxy, 'upstream_connect'), 0);
 	});
 });

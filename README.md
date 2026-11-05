@@ -488,12 +488,17 @@ is still not proof that the application is ready: a proxy that takes longer than
 dial passes. An upstream must keep an idle connection open for at least 250 ms, or its slot never
 clears once marked.
 
-A **passthrough** route (`terminateTls: false`) also forwards a connection when its local connect
-fails, on a client listener and unless the route is suspended. Nothing has been read from the client
-at that point, so the connection that discovers a dead upstream is served by a peer instead of being
-lost. A slot that fails in one of the ways above is marked, and the next local slot is tried first.
-Any other connect error, such as `EACCES`, goes to the peers at once and marks nothing. Either way the
-failure counts `upstream_connect`.
+A route also forwards a connection when its local connect fails, on a client listener and unless the
+route is suspended. A TLS-terminating route makes that connect before its handshake, and keeps the
+connection for after it, unless the route requires a client certificate. Nothing has been read from the client at that point, so the connection that
+discovers a dead upstream is served by a peer instead of being lost. A slot that fails in one of the
+ways above is marked, and the next local slot is tried first. Any other connect error, such as
+`EACCES`, goes to the peers at once and marks nothing. Either way the failure counts
+`upstream_connect`.
+
+On a route with h2-marked upstreams, that connect goes to the destination the ClientHello's ALPN offer
+selects. The handshake's negotiated protocol still decides: if it differs, the early connection is
+closed and the negotiated destination connected.
 
 **How.** The connection is forwarded as raw TLS: the peer's symphony terminates it with its own copy
 of the certificate, so client certificates and ALPN are negotiated with the peer. symphony sends a
@@ -508,10 +513,10 @@ by a success), at most once each.
 - **Local upstream down:** all attempts share the listener's TLS handshake timeout. If every peer is
   cooling down, the one whose cooldown ends first is tried once. If no peer takes the connection it
   is closed (`exhausted`).
-- **Local connect failed (passthrough):** the connect and the peer attempts share one TLS handshake
-  timeout. The connect gets at most half of it, and the peers get whatever it left, as above. After a
-  drain or spill attempt no peer took, the two split what is left of the timeout, and a peer tried
-  before may be tried again.
+- **Local connect failed:** the connect and the peer attempts share one TLS handshake timeout. The
+  connect gets at most half of it, and the peers get whatever it left, as above. When the connect
+  succeeds on a TLS-terminating route, the handshake gets what it left. After a drain or spill attempt
+  no peer took, these share what is left of the timeout, and a peer tried before may be tried again.
 - **Draining** (`drain`, local upstream up): peers in cooldown are skipped, the attempts share at most
   half the handshake timeout (and at most 2 s), and if no peer takes the connection before answering
   it is served by the local upstream with what is left of the handshake timeout (`localFallbacks`).
@@ -532,19 +537,27 @@ by a success), at most once each.
 **Limits and security.**
 
 - Only new connections are forwarded; established ones close with their upstream.
-- A **TLS-terminating** route loses the connection that discovers a dead upstream: it connects after
-  the handshake, which has already read the ClientHello, so there is nothing to replay. Only a failed
-  connect, or a reload of a down route onto new endpoints, marks a slot (the probe only clears marks),
-  so on a quiet route that is the first connection after every outage. A passthrough route forwards
-  that connection instead.
+- A **TLS-terminating failover route connects to its upstream before the handshake.** A client that
+  fails or abandons its handshake causes an upstream connection that closes with no bytes, and holds it
+  for up to the handshake timeout. Nothing reaches the upstream until the handshake completes, including
+  the PROXY header. A flood of them that overruns a Unix socket's accept queue marks slots refusing, which
+  moves new connections to peers until the probe clears them. `maxConnections` and the per-IP limits run
+  first, but are off by default.
+- A connection goes through the handshake first, and is lost if its upstream refuses after that, when:
+  its route requires a client certificate, so that no unauthenticated client reaches the upstream; its
+  ClientHello is over 16 KiB, too large to replay; the negotiated protocol selects a destination other
+  than the one the offer predicted; the connection made before the handshake was closed during it and
+  its replacement fails; or it arrived on an ingress listener.
 - A route with no mark is not probed, so an upstream that accepts and then closes does not bring it
   down: those connections fail with route error `stream`. Behind Docker, set `userland-proxy: false`
   so a published port refuses until the container listens.
-- At a peer, a failed local connect on the ingress listener closes with no bytes, which sends the
-  forwarding node on to its next peer. A suspended route's resolved upstream is not covered either.
-- On a passthrough route, a TCP upstream slower to accept than half the handshake timeout counts as
-  down: its connections go to peers and the slot is marked. A probe has 1 s to clear the mark, so the
-  route stays failed over while connects take longer than that.
+- At a peer, a passthrough route's failed local connect on the ingress listener closes with no bytes,
+  which sends the forwarding node on to its next peer. A TLS-terminating route there has already
+  answered the handshake, so that connection is lost. A suspended route's resolved upstream is not
+  covered either.
+- A TCP upstream slower to accept than half the handshake timeout counts as down: its connections go
+  to peers and the slot is marked. A probe has 1 s to clear the mark, so the route stays failed over
+  while connects take longer than that.
 - A trusted source can assert any client address, which bypasses per-IP limits and
   `allowedSources`. It grants no identity: the peer verifies client certificates itself. On hosts
   where containers egress with the host's address, block container traffic to the ingress port.
@@ -564,9 +577,9 @@ Ingress refusals are listener block reasons (`untrusted_source`, `proxy_header_i
 `proxy_header_local`, `proxy_header_v1`, `proxy_header_timeout`); a forwarded connection refused
 for a down route is the route error `locally_down`.
 
-On a passthrough route, `upstream_connect` counts failed local connects, including those a peer then
-served. Compare it with `forwarded` and `exhausted` to see whether clients were affected. A connection
-no peer took counts one `upstream_connect`, not two.
+`upstream_connect` counts failed local connects, including those a peer then served. Compare it with
+`forwarded` and `exhausted` to see whether clients were affected. A connection no peer took counts one
+`upstream_connect`, not two.
 
 ### Spill-over to a less-loaded peer
 
