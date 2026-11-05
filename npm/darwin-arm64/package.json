@@ -1,6 +1,6 @@
 {
   "name": "@harperfast/symphony-darwin-arm64",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "symphony native binary for macOS arm64 (Apple Silicon)",
   "os": [
     "darwin"
