@@ -19,7 +19,14 @@ import * as tls from 'node:tls';
 import { after, describe, it, type TestContext } from 'node:test';
 import { SymphonyProxy } from '../ts/proxy.js';
 import type { FailoverConfig, MtlsConfig, ProtectionConfig, RouteConfig, SpillConfig } from '../ts/types.js';
-import { clientHello, generateClientCa, generateSelfSignedCert, getFreePort, sleep } from './util.js';
+import {
+	clientHello,
+	generateClientCa,
+	generateSelfSignedCert,
+	getFreePort,
+	sleep,
+	startSlowRelay as startRelay,
+} from './util.js';
 
 const SNI = 'app.test';
 const CLIENT_ADDRESS = '127.0.0.2';
@@ -37,20 +44,43 @@ after(() => fs.rmSync(socketDir, { recursive: true, force: true }));
 interface UdsUpstream {
 	/** Client addresses from the PROXY v1 header of each request served. */
 	sources: string[];
+	accepted: number;
+	closedWithNoBytes: number;
 	close(): Promise<void>;
 }
 
-/** Echo server on a Unix socket that records the PROXY v1 source address it was given. */
-function startUdsUpstream(socketPath: string): Promise<UdsUpstream> {
+/**
+ * Echo server on a Unix socket that records the PROXY v1 source address it was given.
+ * `closeIdleAfterMs` closes a connection that has sent nothing by then, as Harper does, with
+ * `farewell` as its last bytes.
+ */
+function startUdsUpstream(
+	socketPath: string,
+	opts: { closeIdleAfterMs?: number; farewell?: string } = {}
+): Promise<UdsUpstream> {
 	return new Promise((resolve, reject) => {
 		const sources: string[] = [];
 		const sockets = new Set<net.Socket>();
 		const server = net.createServer((socket) => {
+			upstream.accepted++;
 			sockets.add(socket);
-			socket.on('close', () => sockets.delete(socket));
+			let empty = true;
+			socket.on('close', () => {
+				sockets.delete(socket);
+				if (empty) upstream.closedWithNoBytes++;
+			});
 			socket.on('error', () => {});
+			if (opts.closeIdleAfterMs) {
+				const idle = setTimeout(
+					() => (opts.farewell ? socket.end(opts.farewell) : socket.destroy()),
+					opts.closeIdleAfterMs
+				);
+				socket.once('data', () => clearTimeout(idle));
+				socket.once('close', () => clearTimeout(idle));
+			}
 			let pending: Buffer | null = Buffer.alloc(0);
 			socket.on('data', (chunk: Buffer) => {
+				empty = false;
 				if (pending === null) {
 					socket.write(chunk);
 					return;
@@ -64,16 +94,17 @@ function startUdsUpstream(socketPath: string): Promise<UdsUpstream> {
 				if (rest.length > 0) socket.write(rest);
 			});
 		});
-		server.listen(socketPath, () =>
-			resolve({
-				sources,
-				close: () =>
-					new Promise((res) => {
-						for (const s of sockets) s.destroy();
-						server.close(() => res());
-					}),
-			})
-		);
+		const upstream: UdsUpstream = {
+			sources,
+			accepted: 0,
+			closedWithNoBytes: 0,
+			close: () =>
+				new Promise((res) => {
+					for (const s of sockets) s.destroy();
+					server.close(() => res());
+				}),
+		};
+		server.listen(socketPath, () => resolve(upstream));
 		server.on('error', reject);
 	});
 }
@@ -120,18 +151,23 @@ const NON_ACCEPTING_LISTENER = `
 const fs = require('node:fs');
 require('node:net').createServer().listen({ port: 0, host: '127.0.0.1', backlog: 1 }, function () {
 	fs.writeFileSync(process.argv[1], String(this.address().port));
-	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, process.argv[2] ? Number(process.argv[2]) : undefined);
 });
 `;
 
 /**
  * A TCP address whose connects hang: its accept queue is full, so Linux drops further SYNs. `kill()`
  * ends the listener, after which a pending connect fails with ECONNREFUSED at its next SYN
- * retransmit, 1 s after it started.
+ * retransmit, 1 s after it started. With `stallMs`, the listener starts accepting that long after it
+ * bound, and a pending connect succeeds at that retransmit instead.
  */
-async function startHangingUpstream(t: TestContext): Promise<{ host: string; port: number; kill(): void }> {
+async function startHangingUpstream(
+	t: TestContext,
+	stallMs?: number
+): Promise<{ host: string; port: number; kill(): void }> {
 	const portFile = path.join(socketDir, `hanging-${++socketSeq}.port`);
-	const child = spawn(process.execPath, ['-e', NON_ACCEPTING_LISTENER, portFile], { stdio: 'ignore' });
+	const args = ['-e', NON_ACCEPTING_LISTENER, portFile, ...(stallMs ? [String(stallMs)] : [])];
+	const child = spawn(process.execPath, args, { stdio: 'ignore' });
 	t.after(() => void child.kill('SIGKILL'));
 	await waitFor(() => fs.existsSync(portFile) && fs.readFileSync(portFile, 'utf8').length > 0, 10_000);
 	const port = Number(fs.readFileSync(portFile, 'utf8'));
@@ -350,6 +386,12 @@ async function allocatePorts(count: number): Promise<{ publicPort: number; ingre
 	return ports;
 }
 
+async function startSlowRelay(t: TestContext, port: number, delayMs: number): Promise<number> {
+	const relay = await startRelay('127.0.0.1', port, delayMs);
+	t.after(() => relay.close());
+	return relay.port;
+}
+
 async function startNode(
 	t: TestContext,
 	ports: { publicPort: number; ingressPort: number },
@@ -399,6 +441,8 @@ function tryEcho(opts: {
 	clientCert?: string;
 	clientKey?: string;
 	socket?: net.Socket;
+	alpn?: string[];
+	onSecure?(socket: tls.TLSSocket): void;
 }): Promise<string | null> {
 	return new Promise((resolve) => {
 		const payload = 'ping';
@@ -409,6 +453,7 @@ function tryEcho(opts: {
 			rejectUnauthorized: false,
 			cert: opts.clientCert,
 			key: opts.clientKey,
+			ALPNProtocols: opts.alpn,
 		});
 		const timer = setTimeout(() => finish(null), 5000);
 		const finish = (value: string | null) => {
@@ -416,7 +461,10 @@ function tryEcho(opts: {
 			socket.destroy();
 			resolve(value);
 		};
-		socket.on('secureConnect', () => socket.write(payload));
+		socket.on('secureConnect', () => {
+			opts.onSecure?.(socket);
+			socket.write(payload);
+		});
 		socket.on('data', (chunk: Buffer) => {
 			reply += chunk.toString();
 			if (reply.length >= payload.length) finish(reply);
@@ -439,12 +487,15 @@ function routeHealth(proxy: SymphonyProxy, status: 'up' | 'down'): Promise<void>
 }
 
 /**
- * Lose one connection to the absent local upstream, which is how a route learns it is down (the
- * race window the design accepts), and wait for the probe to report it.
+ * Lose one connection to the absent local upstream and wait for the probe to report the route down.
+ * Through the ingress listener, whose TLS-terminating routes connect after the handshake and which
+ * never forwards, so no peer's counters move.
  */
 async function markDown(node: Node): Promise<void> {
 	const down = routeHealth(node.proxy, 'down');
-	assert.equal(await tryEcho({ port: node.publicPort }), null, 'the first connection to a dead upstream is lost');
+	const socket = await connectRaw(node.ingressPort);
+	socket.write(proxyV2Header(CLIENT_ADDRESS, 4000));
+	assert.equal(await tryEcho({ port: node.ingressPort, socket }), null, 'the connection that finds out is lost');
 	await down;
 }
 
@@ -717,353 +768,673 @@ describe('peer failover', { skip: noClientAddress, timeout: SUITE_TIMEOUT_MS }, 
 	});
 });
 
-describe(
-	'a failed local connect on a passthrough failover route',
-	{ skip: noClientAddress, timeout: SUITE_TIMEOUT_MS },
-	() => {
-		const localUpstreams: [string, () => Promise<NodeOptions>][] = [
-			[
-				'a TCP port nothing listens on',
-				async () => ({ tcpUpstream: { host: '127.0.0.1', port: await getFreePort() } }),
-			],
-			['a Unix socket file that is missing', async () => ({})],
-			[
-				'a Unix socket file nothing listens on',
-				async () => {
-					const socketPath = path.join(socketDir, `stale-${++socketSeq}.sock`);
-					await createStaleSocket(socketPath);
-					return { socketPath };
-				},
-			],
-		];
-		for (const [name, localUpstream] of localUpstreams) {
-			it(`serves the first connection from a peer, with ${name}`, async (t) => {
-				const [a, b] = await allocatePorts(2);
-				const nodeA = await startNode(t, a, { peers: [b.ingressPort], passthrough: true, ...(await localUpstream()) });
-				const nodeB = await startNode(t, b);
-				const upstreamB = await startUdsUpstream(nodeB.socketPath);
-				t.after(() => upstreamB.close());
-
-				assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
-				assert.deepEqual(upstreamB.sources, [CLIENT_ADDRESS], 'the peer sees the real client');
-				const route = routeMetrics(nodeA);
-				assert.equal(count(route.errorsByReason, 'upstream_connect'), 1, 'the local failure is counted');
-				assert.equal(route.failover!.refusingSlots, 1, 'the slot is marked');
-				assert.equal(route.failover!.peers[0].forwarded, 1);
-				assert.equal(route.failover!.exhausted, 0);
-
-				assert.equal(await tryEcho({ port: a.publicPort }), 'ping', 'later connections go straight to the peer');
-				assert.equal(count(routeMetrics(nodeA).errorsByReason, 'upstream_connect'), 1);
-				assert.equal(routeMetrics(nodeA).failover!.peers[0].forwarded, 2);
-			});
-		}
-
-		it(
-			'forwards on a connect error that is not a refusal, and marks nothing',
-			{ skip: process.getuid?.() === 0 && 'root ignores socket file permissions' },
-			async (t) => {
-				const [a, b] = await allocatePorts(2);
-				const nodeA = await startNode(t, a, { peers: [b.ingressPort], passthrough: true });
-				const upstreamA = await startUdsUpstream(nodeA.socketPath);
-				t.after(() => upstreamA.close());
-				fs.chmodSync(nodeA.socketPath, 0);
-				const nodeB = await startNode(t, b);
-				const upstreamB = await startUdsUpstream(nodeB.socketPath);
-				t.after(() => upstreamB.close());
-
-				assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
-				assert.equal(upstreamB.sources.length, 1);
-				assert.equal(upstreamA.sources.length, 0);
-				const route = routeMetrics(nodeA);
-				assert.equal(count(route.errorsByReason, 'upstream_connect'), 1);
-				assert.equal(route.failover!.refusingSlots, 0);
-				assert.equal(route.failover!.peers[0].forwarded, 1);
-			}
-		);
-
-		it('reaches a TLS server behind the peer when both nodes pass through', async (t) => {
-			const [a, b] = await allocatePorts(2);
-			const nodeA = await startNode(t, a, { peers: [b.ingressPort], passthrough: true });
-			const upstreamPath = path.join(socketDir, `tls-${++socketSeq}.sock`);
-			await startTlsUdsUpstream(t, upstreamPath);
-			await startNode(t, b, {
-				routes: [
-					{
-						sni: SNI,
-						upstreams: [{ kind: 'uds', path: upstreamPath }],
-						terminateTls: false,
-						sourceAddressHeader: 'none',
+const routeModes: [string, boolean][] = [
+	['passthrough', true],
+	['TLS-terminating', false],
+];
+for (const [mode, passthrough] of routeModes) {
+	describe(
+		`a failed local connect on a ${mode} failover route`,
+		{ skip: noClientAddress, timeout: SUITE_TIMEOUT_MS },
+		() => {
+			const localUpstreams: [string, () => Promise<NodeOptions>][] = [
+				[
+					'a TCP port nothing listens on',
+					async () => ({ tcpUpstream: { host: '127.0.0.1', port: await getFreePort() } }),
+				],
+				['a Unix socket file that is missing', async () => ({})],
+				[
+					'a Unix socket file nothing listens on',
+					async () => {
+						const socketPath = path.join(socketDir, `stale-${++socketSeq}.sock`);
+						await createStaleSocket(socketPath);
+						return { socketPath };
 					},
 				],
+			];
+			for (const [name, localUpstream] of localUpstreams) {
+				it(`serves the first connection from a peer, with ${name}`, async (t) => {
+					const [a, b] = await allocatePorts(2);
+					const nodeA = await startNode(t, a, { peers: [b.ingressPort], passthrough, ...(await localUpstream()) });
+					const nodeB = await startNode(t, b);
+					const upstreamB = await startUdsUpstream(nodeB.socketPath);
+					t.after(() => upstreamB.close());
+
+					assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
+					assert.deepEqual(upstreamB.sources, [CLIENT_ADDRESS], 'the peer sees the real client');
+					const route = routeMetrics(nodeA);
+					assert.equal(count(route.errorsByReason, 'upstream_connect'), 1, 'the local failure is counted');
+					assert.equal(route.failover!.refusingSlots, 1, 'the slot is marked');
+					assert.equal(route.failover!.peers[0].forwarded, 1);
+					assert.equal(route.failover!.exhausted, 0);
+
+					assert.equal(await tryEcho({ port: a.publicPort }), 'ping', 'later connections go straight to the peer');
+					assert.equal(count(routeMetrics(nodeA).errorsByReason, 'upstream_connect'), 1);
+					assert.equal(routeMetrics(nodeA).failover!.peers[0].forwarded, 2);
+				});
+			}
+
+			it(
+				'forwards on a connect error that is not a refusal, and marks nothing',
+				{ skip: process.getuid?.() === 0 && 'root ignores socket file permissions' },
+				async (t) => {
+					const [a, b] = await allocatePorts(2);
+					const nodeA = await startNode(t, a, { peers: [b.ingressPort], passthrough });
+					const upstreamA = await startUdsUpstream(nodeA.socketPath);
+					t.after(() => upstreamA.close());
+					fs.chmodSync(nodeA.socketPath, 0);
+					const nodeB = await startNode(t, b);
+					const upstreamB = await startUdsUpstream(nodeB.socketPath);
+					t.after(() => upstreamB.close());
+
+					assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
+					assert.equal(upstreamB.sources.length, 1);
+					assert.equal(upstreamA.sources.length, 0);
+					const route = routeMetrics(nodeA);
+					assert.equal(count(route.errorsByReason, 'upstream_connect'), 1);
+					assert.equal(route.failover!.refusingSlots, 0);
+					assert.equal(route.failover!.peers[0].forwarded, 1);
+				}
+			);
+
+			it('closes the client when every peer refuses, counting one upstream_connect', async (t) => {
+				const [a] = await allocatePorts(1);
+				const nodeA = await startNode(t, a, { peers: [await getFreePort()], passthrough });
+
+				assert.equal(await tryEcho({ port: a.publicPort }), null);
+				const route = routeMetrics(nodeA);
+				assert.equal(count(route.errorsByReason, 'upstream_connect'), 1);
+				assert.equal(route.failover!.exhausted, 1);
+				assert.equal(count(route.failover!.peers[0].failuresByReason, 'refused'), 1);
 			});
 
-			assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
-			assert.equal(routeMetrics(nodeA).failover!.peers[0].forwarded, 1);
+			it('tries the peers again when a draining route falls back to a local upstream that refuses', async (t) => {
+				const [a] = await allocatePorts(1);
+				const nodeA = await startNode(t, a, { peers: [await getFreePort()], passthrough, drain: true });
+
+				assert.equal(await tryEcho({ port: a.publicPort }), null);
+				const failover = routeMetrics(nodeA).failover!;
+				assert.equal(failover.localFallbacks, 1);
+				assert.equal(failover.exhausted, 1);
+				assert.equal(count(failover.peers[0].failuresByReason, 'refused'), 2);
+			});
+
+			it('a suspended route does not forward when its resolved upstream refuses', async (t) => {
+				const [a] = await allocatePorts(1);
+				const peer = await startFakePeer(t, 'answering');
+				const deadPort = await getFreePort();
+				const nodeA = await startNode(t, a, {
+					routes: [
+						{
+							sni: SNI,
+							upstreams: [],
+							terminateTls: false,
+							suspended: true,
+							suspendTimeoutMs: 2000,
+							failover: { peers: [{ host: '127.0.0.1', port: peer.port }] },
+						},
+					],
+				});
+				nodeA.proxy.on('suspended', (conn) =>
+					nodeA.proxy.resolveConnection(conn.id, {
+						upstream: { kind: 'tcp', host: '127.0.0.1', port: deadPort },
+						terminateTls: !passthrough,
+						cert: passthrough ? undefined : { certChain: cert, privateKey: key },
+					})
+				);
+
+				assert.equal(await tryEcho({ port: a.publicPort }), null);
+				await sleep(50);
+				assert.equal(peer.seen.forwarded, 0);
+				assert.equal(count(routeMetrics(nodeA).errorsByReason, 'upstream_connect'), 1);
+			});
+
+			describe(
+				'whose connect times out',
+				{ skip: process.platform !== 'linux' && 'relies on Linux dropping SYNs' },
+				() => {
+					const handshakeMs = 2000;
+
+					it('gives the peer the rest of the handshake timeout', async (t) => {
+						const [a, b] = await allocatePorts(2);
+						const nodeA = await startNode(t, a, {
+							peers: [b.ingressPort],
+							passthrough,
+							tcpUpstream: await startHangingUpstream(t),
+							publicProtection: { tlsHandshakeTimeoutMs: handshakeMs },
+						});
+						const nodeB = await startNode(t, b);
+						const upstreamB = await startUdsUpstream(nodeB.socketPath);
+						t.after(() => upstreamB.close());
+
+						const started = performance.now();
+						assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
+						const elapsed = performance.now() - started;
+						assert.ok(elapsed >= handshakeMs * 0.4, `the local connect was given time: ${elapsed} ms`);
+						assert.ok(elapsed < handshakeMs, `within the handshake timeout: ${elapsed} ms`);
+						const route = routeMetrics(nodeA);
+						assert.equal(count(route.errorsByReason, 'upstream_connect'), 1);
+						assert.equal(route.failover!.refusingSlots, 1);
+					});
+
+					it('closes a client no peer answered at the end of the handshake timeout', async (t) => {
+						const [a] = await allocatePorts(1);
+						const peer = await startFakePeer(t, 'silent');
+						const nodeA = await startNode(t, a, {
+							peers: [peer.port],
+							passthrough,
+							tcpUpstream: await startHangingUpstream(t),
+							publicProtection: { tlsHandshakeTimeoutMs: handshakeMs },
+						});
+
+						const started = performance.now();
+						assert.equal(await tryEcho({ port: a.publicPort }), null);
+						const elapsed = performance.now() - started;
+						assert.equal(peer.seen.forwarded, 1, 'the peer was tried');
+						assert.ok(elapsed >= handshakeMs * 0.9, `the peer was given the rest: ${elapsed} ms`);
+						assert.ok(elapsed < handshakeMs + 500, `the total stays within the handshake timeout: ${elapsed} ms`);
+						const failover = routeMetrics(nodeA).failover!;
+						assert.equal(count(failover.peers[0].failuresByReason, 'timeout'), 1);
+						assert.equal(failover.exhausted, 1);
+					});
+
+					it('keeps one allowance across a silent drain peer, the local connect and a silent peer', async (t) => {
+						const [a] = await allocatePorts(1);
+						const peer = await startFakePeer(t, 'silent');
+						const nodeA = await startNode(t, a, {
+							peers: [peer.port],
+							passthrough,
+							drain: true,
+							tcpUpstream: await startHangingUpstream(t),
+							publicProtection: { tlsHandshakeTimeoutMs: handshakeMs },
+						});
+
+						const started = performance.now();
+						assert.equal(await tryEcho({ port: a.publicPort }), null);
+						const elapsed = performance.now() - started;
+						assert.equal(peer.seen.forwarded, 2, 'tried by the drain, and again once the local connect failed');
+						assert.ok(elapsed >= handshakeMs * 0.9, `the allowance was used: ${elapsed} ms`);
+						assert.ok(elapsed < handshakeMs + 500, `and not exceeded: ${elapsed} ms`);
+						const failover = routeMetrics(nodeA).failover!;
+						assert.equal(failover.localFallbacks, 1);
+						assert.equal(failover.exhausted, 1);
+					});
+				}
+			);
+
+			describe(
+				'whose connect fails slowly',
+				{ skip: process.platform !== 'linux' && 'relies on Linux dropping SYNs' },
+				() => {
+					// The local connect is capped at half of this, later than the 1 s SYN retransmit that fails it.
+					const handshakeMs = 3000;
+					async function startDyingNode(
+						t: TestContext,
+						ports: { publicPort: number; ingressPort: number },
+						peer: number
+					): Promise<{ node: Node; killUpstream(): void }> {
+						const upstream = await startHangingUpstream(t);
+						const node = await startNode(t, ports, {
+							peers: [peer],
+							passthrough,
+							tcpUpstream: { host: upstream.host, port: upstream.port },
+							publicProtection: { tlsHandshakeTimeoutMs: handshakeMs },
+						});
+						return { node, killUpstream: upstream.kill };
+					}
+
+					it('gives the peer the time that is left', async (t) => {
+						const [a, b] = await allocatePorts(2);
+						const nodeB = await startNode(t, b);
+						const upstreamB = await startUdsUpstream(nodeB.socketPath);
+						t.after(() => upstreamB.close());
+						const { node: nodeA, killUpstream } = await startDyingNode(t, a, b.ingressPort);
+
+						const started = performance.now();
+						const reply = tryEcho({ port: a.publicPort });
+						setTimeout(killUpstream, 200);
+						assert.equal(await reply, 'ping');
+						const elapsed = performance.now() - started;
+						assert.ok(elapsed >= 900, `the connect failed at its retransmit: ${elapsed} ms`);
+						assert.ok(elapsed < handshakeMs / 2, `before the cap: ${elapsed} ms`);
+						assert.equal(count(routeMetrics(nodeA).errorsByReason, 'upstream_connect'), 1);
+					});
+
+					it('closes at the end of the handshake timeout when the peer stays silent', async (t) => {
+						const [a] = await allocatePorts(1);
+						const peer = await startFakePeer(t, 'silent');
+						const { node: nodeA, killUpstream } = await startDyingNode(t, a, peer.port);
+
+						const started = performance.now();
+						const reply = tryEcho({ port: a.publicPort });
+						setTimeout(killUpstream, 200);
+						assert.equal(await reply, null);
+						const elapsed = performance.now() - started;
+						assert.equal(peer.seen.forwarded, 1);
+						assert.ok(elapsed >= handshakeMs * 0.9, `the peer was given the rest: ${elapsed} ms`);
+						assert.ok(elapsed < handshakeMs + 500, `the total stays within the handshake timeout: ${elapsed} ms`);
+						assert.equal(routeMetrics(nodeA).failover!.exhausted, 1);
+					});
+				}
+			);
+
+			it('closes a connection whose local upstream accepts and then resets, without a peer', async (t) => {
+				const [a] = await allocatePorts(1);
+				const peer = await startFakePeer(t, 'answering');
+				const nodeA = await startNode(t, a, { peers: [peer.port], passthrough });
+				const server = net.createServer((socket) => socket.destroy());
+				await new Promise<void>((resolve) => server.listen(nodeA.socketPath, resolve));
+				t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+
+				assert.equal(await tryEcho({ port: a.publicPort }), null);
+				await sleep(50);
+				assert.equal(peer.seen.forwarded, 0);
+				assert.equal(count(routeMetrics(nodeA).errorsByReason, 'upstream_connect'), 0);
+			});
+
+			it('a peer that answered is not retried when it then closes', async (t) => {
+				const [a] = await allocatePorts(1);
+				const committing = await startFakePeer(t, 'commits');
+				const next = await startFakePeer(t, 'answering');
+				const nodeA = await startNode(t, a, { peers: [committing.port, next.port], passthrough });
+
+				assert.equal(await tryEcho({ port: a.publicPort }), null);
+				await sleep(50);
+				assert.equal(committing.seen.forwarded, 1);
+				assert.equal(next.seen.forwarded, 0);
+				const failover = routeMetrics(nodeA).failover!;
+				assert.equal(failover.peers[0].forwarded, 1);
+				assert.equal(failover.replays, 0);
+			});
+		}
+	);
+}
+
+describe('a passthrough failover route', { skip: noClientAddress, timeout: SUITE_TIMEOUT_MS }, () => {
+	it('reaches a TLS server behind the peer when both nodes pass through', async (t) => {
+		const [a, b] = await allocatePorts(2);
+		const nodeA = await startNode(t, a, { peers: [b.ingressPort], passthrough: true });
+		const upstreamPath = path.join(socketDir, `tls-${++socketSeq}.sock`);
+		await startTlsUdsUpstream(t, upstreamPath);
+		await startNode(t, b, {
+			routes: [
+				{
+					sni: SNI,
+					upstreams: [{ kind: 'uds', path: upstreamPath }],
+					terminateTls: false,
+					sourceAddressHeader: 'none',
+				},
+			],
 		});
 
-		it('serves a local upstream that accepts, without a peer', async (t) => {
+		assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
+		assert.equal(routeMetrics(nodeA).failover!.peers[0].forwarded, 1);
+	});
+
+	it('serves a local upstream that accepts, without a peer', async (t) => {
+		const [a] = await allocatePorts(1);
+		const peer = await startFakePeer(t, 'answering');
+		const nodeA = await startNode(t, a, { peers: [peer.port], passthrough: true });
+		const upstreamA = await startUdsUpstream(nodeA.socketPath);
+		t.after(() => upstreamA.close());
+
+		const hello = clientHello(SNI);
+		const client = await connectRaw(a.publicPort);
+		t.after(() => void client.destroy());
+		const echoed = new Promise<number>((resolve) => client.once('data', (chunk: Buffer) => resolve(chunk.length)));
+		client.write(hello);
+		assert.equal(await echoed, hello.length);
+		assert.equal(upstreamA.sources.length, 1);
+		assert.equal(peer.seen.forwarded, 0);
+		assert.deepEqual(routeMetrics(nodeA).errorsByReason, []);
+	});
+
+	it('an ingress connection is closed with no bytes and goes to no peer, so the forwarder moves on', async (t) => {
+		const [a, b, c] = await allocatePorts(3);
+		const peerOfB = await startFakePeer(t, 'answering');
+		const nodeA = await startNode(t, a, { peers: [b.ingressPort, c.ingressPort], passthrough: true });
+		const nodeB = await startNode(t, b, { peers: [peerOfB.port], passthrough: true });
+		const nodeC = await startNode(t, c);
+		const upstreamC = await startUdsUpstream(nodeC.socketPath);
+		t.after(() => upstreamC.close());
+
+		assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
+		assert.equal(upstreamC.sources.length, 1);
+		const failoverA = routeMetrics(nodeA).failover!;
+		assert.equal(count(failoverA.peers[0].failuresByReason, 'zero_byte_close'), 1);
+		assert.equal(failoverA.replays, 1);
+		const routeB = routeMetrics(nodeB);
+		assert.equal(count(routeB.errorsByReason, 'upstream_connect'), 1);
+		assert.equal(routeB.failover!.exhausted, 0);
+		assert.equal(routeB.failover!.peers[0].forwarded, 0);
+		assert.equal(peerOfB.seen.forwarded, 0);
+	});
+});
+
+describe('a TLS-terminating failover route', { skip: noClientAddress, timeout: SUITE_TIMEOUT_MS }, () => {
+	function nextSocket(): string {
+		return path.join(socketDir, `split-${++socketSeq}.sock`);
+	}
+
+	function splitRoute(h1Path: string, h2Path: string, peers: number[]): RouteConfig {
+		return {
+			sni: SNI,
+			upstreams: [
+				{ kind: 'uds', path: h1Path },
+				{ kind: 'uds', path: h2Path, protocol: 'h2' },
+			],
+			terminateTls: true,
+			http2: true,
+			cert: { certChain: cert, privateKey: key },
+			failover: {
+				peers: peers.map((port) => ({ host: '127.0.0.1', port })),
+				probeIntervalMs: 50,
+				peerCooldownMs: { min: 200, max: 1000 },
+			},
+		};
+	}
+
+	it('uses the connection it made before the handshake, without a second connect', async (t) => {
+		const [a] = await allocatePorts(1);
+		const peer = await startFakePeer(t, 'answering');
+		const nodeA = await startNode(t, a, { peers: [peer.port] });
+		const upstreamA = await startUdsUpstream(nodeA.socketPath);
+		t.after(() => upstreamA.close());
+
+		assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
+		assert.equal(upstreamA.accepted, 1);
+		assert.deepEqual(upstreamA.sources, [CLIENT_ADDRESS]);
+		assert.equal(peer.seen.forwarded, 0);
+		assert.equal(count(routeMetrics(nodeA).errorsByReason, 'upstream_connect'), 0);
+	});
+
+	it('connects each client only to the destination its protocol selects', async (t) => {
+		const [a] = await allocatePorts(1);
+		const peer = await startFakePeer(t, 'answering');
+		const [h1Path, h2Path] = [nextSocket(), nextSocket()];
+		const h1 = await startUdsUpstream(h1Path);
+		const h2 = await startUdsUpstream(h2Path);
+		t.after(() => h1.close());
+		t.after(() => h2.close());
+		await startNode(t, a, { routes: [splitRoute(h1Path, h2Path, [peer.port])] });
+
+		const cases: [string[] | undefined, UdsUpstream, string | false][] = [
+			[['h2'], h2, 'h2'],
+			[['http/1.1', 'h2'], h2, 'h2'],
+			[['h2', 'http/1.1'], h2, 'h2'],
+			[['http/1.1'], h1, 'http/1.1'],
+			[undefined, h1, false],
+		];
+		for (const [alpn, served, expected] of cases) {
+			const before = served.sources.length;
+			let negotiated: string | false | null = null;
+			const reply = await tryEcho({ port: a.publicPort, alpn, onSecure: (s) => (negotiated = s.alpnProtocol) });
+			assert.equal(reply, 'ping', `offer ${alpn}`);
+			assert.equal(negotiated, expected, `offer ${alpn}`);
+			assert.equal(served.sources.length, before + 1, `offer ${alpn}`);
+		}
+		assert.equal(h2.accepted, 3, 'no connection to the h1 destination for an h2 client, or the reverse');
+		assert.equal(h1.accepted, 2);
+		assert.equal(h1.closedWithNoBytes + h2.closedWithNoBytes, 0);
+		assert.equal(peer.seen.forwarded, 0);
+	});
+
+	it('with only its h2 destination refusing, forwards an h2 client and serves an h1 client until the route is marked', async (t) => {
+		const [a, b] = await allocatePorts(2);
+		const [h1Path, absentH2] = [nextSocket(), nextSocket()];
+		const h1 = await startUdsUpstream(h1Path);
+		t.after(() => h1.close());
+		const nodeA = await startNode(t, a, { routes: [splitRoute(h1Path, absentH2, [b.ingressPort])] });
+		const peerPath = nextSocket();
+		const upstreamB = await startUdsUpstream(peerPath);
+		t.after(() => upstreamB.close());
+		await startNode(t, b, {
+			routes: [
+				{
+					sni: SNI,
+					upstreams: [{ kind: 'uds', path: peerPath }],
+					terminateTls: true,
+					http2: true,
+					cert: { certChain: cert, privateKey: key },
+				},
+			],
+		});
+
+		assert.equal(await tryEcho({ port: a.publicPort, alpn: ['http/1.1'] }), 'ping');
+		assert.equal(h1.sources.length, 1, 'nothing marked yet: served locally');
+		assert.equal(upstreamB.sources.length, 0);
+
+		let negotiated: string | false | null = null;
+		const reply = await tryEcho({
+			port: a.publicPort,
+			alpn: ['http/1.1', 'h2'],
+			onSecure: (s) => (negotiated = s.alpnProtocol),
+		});
+		assert.equal(reply, 'ping');
+		assert.equal(negotiated, 'h2', 'negotiated with the peer');
+		assert.deepEqual(upstreamB.sources, [CLIENT_ADDRESS]);
+		assert.equal(count(routeMetrics(nodeA).errorsByReason, 'upstream_connect'), 1);
+		assert.equal(routeMetrics(nodeA).failover!.refusingSlots, 1);
+
+		// A refusing h2 destination now means the route is down, for either protocol.
+		assert.equal(await tryEcho({ port: a.publicPort, alpn: ['http/1.1'] }), 'ping');
+		assert.equal(h1.sources.length, 1);
+		assert.equal(upstreamB.sources.length, 2);
+		assert.equal(count(routeMetrics(nodeA).errorsByReason, 'upstream_connect'), 1);
+	});
+
+	it('connects after the handshake for a hello too large to replay, which a healthy h2 destination still serves', async (t) => {
+		const [a] = await allocatePorts(1);
+		const peer = await startFakePeer(t, 'answering');
+		const [absentH1, h2Path] = [nextSocket(), nextSocket()];
+		const h2 = await startUdsUpstream(h2Path);
+		t.after(() => h2.close());
+		const nodeA = await startNode(t, a, { routes: [splitRoute(absentH1, h2Path, [peer.port])] });
+
+		// Over symphony's 16 KiB hello cap: the name is parsed, the offer past the cap is not.
+		const filler = Array.from({ length: 100 }, (_, i) => `filler-${i}-`.padEnd(200, 'x'));
+		assert.equal(await tryEcho({ port: a.publicPort, alpn: [...filler, 'h2'] }), 'ping');
+		assert.equal(h2.sources.length, 1);
+		assert.equal(peer.seen.forwarded, 0);
+		const route = routeMetrics(nodeA);
+		assert.equal(count(route.errorsByReason, 'upstream_connect'), 0);
+		assert.equal(route.failover!.refusingSlots, 0);
+	});
+
+	it('closes the upstream with no bytes when a client fails its handshake, and tries no peer', async (t) => {
+		const [a] = await allocatePorts(1);
+		const peer = await startFakePeer(t, 'answering');
+		const [h1Path, h2Path] = [nextSocket(), nextSocket()];
+		const h1 = await startUdsUpstream(h1Path);
+		const h2 = await startUdsUpstream(h2Path);
+		t.after(() => h1.close());
+		t.after(() => h2.close());
+		const nodeA = await startNode(t, a, { routes: [splitRoute(h1Path, h2Path, [peer.port])] });
+
+		assert.equal(await tryEcho({ port: a.publicPort, alpn: ['mqtt'] }), null, 'no protocol in common');
+		await waitFor(() => h1.closedWithNoBytes === 1);
+		assert.equal(h1.accepted, 1);
+		assert.equal(h1.sources.length, 0);
+		assert.equal(h2.accepted, 0);
+		assert.equal(peer.seen.forwarded, 0);
+		const route = routeMetrics(nodeA);
+		assert.equal(count(route.errorsByReason, 'tls_handshake'), 1);
+		assert.equal(count(route.errorsByReason, 'upstream_connect'), 0);
+	});
+
+	describe('that requires a client certificate', () => {
+		it('lets no client reach its upstream before the certificate is verified', async (t) => {
+			const ca = generateClientCa();
 			const [a] = await allocatePorts(1);
 			const peer = await startFakePeer(t, 'answering');
-			const nodeA = await startNode(t, a, { peers: [peer.port], passthrough: true });
+			const nodeA = await startNode(t, a, {
+				peers: [peer.port],
+				mtls: { clientCaCert: ca.caCert, requireClientCert: true },
+			});
 			const upstreamA = await startUdsUpstream(nodeA.socketPath);
 			t.after(() => upstreamA.close());
 
-			const hello = clientHello(SNI);
-			const client = await connectRaw(a.publicPort);
-			t.after(() => void client.destroy());
-			const echoed = new Promise<number>((resolve) => client.once('data', (chunk: Buffer) => resolve(chunk.length)));
-			client.write(hello);
-			assert.equal(await echoed, hello.length);
+			assert.equal(await tryEcho({ port: a.publicPort }), null);
+			await sleep(50);
+			assert.equal(upstreamA.accepted, 0);
+			assert.equal(count(routeMetrics(nodeA).errorsByReason, 'tls_handshake'), 1);
+
+			assert.equal(await tryEcho({ port: a.publicPort, clientCert: ca.clientCert, clientKey: ca.clientKey }), 'ping');
+			assert.equal(upstreamA.accepted, 1);
 			assert.equal(upstreamA.sources.length, 1);
 			assert.equal(peer.seen.forwarded, 0);
-			assert.deepEqual(routeMetrics(nodeA).errorsByReason, []);
 		});
 
-		it('closes the client when every peer refuses, counting one upstream_connect', async (t) => {
-			const [a] = await allocatePorts(1);
-			const nodeA = await startNode(t, a, { peers: [await getFreePort()], passthrough: true });
+		it('loses the connection that finds its upstream dead, and forwards once the slot is marked', async (t) => {
+			const ca = generateClientCa();
+			const [a, b] = await allocatePorts(2);
+			const client = { clientCert: ca.clientCert, clientKey: ca.clientKey };
+			const mtls = { clientCaCert: ca.caCert, requireClientCert: true };
+			const nodeA = await startNode(t, a, { peers: [b.ingressPort], mtls });
+			const nodeB = await startNode(t, b, { mtls });
+			const upstreamB = await startUdsUpstream(nodeB.socketPath);
+			t.after(() => upstreamB.close());
 
-			assert.equal(await tryEcho({ port: a.publicPort }), null);
-			const route = routeMetrics(nodeA);
-			assert.equal(count(route.errorsByReason, 'upstream_connect'), 1);
-			assert.equal(route.failover!.exhausted, 1);
-			assert.equal(count(route.failover!.peers[0].failuresByReason, 'refused'), 1);
+			assert.equal(await tryEcho({ port: a.publicPort, ...client }), null);
+			assert.equal(count(routeMetrics(nodeA).errorsByReason, 'upstream_connect'), 1);
+			assert.equal(routeMetrics(nodeA).failover!.peers[0].forwarded, 0);
+
+			assert.equal(await tryEcho({ port: a.publicPort, ...client }), 'ping');
+			assert.equal(routeMetrics(nodeA).failover!.peers[0].forwarded, 1);
+			assert.equal(upstreamB.sources.length, 1);
 		});
+	});
 
-		it('tries the peers again when a draining route falls back to a local upstream that refuses', async (t) => {
-			const [a] = await allocatePorts(1);
-			const nodeA = await startNode(t, a, { peers: [await getFreePort()], passthrough: true, drain: true });
+	it('closes the upstream when a client abandons its handshake', async (t) => {
+		const [a] = await allocatePorts(1);
+		const peer = await startFakePeer(t, 'answering');
+		const nodeA = await startNode(t, a, { peers: [peer.port] });
+		const upstreamA = await startUdsUpstream(nodeA.socketPath);
+		t.after(() => upstreamA.close());
+		const relay = await startSlowRelay(t, a.publicPort, 60_000);
 
-			assert.equal(await tryEcho({ port: a.publicPort }), null);
-			const failover = routeMetrics(nodeA).failover!;
-			assert.equal(failover.localFallbacks, 1);
-			assert.equal(failover.exhausted, 1);
-			assert.equal(count(failover.peers[0].failuresByReason, 'refused'), 2);
-		});
+		const socket = net.connect({ host: '127.0.0.1', port: relay });
+		const client = tls.connect({ socket, servername: SNI, rejectUnauthorized: false });
+		client.on('error', () => {});
+		await waitFor(() => upstreamA.accepted === 1);
+		assert.equal(upstreamA.closedWithNoBytes, 0, 'held across the handshake');
+		client.destroy();
+		await waitFor(() => upstreamA.closedWithNoBytes === 1);
+		assert.equal(peer.seen.forwarded, 0);
+	});
 
-		it('an ingress connection is closed with no bytes and goes to no peer, so the forwarder moves on', async (t) => {
-			const [a, b, c] = await allocatePorts(3);
-			const peerOfB = await startFakePeer(t, 'answering');
-			const nodeA = await startNode(t, a, { peers: [b.ingressPort, c.ingressPort], passthrough: true });
-			const nodeB = await startNode(t, b, { peers: [peerOfB.port], passthrough: true });
-			const nodeC = await startNode(t, c);
-			const upstreamC = await startUdsUpstream(nodeC.socketPath);
-			t.after(() => upstreamC.close());
-
-			assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
-			assert.equal(upstreamC.sources.length, 1);
-			const failoverA = routeMetrics(nodeA).failover!;
-			assert.equal(count(failoverA.peers[0].failuresByReason, 'zero_byte_close'), 1);
-			assert.equal(failoverA.replays, 1);
-			const routeB = routeMetrics(nodeB);
-			assert.equal(count(routeB.errorsByReason, 'upstream_connect'), 1);
-			assert.equal(routeB.failover!.exhausted, 0);
-			assert.equal(routeB.failover!.peers[0].forwarded, 0);
-			assert.equal(peerOfB.seen.forwarded, 0);
-		});
-
-		it('a TLS-terminating route still loses the connection, whose hello the handshake consumed', async (t) => {
+	for (const [how, farewell] of [
+		['with nothing unread', undefined],
+		['behind unread bytes', 'bye'],
+	] as const) {
+		it(`replaces a connection the upstream closed during a slow handshake, ${how}`, async (t) => {
 			const [a] = await allocatePorts(1);
 			const peer = await startFakePeer(t, 'answering');
 			const nodeA = await startNode(t, a, { peers: [peer.port] });
+			const upstreamA = await startUdsUpstream(nodeA.socketPath, { closeIdleAfterMs: 100, farewell });
+			t.after(() => upstreamA.close());
+			const relay = await startSlowRelay(t, a.publicPort, 400);
 
-			assert.equal(await tryEcho({ port: a.publicPort }), null);
-			await sleep(50);
-			assert.equal(peer.seen.forwarded, 0);
-			const route = routeMetrics(nodeA);
-			assert.equal(count(route.errorsByReason, 'upstream_connect'), 1);
-			assert.equal(route.failover!.peers[0].forwarded, 0);
-			assert.equal(route.failover!.exhausted, 0);
-		});
-
-		it('a suspended route does not forward when its resolved upstream refuses', async (t) => {
-			const [a] = await allocatePorts(1);
-			const peer = await startFakePeer(t, 'answering');
-			const deadPort = await getFreePort();
-			const nodeA = await startNode(t, a, {
-				routes: [
-					{
-						sni: SNI,
-						upstreams: [],
-						terminateTls: false,
-						suspended: true,
-						suspendTimeoutMs: 2000,
-						failover: { peers: [{ host: '127.0.0.1', port: peer.port }] },
-					},
-				],
-			});
-			nodeA.proxy.on('suspended', (conn) =>
-				nodeA.proxy.resolveConnection(conn.id, {
-					upstream: { kind: 'tcp', host: '127.0.0.1', port: deadPort },
-					terminateTls: false,
-				})
-			);
-
-			assert.equal(await tryEcho({ port: a.publicPort }), null);
-			await sleep(50);
-			assert.equal(peer.seen.forwarded, 0);
-			assert.equal(count(routeMetrics(nodeA).errorsByReason, 'upstream_connect'), 1);
-		});
-
-		describe(
-			'whose connect times out',
-			{ skip: process.platform !== 'linux' && 'relies on Linux dropping SYNs' },
-			() => {
-				const handshakeMs = 2000;
-
-				it('gives the peer the rest of the handshake timeout', async (t) => {
-					const [a, b] = await allocatePorts(2);
-					const nodeA = await startNode(t, a, {
-						peers: [b.ingressPort],
-						passthrough: true,
-						tcpUpstream: await startHangingUpstream(t),
-						publicProtection: { tlsHandshakeTimeoutMs: handshakeMs },
-					});
-					const nodeB = await startNode(t, b);
-					const upstreamB = await startUdsUpstream(nodeB.socketPath);
-					t.after(() => upstreamB.close());
-
-					const started = performance.now();
-					assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
-					const elapsed = performance.now() - started;
-					assert.ok(elapsed >= handshakeMs * 0.4, `the local connect was given time: ${elapsed} ms`);
-					assert.ok(elapsed < handshakeMs, `within the handshake timeout: ${elapsed} ms`);
-					const route = routeMetrics(nodeA);
-					assert.equal(count(route.errorsByReason, 'upstream_connect'), 1);
-					assert.equal(route.failover!.refusingSlots, 1);
-				});
-
-				it('closes a client no peer answered at the end of the handshake timeout', async (t) => {
-					const [a] = await allocatePorts(1);
-					const peer = await startFakePeer(t, 'silent');
-					const nodeA = await startNode(t, a, {
-						peers: [peer.port],
-						passthrough: true,
-						tcpUpstream: await startHangingUpstream(t),
-						publicProtection: { tlsHandshakeTimeoutMs: handshakeMs },
-					});
-
-					const started = performance.now();
-					assert.equal(await tryEcho({ port: a.publicPort }), null);
-					const elapsed = performance.now() - started;
-					assert.equal(peer.seen.forwarded, 1, 'the peer was tried');
-					assert.ok(elapsed >= handshakeMs * 0.9, `the peer was given the rest: ${elapsed} ms`);
-					assert.ok(elapsed < handshakeMs + 500, `the total stays within the handshake timeout: ${elapsed} ms`);
-					const failover = routeMetrics(nodeA).failover!;
-					assert.equal(count(failover.peers[0].failuresByReason, 'timeout'), 1);
-					assert.equal(failover.exhausted, 1);
-				});
-
-				it('keeps one allowance across a silent drain peer, the local connect and a silent peer', async (t) => {
-					const [a] = await allocatePorts(1);
-					const peer = await startFakePeer(t, 'silent');
-					const nodeA = await startNode(t, a, {
-						peers: [peer.port],
-						passthrough: true,
-						drain: true,
-						tcpUpstream: await startHangingUpstream(t),
-						publicProtection: { tlsHandshakeTimeoutMs: handshakeMs },
-					});
-
-					const started = performance.now();
-					assert.equal(await tryEcho({ port: a.publicPort }), null);
-					const elapsed = performance.now() - started;
-					assert.equal(peer.seen.forwarded, 2, 'tried by the drain, and again once the local connect failed');
-					assert.ok(elapsed >= handshakeMs * 0.9, `the allowance was used: ${elapsed} ms`);
-					assert.ok(elapsed < handshakeMs + 500, `and not exceeded: ${elapsed} ms`);
-					const failover = routeMetrics(nodeA).failover!;
-					assert.equal(failover.localFallbacks, 1);
-					assert.equal(failover.exhausted, 1);
-				});
-			}
-		);
-
-		describe(
-			'whose connect fails slowly',
-			{ skip: process.platform !== 'linux' && 'relies on Linux dropping SYNs' },
-			() => {
-				// The local connect is capped at half of this, later than the 1 s SYN retransmit that fails it.
-				const handshakeMs = 3000;
-				async function startDyingNode(
-					t: TestContext,
-					ports: { publicPort: number; ingressPort: number },
-					peer: number
-				): Promise<{ node: Node; killUpstream(): void }> {
-					const upstream = await startHangingUpstream(t);
-					const node = await startNode(t, ports, {
-						peers: [peer],
-						passthrough: true,
-						tcpUpstream: { host: upstream.host, port: upstream.port },
-						publicProtection: { tlsHandshakeTimeoutMs: handshakeMs },
-					});
-					return { node, killUpstream: upstream.kill };
-				}
-
-				it('gives the peer the time that is left', async (t) => {
-					const [a, b] = await allocatePorts(2);
-					const nodeB = await startNode(t, b);
-					const upstreamB = await startUdsUpstream(nodeB.socketPath);
-					t.after(() => upstreamB.close());
-					const { node: nodeA, killUpstream } = await startDyingNode(t, a, b.ingressPort);
-
-					const started = performance.now();
-					const reply = tryEcho({ port: a.publicPort });
-					setTimeout(killUpstream, 200);
-					assert.equal(await reply, 'ping');
-					const elapsed = performance.now() - started;
-					assert.ok(elapsed >= 900, `the connect failed at its retransmit: ${elapsed} ms`);
-					assert.ok(elapsed < handshakeMs / 2, `before the cap: ${elapsed} ms`);
-					assert.equal(count(routeMetrics(nodeA).errorsByReason, 'upstream_connect'), 1);
-				});
-
-				it('closes at the end of the handshake timeout when the peer stays silent', async (t) => {
-					const [a] = await allocatePorts(1);
-					const peer = await startFakePeer(t, 'silent');
-					const { node: nodeA, killUpstream } = await startDyingNode(t, a, peer.port);
-
-					const started = performance.now();
-					const reply = tryEcho({ port: a.publicPort });
-					setTimeout(killUpstream, 200);
-					assert.equal(await reply, null);
-					const elapsed = performance.now() - started;
-					assert.equal(peer.seen.forwarded, 1);
-					assert.ok(elapsed >= handshakeMs * 0.9, `the peer was given the rest: ${elapsed} ms`);
-					assert.ok(elapsed < handshakeMs + 500, `the total stays within the handshake timeout: ${elapsed} ms`);
-					assert.equal(routeMetrics(nodeA).failover!.exhausted, 1);
-				});
-			}
-		);
-
-		it('closes a connection whose local upstream accepts and then resets, without a peer', async (t) => {
-			const [a] = await allocatePorts(1);
-			const peer = await startFakePeer(t, 'answering');
-			const nodeA = await startNode(t, a, { peers: [peer.port], passthrough: true });
-			const server = net.createServer((socket) => socket.destroy());
-			await new Promise<void>((resolve) => server.listen(nodeA.socketPath, resolve));
-			t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
-
-			assert.equal(await tryEcho({ port: a.publicPort }), null);
-			await sleep(50);
+			const socket = net.connect({ host: '127.0.0.1', port: relay });
+			assert.equal(await tryEcho({ port: relay, socket }), 'ping');
+			assert.equal(upstreamA.accepted, 2);
+			assert.equal(upstreamA.sources.length, 1);
 			assert.equal(peer.seen.forwarded, 0);
 			assert.equal(count(routeMetrics(nodeA).errorsByReason, 'upstream_connect'), 0);
-		});
-
-		it('a peer that answered is not retried when it then closes', async (t) => {
-			const [a] = await allocatePorts(1);
-			const committing = await startFakePeer(t, 'commits');
-			const next = await startFakePeer(t, 'answering');
-			const nodeA = await startNode(t, a, { peers: [committing.port, next.port], passthrough: true });
-
-			assert.equal(await tryEcho({ port: a.publicPort }), null);
-			await sleep(50);
-			assert.equal(committing.seen.forwarded, 1);
-			assert.equal(next.seen.forwarded, 0);
-			const failover = routeMetrics(nodeA).failover!;
-			assert.equal(failover.peers[0].forwarded, 1);
-			assert.equal(failover.replays, 0);
+			await waitFor(() => upstreamA.closedWithNoBytes === 1);
 		});
 	}
-);
+
+	it('loses the connection, once counted, when the upstream stops during the handshake', async (t) => {
+		const [a] = await allocatePorts(1);
+		const peer = await startFakePeer(t, 'answering');
+		const nodeA = await startNode(t, a, { peers: [peer.port] });
+		const upstreamA = await startUdsUpstream(nodeA.socketPath);
+		const relay = await startSlowRelay(t, a.publicPort, 400);
+
+		const socket = net.connect({ host: '127.0.0.1', port: relay });
+		const reply = tryEcho({ port: relay, socket });
+		await waitFor(() => upstreamA.accepted === 1);
+		await upstreamA.close();
+		assert.equal(await reply, null);
+		await sleep(50);
+		assert.equal(peer.seen.forwarded, 0, 'the hello was consumed: too late for a peer');
+		const route = routeMetrics(nodeA);
+		assert.equal(count(route.errorsByReason, 'upstream_connect'), 1);
+		assert.equal(route.failover!.peers[0].forwarded, 0);
+		assert.equal(route.failover!.refusingSlots, 1);
+	});
+
+	it('tries its other local slots before any peer', async (t) => {
+		const [a] = await allocatePorts(1);
+		const peer = await startFakePeer(t, 'answering');
+		const [absent, live] = [nextSocket(), nextSocket()];
+		const upstreamA = await startUdsUpstream(live);
+		t.after(() => upstreamA.close());
+		const route = splitRoute(absent, live, [peer.port]);
+		route.upstreams = [
+			{ kind: 'uds', path: absent },
+			{ kind: 'uds', path: live },
+		];
+		const nodeA = await startNode(t, a, { routes: [route] });
+
+		assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
+		assert.equal(upstreamA.sources.length, 1);
+		assert.equal(peer.seen.forwarded, 0);
+		const metrics = routeMetrics(nodeA);
+		assert.equal(count(metrics.errorsByReason, 'upstream_connect'), 0);
+		assert.equal(metrics.failover!.refusingSlots, 1);
+	});
+
+	it('on the ingress listener still connects after its handshake, and goes to no peer', async (t) => {
+		const [b] = await allocatePorts(1);
+		const peerOfB = await startFakePeer(t, 'answering');
+		const nodeB = await startNode(t, b, { peers: [peerOfB.port] });
+
+		const socket = await connectRaw(b.ingressPort);
+		socket.write(proxyV2Header(CLIENT_ADDRESS, 4000));
+		let handshakeFinished = false;
+		const reply = await tryEcho({ port: b.ingressPort, socket, onSecure: () => (handshakeFinished = true) });
+		assert.equal(reply, null);
+		assert.ok(handshakeFinished);
+		await sleep(50);
+		const route = routeMetrics(nodeB);
+		assert.equal(count(route.errorsByReason, 'upstream_connect'), 1);
+		assert.equal(route.failover!.peers[0].forwarded, 0);
+		assert.equal(route.failover!.exhausted, 0);
+		assert.equal(peerOfB.seen.forwarded, 0);
+	});
+
+	it(
+		'gives the handshake only what a slow local connect left of the timeout',
+		{ skip: process.platform !== 'linux' && 'relies on Linux dropping SYNs' },
+		async (t) => {
+			const handshakeMs = 3000;
+			const [a] = await allocatePorts(1);
+			const peer = await startFakePeer(t, 'answering');
+			const upstream = await startHangingUpstream(t, 800);
+			const nodeA = await startNode(t, a, {
+				peers: [peer.port],
+				tcpUpstream: { host: upstream.host, port: upstream.port },
+				publicProtection: { tlsHandshakeTimeoutMs: handshakeMs },
+			});
+			const relay = await startSlowRelay(t, a.publicPort, 60_000);
+
+			const started = performance.now();
+			const socket = net.connect({ host: '127.0.0.1', port: relay });
+			const client = tls.connect({ socket, servername: SNI, rejectUnauthorized: false });
+			client.on('error', () => {});
+			await Promise.race([new Promise((resolve) => client.once('close', resolve)), sleep(handshakeMs * 2)]);
+			const elapsed = performance.now() - started;
+			assert.ok(elapsed >= handshakeMs * 0.9, `the handshake had the rest: ${elapsed} ms`);
+			assert.ok(elapsed < handshakeMs + 500, `and no more: ${elapsed} ms`);
+			const route = routeMetrics(nodeA);
+			assert.equal(count(route.errorsByReason, 'tls_handshake'), 1);
+			assert.equal(count(route.errorsByReason, 'upstream_connect'), 0, 'the connect succeeded');
+			assert.equal(peer.seen.forwarded, 0);
+		}
+	);
+});
 
 describe(
 	'spill-over',
@@ -1337,7 +1708,7 @@ describe('an upstream that accepts before it serves', { skip: noClientAddress, t
 		await markDown(nodeA);
 		assert.equal(routeMetrics(nodeA).failover!.refusingSlots, 65);
 
-		const upstreams = await Promise.all(paths.map(startUdsUpstream));
+		const upstreams = await Promise.all(paths.map((socketPath) => startUdsUpstream(socketPath)));
 		t.after(() => Promise.all(upstreams.map((upstream) => upstream.close())));
 		await waitFor(() => routeMetrics(nodeA).failover!.refusingSlots === 0);
 	});

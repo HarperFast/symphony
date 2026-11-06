@@ -3,7 +3,7 @@ use crate::router::Destination;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, Interest, Ready};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 
@@ -15,6 +15,25 @@ pub enum UpstreamStream {
 		/// Keep the guard alive for the duration of the connection.
 		_guard: BalancerGuard,
 	},
+}
+
+impl UpstreamStream {
+	/// The upstream has closed its side of this connection, unread data or not, as far as the
+	/// reactor has seen. Never waits, and reads nothing.
+	pub fn closed(&self) -> bool {
+		match self {
+			Self::Tcp(stream) => read_closed(stream.ready(Interest::READABLE)),
+			Self::Uds { stream, .. } => read_closed(stream.ready(Interest::READABLE)),
+		}
+	}
+}
+
+fn read_closed(ready: impl std::future::Future<Output = std::io::Result<Ready>>) -> bool {
+	let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+	match std::pin::pin!(ready).poll(&mut cx) {
+		std::task::Poll::Ready(result) => result.map_or(true, |ready| ready.is_read_closed()),
+		std::task::Poll::Pending => false,
+	}
 }
 
 /// Connect to an upstream destination.
@@ -285,6 +304,62 @@ pub async fn write_proxy_v2_header<W: tokio::io::AsyncWrite + Unpin>(
 mod tests {
 	use super::*;
 	use crate::balancer::UdsSlotSpec;
+
+	/// The reactor has to see the close, which needs this task to yield.
+	async fn settle(closed: impl Fn() -> bool, expected: bool) -> bool {
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+		while closed() != expected && tokio::time::Instant::now() < deadline {
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+		tokio::time::sleep(Duration::from_millis(5)).await;
+		closed()
+	}
+
+	fn uds_closed(socket: &UnixStream) -> bool {
+		read_closed(socket.ready(Interest::READABLE))
+	}
+
+	fn tcp_closed(socket: &TcpStream) -> bool {
+		read_closed(socket.ready(Interest::READABLE))
+	}
+
+	#[tokio::test]
+	async fn a_unix_socket_reads_as_closed_only_once_its_peer_has_gone() {
+		let (socket, peer) = UnixStream::pair().unwrap();
+		assert!(!settle(|| uds_closed(&socket), false).await);
+
+		peer.try_write(b"x").unwrap();
+		assert!(
+			!settle(|| uds_closed(&socket), false).await,
+			"unread data is not a close"
+		);
+
+		drop(peer);
+		assert!(
+			settle(|| uds_closed(&socket), true).await,
+			"a close behind unread data is still a close"
+		);
+		let mut byte = [0u8; 1];
+		assert_eq!(socket.try_read(&mut byte).unwrap(), 1, "nothing was read");
+	}
+
+	#[tokio::test]
+	async fn a_tcp_socket_reads_as_closed_after_a_fin_or_a_reset() {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		for reset in [false, true] {
+			let socket = TcpStream::connect(addr).await.unwrap();
+			let (peer, _) = listener.accept().await.unwrap();
+			assert!(!settle(|| tcp_closed(&socket), false).await);
+			if reset {
+				socket2::SockRef::from(&peer)
+					.set_linger(Some(Duration::ZERO))
+					.unwrap();
+			}
+			drop(peer);
+			assert!(settle(|| tcp_closed(&socket), true).await, "reset={reset}");
+		}
+	}
 
 	fn socket_dir(name: &str) -> std::path::PathBuf {
 		let dir = std::env::temp_dir().join(format!("symphony-{name}-{}", std::process::id()));

@@ -250,6 +250,7 @@ pub struct Route {
 	pub protocol: RouteProtocol,
 	pub allowed_sources: Option<SourceAllowlist>,
 	pub failover: Option<Arc<Failover>>,
+	pub requires_client_cert: bool,
 }
 
 pub struct RouteMetricIdentity {
@@ -1099,6 +1100,8 @@ fn build_route(
 		protocol: spec.protocol,
 		allowed_sources: None,
 		failover: None,
+		requires_client_cert: spec.terminate_tls
+			&& effective_mtls(spec, listener_tls).is_some_and(|(_, required)| required),
 	})
 }
 
