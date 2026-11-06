@@ -29,8 +29,8 @@ const MAX_INTERVAL_MS: f64 = 86_400_000.0;
 /// One probe connect's limit, independent of `probeIntervalMs`: a short interval must not turn a
 /// slow accept into a refusal that keeps the route failed over.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-/// How long a probe's connection has to stay open: well above the milliseconds docker-proxy takes to
-/// close on a refused dial. A failover upstream has to keep an idle connection open this long.
+/// How long a probe's connection has to stay open, and so how long a failover upstream has to keep
+/// an idle connection open.
 const PROBE_SETTLE: Duration = Duration::from_millis(250);
 /// Longest the probe task sleeps, so a reload that shortens `probeIntervalMs` takes effect promptly.
 const MAX_PROBE_TICK: Duration = Duration::from_secs(1);
@@ -1179,13 +1179,19 @@ async fn probe(endpoint: &Endpoint) -> bool {
 	}
 }
 
-/// An accept is not evidence of a server: docker-proxy accepts on a published port, dials the
-/// container, and closes when that is refused. Nothing is sent, since the servers behind a route wait
-/// for their client, and without a protocol that is as much as a probe can learn: a proxy slower
-/// than this to fail its dial still passes.
+/// An accept is not evidence of a server: docker-proxy accepts on a published port and closes when
+/// its dial into the container is refused. Sends nothing, since the servers behind a route wait for
+/// their client, and reads to the deadline so that one answering and closing does not pass.
 async fn stays_open(mut stream: impl tokio::io::AsyncRead + Unpin) -> bool {
 	let mut discard = [0u8; 256];
-	let closed = async { while matches!(stream.read(&mut discard).await, Ok(1..)) {} };
+	let closed = async {
+		loop {
+			match stream.read(&mut discard).await {
+				Ok(0) | Err(_) => return,
+				Ok(_) => {}
+			}
+		}
+	};
 	timeout(PROBE_SETTLE, closed).await.is_err()
 }
 
@@ -1378,6 +1384,17 @@ mod tests {
 			"a close after the deadline is not seen"
 		);
 		close_late.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_peer_that_keeps_writing_cannot_hold_a_probe_past_its_deadline() {
+		let (socket, mut peer) = UnixStream::pair().unwrap();
+		let writer =
+			tokio::spawn(async move { while peer.write_all(&[0u8; 4096]).await.is_ok() {} });
+		let started = Instant::now();
+		assert!(stays_open(socket).await);
+		assert!(started.elapsed() < PROBE_SETTLE * 4);
+		writer.abort();
 	}
 
 	#[tokio::test]

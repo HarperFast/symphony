@@ -1177,7 +1177,6 @@ describe('an upstream that accepts before it serves', { skip: noClientAddress, t
 		return events;
 	}
 
-	/** The peer serves every connection, none reaches the local upstream, and the route stays down. */
 	async function assertServedByPeerOnly(node: Node, forwardedBefore: number) {
 		for (let i = 0; i < 3; i++) assert.equal(await tryEcho({ port: node.publicPort }), 'ping');
 		const route = routeMetrics(node);

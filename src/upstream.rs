@@ -20,7 +20,9 @@ pub enum UpstreamStream {
 /// Connect to an upstream destination.
 /// `peer_ip` is passed to UDS balancers for IP affinity.
 /// `connect_timeout` caps the time spent waiting for the connection, across every slot tried.
-/// `tcp_health` is a failover route's state for a TCP destination; UDS slots carry their own.
+/// `tcp_health` is a failover route's state for a TCP destination; UDS slots carry their own. A
+/// refusal marks it. A success leaves a mark in place: an accept proves nothing, so only the probe
+/// clears one.
 pub async fn connect(
 	destination: &Destination,
 	peer_ip: Option<IpAddr>,
