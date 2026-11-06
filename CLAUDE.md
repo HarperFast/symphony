@@ -175,9 +175,26 @@ hand over the TLS session), and it lets the peer terminate and verify client cer
   destination's one-slot health lives on `Failover::tcp_health`, so `Destination::Tcp` stays a value.
 - **Health is shared across reloads, not copied.** A rebuild reuses the previous `Arc<SlotHealth>`
   per unchanged path/addr, so a connection on the old table marks what the live table reads. The
-  probe and a successful connect both clear with `clear_if_unchanged(observed)` (the value read
-  before connecting), so neither can erase a newer refusal, and an accepting slot costs no write.
-  Peer state and counters carry only when the route keeps its metric identity.
+  probe clears with `clear_if_unchanged(observed)` (the value read before connecting), so it cannot
+  erase a newer refusal. Peer state and counters carry only when the route keeps its metric identity.
+- **An accept is not evidence that a route is up (symphony#84).** host-manager republishes a route as
+  TCP passthrough to a Docker-published port when Harper's socket metadata is missing, and docker-proxy
+  accepts there before Harper binds, then closes when its dial is refused. Three things follow:
+  - `probe` needs the connection to stay open for `PROBE_SETTLE` (`stays_open`), reading to the
+    deadline so a server that answers and closes does not pass. It sends nothing, so it needs no
+    protocol, and so it cannot catch a proxy slower than that to fail its dial or a server that closes
+    only on its first byte.
+  - Only the probe clears a slot. A client connect does not: a retry landing on a marked slot
+    (`next_untried`) would clear it on an accept.
+  - A rebuild of a `locally_down` route starts the endpoints it did not have as refusing
+    (`Inherit::refuse_new`), because fresh health reads as up and an unmarked slot is never probed.
+    Inherited health is left alone, or frequent config writes could block recovery. The test is
+    `locally_down`, not any slot refusing: a route with one dead worker replaced wholesale, with no
+    peer answering, would take an outage it does not otherwise have.
+
+  An unmarked route that starts accepting early stays exposed, since `Stream` errors do not mark: the
+  copy cannot tell a client's reset from an upstream's, so marking on one would let a client take a
+  route down. Docker's `userland-proxy: false` is the fix for that, and for this whole window on Fabric.
 - **Slots tracked ⇔ route has failover**, enforced in `build_route_table` even for a carried-forward
   route (its destinations are rebuilt when the policy's presence changed). A tracked slot with no
   probe would be skipped forever; a failover route without tracking would never go down.
@@ -195,6 +212,8 @@ hand over the TLS session), and it lets the peer terminate and verify client cer
   through `ArcSwap`, validated with the rest of `updateConfig` before anything is stored.
 - **The probe task is the only writer of `reported_down`**, so each transition emits one
   `routeHealth`. It dedups endpoints across routes, runs probes concurrently, and stops on shutdown.
+  It reports from the live table after a pass, because a reload during a probe can replace the
+  endpoint just cleared. A pass takes up to `ceil(endpoints / 64) x (PROBE_TIMEOUT + PROBE_SETTLE)`.
 - **Drain and spill fall back to local service; down does not.** Because the hello stays unread
   until a peer commits, a drain or spill attempt that no peer answers returns `ServeLocally` with
   the socket untouched; drain skips cooling peers and caps its attempts at 2 s so the local
@@ -402,7 +421,7 @@ instead.
 - **`suspended.spec.ts`** — hold → resolve → proxy, hold → null → close, hold → timeout → drop
 - **`mtls.spec.ts`** — mTLS termination + PROXY v2 TLV forwarding of the client cert chain (0xE2, SSL TLV 0x20); skips without openssl
 - **`metrics.spec.ts`** — per-listener breakdown and byte counting, `renderPrometheus` output shape, the admin endpoint over UDS + TCP, and stale-socket reclaim after a `SIGKILL`
-- **`failover.spec.ts`** — peer failover across two or three proxies in one process (UDS upstreams that record the PROXY v1 source); the client binds 127.0.0.2 so the forwarded client address differs from the forwarding node's (macOS has it only through an `lo0` alias, which CI adds; without one the suite skips). A TLS-terminating route learns it is down only by losing one connection (`markDown`), as in production; a passthrough route forwards that connection instead. The hanging-connect cases (Linux) use a TCP port whose accept queue is full (`startHangingUpstream`). The unreachable-TCP-upstream case (Linux only) points a passthrough route at `255.255.255.255`, which Linux fails with `ENETUNREACH` at once. Spill-over tests (Linux) serve the upstream from a child process whose busy main thread is the slot's `pid`/`tid`, so the load is real thread CPU; the PID-namespace case runs that child under `bwrap --unshare-pid` (CI installs bubblewrap) and skips without it
+- **`failover.spec.ts`** — peer failover across two or three proxies in one process (UDS upstreams that record the PROXY v1 source); the client binds 127.0.0.2 so the forwarded client address differs from the forwarding node's (macOS has it only through an `lo0` alias, which CI adds; without one the suite skips). A TLS-terminating route learns it is down only by losing one connection (`markDown`), as in production; a passthrough route forwards that connection instead. Upstreams that accept before they serve use `startClosingUpstream` and `startDockerProxy`, which closes with the client's bytes unread, as docker-proxy does. The hanging-connect cases (Linux) use a TCP port whose accept queue is full (`startHangingUpstream`). The unreachable-TCP-upstream case (Linux only) points a passthrough route at `255.255.255.255`, which Linux fails with `ENETUNREACH` at once. Spill-over tests (Linux) serve the upstream from a child process whose busy main thread is the slot's `pid`/`tid`, so the load is real thread CPU; the PID-namespace case runs that child under `bwrap --unshare-pid` (CI installs bubblewrap) and skips without it
 - **`liveness.spec.ts`** — the half-close bound over a real passthrough proxy. Its client uses `allowHalfOpen: true` (otherwise Node answers the proxy's FIN with its own and there is no half-close to bound) and a synthetic `clientHello()` from `util.ts` (otherwise `peek()` blocks for its 5s reassembly timeout and a no-SNI connection resolves to no route)
 
 The Rust toolchain is pinned to `1.94.1` in `rust-toolchain.toml`. Ensure rustup's

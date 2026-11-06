@@ -35,6 +35,14 @@ pub struct SlotHealth {
 }
 
 impl SlotHealth {
+	pub fn new(refusing: bool) -> Self {
+		let health = Self::default();
+		if refusing {
+			health.mark_refused();
+		}
+		health
+	}
+
 	pub fn refusing(&self) -> bool {
 		self.refused_at_ns.load(Ordering::Relaxed) != 0
 	}
@@ -177,7 +185,8 @@ impl UdsBalancer {
 
 	/// Track per-slot health for a failover route, reusing `previous`'s state for any path it
 	/// shares so a rebuild neither forgets a refusing slot nor detaches in-flight connections from it.
-	pub fn with_health(mut self, previous: Option<&UdsBalancer>) -> Self {
+	/// `refuse_new`: a path it does not share starts refusing, until the probe has tested it.
+	pub fn with_health(mut self, previous: Option<&UdsBalancer>, refuse_new: bool) -> Self {
 		for slot in &mut self.sockets {
 			let inherited = previous.and_then(|prev| {
 				prev.sockets
@@ -185,7 +194,7 @@ impl UdsBalancer {
 					.find(|p| p.path == slot.path)
 					.and_then(|p| p.health.clone())
 			});
-			slot.health = Some(inherited.unwrap_or_default());
+			slot.health = Some(inherited.unwrap_or_else(|| Arc::new(SlotHealth::new(refuse_new))));
 		}
 		self
 	}
@@ -208,7 +217,7 @@ impl UdsBalancer {
 			.map_or((false, 0), |a| (true, a.ttl_ns / 1_000_000));
 		let balancer = UdsBalancer::new(slots, ip_affinity, ttl_ms).with_cpu_from(Some(self));
 		if track {
-			balancer.with_health(Some(self))
+			balancer.with_health(Some(self), false)
 		} else {
 			balancer
 		}
