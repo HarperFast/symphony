@@ -29,17 +29,12 @@ pub async fn connect(
 ) -> crate::error::Result<UpstreamStream> {
 	match destination {
 		Destination::Tcp(addr) => {
-			let observed = tcp_health.map_or(0, |h| h.refused_at());
 			let result = timeout(connect_timeout, TcpStream::connect(addr))
 				.await
 				.unwrap_or_else(|_| Err(connect_timed_out()));
-			if let Some(health) = tcp_health {
-				match &result {
-					Ok(_) if observed != 0 => {
-						health.clear_if_unchanged(observed);
-					}
-					Err(e) if is_refusal(e) => health.mark_refused(),
-					_ => {}
+			if let (Some(health), Err(e)) = (tcp_health, &result) {
+				if is_refusal(e) {
+					health.mark_refused();
 				}
 			}
 			let stream = result?;
@@ -93,17 +88,11 @@ async fn connect_uds(
 	loop {
 		let path = balancer.path(idx);
 		let health = balancer.health(idx);
-		// Read before connecting: clearing only this refusal means a connect that raced a newer
-		// one cannot erase it, and an accepting slot costs no write.
-		let observed = health.map_or(0, |h| h.refused_at());
 		let result = tokio::time::timeout_at(deadline, UnixStream::connect(path.as_ref()))
 			.await
 			.unwrap_or_else(|_| Err(connect_timed_out()));
 		match result {
 			Ok(stream) => {
-				if let (Some(h), true) = (health, observed != 0) {
-					h.clear_if_unchanged(observed);
-				}
 				if !tried.is_empty() {
 					balancer.rebind_affinity(peer_ip, idx);
 				}
@@ -360,7 +349,7 @@ mod tests {
 		let a = dir.join("a.sock");
 		let b = dir.join("b.sock");
 		let listener = tokio::net::UnixListener::bind(&b).unwrap();
-		let bal = Arc::new(balancer(&[&a, &b], false).with_health(None));
+		let bal = Arc::new(balancer(&[&a, &b], false).with_health(None, false));
 		let dest = Destination::UdsSet(bal.clone());
 
 		assert_eq!(connected_path(&dest, None).await.as_deref(), b.to_str());
@@ -378,7 +367,7 @@ mod tests {
 		assert!(connected_path(&dest, None).await.is_none());
 		assert!(bal.all_refusing());
 
-		let rebuilt = balancer(&[&a, &b], false).with_health(Some(&bal));
+		let rebuilt = balancer(&[&a, &b], false).with_health(Some(&bal), false);
 		assert!(rebuilt.all_refusing(), "a rebuild keeps the refusals");
 		assert!(Arc::ptr_eq(
 			rebuilt.health(0).unwrap(),
@@ -391,6 +380,27 @@ mod tests {
 		assert!(
 			!rebuilt.all_refusing(),
 			"clearing the shared state reaches the rebuilt table"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_connect_to_a_marked_slot_leaves_it_marked() {
+		let dir = socket_dir("marked");
+		let a = dir.join("a.sock");
+		let b = dir.join("b.sock");
+		let _listener = tokio::net::UnixListener::bind(&a).unwrap();
+		let bal = Arc::new(balancer(&[&a, &b], false).with_health(None, false));
+		bal.health(0).unwrap().mark_refused();
+		let dest = Destination::UdsSet(bal.clone());
+
+		assert_eq!(
+			connected_path(&dest, None).await.as_deref(),
+			a.to_str(),
+			"the unmarked slot refuses, so the marked one is tried"
+		);
+		assert!(
+			bal.health(0).unwrap().refusing(),
+			"an accept is not evidence; only the probe clears"
 		);
 	}
 
@@ -409,7 +419,7 @@ mod tests {
 		assert!(connect(&dest, None, Duration::from_secs(1), Some(&health))
 			.await
 			.is_ok());
-		assert!(!health.refusing());
+		assert!(health.refusing(), "only the probe clears");
 		drop(listener);
 	}
 

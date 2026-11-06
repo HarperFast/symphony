@@ -477,9 +477,16 @@ upstream) is refusing connections. A slot is marked refusing when a connect to i
 no socket file, finds its accept queue full, times out, or finds its host or network unreachable or
 down (`EHOSTUNREACH`, `ENETUNREACH`, `ENETDOWN`, `EHOSTDOWN`; a TCP connect to a stopped container's
 bridge address fails this way after a few seconds of unanswered ARP). A background probe connects
-to each refusing slot every `probeIntervalMs` and closes at once; a successful connect clears the slot. A `routeHealth` event
-(`{ route, metricsGroup, status: 'up' | 'down' }`) reports each transition. A connect proves the
-socket accepts, not that the application behind it is ready.
+to each refusing slot every `probeIntervalMs`, sends nothing, and clears the slot only if the
+connection is still open 250 ms later. Nothing else clears a slot, and a reload that moves a down
+route to endpoints it did not have starts them refusing. A `routeHealth` event
+(`{ route, metricsGroup, status: 'up' | 'down' }`) reports each transition.
+
+An accept alone does not bring a route up, because Docker's userland proxy accepts on a published
+port before the container listens, and closes when its dial is refused. A connection that stays open
+is still not proof that the application is ready: a proxy that takes longer than 250 ms to fail its
+dial passes. An upstream must keep an idle connection open for at least 250 ms, or its slot never
+clears once marked.
 
 A **passthrough** route (`terminateTls: false`) also forwards a connection when its local connect
 fails, on a client listener and unless the route is suspended. Nothing has been read from the client
@@ -527,8 +534,12 @@ by a success), at most once each.
 - Only new connections are forwarded; established ones close with their upstream.
 - A **TLS-terminating** route loses the connection that discovers a dead upstream: it connects after
   the handshake, which has already read the ClientHello, so there is nothing to replay. Only a failed
-  connect marks a slot (the probe only clears marks), so on a quiet route that is the first connection
-  after every outage. A passthrough route forwards that connection instead.
+  connect, or a reload of a down route onto new endpoints, marks a slot (the probe only clears marks),
+  so on a quiet route that is the first connection after every outage. A passthrough route forwards
+  that connection instead.
+- A route with no mark is not probed, so an upstream that accepts and then closes does not bring it
+  down: those connections fail with route error `stream`. Behind Docker, set `userland-proxy: false`
+  so a published port refuses until the container listens.
 - At a peer, a failed local connect on the ingress listener closes with no bytes, which sends the
   forwarding node on to its next peer. A suspended route's resolved upstream is not covered either.
 - On a passthrough route, a TCP upstream slower to accept than half the handshake timeout counts as

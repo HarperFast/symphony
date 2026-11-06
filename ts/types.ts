@@ -209,8 +209,8 @@ export interface FailoverConfig {
 	 */
 	drain?: boolean;
 	/**
-	 * How often a refusing local upstream slot is re-tested (connect, then close). Minimum 10.
-	 * Default: 1000.
+	 * How often a refusing local upstream slot is re-tested (connect, send nothing, and clear it if
+	 * the connection is still open 250 ms later). Minimum 10. Default: 1000.
 	 */
 	probeIntervalMs?: number;
 	/**

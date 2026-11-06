@@ -150,6 +150,44 @@ async function startHangingUpstream(t: TestContext): Promise<{ host: string; por
 	throw new Error('the accept queue never filled');
 }
 
+/** Accepts and, `closeAfterMs` later, closes with nothing read. */
+async function startClosingUpstream(socketPath: string, closeAfterMs = 0) {
+	let accepted = 0;
+	const server = net.createServer({ pauseOnConnect: true }, (socket) => {
+		accepted++;
+		socket.on('error', () => {});
+		setTimeout(() => socket.destroy(), closeAfterMs);
+	});
+	await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+	return {
+		accepted: () => accepted,
+		close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+	};
+}
+
+/**
+ * What Docker's userland proxy does on a published port: accepts first, then dials the container, and
+ * on a refused dial closes with the client's bytes unread, which makes the close a reset.
+ */
+async function startDockerProxy(t: TestContext, port: number, backendPath: string) {
+	let accepted = 0;
+	const server = net.createServer({ pauseOnConnect: true }, (client) => {
+		accepted++;
+		client.on('error', () => {});
+		const backend = net.connect(backendPath);
+		backend.once('connect', () => {
+			client.pipe(backend);
+			backend.pipe(client);
+			client.resume();
+		});
+		backend.on('error', () => client.destroy());
+		client.once('close', () => backend.destroy());
+	});
+	await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
+	t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+	return { accepted: () => accepted };
+}
+
 /** A socket file with nothing listening on it, as a stopped container leaves behind. */
 async function createStaleSocket(socketPath: string): Promise<void> {
 	const upstream = await startUdsUpstream(socketPath);
@@ -1124,6 +1162,211 @@ describe(
 		});
 	}
 );
+
+describe('an upstream that accepts before it serves', { skip: noClientAddress, timeout: SUITE_TIMEOUT_MS }, () => {
+	async function startPeer(t: TestContext) {
+		const [ports] = await allocatePorts(1);
+		const node = await startNode(t, ports);
+		const upstream = await startUdsUpstream(node.socketPath);
+		t.after(() => upstream.close());
+		return { node, upstream };
+	}
+
+	function recordHealth(proxy: SymphonyProxy): string[] {
+		const events: string[] = [];
+		proxy.on('routeHealth', (event: { status: string }) => events.push(event.status));
+		return events;
+	}
+
+	/** The peer serves every connection, none reaches the local upstream, and the route stays down. */
+	async function assertServedByPeerOnly(node: Node, forwardedBefore: number) {
+		for (let i = 0; i < 3; i++) assert.equal(await tryEcho({ port: node.publicPort }), 'ping');
+		const route = routeMetrics(node);
+		assert.equal(route.failover!.localUp, false);
+		assert.equal(route.failover!.peers[0].forwarded, forwardedBefore + 3);
+		assert.equal(count(route.errorsByReason, 'stream'), 0);
+	}
+
+	function tcpRoute(port: number, peer: number): RouteConfig {
+		return {
+			sni: SNI,
+			upstreams: [{ kind: 'tcp', host: '127.0.0.1', port }],
+			terminateTls: false,
+			failover: {
+				peers: [{ host: '127.0.0.1', port: peer }],
+				probeIntervalMs: 50,
+				peerCooldownMs: { min: 200, max: 1000 },
+			},
+		};
+	}
+
+	it('keeps a Unix socket that accepts and closes out of rotation until it serves', async (t) => {
+		const peer = await startPeer(t);
+		const [a] = await allocatePorts(1);
+		const nodeA = await startNode(t, a, { peers: [peer.node.ingressPort] });
+		await markDown(nodeA);
+		const health = recordHealth(nodeA.proxy);
+
+		const closing = await startClosingUpstream(nodeA.socketPath);
+		await waitFor(() => closing.accepted() >= 3);
+		await assertServedByPeerOnly(nodeA, 0);
+		assert.deepEqual(health, []);
+
+		const up = routeHealth(nodeA.proxy, 'up');
+		await closing.close();
+		const upstreamA = await startUdsUpstream(nodeA.socketPath);
+		t.after(() => upstreamA.close());
+		await up;
+		assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
+		assert.equal(upstreamA.sources.length, 1, 'served locally');
+		assert.equal(routeMetrics(nodeA).failover!.peers[0].forwarded, 3);
+		assert.deepEqual(health, ['up']);
+	});
+
+	it('does not count a proxy in front of a refusing backend as up', async (t) => {
+		const peer = await startPeer(t);
+		const [a] = await allocatePorts(1);
+		const port = await getFreePort();
+		const backend = path.join(socketDir, `backend-${++socketSeq}.sock`);
+		const nodeA = await startNode(t, a, {
+			peers: [peer.node.ingressPort],
+			passthrough: true,
+			tcpUpstream: { host: '127.0.0.1', port },
+		});
+		assert.equal(await tryEcho({ port: a.publicPort }), 'ping', 'the published port refuses');
+
+		const proxy = await startDockerProxy(t, port, backend);
+		await waitFor(() => proxy.accepted() >= 3);
+		await assertServedByPeerOnly(nodeA, 1);
+
+		const up = routeHealth(nodeA.proxy, 'up');
+		await startTlsUdsUpstream(t, backend);
+		await up;
+		assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
+		assert.equal(routeMetrics(nodeA).failover!.peers[0].forwarded, 4, 'served locally');
+	});
+
+	it('keeps a down route down when a reload moves it onto a proxy already accepting', async (t) => {
+		const peer = await startPeer(t);
+		const [a] = await allocatePorts(1);
+		const port = await getFreePort();
+		const backend = path.join(socketDir, `backend-${++socketSeq}.sock`);
+		const nodeA = await startNode(t, a, { peers: [peer.node.ingressPort] });
+		await markDown(nodeA);
+		const health = recordHealth(nodeA.proxy);
+		const proxy = await startDockerProxy(t, port, backend);
+
+		nodeA.proxy.updateConfig({ routes: [tcpRoute(port, peer.node.ingressPort)] });
+		await waitFor(() => proxy.accepted() >= 3);
+		await assertServedByPeerOnly(nodeA, 0);
+		assert.deepEqual(health, [], 'no up at the reload');
+
+		const up = routeHealth(nodeA.proxy, 'up');
+		await startTlsUdsUpstream(t, backend);
+		await up;
+		assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
+		assert.equal(routeMetrics(nodeA).failover!.peers[0].forwarded, 3, 'served locally');
+
+		const upstreamA = await startUdsUpstream(nodeA.socketPath);
+		t.after(() => upstreamA.close());
+		nodeA.proxy.updateConfig({ routes: [nodeA.failoverRoute()] });
+		assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
+		assert.equal(upstreamA.sources.length, 1, 'back on the Unix socket');
+		assert.deepEqual(health, ['up']);
+	});
+
+	it('does not report a replaced endpoint up for the route that replaced it', async (t) => {
+		const peer = await startPeer(t);
+		const [a] = await allocatePorts(1);
+		const port = await getFreePort();
+		const nodeA = await startNode(t, a, { peers: [peer.node.ingressPort] });
+		await markDown(nodeA);
+		const health = recordHealth(nodeA.proxy);
+		await startDockerProxy(t, port, path.join(socketDir, `backend-${++socketSeq}.sock`));
+
+		let accepted = false;
+		const settling = net.createServer((socket) => {
+			accepted = true;
+			socket.on('error', () => {});
+		});
+		await new Promise<void>((resolve) => settling.listen(nodeA.socketPath, resolve));
+		t.after(() => new Promise<void>((resolve) => settling.close(() => resolve())));
+		await waitFor(() => accepted, 5000);
+		nodeA.proxy.updateConfig({ routes: [tcpRoute(port, peer.node.ingressPort)] });
+
+		await sleep(500);
+		assert.deepEqual(health, []);
+		assert.equal(routeMetrics(nodeA).failover!.localUp, false);
+	});
+
+	it('brings a down route up after a reload onto a healthy endpoint', async (t) => {
+		const peer = await startPeer(t);
+		const [a] = await allocatePorts(1);
+		const nodeA = await startNode(t, a, { peers: [peer.node.ingressPort] });
+		await markDown(nodeA);
+
+		const healthyPath = path.join(socketDir, `healthy-${++socketSeq}.sock`);
+		const healthy = await startUdsUpstream(healthyPath);
+		t.after(() => healthy.close());
+		const up = routeHealth(nodeA.proxy, 'up');
+		nodeA.proxy.updateConfig({
+			routes: [{ ...nodeA.failoverRoute(), upstreams: [{ kind: 'uds', path: healthyPath }] }],
+		});
+		await up;
+		assert.equal(await tryEcho({ port: a.publicPort }), 'ping');
+		assert.equal(healthy.sources.length, 1);
+	});
+
+	it('clears more endpoints than one batch of probes holds', async (t) => {
+		const peer = await startPeer(t);
+		const [a] = await allocatePorts(1);
+		const paths = Array.from({ length: 65 }, () => path.join(socketDir, `slot-${++socketSeq}.sock`));
+		const nodeA = await startNode(t, a, {
+			routes: [
+				{
+					sni: SNI,
+					upstreams: paths.map((socketPath) => ({ kind: 'uds' as const, path: socketPath })),
+					terminateTls: true,
+					cert: { certChain: cert, privateKey: key },
+					failover: {
+						peers: [{ host: '127.0.0.1', port: peer.node.ingressPort }],
+						probeIntervalMs: 50,
+						peerCooldownMs: { min: 200, max: 1000 },
+					},
+				},
+			],
+		});
+		await markDown(nodeA);
+		assert.equal(routeMetrics(nodeA).failover!.refusingSlots, 65);
+
+		const upstreams = await Promise.all(paths.map(startUdsUpstream));
+		t.after(() => Promise.all(upstreams.map((upstream) => upstream.close())));
+		await waitFor(() => routeMetrics(nodeA).failover!.refusingSlots === 0);
+	});
+
+	it('keeps an upstream down while it closes idle connections sooner than the probe waits', async (t) => {
+		const peer = await startPeer(t);
+		const [a] = await allocatePorts(1);
+		const nodeA = await startNode(t, a, { peers: [peer.node.ingressPort] });
+		await markDown(nodeA);
+		const closing = await startClosingUpstream(nodeA.socketPath, 50);
+		t.after(() => closing.close());
+
+		await waitFor(() => closing.accepted() >= 3);
+		assert.equal(routeMetrics(nodeA).failover!.localUp, false);
+	});
+
+	it('cannot see a close later than the probe waits', async (t) => {
+		const peer = await startPeer(t);
+		const [a] = await allocatePorts(1);
+		const nodeA = await startNode(t, a, { peers: [peer.node.ingressPort] });
+		await markDown(nodeA);
+		const up = routeHealth(nodeA.proxy, 'up');
+		const closing = await startClosingUpstream(nodeA.socketPath, 1000);
+		t.after(() => closing.close());
+		await up;
+	});
+});
 
 describe('thread CPU under a PID namespace', { skip: noPidNamespace, timeout: SUITE_TIMEOUT_MS }, () => {
 	it('reads the load of a worker that reports the ids of its own namespace', async (t) => {

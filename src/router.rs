@@ -1,4 +1,4 @@
-use crate::balancer::{UdsBalancer, UdsSlotSpec};
+use crate::balancer::{SlotHealth, UdsBalancer, UdsSlotSpec};
 use crate::failover::{Failover, FailoverRoute, FailoverSpec};
 use crate::metrics::RouteMetrics;
 use crate::tls::{sha256, CertSpec, MtlsSpec, TlsConfigCache};
@@ -733,9 +733,15 @@ pub fn build_route_table(
 		// Isolate per-route failures: a single route whose cert can't be built (e.g. a
 		// rotated key no longer matching an inlined chain → rustls KeyMismatch) must not
 		// abort the whole table and take every other tenant on the port down with it.
+		let previous_down = previous_route.is_some_and(|p| {
+			p.failover
+				.as_ref()
+				.is_some_and(|f| f.locally_down(&p.destination, p.destination_h2.as_ref()))
+		});
 		let inherit = Inherit {
 			previous: previous_route,
 			track_health: failover_policy.is_some(),
+			refuse_new: previous_down,
 		};
 		let mut carried = false;
 		let mut route = match build_route(spec, listener_tls, cache, inherit) {
@@ -838,7 +844,7 @@ pub fn build_route_table(
 							}
 							_ => None,
 						})
-						.unwrap_or_default(),
+						.unwrap_or_else(|| Arc::new(SlotHealth::new(previous_down))),
 				),
 				Destination::UdsSet(_) => None,
 			};
@@ -992,6 +998,9 @@ fn tracks_health_as(route: &Route, tracked: bool) -> bool {
 struct Inherit<'a> {
 	previous: Option<&'a Route>,
 	track_health: bool,
+	/// The route being replaced is down, so an endpoint it did not have starts refusing: nothing has
+	/// tested it, and a publisher can move a down route to an address that accepts but cannot serve.
+	refuse_new: bool,
 }
 
 fn build_route(
@@ -1127,6 +1136,7 @@ fn build_destinations(
 		&h1_specs,
 		previous_balancer(|r| Some(&r.destination)),
 		inherit.track_health,
+		inherit.refuse_new,
 	)?;
 	let destination_h2 = if h2_specs.is_empty() {
 		None
@@ -1135,6 +1145,7 @@ fn build_destinations(
 			&h2_specs,
 			previous_balancer(|r| r.destination_h2.as_ref()),
 			inherit.track_health,
+			inherit.refuse_new,
 		)?)
 	};
 	Ok((destination, destination_h2))
@@ -1144,6 +1155,7 @@ fn build_destination_for(
 	upstreams: &[&UpstreamSpec],
 	previous: Option<&UdsBalancer>,
 	track_health: bool,
+	refuse_new: bool,
 ) -> crate::error::Result<Destination> {
 	let first = upstreams
 		.first()
@@ -1185,7 +1197,7 @@ fn build_destination_for(
 			let balancer =
 				UdsBalancer::new(slots, ip_affinity, affinity_ttl_ms).with_cpu_from(previous);
 			Ok(Destination::UdsSet(Arc::new(if track_health {
-				balancer.with_health(previous)
+				balancer.with_health(previous, refuse_new)
 			} else {
 				balancer
 			})))
@@ -1984,6 +1996,101 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			Destination::Tcp(_) => panic!("expected a UDS destination"),
 		};
 		assert!(Arc::ptr_eq(&health(&live), &health(&rebuilt)));
+	}
+
+	fn is_down(table: &RouteTable, sni: &str) -> bool {
+		let route = table.resolve(Some(sni)).unwrap();
+		route
+			.failover
+			.as_ref()
+			.unwrap()
+			.locally_down(&route.destination, route.destination_h2.as_ref())
+	}
+
+	fn uds_health(destination: &Destination) -> Arc<SlotHealth> {
+		match destination {
+			Destination::UdsSet(balancer) => balancer.health(0).unwrap().clone(),
+			Destination::Tcp(_) => panic!("expected a UDS destination"),
+		}
+	}
+
+	#[test]
+	fn a_reload_onto_new_endpoints_keeps_a_down_route_down() {
+		let sni = "tenant.example.com";
+		let listener = ListenerTlsSpec::empty();
+		let spec = with_failover(tls_route(sni, CERT_A, KEY_A), false, "10.0.0.2");
+		let live = build(std::slice::from_ref(&spec), &listener, None);
+		uds_health(&live.resolve(Some(sni)).unwrap().destination).mark_refused();
+		assert!(is_down(&live, sni));
+
+		let mut tcp = spec.clone();
+		tcp.upstreams = vec![UpstreamSpec::Tcp {
+			host: "127.0.0.1".into(),
+			port: 9936,
+		}];
+		let on_tcp = build(std::slice::from_ref(&tcp), &listener, Some(&live));
+		assert!(is_down(&on_tcp, sni), "from UDS to TCP");
+
+		let mut other_tcp = tcp.clone();
+		other_tcp.upstreams = vec![UpstreamSpec::Tcp {
+			host: "127.0.0.1".into(),
+			port: 9937,
+		}];
+		assert!(
+			is_down(&build(&[other_tcp], &listener, Some(&on_tcp)), sni),
+			"to another TCP address"
+		);
+
+		let mut other_uds = spec.clone();
+		other_uds.upstreams = vec![uds_upstream("/tmp/symphony-other.sock", None, false)];
+		assert!(
+			is_down(&build(&[other_uds], &listener, Some(&on_tcp)), sni),
+			"from TCP to UDS"
+		);
+	}
+
+	#[test]
+	fn a_reload_onto_new_endpoints_leaves_an_up_route_up() {
+		let sni = "tenant.example.com";
+		let listener = ListenerTlsSpec::empty();
+		let spec = with_failover(tls_route(sni, CERT_A, KEY_A), false, "10.0.0.2");
+		let live = build(std::slice::from_ref(&spec), &listener, None);
+		let mut tcp = spec;
+		tcp.upstreams = vec![UpstreamSpec::Tcp {
+			host: "127.0.0.1".into(),
+			port: 9936,
+		}];
+		assert!(!is_down(&build(&[tcp], &listener, Some(&live)), sni));
+	}
+
+	#[test]
+	fn a_down_route_marks_only_endpoints_it_did_not_have() {
+		let sni = "tenant.example.com";
+		let listener = ListenerTlsSpec::empty();
+		let mut spec = with_failover(tls_route(sni, CERT_A, KEY_A), false, "10.0.0.2");
+		spec.upstreams = vec![
+			uds_upstream("/tmp/symphony-h1.sock", None, false),
+			uds_upstream("/tmp/symphony-h2.sock", Some("h2"), false),
+		];
+		let live = build(std::slice::from_ref(&spec), &listener, None);
+		let route = live.resolve(Some(sni)).unwrap();
+		uds_health(route.destination_h2.as_ref().unwrap()).mark_refused();
+		assert!(is_down(&live, sni), "either destination refusing is enough");
+
+		let rebuilt = build(std::slice::from_ref(&spec), &listener, Some(&live));
+		let rebuilt_route = rebuilt.resolve(Some(sni)).unwrap();
+		assert!(
+			!uds_health(&rebuilt_route.destination).refusing(),
+			"an endpoint the route already had keeps its own state"
+		);
+		assert!(Arc::ptr_eq(
+			&uds_health(&rebuilt_route.destination),
+			&uds_health(&route.destination)
+		));
+
+		spec.upstreams[0] = uds_upstream("/tmp/symphony-h1-new.sock", None, false);
+		let replaced = build(&[spec], &listener, Some(&rebuilt));
+		assert!(uds_health(&replaced.resolve(Some(sni)).unwrap().destination).refusing());
 	}
 
 	/// A passthrough spec whose build fails: every upstream is h2-marked, so it has no default one.

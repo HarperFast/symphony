@@ -29,6 +29,9 @@ const MAX_INTERVAL_MS: f64 = 86_400_000.0;
 /// One probe connect's limit, independent of `probeIntervalMs`: a short interval must not turn a
 /// slow accept into a refusal that keeps the route failed over.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a probe's connection has to stay open. Far above what a proxy in front of a refusing
+/// backend takes to close it, and far below any server's idle limit.
+const PROBE_SETTLE: Duration = Duration::from_millis(250);
 /// Longest the probe task sleeps, so a reload that shortens `probeIntervalMs` takes effect promptly.
 const MAX_PROBE_TICK: Duration = Duration::from_secs(1);
 const MAX_CONCURRENT_PROBES: usize = 64;
@@ -860,7 +863,9 @@ pub async fn probe_periodically(
 			_ = pass => {}
 		}
 
-		for route in routes {
+		// The live table, not the one probed: a reload during the pass may have replaced the endpoint
+		// just cleared with one that is still down.
+		for route in live.0.load().failover_routes() {
 			let down = route.locally_down();
 			let reported = &route.failover.status.reported_down;
 			if reported.load(Ordering::Relaxed) != down {
@@ -1159,19 +1164,29 @@ async fn query_load(addr: SocketAddr, names: &[Arc<str>]) -> Option<LoadAnswer> 
 	Some(LoadAnswer { rtt: rtt?, loads })
 }
 
-/// Connect and close at once. Proves the socket accepts, not that the application behind it is
-/// ready.
 async fn probe(endpoint: &Endpoint) -> bool {
 	match endpoint {
-		Endpoint::Uds(path) => matches!(
-			timeout(PROBE_TIMEOUT, UnixStream::connect(path.as_ref())).await,
-			Ok(Ok(_))
-		),
-		Endpoint::Tcp(addr) => matches!(
-			timeout(PROBE_TIMEOUT, TcpStream::connect(addr)).await,
-			Ok(Ok(_))
-		),
+		Endpoint::Uds(path) => {
+			match timeout(PROBE_TIMEOUT, UnixStream::connect(path.as_ref())).await {
+				Ok(Ok(stream)) => stays_open(stream).await,
+				_ => false,
+			}
+		}
+		Endpoint::Tcp(addr) => match timeout(PROBE_TIMEOUT, TcpStream::connect(addr)).await {
+			Ok(Ok(stream)) => stays_open(stream).await,
+			_ => false,
+		},
 	}
+}
+
+/// An accept is not evidence of a server: docker-proxy accepts on a published port, dials the
+/// container, and closes when that is refused. Nothing is sent, since the servers behind a route wait
+/// for their client, and without a protocol that is as much as a probe can learn: a proxy slower
+/// than this to fail its dial still passes.
+async fn stays_open(mut stream: impl tokio::io::AsyncRead + Unpin) -> bool {
+	let mut discard = [0u8; 256];
+	let closed = async { while matches!(stream.read(&mut discard).await, Ok(1..)) {} };
+	timeout(PROBE_SETTLE, closed).await.is_err()
 }
 
 #[cfg(test)]
@@ -1333,6 +1348,57 @@ mod tests {
 		assert_eq!(new.peers[0].forwarded.load(Ordering::Relaxed), 1);
 		assert_eq!(new.peers[1].forwarded.load(Ordering::Relaxed), 0);
 		assert_eq!(new.status.replays.load(Ordering::Relaxed), 3);
+	}
+
+	#[tokio::test]
+	async fn a_probe_passes_only_a_connection_that_stays_open() {
+		let (socket, peer) = UnixStream::pair().unwrap();
+		drop(peer);
+		assert!(!stays_open(socket).await, "closed at once");
+
+		let (socket, _peer) = UnixStream::pair().unwrap();
+		assert!(stays_open(socket).await, "silent, as a server waits");
+
+		let (socket, mut peer) = UnixStream::pair().unwrap();
+		peer.write_all(b"banner").await.unwrap();
+		assert!(stays_open(socket).await, "speaks first and stays");
+
+		let (socket, mut peer) = UnixStream::pair().unwrap();
+		peer.write_all(b"HTTP/1.1 503 Busy\r\n\r\n").await.unwrap();
+		drop(peer);
+		assert!(!stays_open(socket).await, "answers and closes");
+
+		let (socket, peer) = UnixStream::pair().unwrap();
+		let close_late = tokio::spawn(async move {
+			tokio::time::sleep(PROBE_SETTLE + Duration::from_millis(250)).await;
+			drop(peer);
+		});
+		assert!(
+			stays_open(socket).await,
+			"a close after the deadline is not seen"
+		);
+		close_late.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_probe_fails_on_a_reset() {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		let reset = tokio::spawn(async move {
+			let (accepted, _) = listener.accept().await.unwrap();
+			accepted.set_zero_linger().unwrap();
+		});
+		assert!(!probe(&Endpoint::Tcp(addr)).await);
+		reset.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_probe_fails_where_nothing_accepts() {
+		let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let addr = closed.local_addr().unwrap();
+		drop(closed);
+		assert!(!probe(&Endpoint::Tcp(addr)).await);
+		assert!(!probe(&Endpoint::Uds("/nonexistent/symphony.sock".into())).await);
 	}
 
 	#[test]
