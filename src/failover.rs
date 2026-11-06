@@ -29,8 +29,8 @@ const MAX_INTERVAL_MS: f64 = 86_400_000.0;
 /// One probe connect's limit, independent of `probeIntervalMs`: a short interval must not turn a
 /// slow accept into a refusal that keeps the route failed over.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-/// How long a probe's connection has to stay open. Far above what a proxy in front of a refusing
-/// backend takes to close it, and far below any server's idle limit.
+/// How long a probe's connection has to stay open: well above the milliseconds docker-proxy takes to
+/// close on a refused dial. A failover upstream has to keep an idle connection open this long.
 const PROBE_SETTLE: Duration = Duration::from_millis(250);
 /// Longest the probe task sleeps, so a reload that shortens `probeIntervalMs` takes effect promptly.
 const MAX_PROBE_TICK: Duration = Duration::from_secs(1);

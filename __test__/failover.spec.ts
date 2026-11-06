@@ -150,7 +150,6 @@ async function startHangingUpstream(t: TestContext): Promise<{ host: string; por
 	throw new Error('the accept queue never filled');
 }
 
-/** Accepts and, `closeAfterMs` later, closes with nothing read. */
 async function startClosingUpstream(socketPath: string, closeAfterMs = 0) {
 	let accepted = 0;
 	const server = net.createServer({ pauseOnConnect: true }, (socket) => {
