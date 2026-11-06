@@ -166,7 +166,7 @@ async function startClosingUpstream(socketPath: string, closeAfterMs = 0) {
 
 /**
  * What Docker's userland proxy does on a published port: accepts first, then dials the container, and
- * on a refused dial closes with the client's bytes unread, which makes the close a reset.
+ * on a refused dial closes with the client's bytes unread.
  */
 async function startDockerProxy(t: TestContext, port: number, backendPath: string) {
 	let accepted = 0;
