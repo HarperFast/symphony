@@ -1646,6 +1646,9 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			exact_key("Ü.API.Example.com", &mut buf),
 			Some("Ü.api.example.com")
 		);
+		for name in ["api.example.com", "Ü.API.Example.com", "*.Apps.Example.COM"] {
+			assert_eq!(exact_key(name, &mut buf), Some(fold_case(name).as_ref()));
+		}
 		let longest = "A".repeat(MAX_ROUTE_NAME_BYTES);
 		assert_eq!(
 			exact_key(&longest, &mut buf),
@@ -1697,7 +1700,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	fn a_dropped_route_fails_closed_in_any_case() {
 		let table = build(
 			&[
-				tls_route("API.acme.com", CERT_A, KEY_B), // KeyMismatch — dropped, no last-good
+				tls_route("API.acme.com", CERT_A, KEY_B),
 				tls_route("*.Bad.acme.com", CERT_A, KEY_B),
 				tls_route("*.acme.com", CERT_A, KEY_A),
 				tls_route("", CERT_A, KEY_A),
@@ -1782,30 +1785,28 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	#[test]
 	fn a_reload_that_only_changes_case_keeps_the_route() {
 		let mut cache = TlsConfigCache::new();
-		let live = build_route_table(
-			&[tls_route("tenant.example.com", CERT_A, KEY_A)],
-			&ListenerTlsSpec::empty(),
-			None,
-			&mut cache,
-		)
-		.expect("initial build");
-		let reloaded = build_route_table(
-			&[tls_route("Tenant.Example.com", CERT_A, KEY_B)],
-			&ListenerTlsSpec::empty(),
-			Some(&live),
-			&mut cache,
-		)
-		.expect("reload");
-		let route = reloaded
-			.resolve(Some("TENANT.example.com"))
-			.expect("last-good carried forward");
-		assert!(Arc::ptr_eq(
-			&route.metric_identity,
-			&live
-				.resolve(Some("tenant.example.com"))
-				.unwrap()
-				.metric_identity
-		));
+		let mut build_one = |sni: &str, key: &[u8], previous: Option<&RouteTable>| {
+			build_route_table(
+				&[tls_route(sni, CERT_A, key)],
+				&ListenerTlsSpec::empty(),
+				previous,
+				&mut cache,
+			)
+			.expect("build")
+		};
+		let live = build_one("tenant.example.com", KEY_A, None);
+		let identity = live
+			.resolve(Some("tenant.example.com"))
+			.unwrap()
+			.metric_identity
+			.clone();
+		let healthy = build_one("Tenant.Example.com", KEY_A, Some(&live));
+		let failing = build_one("TENANT.example.com", KEY_B, Some(&healthy));
+		for table in [&healthy, &failing] {
+			let route = table.resolve(Some("tenant.EXAMPLE.com")).expect("served");
+			assert!(Arc::ptr_eq(&route.metric_identity, &identity));
+			assert_eq!(route_name(Some(route)), Some("tenant.example.com"));
+		}
 	}
 
 	#[test]
