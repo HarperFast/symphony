@@ -235,6 +235,9 @@ Set `terminateTls: false` to forward raw TLS bytes to the upstream without decry
 ## Routing
 
 Routes are checked in order: **exact match** → **wildcard suffix** → **default** (empty `sni`).
+Names match without regard to ASCII case (RFC 6066 §3): a client sending `API.Example.com` reaches
+the `api.example.com` route, and a route configured as `API.Example.com` matches `api.example.com`.
+Two routes that differ only in case are duplicates. Metrics and events keep the configured spelling.
 
 ```typescript
 routes: [

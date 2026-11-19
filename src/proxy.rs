@@ -1277,7 +1277,7 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 }
 
 const MAX_METRICS_GROUP_BYTES: usize = 128;
-const MAX_ROUTE_METRIC_LABEL_BYTES: usize = 255;
+const MAX_ROUTE_METRIC_LABEL_BYTES: usize = crate::router::MAX_ROUTE_NAME_BYTES;
 
 fn validate_route_metric_label(sni: &str) -> Result<()> {
 	if sni.len() > MAX_ROUTE_METRIC_LABEL_BYTES {

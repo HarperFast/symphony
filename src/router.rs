@@ -5,6 +5,7 @@ use crate::tls::{sha256, CertSpec, MtlsSpec, TlsConfigCache};
 use arc_swap::ArcSwap;
 use ipnetwork::{IpNetwork, Ipv4Network};
 use rustls::ServerConfig;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -271,9 +272,33 @@ impl RouteMetricIdentity {
 
 // ── Route table ───────────────────────────────────────────────────────────────
 
+/// The longest route name `proxy.rs` accepts, so no longer name can be an exact key.
+pub const MAX_ROUTE_NAME_BYTES: usize = 255;
+
+/// Host names compare ASCII-case-insensitively (RFC 6066 §3): every key the table stores is folded.
+fn fold_case(name: &str) -> Cow<'_, str> {
+	if name.bytes().any(|b| b.is_ascii_uppercase()) {
+		Cow::Owned(name.to_ascii_lowercase())
+	} else {
+		Cow::Borrowed(name)
+	}
+}
+
+/// `name` as an exact key, folded into `buf` rather than allocated, since this runs per connection.
+/// `None` when it is too long to be one.
+fn exact_key<'a>(name: &'a str, buf: &'a mut [u8; MAX_ROUTE_NAME_BYTES]) -> Option<&'a str> {
+	if !name.bytes().any(|b| b.is_ascii_uppercase()) {
+		return Some(name);
+	}
+	let folded = buf.get_mut(..name.len())?;
+	folded.copy_from_slice(name.as_bytes());
+	folded.make_ascii_lowercase();
+	std::str::from_utf8(folded).ok()
+}
+
 /// True when `sni` matches exactly one left-most label against `suffix` (a wildcard's stored
-/// suffix, without the `*.` prefix) — e.g. "foo.example.com" matches suffix "example.com" but
-/// "a.b.example.com" does not.
+/// suffix, without the `*.` prefix, already folded) — e.g. "Foo.Example.com" matches suffix
+/// "example.com" but "a.b.example.com" does not.
 /// Compares bytes: a client SNI may be any UTF-8, and a `&str` slice off a char boundary panics.
 fn wildcard_suffix_matches(sni: &str, suffix: &str) -> bool {
 	let (sni, suffix) = (sni.as_bytes(), suffix.as_bytes());
@@ -281,7 +306,9 @@ fn wildcard_suffix_matches(sni: &str, suffix: &str) -> bool {
 		return false;
 	}
 	let dot_pos = sni.len() - suffix.len() - 1;
-	sni[dot_pos] == b'.' && &sni[dot_pos + 1..] == suffix && !sni[..dot_pos].contains(&b'.')
+	sni[dot_pos] == b'.'
+		&& sni[dot_pos + 1..].eq_ignore_ascii_case(suffix)
+		&& !sni[..dot_pos].contains(&b'.')
 }
 
 pub struct RouteTable {
@@ -344,7 +371,11 @@ impl RouteTable {
 	/// wildcard or the default, which a spilled connection for that name might not reach), while it
 	/// is up, not draining and measurable. `None` = do not spill this name here.
 	pub fn load_answer(&self, name: &str, now: u64) -> Option<u32> {
-		let route = self.exact.get(name).filter(|r| !r.suspended)?;
+		let mut buf = [0; MAX_ROUTE_NAME_BYTES];
+		let route = self
+			.exact
+			.get(exact_key(name, &mut buf)?)
+			.filter(|r| !r.suspended)?;
 		if let Some(failover) = &route.failover {
 			if failover.drain
 				|| failover.locally_down(&route.destination, route.destination_h2.as_ref())
@@ -393,11 +424,14 @@ impl RouteTable {
 		// black-hole every exact route under a wildcard that happened to fail validation).
 
 		// Exact, live or dropped — most specific, decided first.
-		if let Some(r) = self.exact.get(sni) {
-			return Some(r);
-		}
-		if self.dropped_exact.contains(sni) {
-			return None;
+		let mut buf = [0; MAX_ROUTE_NAME_BYTES];
+		if let Some(key) = exact_key(sni, &mut buf) {
+			if let Some(r) = self.exact.get(key) {
+				return Some(r);
+			}
+			if self.dropped_exact.contains(key) {
+				return None;
+			}
 		}
 
 		// Wildcard, live or dropped — match exactly one left-most label against stored suffixes.
@@ -590,6 +624,10 @@ pub fn build_route_table(
 	cache: &mut TlsConfigCache,
 ) -> crate::error::Result<RouteTable> {
 	cache.clear_used();
+	// Every key below is the folded name, so two spellings of one name are one route (duplicate rules
+	// included) and a reload that only respells a route still finds its previous one. Metric labels
+	// and logs keep the configured spelling.
+	let names: Vec<Cow<'_, str>> = specs.iter().map(|spec| fold_case(&spec.sni)).collect();
 	let mut exact: HashMap<Arc<str>, Route> = HashMap::new();
 	let mut wildcard: Vec<(Arc<str>, Route)> = Vec::new();
 	let mut monitored_balancers: Vec<Arc<UdsBalancer>> = Vec::new();
@@ -603,29 +641,26 @@ pub fn build_route_table(
 	let mut client_auth: HashMap<Arc<str>, ClientAuth> = HashMap::new();
 	let mut failover_routes: Vec<FailoverRoute> = Vec::new();
 	let mut default: Option<Route> = None;
-	let last_exact: HashMap<&str, usize> = specs
+	let last_exact: HashMap<&str, usize> = names
 		.iter()
 		.enumerate()
-		.filter(|(_, spec)| !spec.sni.starts_with("*."))
-		.map(|(i, spec)| (spec.sni.as_str(), i))
+		.filter(|(_, name)| !name.starts_with("*."))
+		.map(|(i, name)| (name.as_ref(), i))
 		.collect();
 
-	for (i, spec) in specs.iter().enumerate() {
+	for (i, (spec, name)) in specs.iter().zip(&names).enumerate() {
+		let name: &str = name;
 		// One spec decides each configured SNI, even when it is rejected: otherwise a duplicate could
 		// serve the SNI under a policy the deciding spec didn't ask for. Exact duplicates collapse
 		// last-wins. Wildcards live in a Vec and resolve first-wins, so later duplicates are isolated,
 		// which also keeps the metric table from exposing two identical configured route labels.
-		if last_exact
-			.get(spec.sni.as_str())
-			.is_some_and(|&last| last != i)
-		{
+		if last_exact.get(name).is_some_and(|&last| last != i) {
 			continue;
 		}
-		let wildcard_suffix = spec.sni.strip_prefix("*.");
+		let wildcard_suffix = name.strip_prefix("*.");
 		if wildcard_suffix.is_some_and(|suffix| !configured_wildcards.insert(suffix)) {
-			let newly_failing =
-				previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
-			failing_snis.insert(Arc::from(spec.sni.as_str()));
+			let newly_failing = previous.is_none_or(|p| !p.failing_snis.contains(name));
+			failing_snis.insert(Arc::from(name));
 			if newly_failing {
 				eprintln!(
 					"symphony: skipping duplicate route '{}': duplicate SNI",
@@ -645,13 +680,12 @@ pub fn build_route_table(
 		// same reconcile made to that route — the operator's `updateConfig` reports success while
 		// their edit quietly never took effect.
 		if let Err(e) = validate_route_protocol_declaration(spec) {
-			let newly_failing =
-				previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
-			failing_snis.insert(Arc::from(spec.sni.as_str()));
+			let newly_failing = previous.is_none_or(|p| !p.failing_snis.contains(name));
+			failing_snis.insert(Arc::from(name));
 			if newly_failing {
 				eprintln!("symphony: skipping route '{}': {}", spec.sni, e);
 			}
-			tombstone(&spec.sni, &mut dropped_exact, &mut dropped_wildcard);
+			tombstone(name, &mut dropped_exact, &mut dropped_wildcard);
 			continue;
 		}
 
@@ -661,23 +695,22 @@ pub fn build_route_table(
 		let allowed_sources = match SourceAllowlist::parse(&spec.allowed_sources) {
 			Ok(allowed_sources) => allowed_sources,
 			Err(e) => {
-				let newly_failing =
-					previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
-				let was_serving = previous.is_some_and(|p| p.get_for_spec_sni(&spec.sni).is_some());
-				failing_snis.insert(Arc::from(spec.sni.as_str()));
+				let newly_failing = previous.is_none_or(|p| !p.failing_snis.contains(name));
+				let was_serving = previous.is_some_and(|p| p.get_for_spec_sni(name).is_some());
+				failing_snis.insert(Arc::from(name));
 				if newly_failing || was_serving {
 					eprintln!("symphony: skipping route '{}': {}", spec.sni, e);
 				}
-				tombstone(&spec.sni, &mut dropped_exact, &mut dropped_wildcard);
+				tombstone(name, &mut dropped_exact, &mut dropped_wildcard);
 				continue;
 			}
 		};
 
-		let previous_route = previous.and_then(|p| p.get_for_spec_sni(&spec.sni));
+		let previous_route = previous.and_then(|p| p.get_for_spec_sni(name));
 		// Failover adds availability; a broken policy must not remove the route itself.
 		// A peer's failover ingress never serves its default route, so every peer would refuse it.
 		let failover_policy = match spec.failover.as_ref().map(|f| {
-			if spec.sni.is_empty() {
+			if name.is_empty() {
 				Err("failover is not supported on the default route".to_string())
 			} else {
 				f.parse()
@@ -692,7 +725,7 @@ pub fn build_route_table(
 					.as_ref()
 					.and_then(|f| f.spill.as_ref())
 					.map(|s| {
-						if spec.sni.starts_with("*.") {
+						if name.starts_with("*.") {
 							Err("failover.spill is supported on exact-SNI routes only".to_string())
 						} else {
 							s.parse()
@@ -703,8 +736,8 @@ pub fn build_route_table(
 					Some(Ok(spill)) => policy.spill = Some(spill),
 					Some(Err(e)) => {
 						let newly_failing =
-							previous.is_none_or(|p| !p.invalid_spill.contains(spec.sni.as_str()));
-						invalid_spill.insert(Arc::from(spec.sni.as_str()));
+							previous.is_none_or(|p| !p.invalid_spill.contains(name));
+						invalid_spill.insert(Arc::from(name));
 						if newly_failing {
 							eprintln!(
 								"symphony: route '{}': {e}; serving its failover without spill-over",
@@ -716,9 +749,8 @@ pub fn build_route_table(
 				Some(policy)
 			}
 			Some(Err(e)) => {
-				let newly_failing =
-					previous.is_none_or(|p| !p.invalid_failover.contains(spec.sni.as_str()));
-				invalid_failover.insert(Arc::from(spec.sni.as_str()));
+				let newly_failing = previous.is_none_or(|p| !p.invalid_failover.contains(name));
+				invalid_failover.insert(Arc::from(name));
 				if newly_failing {
 					eprintln!(
 						"symphony: route '{}': {e}; serving it without failover",
@@ -751,16 +783,12 @@ pub fn build_route_table(
 				// Log only on the good→bad transition: a persistently-broken cert would
 				// otherwise re-log on every reconcile, since each cert-file event rebuilds
 				// the whole table.
-				let newly_failing =
-					previous.is_none_or(|p| !p.failing_snis.contains(spec.sni.as_str()));
-				failing_snis.insert(Arc::from(spec.sni.as_str()));
+				let newly_failing = previous.is_none_or(|p| !p.failing_snis.contains(name));
+				failing_snis.insert(Arc::from(name));
 
 				let last_good = previous.and_then(|p| {
-					let route = p.get_for_spec_sni(&spec.sni)?;
-					Some((
-						route,
-						p.client_auth.get(spec.sni.as_str()) == Some(&requested_auth),
-					))
+					let route = p.get_for_spec_sni(name)?;
+					Some((route, p.client_auth.get(name) == Some(&requested_auth)))
 				});
 				match last_good {
 					// On a hot-swap, a cert and key rotate as two non-atomic files, so a
@@ -787,7 +815,7 @@ pub fn build_route_table(
 							"symphony: skipping route '{}': {}; its last-good route enforces a different client-certificate policy, so it is not retained",
 							spec.sni, e
 						);
-						tombstone(&spec.sni, &mut dropped_exact, &mut dropped_wildcard);
+						tombstone(name, &mut dropped_exact, &mut dropped_wildcard);
 						continue;
 					}
 					// No prior route (initial build, or a newly-added route): drop this SNI. It must
@@ -800,7 +828,7 @@ pub fn build_route_table(
 						if newly_failing {
 							eprintln!("symphony: skipping route '{}': {}", spec.sni, e);
 						}
-						tombstone(&spec.sni, &mut dropped_exact, &mut dropped_wildcard);
+						tombstone(name, &mut dropped_exact, &mut dropped_wildcard);
 						continue;
 					}
 				}
@@ -884,14 +912,13 @@ pub fn build_route_table(
 			}
 		}
 
-		client_auth.insert(Arc::from(spec.sni.as_str()), requested_auth);
-		if spec.sni.starts_with("*.") {
-			let suffix: Arc<str> = Arc::from(&spec.sni[2..]);
-			wildcard.push((suffix, route));
-		} else if spec.sni.is_empty() {
+		client_auth.insert(Arc::from(name), requested_auth);
+		if let Some(suffix) = name.strip_prefix("*.") {
+			wildcard.push((Arc::from(suffix), route));
+		} else if name.is_empty() {
 			default = Some(route);
 		} else {
-			let key: Arc<str> = Arc::from(spec.sni.as_str());
+			let key: Arc<str> = Arc::from(name);
 			exact.insert(key, route);
 		}
 	}
@@ -1613,6 +1640,158 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	}
 
 	#[test]
+	fn sni_matching_ignores_ascii_case() {
+		let table = build(
+			&[
+				tls_route("pr-12.app.example.com", CERT_A, KEY_A),
+				tls_route("Admin.Example.com", CERT_A, KEY_A),
+				tls_route("*.app.example.com", CERT_A, KEY_A),
+				tls_route("*.Other.Example.COM", CERT_A, KEY_A),
+				tls_route("", CERT_A, KEY_A),
+			],
+			&ListenerTlsSpec::empty(),
+			None,
+		);
+		for (sni, expected) in [
+			("PR-12.app.example.com", "pr-12.app.example.com"),
+			("pr-12.APP.Example.com", "pr-12.app.example.com"),
+			("admin.example.com", "Admin.Example.com"),
+			("ADMIN.EXAMPLE.COM", "Admin.Example.com"),
+			("PR-13.app.example.com", "*.app.example.com"),
+			("pr-13.App.Example.Com", "*.app.example.com"),
+			(
+				&format!("{}.APP.example.com", "X".repeat(300)),
+				"*.app.example.com",
+			),
+			("x.other.example.com", "*.Other.Example.COM"),
+			("X.OTHER.EXAMPLE.COM", "*.Other.Example.COM"),
+			("A.B.APP.EXAMPLE.COM", ""),
+		] {
+			assert_eq!(
+				route_name(table.resolve(Some(sni))),
+				Some(expected),
+				"{sni}"
+			);
+		}
+	}
+
+	#[test]
+	fn a_dropped_route_fails_closed_in_any_case() {
+		let table = build(
+			&[
+				tls_route("API.acme.com", CERT_A, KEY_B), // KeyMismatch — dropped, no last-good
+				tls_route("*.Bad.acme.com", CERT_A, KEY_B),
+				tls_route("*.acme.com", CERT_A, KEY_A),
+				tls_route("", CERT_A, KEY_A),
+			],
+			&ListenerTlsSpec::empty(),
+			None,
+		);
+		for sni in [
+			"api.acme.com",
+			"API.ACME.COM",
+			"x.bad.acme.com",
+			"X.BAD.ACME.COM",
+		] {
+			assert!(table.resolve(Some(sni)).is_none(), "{sni} must fail closed");
+		}
+		assert_eq!(
+			route_name(table.resolve(Some("Other.ACME.com"))),
+			Some("*.acme.com")
+		);
+	}
+
+	#[test]
+	fn routes_that_differ_only_in_case_are_duplicates() {
+		let mut first = tls_route("Tenant.example.com", CERT_A, KEY_A);
+		first.metrics_group = "first".to_string();
+		let mut second = tls_route("tenant.EXAMPLE.com", CERT_A, KEY_A);
+		second.metrics_group = "second".to_string();
+		let mut wildcard_first = tls_route("*.Apps.example.com", CERT_A, KEY_A);
+		wildcard_first.metrics_group = "first".to_string();
+		let mut wildcard_second = tls_route("*.apps.example.com", CERT_A, KEY_A);
+		wildcard_second.metrics_group = "second".to_string();
+		let table = build(
+			&[first, second, wildcard_first, wildcard_second],
+			&ListenerTlsSpec::empty(),
+			None,
+		);
+		assert_eq!(table.metric_identities().len(), 2);
+		let group = |sni| {
+			table
+				.resolve(Some(sni))
+				.map(|r| r.metric_identity.group.as_ref())
+		};
+		assert_eq!(
+			group("tenant.example.com"),
+			Some("second"),
+			"exact: last wins"
+		);
+		assert_eq!(
+			group("x.apps.example.com"),
+			Some("first"),
+			"wildcard: first wins"
+		);
+		assert_eq!(table.failing_route_count(), 1, "the skipped wildcard");
+	}
+
+	#[test]
+	fn a_respelled_route_under_a_new_client_cert_policy_is_dropped() {
+		let live = build(
+			&[
+				tls_route("tenant.example.com", CERT_A, KEY_A),
+				tls_route("*.example.com", CERT_A, KEY_A),
+			],
+			&ListenerTlsSpec::empty(),
+			None,
+		);
+		let swapped = build(
+			&[
+				with_client_ca(tls_route("Tenant.Example.com", CERT_A, KEY_B), CERT_A, true),
+				tls_route("*.example.com", CERT_A, KEY_A),
+			],
+			&ListenerTlsSpec::empty(),
+			Some(&live),
+		);
+		for sni in ["tenant.example.com", "TENANT.example.com"] {
+			assert!(
+				swapped.resolve(Some(sni)).is_none(),
+				"{sni} must fail closed"
+			);
+		}
+	}
+
+	#[test]
+	fn a_reload_that_only_changes_case_keeps_the_route() {
+		let mut cache = TlsConfigCache::new();
+		let live = build_route_table(
+			&[tls_route("tenant.example.com", CERT_A, KEY_A)],
+			&ListenerTlsSpec::empty(),
+			None,
+			&mut cache,
+		)
+		.expect("initial build");
+		// KeyMismatch on the respelled route: only a last-good found under the folded name serves.
+		let reloaded = build_route_table(
+			&[tls_route("Tenant.Example.com", CERT_A, KEY_B)],
+			&ListenerTlsSpec::empty(),
+			Some(&live),
+			&mut cache,
+		)
+		.expect("reload");
+		let route = reloaded
+			.resolve(Some("TENANT.example.com"))
+			.expect("last-good carried forward");
+		assert!(Arc::ptr_eq(
+			&route.metric_identity,
+			&live
+				.resolve(Some("tenant.example.com"))
+				.unwrap()
+				.metric_identity
+		));
+	}
+
+	#[test]
 	fn empty_sni_route_is_the_default_for_no_sni_and_unmatched_sni() {
 		let specs = vec![
 			tls_route("api.acme.com", CERT_A, KEY_A),
@@ -1861,6 +2040,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		);
 		balancer.load().publish_for_test(420, 10);
 		assert_eq!(table.load_answer("up.example.com", 0), Some(420));
+		assert_eq!(table.load_answer("UP.Example.com", 0), Some(420));
 		assert_eq!(table.load_answer("drain.example.com", 0), None);
 		assert_eq!(
 			table.load_answer("other.example.com", 0),

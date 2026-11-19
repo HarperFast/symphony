@@ -58,7 +58,8 @@ export interface RouteConfig {
 	/**
 	 * SNI hostname to match. Exact match (e.g. "api.example.com") or wildcard
 	 * left-label (e.g. "*.example.com"). Use "" for the default/catch-all route. Maximum 255
-	 * UTF-8 bytes; control characters are rejected.
+	 * UTF-8 bytes; control characters are rejected. Matched without regard to ASCII case;
+	 * metrics and events report it as configured.
 	 */
 	sni: string;
 	/**
@@ -592,7 +593,7 @@ export interface BlockedIpsInfo {
 export interface SuspendedConnection {
 	/** Opaque ID — pass to resolveConnection(). */
 	id: string;
-	/** The SNI hostname from the ClientHello (empty string if absent). */
+	/** The SNI hostname from the ClientHello, in the client's case (empty string if absent). */
 	sni: string;
 	peerIp: string;
 	peerPort: number;
