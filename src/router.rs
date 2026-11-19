@@ -277,26 +277,36 @@ pub const MAX_ROUTE_NAME_BYTES: usize = 255;
 
 /// Host names compare ASCII-case-insensitively (RFC 6066 §3), so every exact key is stored folded.
 fn fold_case(name: &str) -> Cow<'_, str> {
-	let mut buf = [0; MAX_ROUTE_NAME_BYTES];
-	match folded_key(name, &mut buf) {
-		Some(folded) => Cow::Owned(folded.to_owned()),
-		None => Cow::Borrowed(name),
-	}
+	first_to_fold(name)
+		.and_then(|first_upper| {
+			fold_into(name, first_upper, &mut [0; MAX_ROUTE_NAME_BYTES]).map(str::to_owned)
+		})
+		.map_or(Cow::Borrowed(name), Cow::Owned)
 }
 
-/// `name` folded into `buf`, without allocating, since lookups run per connection. `None` when
-/// there is nothing to fold, so a lookup of `name` itself already decided, or when `name` is too
-/// long to be an exact key.
-fn folded_key<'a>(name: &str, buf: &'a mut [u8; MAX_ROUTE_NAME_BYTES]) -> Option<&'a str> {
+/// The first ASCII uppercase byte of a name short enough to be an exact key. `None` means `name`
+/// is already the only key it can match.
+fn first_to_fold(name: &str) -> Option<usize> {
+	if name.len() > MAX_ROUTE_NAME_BYTES {
+		return None;
+	}
+	name.bytes().position(|b| b.is_ascii_uppercase())
+}
+
+/// `name` lowercased from `first_upper` on, in a stack buffer, since lookups run per connection.
+fn fold_into<'a>(
+	name: &str,
+	first_upper: usize,
+	buf: &'a mut [u8; MAX_ROUTE_NAME_BYTES],
+) -> Option<&'a str> {
 	let folded = buf.get_mut(..name.len())?;
-	let first_upper = name.bytes().position(|b| b.is_ascii_uppercase())?;
 	folded.copy_from_slice(name.as_bytes());
 	folded[first_upper..].make_ascii_lowercase();
 	std::str::from_utf8(folded).ok()
 }
 
 /// True when `sni` matches exactly one left-most label against `suffix` (a wildcard's stored
-/// suffix, without the `*.` prefix, already folded) — e.g. "Foo.Example.com" matches suffix
+/// suffix, without the `*.` prefix, already folded) — e.g. "foo.example.com" matches suffix
 /// "example.com" but "a.b.example.com" does not.
 /// Compares bytes: a client SNI may be any UTF-8, and a `&str` slice off a char boundary panics.
 fn wildcard_suffix_matches(sni: &str, suffix: &str) -> bool {
@@ -374,8 +384,9 @@ impl RouteTable {
 			.exact
 			.get(name)
 			.or_else(|| {
-				self.exact
-					.get(folded_key(name, &mut [0; MAX_ROUTE_NAME_BYTES])?)
+				let first_upper = first_to_fold(name)?;
+				let mut buf = [0; MAX_ROUTE_NAME_BYTES];
+				self.exact.get(fold_into(name, first_upper, &mut buf)?)
 			})
 			.filter(|r| !r.suspended)?;
 		if let Some(failover) = &route.failover {
@@ -429,9 +440,13 @@ impl RouteTable {
 		if let Some(decided) = self.exact_match(sni) {
 			return decided;
 		}
-		let mut buf = [0; MAX_ROUTE_NAME_BYTES];
-		if let Some(decided) = folded_key(sni, &mut buf).and_then(|key| self.exact_match(key)) {
-			return decided;
+		if let Some(first_upper) = first_to_fold(sni) {
+			let mut buf = [0; MAX_ROUTE_NAME_BYTES];
+			let decided =
+				fold_into(sni, first_upper, &mut buf).and_then(|key| self.exact_match(key));
+			if let Some(decided) = decided {
+				return decided;
+			}
 		}
 
 		// Wildcard, live or dropped — match exactly one left-most label against stored suffixes.
@@ -1646,17 +1661,13 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 
 	#[test]
 	fn folding_is_ascii_only_and_skips_names_too_long_for_a_route() {
-		let fold = |name: &str| folded_key(name, &mut [0; MAX_ROUTE_NAME_BYTES]).map(str::to_owned);
-		assert_eq!(fold("api.example.com"), None, "nothing to fold");
+		assert_eq!(first_to_fold("api.example.com"), None, "nothing to fold");
+		assert_eq!(first_to_fold(&"A".repeat(MAX_ROUTE_NAME_BYTES + 1)), None);
+		assert_eq!(fold_case("Ü.API.Example.com"), "Ü.api.example.com");
 		assert_eq!(
-			fold("Ü.API.Example.com").as_deref(),
-			Some("Ü.api.example.com")
+			fold_case(&"A".repeat(MAX_ROUTE_NAME_BYTES)),
+			"a".repeat(MAX_ROUTE_NAME_BYTES)
 		);
-		assert_eq!(
-			fold(&"A".repeat(MAX_ROUTE_NAME_BYTES)),
-			Some("a".repeat(MAX_ROUTE_NAME_BYTES))
-		);
-		assert_eq!(fold(&"A".repeat(MAX_ROUTE_NAME_BYTES + 1)), None);
 		assert_eq!(fold_case("*.Apps.Example.COM"), "*.apps.example.com");
 		assert!(matches!(fold_case("api.example.com"), Cow::Borrowed(_)));
 	}
