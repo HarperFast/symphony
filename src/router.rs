@@ -275,21 +275,21 @@ impl RouteMetricIdentity {
 /// `proxy.rs` rejects longer route names, so a longer name cannot be an exact key.
 pub const MAX_ROUTE_NAME_BYTES: usize = 255;
 
-/// Host names compare ASCII-case-insensitively (RFC 6066 §3); `exact_key` must fold the same way.
+/// Host names compare ASCII-case-insensitively (RFC 6066 §3), so every exact key is stored folded.
 fn fold_case(name: &str) -> Cow<'_, str> {
-	if name.bytes().any(|b| b.is_ascii_uppercase()) {
-		Cow::Owned(name.to_ascii_lowercase())
-	} else {
-		Cow::Borrowed(name)
+	let mut buf = [0; MAX_ROUTE_NAME_BYTES];
+	match folded_key(name, &mut buf) {
+		Some(folded) => Cow::Owned(folded.to_owned()),
+		None => Cow::Borrowed(name),
 	}
 }
 
-/// `fold_case` without allocating, for lookups on the connection path.
-fn exact_key<'a>(name: &'a str, buf: &'a mut [u8; MAX_ROUTE_NAME_BYTES]) -> Option<&'a str> {
+/// `name` folded into `buf`, without allocating, since lookups run per connection. `None` when
+/// there is nothing to fold, so a lookup of `name` itself already decided, or when `name` is too
+/// long to be an exact key.
+fn folded_key<'a>(name: &str, buf: &'a mut [u8; MAX_ROUTE_NAME_BYTES]) -> Option<&'a str> {
 	let folded = buf.get_mut(..name.len())?;
-	let Some(first_upper) = name.bytes().position(|b| b.is_ascii_uppercase()) else {
-		return Some(name);
-	};
+	let first_upper = name.bytes().position(|b| b.is_ascii_uppercase())?;
 	folded.copy_from_slice(name.as_bytes());
 	folded[first_upper..].make_ascii_lowercase();
 	std::str::from_utf8(folded).ok()
@@ -370,10 +370,13 @@ impl RouteTable {
 	/// wildcard or the default, which a spilled connection for that name might not reach), while it
 	/// is up, not draining and measurable. `None` = do not spill this name here.
 	pub fn load_answer(&self, name: &str, now: u64) -> Option<u32> {
-		let mut buf = [0; MAX_ROUTE_NAME_BYTES];
 		let route = self
 			.exact
-			.get(exact_key(name, &mut buf)?)
+			.get(name)
+			.or_else(|| {
+				self.exact
+					.get(folded_key(name, &mut [0; MAX_ROUTE_NAME_BYTES])?)
+			})
 			.filter(|r| !r.suspended)?;
 		if let Some(failover) = &route.failover {
 			if failover.drain
@@ -423,14 +426,12 @@ impl RouteTable {
 		// black-hole every exact route under a wildcard that happened to fail validation).
 
 		// Exact, live or dropped — most specific, decided first.
+		if let Some(decided) = self.exact_match(sni) {
+			return decided;
+		}
 		let mut buf = [0; MAX_ROUTE_NAME_BYTES];
-		if let Some(key) = exact_key(sni, &mut buf) {
-			if let Some(r) = self.exact.get(key) {
-				return Some(r);
-			}
-			if self.dropped_exact.contains(key) {
-				return None;
-			}
+		if let Some(decided) = folded_key(sni, &mut buf).and_then(|key| self.exact_match(key)) {
+			return decided;
 		}
 
 		// Wildcard, live or dropped — match exactly one left-most label against stored suffixes.
@@ -449,6 +450,14 @@ impl RouteTable {
 		}
 
 		default()
+	}
+
+	/// `Some(Some(route))` for a live exact route, `Some(None)` for a dropped one.
+	fn exact_match(&self, name: &str) -> Option<Option<&Route>> {
+		if let Some(route) = self.exact.get(name) {
+			return Some(Some(route));
+		}
+		self.dropped_exact.contains(name).then_some(None)
 	}
 
 	/// Look up the route stored under the key a spec's SNI would insert to (the exact SNI,
@@ -1636,28 +1645,20 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	}
 
 	#[test]
-	fn exact_key_folds_ascii_only_and_skips_names_too_long_for_a_route() {
-		let mut buf = [0; MAX_ROUTE_NAME_BYTES];
+	fn folding_is_ascii_only_and_skips_names_too_long_for_a_route() {
+		let fold = |name: &str| folded_key(name, &mut [0; MAX_ROUTE_NAME_BYTES]).map(str::to_owned);
+		assert_eq!(fold("api.example.com"), None, "nothing to fold");
 		assert_eq!(
-			exact_key("api.example.com", &mut buf),
-			Some("api.example.com")
-		);
-		assert_eq!(
-			exact_key("Ü.API.Example.com", &mut buf),
+			fold("Ü.API.Example.com").as_deref(),
 			Some("Ü.api.example.com")
 		);
-		for name in ["api.example.com", "Ü.API.Example.com", "*.Apps.Example.COM"] {
-			assert_eq!(exact_key(name, &mut buf), Some(fold_case(name).as_ref()));
-		}
-		let longest = "A".repeat(MAX_ROUTE_NAME_BYTES);
 		assert_eq!(
-			exact_key(&longest, &mut buf),
-			Some("a".repeat(MAX_ROUTE_NAME_BYTES).as_str())
+			fold(&"A".repeat(MAX_ROUTE_NAME_BYTES)),
+			Some("a".repeat(MAX_ROUTE_NAME_BYTES))
 		);
-		assert_eq!(
-			exact_key(&"a".repeat(MAX_ROUTE_NAME_BYTES + 1), &mut buf),
-			None
-		);
+		assert_eq!(fold(&"A".repeat(MAX_ROUTE_NAME_BYTES + 1)), None);
+		assert_eq!(fold_case("*.Apps.Example.COM"), "*.apps.example.com");
+		assert!(matches!(fold_case("api.example.com"), Cow::Borrowed(_)));
 	}
 
 	#[test]
