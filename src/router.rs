@@ -272,10 +272,10 @@ impl RouteMetricIdentity {
 
 // ── Route table ───────────────────────────────────────────────────────────────
 
-/// The longest route name `proxy.rs` accepts, so no longer name can be an exact key.
+/// `proxy.rs` rejects longer route names, so a longer name cannot be an exact key.
 pub const MAX_ROUTE_NAME_BYTES: usize = 255;
 
-/// Host names compare ASCII-case-insensitively (RFC 6066 §3): every key the table stores is folded.
+/// Host names compare ASCII-case-insensitively (RFC 6066 §3); `exact_key` must fold the same way.
 fn fold_case(name: &str) -> Cow<'_, str> {
 	if name.bytes().any(|b| b.is_ascii_uppercase()) {
 		Cow::Owned(name.to_ascii_lowercase())
@@ -284,15 +284,14 @@ fn fold_case(name: &str) -> Cow<'_, str> {
 	}
 }
 
-/// `name` as an exact key, folded into `buf` rather than allocated, since this runs per connection.
-/// `None` when it is too long to be one.
+/// `fold_case` without allocating, for lookups on the connection path.
 fn exact_key<'a>(name: &'a str, buf: &'a mut [u8; MAX_ROUTE_NAME_BYTES]) -> Option<&'a str> {
-	if !name.bytes().any(|b| b.is_ascii_uppercase()) {
-		return Some(name);
-	}
 	let folded = buf.get_mut(..name.len())?;
+	let Some(first_upper) = name.bytes().position(|b| b.is_ascii_uppercase()) else {
+		return Some(name);
+	};
 	folded.copy_from_slice(name.as_bytes());
-	folded.make_ascii_lowercase();
+	folded[first_upper..].make_ascii_lowercase();
 	std::str::from_utf8(folded).ok()
 }
 
@@ -343,8 +342,8 @@ pub struct RouteTable {
 	/// fail-closed reasoning as `dropped_exact`, checked against incoming SNIs with the same
 	/// suffix-matching rule as `wildcard` itself.
 	dropped_wildcard: Vec<Arc<str>>,
-	/// The client-certificate policy each installed route enforces, keyed by configured SNI
-	/// (`*.`-prefixed for a wildcard). Kept here rather than on `Route`, which every connection
+	/// The client-certificate policy each installed route enforces, keyed by the folded configured
+	/// SNI (`*.`-prefixed for a wildcard). Kept here rather than on `Route`, which every connection
 	/// clones into its task.
 	client_auth: HashMap<Arc<str>, ClientAuth>,
 	/// Routes with `failover`, for the recovery probe and the metrics export.
@@ -624,9 +623,6 @@ pub fn build_route_table(
 	cache: &mut TlsConfigCache,
 ) -> crate::error::Result<RouteTable> {
 	cache.clear_used();
-	// Every key below is the folded name, so two spellings of one name are one route (duplicate rules
-	// included) and a reload that only respells a route still finds its previous one. Metric labels
-	// and logs keep the configured spelling.
 	let names: Vec<Cow<'_, str>> = specs.iter().map(|spec| fold_case(&spec.sni)).collect();
 	let mut exact: HashMap<Arc<str>, Route> = HashMap::new();
 	let mut wildcard: Vec<(Arc<str>, Route)> = Vec::new();
@@ -1640,6 +1636,28 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	}
 
 	#[test]
+	fn exact_key_folds_ascii_only_and_skips_names_too_long_for_a_route() {
+		let mut buf = [0; MAX_ROUTE_NAME_BYTES];
+		assert_eq!(
+			exact_key("api.example.com", &mut buf),
+			Some("api.example.com")
+		);
+		assert_eq!(
+			exact_key("Ü.API.Example.com", &mut buf),
+			Some("Ü.api.example.com")
+		);
+		let longest = "A".repeat(MAX_ROUTE_NAME_BYTES);
+		assert_eq!(
+			exact_key(&longest, &mut buf),
+			Some("a".repeat(MAX_ROUTE_NAME_BYTES).as_str())
+		);
+		assert_eq!(
+			exact_key(&"a".repeat(MAX_ROUTE_NAME_BYTES + 1), &mut buf),
+			None
+		);
+	}
+
+	#[test]
 	fn sni_matching_ignores_ascii_case() {
 		let table = build(
 			&[
@@ -1771,7 +1789,6 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			&mut cache,
 		)
 		.expect("initial build");
-		// KeyMismatch on the respelled route: only a last-good found under the folded name serves.
 		let reloaded = build_route_table(
 			&[tls_route("Tenant.Example.com", CERT_A, KEY_B)],
 			&ListenerTlsSpec::empty(),

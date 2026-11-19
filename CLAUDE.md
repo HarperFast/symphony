@@ -131,8 +131,9 @@ events is left as accepted.
 ### Host names fold ASCII case (`router.rs::fold_case`, `exact_key`)
 RFC 6066 §3 compares host names case-insensitively. Every key `build_route_table` stores is the
 folded name (duplicate rules, tombstones, carry-forward, `client_auth`), while `Route` and its metric
-identity keep the configured spelling: metric series, `routeHealth` and the names a node sends in a
-peer load query are unchanged, and a peer still on an older release can still answer that query.
+identity keep the spelling the route was installed with (a same-group reload that only respells it
+reuses the identity): metric series, `routeHealth` and the names a node sends in a peer load query
+are unchanged, and a peer still on an older release can still answer that query.
 `resolve_with` and `load_answer` fold into a stack buffer (`exact_key`) because they run per
 connection, and `wildcard_suffix_matches` compares the suffix with `eq_ignore_ascii_case`; a lookup
 that skips both misses every mixed-case name. Folding in the table, not in `sni.rs`, is what covers
