@@ -293,7 +293,7 @@ fn first_to_fold(name: &str) -> Option<usize> {
 	name.bytes().position(|b| b.is_ascii_uppercase())
 }
 
-/// `name` lowercased from `first_upper` on, in a stack buffer, since lookups run per connection.
+/// Folds into a stack buffer rather than allocating, since lookups run per connection.
 fn fold_into<'a>(
 	name: &str,
 	first_upper: usize,
@@ -384,7 +384,7 @@ impl RouteTable {
 			.exact
 			.get(name)
 			.or_else(|| {
-				let first_upper = first_to_fold(name)?;
+				let first_upper = first_to_fold(name).filter(|_| !self.exact.is_empty())?;
 				let mut buf = [0; MAX_ROUTE_NAME_BYTES];
 				self.exact.get(fold_into(name, first_upper, &mut buf)?)
 			})
@@ -440,7 +440,8 @@ impl RouteTable {
 		if let Some(decided) = self.exact_match(sni) {
 			return decided;
 		}
-		if let Some(first_upper) = first_to_fold(sni) {
+		let has_exact_names = !self.exact.is_empty() || !self.dropped_exact.is_empty();
+		if let Some(first_upper) = first_to_fold(sni).filter(|_| has_exact_names) {
 			let mut buf = [0; MAX_ROUTE_NAME_BYTES];
 			let decided =
 				fold_into(sni, first_upper, &mut buf).and_then(|key| self.exact_match(key));
