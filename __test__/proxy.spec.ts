@@ -469,6 +469,29 @@ describe('SymphonyProxy – default route (sni: "")', () => {
 		assert.equal(proxy.metrics().routes, 2);
 	});
 
+	it('matches SNI and configured route names regardless of ASCII case', async () => {
+		const port = await getFreePort();
+		const route = (sni: string) => ({ sni, upstreams: upstreams(), terminateTls: true, cert: tlsCert });
+		const proxy = await startProxy({
+			listeners: [{ host: '127.0.0.1', port }],
+			routes: [route('pr-12.app.example.com'), route('Admin.Example.com'), route('*.app.example.com'), route('')],
+		});
+
+		for (const servername of [
+			'PR-12.app.example.com',
+			'pr-12.APP.EXAMPLE.COM',
+			'ADMIN.example.com',
+			'PR-13.App.Example.com',
+		]) {
+			assert.equal((await tlsRoundTrip({ port, servername, data: servername })).toString(), servername);
+		}
+
+		assert.equal(connections(proxy, 'pr-12.app.example.com'), 2);
+		assert.equal(connections(proxy, 'Admin.Example.com'), 1);
+		assert.equal(connections(proxy, '*.app.example.com'), 1);
+		assert.equal(connections(proxy, ''), 0);
+	});
+
 	it('passes a client that sends no ClientHello through a passthrough default route', async () => {
 		const port = await getFreePort();
 		const proxy = await startProxy({

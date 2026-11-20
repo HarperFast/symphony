@@ -173,6 +173,22 @@ describe('HTTP-mode listener', () => {
 		assert.ok(!proxy.metrics().routeMetrics.some((route) => route.route === 'foo.wild.example.com'));
 	});
 
+	it('matches the ACME Host header regardless of ASCII case', async () => {
+		const routeConnections = (name: string) =>
+			proxy.metrics().routeMetrics.find((route) => route.route === name)!.connections;
+		const exactBefore = routeConnections('example.com');
+		const wildcardBefore = routeConnections('*.wild.example.com');
+		for (const host of ['EXAMPLE.com', 'Foo.WILD.Example.com']) {
+			const response = await rawHttp(
+				proxyPort,
+				`GET /.well-known/acme-challenge/case HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`,
+			);
+			assert.match(response, /^HTTP\/1\.1 200 OK\r\n/, host);
+		}
+		assert.equal(routeConnections('example.com'), exactBefore + 1);
+		assert.equal(routeConnections('*.wild.example.com'), wildcardBefore + 1);
+	});
+
 	it('returns 404 for ACME requests with no matching route', async () => {
 		const response = await rawHttp(
 			proxyPort,

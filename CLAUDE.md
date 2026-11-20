@@ -128,6 +128,19 @@ state is canonical too — one client, one bucket; symphony#68), `SourceAllowlis
 would never match a canonical peer. The address forwarded upstream and reported in `'blocked'`
 events is left as accepted.
 
+### Host names fold ASCII case (`router.rs::fold_case`, `first_to_fold`)
+RFC 6066 §3 compares host names case-insensitively. Every key `build_route_table` stores is the
+folded name (duplicate rules, tombstones, carry-forward, `client_auth`), while `Route` and its metric
+identity keep the spelling the route was installed with (a same-group reload that only respells it
+reuses the identity): metric series, `routeHealth` and the names a node sends in a peer load query
+are unchanged, and a peer still on an older release can still answer that query.
+`resolve_with` (per connection) and `load_answer` (per peer load query) probe the raw name first and
+fold only when it has an uppercase letter, into a stack buffer (`fold_into`), so an exact lookup
+that skips that fallback misses mixed-case names. `wildcard_suffix_matches` compares the suffix with
+`eq_ignore_ascii_case`. Folding in the table, not in `sni.rs`, is what covers the ACME `Host` header
+and peer load queries. The `'suspended'` event and the PROXY v2 authority TLV carry the name as
+`sni.rs` parsed it, case included.
+
 ### The default route (`sni: ''`)
 `build_route_table` puts the empty-SNI spec in `RouteTable::default` (symphony#47); everything
 before insertion — duplicate selection, tombstones, cert carry-forward, `client_auth` — keys it by
