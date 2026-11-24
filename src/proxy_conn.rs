@@ -1344,6 +1344,39 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn a_presented_certificate_that_fails_verification_is_counted_as_untrusted() {
+		use crate::router::tests::{CERT_A, KEY_A};
+		let kind = handshake_failure_kind(|io| {
+			tokio::spawn(async move {
+				// The trust anchor itself, presented as a client certificate: webpki refuses it.
+				let chain = rustls_pemfile::certs(&mut &CERT_A[..])
+					.collect::<Result<Vec<_>, _>>()
+					.unwrap();
+				let key = rustls_pemfile::private_key(&mut &KEY_A[..])
+					.unwrap()
+					.unwrap();
+				let provider = Arc::new(rustls::crypto::ring::default_provider());
+				let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+					.with_safe_default_protocol_versions()
+					.unwrap()
+					.dangerous()
+					.with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+					.with_client_auth_cert(chain, key)
+					.unwrap();
+				let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+				if let Ok(mut tls) = tokio_rustls::TlsConnector::from(Arc::new(config))
+					.connect(name, io)
+					.await
+				{
+					let _ = tls.read(&mut [0u8; 64]).await;
+				}
+			})
+		})
+		.await;
+		assert_eq!(kind, ErrorKind::ClientCertUntrusted);
+	}
+
+	#[tokio::test]
 	async fn any_other_handshake_failure_stays_a_handshake_error() {
 		let kind = handshake_failure_kind(|mut io| {
 			tokio::spawn(async move {
