@@ -822,7 +822,10 @@ pub fn build_route_table(
 				let newly_invalid = previous.is_none_or(|p| !p.invalid_hold.contains(name));
 				invalid_hold.insert(Arc::from(name));
 				if newly_invalid {
-					eprintln!(
+					// Not eprintln!, which panics if stderr is a pipe whose reader has gone.
+					use std::io::Write;
+					let _ = writeln!(
+						std::io::stderr(),
 						"symphony: route '{}': {e}; serving it without the hold",
 						spec.sni
 					);

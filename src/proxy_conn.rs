@@ -508,12 +508,11 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 				}
 				Ok(Err(e)) => {
 					tracing::debug!("TLS handshake error from {peer_ip}: {e}");
-					let kind = e
-						.get_ref()
-						.and_then(|inner| inner.downcast_ref::<rustls::Error>())
-						.and_then(crate::mtls::client_cert_rejection)
-						.unwrap_or(ErrorKind::TlsHandshake);
-					inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, kind);
+					inc_route_error(
+						&ctx.listener_metrics,
+						&route.metric_identity.counters,
+						handshake_error_kind(e),
+					);
 					return;
 				}
 				Err(_) => {
@@ -621,6 +620,14 @@ async fn connect_or_forward(
 		}
 	}
 	None
+}
+
+/// tokio-rustls returns the rustls error behind a failed handshake wrapped as `InvalidData`.
+fn handshake_error_kind(e: &std::io::Error) -> ErrorKind {
+	e.get_ref()
+		.and_then(|inner| inner.downcast_ref::<rustls::Error>())
+		.and_then(crate::mtls::client_cert_rejection)
+		.unwrap_or(ErrorKind::TlsHandshake)
 }
 
 fn tls_accept<IO>(
@@ -1280,6 +1287,74 @@ mod tests {
 
 	/// Plaintext the server accepts from one write loop before `Pending`, against a client that
 	/// completed the handshake and then never reads: rustls' queue plus the 4 KiB transport.
+	/// What a real `Accept` failure is counted as, so a change in how tokio-rustls reports it fails
+	/// here rather than quietly moving certificate rejections back into `tls_handshake`.
+	async fn handshake_failure_kind(
+		client: impl FnOnce(tokio::io::DuplexStream) -> tokio::task::JoinHandle<()>,
+	) -> ErrorKind {
+		use crate::router::tests::{CERT_A, KEY_A};
+		use crate::tls::{CertSpec, MtlsSpec, TlsConfigCache};
+
+		let server_cfg = TlsConfigCache::new()
+			.get_or_build(
+				&CertSpec {
+					cert_chain_pem: CERT_A.to_vec(),
+					private_key_pem: zeroize::Zeroizing::new(KEY_A.to_vec()),
+				},
+				Some(&MtlsSpec {
+					client_ca_pem: CERT_A.to_vec(),
+					require_client_cert: true,
+					failure_hold: crate::tarpit::FailureHold::OFF,
+				}),
+				false,
+			)
+			.unwrap()
+			.config;
+		let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+		let client = client(client_io);
+		let error = tls_accept(&TlsAcceptor::from(server_cfg), server_io, None)
+			.await
+			.expect_err("the handshake must fail");
+		client.abort();
+		handshake_error_kind(&error)
+	}
+
+	#[tokio::test]
+	async fn a_required_certificate_that_is_missing_is_counted_as_one() {
+		let kind = handshake_failure_kind(|io| {
+			tokio::spawn(async move {
+				let provider = Arc::new(rustls::crypto::ring::default_provider());
+				let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+					.with_safe_default_protocol_versions()
+					.unwrap()
+					.dangerous()
+					.with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+					.with_no_client_auth();
+				let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+				if let Ok(mut tls) = tokio_rustls::TlsConnector::from(Arc::new(config))
+					.connect(name, io)
+					.await
+				{
+					let _ = tls.read(&mut [0u8; 64]).await;
+				}
+			})
+		})
+		.await;
+		assert_eq!(kind, ErrorKind::ClientCertMissing);
+	}
+
+	#[tokio::test]
+	async fn any_other_handshake_failure_stays_a_handshake_error() {
+		let kind = handshake_failure_kind(|mut io| {
+			tokio::spawn(async move {
+				let _ = io.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+				let _ = io.read(&mut [0u8; 64]).await;
+			})
+		})
+		.await;
+		assert_eq!(kind, ErrorKind::TlsHandshake);
+	}
+
 	async fn accepted_while_client_stalls(buffer_limit: Option<usize>) -> usize {
 		use crate::router::tests::{CERT_A, KEY_A};
 		use crate::tls::{CertSpec, TlsConfigCache};

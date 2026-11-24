@@ -236,7 +236,8 @@ can't slow them without also blocking the valid devices behind the same NAT addr
 Set `mtls.failureHoldMs` on a terminating route, or on the listener's `mtls`, which a route without
 its own `mtls` inherits along with the CA. (As with the CA, only the first TLS listener's `mtls` is
 inherited, and it is fixed when the proxy is constructed: `updateConfig` changes route-level holds
-only. `symphony-server` recreates the proxy when a listener's `mtls` changes.) A client that presents a certificate that fails
+only. `symphony-server` recreates the proxy when a listener's `mtls` changes, so that route's clients
+do one full handshake.) A client that presents a certificate that fails
 verification (expired, not yet valid, unknown issuer, bad signature, wrong key usage) then gets no
 alert. Its handshake completes, then symphony sends nothing and discards what the client sends until
 the hold ends, and closes the connection. A client that waits for an application response (an MQTT
@@ -282,17 +283,19 @@ How it works, and what follows from it:
 - **What a held socket costs.** One file descriptor, no upstream connection, and about 3 KiB of
   process memory (measured with 2,000 and 8,000 held sockets; the TLS state is freed when the hold
   starts), plus the kernel's own per-socket memory. The default cap bounds holds at roughly 30 MB of
-  process memory per listener. A hold ends at its deadline, as soon as its client closes or resets
+  process memory. symphony raises the process's file-descriptor limit only when `maxConnections` is
+  set, so without it make sure the limit covers the held sockets too. A hold ends at its deadline, as soon as its client closes or resets
   the connection (within a second if the client has sent more than 64 KiB, which symphony stops
   reading), or when `stop()` is called.
 - **Held sockets are open connections.** They count toward `maxConnections`, the active-connection
   gauges, and `maxConcurrentPerIp`. With a per-IP limit, failing devices behind a NAT address take
   slots its valid devices would otherwise use, so size the limit for both.
-- **Changing it.** `failureHoldMs` and `failureHoldJitter` hot-swap through `updateConfig`. Changing
-  the hold between two non-zero values keeps sessions resumable. Turning it on or off swaps the
-  route's TLS config, so clients of that route do one full handshake. An invalid value (a hold that
-  is negative, over `600000` or not a number; a jitter outside 0–1) serves the route without the
-  hold and counts it in `failingRoutes`. A route serving its last-good config because its cert
+- **Changing it.** `failureHoldMs` (whole milliseconds; under 1 keeps the alert) and
+  `failureHoldJitter` hot-swap through `updateConfig`. Changing a route's hold between two non-zero
+  values keeps sessions resumable. Turning it on or off swaps the route's TLS config, so clients of
+  that route do one full handshake. An invalid value (a hold that is negative, over `600000` or not
+  a number; a jitter outside 0–1; in a `symphony-server` config file, a value of the wrong type)
+  serves the route without the hold and counts it in `failingRoutes`. A route serving its last-good config because its cert
   failed to rebuild keeps its previous hold setting, like its cert and upstreams, until it rebuilds.
 - **Failover.** The hold happens on the node that terminates the connection. A route that checks
   after the handshake never connects to its upstream early, so, like a route that requires a client
