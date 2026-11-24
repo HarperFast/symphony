@@ -175,7 +175,7 @@ default `0.5`). See [Holding clients whose certificate fails](#holding-clients-w
 | `ja4Blocklist` | `string[]` | `[]` | JA4 TLS fingerprints to block (36-char strings; see [JA4 blocking](#ja4-blocking)) |
 | `tlsHandshakeTimeoutMs` | `number` | `10000` | Abort slow TLS handshakes |
 | `requireSni` | `boolean` | `false` | Reject connections without an SNI extension |
-| `maxHeldConnections` | `number` | `10000`, or half of `maxConnections` if lower | Connections held at once after a client-certificate rejection (`mtls.failureHoldMs`); further rejections close at once. `0` holds none |
+| `maxHeldConnections` | `number` | `10000`, or half of `maxConnections` if lower | Connections held at once, across the proxy, after a client-certificate rejection (`mtls.failureHoldMs`); further rejections on this listener close at once. `0` holds none |
 
 A dual-stack (`[::]`) listener reports an IPv4 client as `::ffff:a.b.c.d`. Protection treats it as
 `a.b.c.d`: only IPv4 `allowlist`/`blocklist` entries match it (`::/0` does not; use `0.0.0.0/0`
@@ -233,8 +233,10 @@ Some clients reconnect the moment a handshake fails, forever: devices with a lon
 unknown-CA certificate that nobody can fix. Each attempt costs a full handshake. Per-IP rate limits
 can't slow them without also blocking the valid devices behind the same NAT address.
 
-Set `mtls.failureHoldMs` on a terminating route (or on the listener's `mtls`, which a route without
-its own `mtls` inherits along with the CA). A client that presents a certificate that fails
+Set `mtls.failureHoldMs` on a terminating route, or on the listener's `mtls`, which a route without
+its own `mtls` inherits along with the CA. (As with the CA, only the first TLS listener's `mtls` is
+inherited, and it is fixed when the proxy is constructed: `updateConfig` changes route-level holds
+only. `symphony-server` recreates the proxy when a listener's `mtls` changes.) A client that presents a certificate that fails
 verification (expired, not yet valid, unknown issuer, bad signature, wrong key usage) then gets no
 alert. Its handshake completes, then symphony sends nothing and discards what the client sends until
 the hold ends, and closes the connection. A client that waits for an application response (an MQTT
@@ -270,11 +272,13 @@ How it works, and what follows from it:
 - **Not held:** a client that presents no certificate where one is required, or whose key doesn't
   match its certificate (CertificateVerify fails). These, cipher mismatches, handshake timeouts and
   scanners still get today's immediate failure.
-- **The cap.** `protection.maxHeldConnections` (per listener, default `10000`, or half of the
-  listener's `maxConnections` when that is lower) bounds the sockets held at once. Past it, a
-  failing client is closed at once without an alert: by then there is no handshake left to fail.
-  `0` holds none. A lowered cap applies to new holds only. A listener without `protection` uses the
-  default.
+- **The cap.** `protection.maxHeldConnections` (default `10000`, or half of the listener's
+  `maxConnections` when that is lower) bounds the sockets held at once. Like `maxConnections`, a
+  listener compares its value with the count across the whole proxy, so held sockets never take more
+  than half of the accept budget by default. Past it, a failing client is closed at once without an
+  alert: by then there is no handshake left to fail. `0` holds none. A lowered cap applies to new
+  holds only. A listener without `protection` uses the default. One route's failing clients can use
+  up the cap for every route on the proxy; those past it are closed, never let through.
 - **What a held socket costs.** One file descriptor, no upstream connection, and about 3 KiB of
   process memory (measured with 2,000 and 8,000 held sockets; the TLS state is freed when the hold
   starts), plus the kernel's own per-socket memory. The default cap bounds holds at roughly 30 MB of
@@ -288,7 +292,8 @@ How it works, and what follows from it:
   the hold between two non-zero values keeps sessions resumable. Turning it on or off swaps the
   route's TLS config, so clients of that route do one full handshake. An invalid value (a hold that
   is negative, over `600000` or not a number; a jitter outside 0–1) serves the route without the
-  hold and counts it in `failingRoutes`.
+  hold and counts it in `failingRoutes`. A route serving its last-good config because its cert
+  failed to rebuild keeps its previous hold setting, like its cert and upstreams, until it rebuilds.
 - **Failover.** The hold happens on the node that terminates the connection. A route that checks
   after the handshake never connects to its upstream early, so, like a route that requires a client
   certificate, it loses the one connection that finds its upstream dead. A connection forwarded to

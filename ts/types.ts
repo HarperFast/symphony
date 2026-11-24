@@ -337,10 +337,10 @@ export interface ProtectionConfig {
 	/** Reject connections that present no SNI. Default: false. */
 	requireSni?: boolean;
 	/**
-	 * Connections this listener holds at once after a client-certificate rejection
-	 * (`mtls.failureHoldMs`); further rejections are closed at once, without an alert. 0 holds none.
-	 * Default: 10000, or half of the listener's `maxConnections` when that is lower. Held
-	 * connections count toward `maxConnections` and `maxConcurrentPerIp`.
+	 * Connections held at once after a client-certificate rejection (`mtls.failureHoldMs`), counted
+	 * across the proxy like `maxConnections`; past it this listener closes rejections at once, without
+	 * an alert. 0 holds none. Default: 10000, or half of the listener's `maxConnections` when that is
+	 * lower. Held connections count toward `maxConnections` and `maxConcurrentPerIp`.
 	 */
 	maxHeldConnections?: number;
 }

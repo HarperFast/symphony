@@ -172,16 +172,19 @@ through a deferring `ServerConfig` reaches no upstream (no connect, no byte) unl
 - **Early connect is off for a deferring route** (beside `!route.requires_client_cert` in `handle`).
 - **Only a presented chain that fails is held.** Mandatory-without-cert and a failed CertificateVerify
   are still alerted inside the handshake (counted `client_cert_missing` / `client_cert_untrusted`).
-- **The held count lives on `ListenerMetrics`** (`held_connections`, taken by `tarpit::HeldSlot`), and
-  only the cap on the protection snapshot: a protection hot-swap replaces the snapshot, and a listener
-  without protection still holds (`ConnContext::default_max_held`).
+- **The held count `maxHeldConnections` caps is proxy-wide** (`GlobalMetrics::held_connections`, taken by
+  `tarpit::HeldSlot`), like the count `maxConnections` caps at accept, because the accept gate compares
+  the proxy-wide active count with each listener's limit; `ListenerMetrics::held_connections` is only
+  the gauge. Only the cap lives on the protection snapshot, which a hot-swap replaces; a listener
+  without protection uses `ConnContext::default_max_held`.
 - **The hold runs in its own task**, given only the socket (rustls state dropped), its `HeldSlot`, and
   the connection's `ActiveGuard`/`RouteActiveGuard`, so a held socket costs ~3 KiB instead of the whole
   connection future and pins no route-table snapshot. Moving the guards keeps held sockets counted
   toward `maxConcurrentPerIp` and `maxConnections` (owner decision).
 - **A hold ends on client close**: on EOF/error while reading, and past the 64 KiB discard budget (no
   more reads) through the reactor's read-closed readiness, polled each second (`upstream::read_closed`).
-- **`stop()` drops `release_holds`**, a `watch` sender; a hold that starts after that sees it closed.
+- **`stop()` drops the `watch` sender kept beside the shutdown broadcast** (one lock, so a native
+  start/stop race cannot split them); a hold that starts after that sees it closed.
 - **An invalid `failureHoldMs` is isolated per route** (`invalid_hold`, served strict, in `failingRoutes`),
   validated on the effective value so the listener level is covered too.
 - The rustls error behind an `Accept` failure is `io::Error::get_ref()` downcast to `rustls::Error`
@@ -539,5 +542,5 @@ Tests bind on random high ports (`port: 0`) to avoid conflicts. Suspended-route 
 - **`resolveConnection` with unknown ID**: a no-op, not an error. The connection has already timed out and been dropped by the time JS calls this with a stale ID.
 - **`ring` vs `md-5`**: `ring 0.17` removed MD5 support. JA3 fingerprints use `md-5 0.10` (RustCrypto). SHA-256 for cert deduplication still uses `ring::digest::SHA256` (ring is a direct dep for this).
 - **musl RLIMIT_NOFILE**: musl hard limit is often 1048576. symphony logs a warning at startup if the requested limit exceeds the hard limit and uses the hard limit instead.
-- **napi async methods must not take `&mut self`**: use `Mutex<>` for fields that need mutation after construction (currently `shutdown_tx: Mutex<Option<broadcast::Sender<()>>>`).
+- **napi async methods must not take `&mut self`**: use `Mutex<>` for fields that need mutation after construction (currently `shutdown_tx: Mutex<Option<(broadcast::Sender<()>, watch::Sender<()>)>>`).
 - **`JsUpstream` is a flat struct**: the TypeScript `Upstream` discriminated union is mapped to a single flat `JsUpstream { kind, host?, port?, path?, ipAffinity?, ipAffinityTtlMs? }` struct on the Rust side to avoid napi union complexity. Fields not relevant to a given `kind` will be `None`.

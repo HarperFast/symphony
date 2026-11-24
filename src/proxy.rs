@@ -184,9 +184,9 @@ pub struct JsProtectionConfig {
 	pub ja4_blocklist: Option<Vec<String>>,
 	pub tls_handshake_timeout_ms: Option<f64>,
 	pub require_sni: Option<bool>,
-	/// Connections this listener holds after a client-certificate rejection (`mtls.failureHoldMs`)
-	/// before it closes further rejections at once. 0 holds none. Default: 10000, or half of
-	/// `maxConnections` when that is lower.
+	/// Connections held across the proxy after a client-certificate rejection (`mtls.failureHoldMs`)
+	/// before this listener closes further rejections at once. 0 holds none. Default: 10000, or half
+	/// of `maxConnections` when that is lower.
 	pub max_held_connections: Option<f64>,
 }
 
@@ -465,10 +465,9 @@ pub struct SymphonyProxyWrap {
 	suspended_registry: Arc<SuspendedRegistry>,
 	global_metrics: Arc<GlobalMetrics>,
 	listener_states: Vec<ListenerState>,
-	// Interior mutability for start/stop
-	shutdown_tx: Mutex<Option<broadcast::Sender<()>>>,
-	// Dropped by stop(), which ends every hold; a hold that starts afterwards sees it closed.
-	release_holds: Mutex<Option<watch::Sender<()>>>,
+	// Interior mutability for start/stop. The watch sender is only ever dropped: that ends every
+	// hold, and a hold that starts afterwards sees it closed.
+	shutdown_tx: Mutex<Option<(broadcast::Sender<()>, watch::Sender<()>)>>,
 	// Outlives every route-table build so an unchanged cert keeps the same ServerConfig — and
 	// with it the TLS session cache and ticket keys — across hot-swaps.
 	tls_cache: Mutex<TlsConfigCache>,
@@ -682,7 +681,6 @@ impl SymphonyProxyWrap {
 			global_metrics: Arc::new(GlobalMetrics::default()),
 			listener_states,
 			shutdown_tx: Mutex::new(None),
-			release_holds: Mutex::new(None),
 			tls_cache: Mutex::new(tls_cache),
 			js_emit: Arc::new(js_emit),
 			_rt: rt,
@@ -716,10 +714,9 @@ impl SymphonyProxyWrap {
 		};
 
 		let (tx, _) = broadcast::channel(1);
-		*shutdown_tx = Some(tx.clone());
-		drop(shutdown_tx);
 		let (release_holds, holds_released) = watch::channel(());
-		*self.release_holds.lock().unwrap() = Some(release_holds);
+		*shutdown_tx = Some((tx.clone(), release_holds));
+		drop(shutdown_tx);
 
 		for ((i, listener), sockets) in self.listeners.iter().enumerate().zip(bound) {
 			let state = &self.listener_states[i];
@@ -823,10 +820,9 @@ impl SymphonyProxyWrap {
 
 	#[napi]
 	pub async fn stop(&self, timeout_ms: Option<f64>) -> Result<()> {
-		if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
+		if let Some((tx, _release_holds)) = self.shutdown_tx.lock().unwrap().take() {
 			let _ = tx.send(());
 		}
-		drop(self.release_holds.lock().unwrap().take());
 		let ms = timeout_ms.unwrap_or(100.0).min(5_000.0) as u64;
 		tokio::time::sleep(Duration::from_millis(ms)).await;
 		Ok(())
@@ -942,16 +938,8 @@ impl SymphonyProxyWrap {
 			None
 		};
 
-		// All validation passed — apply atomically (routes then protection, neither applied on any error above).
-		if let Some(table) = new_route_table {
-			self.route_table.swap(table);
-			// Committed — now retire the ServerConfigs (and their session state) that no route
-			// in the new table asked for, i.e. rotated-out certs.
-			self.tls_cache
-				.lock()
-				.unwrap_or_else(|e| e.into_inner())
-				.retain_used();
-		}
+		// All validation passed — apply (protection then routes, neither applied on any error above).
+		// Protection first, so a route's new hold is never taken under the cap the update replaces.
 		if let Some((protection_updates, parsed)) = validated_protection {
 			// Phase 3: store all (infallible — validation above guarantees each port is valid).
 			for (update, cfg) in protection_updates.iter().zip(parsed) {
@@ -963,6 +951,15 @@ impl SymphonyProxyWrap {
 					.expect("validated above");
 				prot.config.store(Arc::new(cfg));
 			}
+		}
+		if let Some(table) = new_route_table {
+			self.route_table.swap(table);
+			// Committed — now retire the ServerConfigs (and their session state) that no route
+			// in the new table asked for, i.e. rotated-out certs.
+			self.tls_cache
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.retain_used();
 		}
 		for (state, trusted) in validated_ingress.into_iter().flatten() {
 			state.set_trusted(trusted);

@@ -148,8 +148,7 @@ pub struct ListenerMetrics {
 	/// in connections rather than gigabytes.
 	pub half_closed_connections: AtomicU64,
 	/// Subset of `active_connections` held silently after their client certificate was rejected
-	/// (`failureHoldMs`). Also the count `maxHeldConnections` caps, so it lives here rather than on
-	/// the swappable protection snapshot.
+	/// (`failureHoldMs`).
 	pub held_connections: AtomicU64,
 	pub total_accepted: AtomicU64,
 	/// Bytes read from clients on this listener (client → upstream), counted where the proxy
@@ -388,6 +387,9 @@ pub fn total_of(counts: &[(&'static str, u64)]) -> u64 {
 #[derive(Default)]
 pub struct GlobalMetrics {
 	pub active_connections: AtomicU64,
+	/// Connections held after a client-certificate rejection, across listeners: the count each
+	/// listener's `maxHeldConnections` caps, as `maxConnections` caps `active_connections`.
+	pub held_connections: AtomicU64,
 	pub pending_suspended: AtomicU64,
 	/// Suspended connections that JS resolved with a route.
 	pub suspended_resolved: AtomicU64,

@@ -1,4 +1,4 @@
-use crate::metrics::ListenerMetrics;
+use crate::metrics::{GlobalMetrics, ListenerMetrics};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,9 +15,9 @@ const DISCARD_BUDGET: usize = 64 * 1024;
 const CLOSE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A hold longer than any client's connect timeout only holds a socket its client has abandoned.
-pub const MAX_FAILURE_HOLD_MS: f64 = 600_000.0;
+const MAX_FAILURE_HOLD_MS: f64 = 600_000.0;
 
-pub const DEFAULT_FAILURE_HOLD_JITTER: f64 = 0.5;
+const DEFAULT_FAILURE_HOLD_JITTER: f64 = 0.5;
 
 /// How long a client whose certificate is rejected is held: `hold` scaled by a uniform draw from
 /// `[1 - jitter, 1 + jitter]`, so clients rejected together (a restart, a traffic shift) do not all
@@ -79,7 +79,7 @@ fn random_unit() -> f64 {
 const DEFAULT_MAX_HELD_CONNECTIONS: u32 = 10_000;
 
 /// The default leaves at least half of a listener's `maxConnections` to connections that are not
-/// held, since held sockets count toward it.
+/// held, since held sockets count toward it. Both compare against counts across the whole proxy.
 pub fn default_max_held(max_connections: u32) -> u32 {
 	match max_connections {
 		0 => DEFAULT_MAX_HELD_CONNECTIONS,
@@ -87,29 +87,39 @@ pub fn default_max_held(max_connections: u32) -> u32 {
 	}
 }
 
-/// One of a listener's `maxHeldConnections` slots, released on drop.
+/// A held connection, counted proxy-wide (what `maxHeldConnections` caps) and on its listener's
+/// gauge until dropped.
 pub struct HeldSlot {
-	metrics: Arc<ListenerMetrics>,
+	global: Arc<GlobalMetrics>,
+	listener: Arc<ListenerMetrics>,
 }
 
 impl HeldSlot {
-	/// `None` once `cap` slots are taken. A lowered cap applies to new acquisitions only.
-	pub fn acquire(metrics: &Arc<ListenerMetrics>, cap: u32) -> Option<Self> {
-		metrics
+	/// `None` once `cap` connections are held across the proxy. A lowered cap applies to new
+	/// acquisitions only.
+	pub fn acquire(
+		global: &Arc<GlobalMetrics>,
+		listener: &Arc<ListenerMetrics>,
+		cap: u32,
+	) -> Option<Self> {
+		global
 			.held_connections
 			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
 				(held < u64::from(cap)).then_some(held + 1)
 			})
-			.ok()
-			.map(|_| Self {
-				metrics: metrics.clone(),
-			})
+			.ok()?;
+		listener.held_connections.fetch_add(1, Ordering::Relaxed);
+		Some(Self {
+			global: global.clone(),
+			listener: listener.clone(),
+		})
 	}
 }
 
 impl Drop for HeldSlot {
 	fn drop(&mut self) {
-		self.metrics
+		self.global.held_connections.fetch_sub(1, Ordering::Relaxed);
+		self.listener
 			.held_connections
 			.fetch_sub(1, Ordering::Relaxed);
 	}
@@ -323,28 +333,41 @@ mod tests {
 	}
 
 	#[test]
-	fn the_cap_bounds_concurrent_slots_and_drop_releases_them() {
-		let metrics = Arc::new(ListenerMetrics::default());
-		let slots: Vec<_> = (0..5)
-			.filter_map(|_| HeldSlot::acquire(&metrics, 3))
+	fn the_cap_bounds_slots_across_listeners_and_drop_releases_them() {
+		let global = Arc::new(GlobalMetrics::default());
+		let (a, b) = (
+			Arc::new(ListenerMetrics::default()),
+			Arc::new(ListenerMetrics::default()),
+		);
+		let held = |m: &ListenerMetrics| m.held_connections.load(Ordering::Relaxed);
+		let mut slots: Vec<_> = (0..2)
+			.filter_map(|_| HeldSlot::acquire(&global, &a, 3))
 			.collect();
-		assert_eq!(slots.len(), 3);
-		assert_eq!(metrics.held_connections.load(Ordering::Relaxed), 3);
-		assert!(HeldSlot::acquire(&metrics, 0).is_none());
+		slots.extend((0..2).filter_map(|_| HeldSlot::acquire(&global, &b, 3)));
+		assert_eq!(
+			slots.len(),
+			3,
+			"the cap counts the whole proxy, as maxConnections does"
+		);
+		assert_eq!((held(&a), held(&b)), (2, 1));
+		assert!(HeldSlot::acquire(&global, &a, 0).is_none());
+		assert_eq!(held(&a), 2, "a refused slot leaves the gauge alone");
 		drop(slots);
-		assert_eq!(metrics.held_connections.load(Ordering::Relaxed), 0);
-		assert!(HeldSlot::acquire(&metrics, 1).is_some());
+		assert_eq!(global.held_connections.load(Ordering::Relaxed), 0);
+		assert_eq!((held(&a), held(&b)), (0, 0));
+		assert!(HeldSlot::acquire(&global, &b, 1).is_some());
 	}
 
 	#[test]
 	fn racing_acquisitions_never_exceed_the_cap() {
+		let global = Arc::new(GlobalMetrics::default());
 		let metrics = Arc::new(ListenerMetrics::default());
 		let taken = std::sync::atomic::AtomicU32::new(0);
 		std::thread::scope(|scope| {
 			for _ in 0..8 {
 				scope.spawn(|| {
 					for _ in 0..1000 {
-						if let Some(slot) = HeldSlot::acquire(&metrics, 4) {
+						if let Some(slot) = HeldSlot::acquire(&global, &metrics, 4) {
 							let now = taken.fetch_add(1, Ordering::SeqCst) + 1;
 							assert!(now <= 4, "{now} slots held under a cap of 4");
 							taken.fetch_sub(1, Ordering::SeqCst);
@@ -355,6 +378,7 @@ mod tests {
 			}
 		});
 		assert_eq!(metrics.held_connections.load(Ordering::Relaxed), 0);
+		assert_eq!(global.held_connections.load(Ordering::Relaxed), 0);
 	}
 
 	#[test]

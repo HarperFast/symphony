@@ -433,6 +433,40 @@ describe('mtls.failureHoldMs', () => {
 			}
 		});
 
+		it('counts held connections across listeners against each listener\'s cap', async () => {
+			const [portA, portB] = [await getFreePort(), await getFreePort()];
+			const proxy = new SymphonyProxy({
+				listeners: [portA, portB].map((port) => ({
+					host: '127.0.0.1',
+					port,
+					protection: { maxHeldConnections: 1 },
+				})),
+				routes: [
+					route(upstream.port, {
+						clientCaCert: ca.cert,
+						requireClientCert: true,
+						failureHoldMs: HOLD_MS,
+						failureHoldJitter: 0,
+					}),
+				],
+				workerThreads: 2,
+			});
+			await proxy.start();
+			await sleep(50);
+			try {
+				const holding = attempt(portA, { cert: expired });
+				await waitFor(() => proxy.metrics().listeners[0].heldConnections === 1, 'the hold on the first listener');
+				assertPromptCloseWithoutAlert(await attempt(portB, { cert: expired }));
+				assert.deepEqual(
+					proxy.metrics().listeners.map((l) => l.heldConnections),
+					[1, 0]
+				);
+				await holding;
+			} finally {
+				await proxy.stop();
+			}
+		});
+
 		it('counts a held connection toward maxConcurrentPerIp', async () => {
 			const { port, proxy, held } = await startProxy(
 				[route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS, failureHoldJitter: 0 })],
@@ -592,6 +626,10 @@ describe('mtls.failureHoldMs', () => {
 								...route(upstream.port, undefined),
 								mtls: { clientCaCertFile: caFile, requireClientCert: true, failureHoldMs: HOLD_MS, failureHoldJitter: 0 },
 							},
+							{
+								...route(upstream.port, undefined, 'typo.test'),
+								mtls: { clientCaCertFile: caFile, requireClientCert: true, failureHoldMs: '5000' },
+							},
 						],
 					},
 				],
@@ -609,6 +647,10 @@ describe('mtls.failureHoldMs', () => {
 			}
 			assert.ok(up.bytes > 0, 'symphony-server came up');
 			assertHeld(await attempt(port, { cert: expired }));
+			assertPromptAlert(
+				await attempt(port, { cert: expired, servername: 'typo.test' }),
+				/certificate expired/i
+			);
 		} finally {
 			child.kill('SIGTERM');
 			fs.rmSync(dir, { recursive: true, force: true });

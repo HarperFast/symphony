@@ -159,9 +159,9 @@ export interface JsProtectionConfig {
   tlsHandshakeTimeoutMs?: number
   requireSni?: boolean
   /**
-   * Connections this listener holds after a client-certificate rejection (`mtls.failureHoldMs`)
-   * before it closes further rejections at once. 0 holds none. Default: 10000, or half of
-   * `maxConnections` when that is lower.
+   * Connections held across the proxy after a client-certificate rejection (`mtls.failureHoldMs`)
+   * before this listener closes further rejections at once. 0 holds none. Default: 10000, or half
+   * of `maxConnections` when that is lower.
    */
   maxHeldConnections?: number
 }
