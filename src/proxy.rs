@@ -9,10 +9,9 @@ use crate::proxy_conn::{
 	ConnContext, JsEvent, DEFAULT_COPY_BUFFER_SIZE, MAX_COPY_BUFFER_SIZE, MIN_COPY_BUFFER_SIZE,
 };
 use crate::router::{
-	build_route_table, evict_affinity_periodically, parse_failure_hold, parse_source_network,
-	requires_http_protocol, ForwardFingerprint, ListenerTlsSpec, LiveRouteTable,
-	RouteMetricIdentity, RouteProtocol, RouteSpec, SourceAddressMode, SourceAllowlist,
-	UpstreamSpec,
+	build_route_table, evict_affinity_periodically, parse_source_network, requires_http_protocol,
+	ForwardFingerprint, ListenerTlsSpec, LiveRouteTable, RouteMetricIdentity, RouteProtocol,
+	RouteSpec, SourceAddressMode, SourceAllowlist, UpstreamSpec,
 };
 use crate::suspended::{build_resolved_route, ResolveSpec, ResolveUpstream, SuspendedRegistry};
 use crate::tls::TlsConfigCache;
@@ -57,6 +56,9 @@ pub struct JsMtlsConfig {
 	/// Hold a client whose presented certificate fails verification silently for this many ms,
 	/// then close it, instead of answering with a TLS alert. Default 0: alert at once.
 	pub failure_hold_ms: Option<f64>,
+	/// Each hold is `failureHoldMs` scaled by a uniform draw from [1 - jitter, 1 + jitter], 0..=1.
+	/// Default 0.5.
+	pub failure_hold_jitter: Option<f64>,
 }
 
 #[napi(object)]
@@ -1249,6 +1251,7 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 			.and_then(|m| m.require_client_cert)
 			.unwrap_or(false),
 		mtls_failure_hold_ms: r.mtls.as_ref().and_then(|m| m.failure_hold_ms),
+		mtls_failure_hold_jitter: r.mtls.as_ref().and_then(|m| m.failure_hold_jitter),
 		suspended: r.suspended.unwrap_or(false),
 		suspend_timeout_ms: r.suspend_timeout_ms.unwrap_or(30_000.0) as u64,
 		max_cps: r.max_connections_per_second,
@@ -1427,8 +1430,11 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 
 	let allowed_sources = SourceAllowlist::parse(r.allowed_sources.as_deref().unwrap_or(&[]))
 		.map_err(napi::Error::from_reason)?;
-	let mtls_failure_hold = parse_failure_hold(r.mtls.as_ref().and_then(|m| m.failure_hold_ms))
-		.map_err(|e| napi::Error::from_reason(format!("resolveConnection: {e}")))?;
+	let mtls_failure_hold = crate::tarpit::FailureHold::parse(
+		r.mtls.as_ref().and_then(|m| m.failure_hold_ms),
+		r.mtls.as_ref().and_then(|m| m.failure_hold_jitter),
+	)
+	.map_err(|e| napi::Error::from_reason(format!("resolveConnection: {e}")))?;
 
 	Ok(ResolveSpec {
 		upstream,
@@ -1575,6 +1581,7 @@ fn listener_tls_spec(l: &JsListenerConfig) -> ListenerTlsSpec {
 			.and_then(|m| m.require_client_cert)
 			.unwrap_or(true),
 		mtls_failure_hold_ms: l.mtls.as_ref().and_then(|m| m.failure_hold_ms),
+		mtls_failure_hold_jitter: l.mtls.as_ref().and_then(|m| m.failure_hold_jitter),
 	}
 }
 

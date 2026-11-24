@@ -59,6 +59,11 @@ export interface MtlsConfig {
 	 * whose certificate fails".
 	 */
 	failureHoldMs?: number;
+	/**
+	 * Spread of each hold: `failureHoldMs` scaled by a uniform draw from `[1 - jitter, 1 + jitter]`,
+	 * so clients rejected together don't all retry together. 0..1, default 0.5.
+	 */
+	failureHoldJitter?: number;
 }
 
 // ── Route config ──────────────────────────────────────────────────────────────

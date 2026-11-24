@@ -32,6 +32,11 @@ export interface JsMtlsConfig {
    * then close it, instead of answering with a TLS alert. Default 0: alert at once.
    */
   failureHoldMs?: number
+  /**
+   * Each hold is `failureHoldMs` scaled by a uniform draw from [1 - jitter, 1 + jitter], 0..=1.
+   * Default 0.5.
+   */
+  failureHoldJitter?: number
 }
 export interface JsRouteConfig {
   sni: string

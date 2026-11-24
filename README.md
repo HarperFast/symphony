@@ -152,14 +152,14 @@ Both fields accept PEM-encoded strings or `Buffer`. The cert chain may include i
 ### `MtlsConfig`
 
 ```typescript
-{ clientCaCert: string | Buffer, requireClientCert?: boolean, failureHoldMs?: number }
+{ clientCaCert: string | Buffer, requireClientCert?: boolean, failureHoldMs?: number, failureHoldJitter?: number }
 ```
 
 `requireClientCert` defaults to `true`. Set to `false` to accept connections without a client cert while still validating those that do present one.
 
 `failureHoldMs` (default `0`, at most `600000`) holds a client whose certificate fails verification
-silently for that long instead of answering with a TLS alert. See
-[Holding clients whose certificate fails](#holding-clients-whose-certificate-fails).
+silently for that long instead of answering with a TLS alert, spread by `failureHoldJitter` (0–1,
+default `0.5`). See [Holding clients whose certificate fails](#holding-clients-whose-certificate-fails).
 
 ### `ProtectionConfig`
 
@@ -236,14 +236,21 @@ can't slow them without also blocking the valid devices behind the same NAT addr
 Set `mtls.failureHoldMs` on a terminating route (or on the listener's `mtls`, which a route without
 its own `mtls` inherits along with the CA). A client that presents a certificate that fails
 verification (expired, not yet valid, unknown issuer, bad signature, wrong key usage) then gets no
-alert. Its handshake completes, symphony sends nothing and discards what it sends for
-`failureHoldMs`, then closes the connection. A client that waits for an application response (an
-MQTT CONNACK, an HTTP 101) waits until its own timeout or the hold ends. A client with a 30 s
-connect timeout and no backoff then retries about twice a minute instead of continuously.
+alert. Its handshake completes, then symphony sends nothing and discards what the client sends until
+the hold ends, and closes the connection. A client that waits for an application response (an MQTT
+CONNACK, an HTTP 101) waits until its own timeout or the hold ends, whichever comes first, so the
+delay it sees is `min(hold, its connect timeout)`.
 
 ```typescript
-mtls: { clientCaCert: caPem, requireClientCert: true, failureHoldMs: 30_000 }
+mtls: { clientCaCert: caPem, requireClientCert: true, failureHoldMs: 5_000, failureHoldJitter: 0.5 }
 ```
+
+Start with about 5 s and the default jitter of 0.5. A client that retries milliseconds after each
+rejection is cut to about one attempt per hold, so a few seconds is already a large reduction, and a
+short hold keeps fewer sockets open. Each hold is `failureHoldMs` scaled by a uniform draw from
+`[1 - jitter, 1 + jitter]` (5 s → 2.5–7.5 s), so clients rejected together (a restart, traffic moving
+between nodes) don't all come back together. Keep the whole range below the clients' connect
+timeout: a hold the client outlasts with its own timeout gains nothing from jitter.
 
 How it works, and what follows from it:
 
@@ -267,15 +274,21 @@ How it works, and what follows from it:
   listener's `maxConnections` when that is lower) bounds the sockets held at once. Past it, a
   failing client is closed at once without an alert: by then there is no handshake left to fail.
   `0` holds none. A lowered cap applies to new holds only. A listener without `protection` uses the
-  default. A held socket uses one file descriptor and no upstream connection, and it is released
-  when its hold ends, its client closes, or `stop()` is called.
+  default.
+- **What a held socket costs.** One file descriptor, no upstream connection, and about 3 KiB of
+  process memory (measured with 2,000 and 8,000 held sockets; the TLS state is freed when the hold
+  starts), plus the kernel's own per-socket memory. The default cap bounds holds at roughly 30 MB of
+  process memory per listener. A hold ends at its deadline, as soon as its client closes or resets
+  the connection (within a second if the client has sent more than 64 KiB, which symphony stops
+  reading), or when `stop()` is called.
 - **Held sockets are open connections.** They count toward `maxConnections`, the active-connection
   gauges, and `maxConcurrentPerIp`. With a per-IP limit, failing devices behind a NAT address take
   slots its valid devices would otherwise use, so size the limit for both.
-- **Changing it.** `failureHoldMs` hot-swaps through `updateConfig`. Changing it between two
-  non-zero values keeps sessions resumable. Turning it on or off swaps the route's TLS config, so
-  clients of that route do one full handshake. An invalid value (negative, over `600000`, not a
-  number) serves the route without the hold and counts it in `failingRoutes`.
+- **Changing it.** `failureHoldMs` and `failureHoldJitter` hot-swap through `updateConfig`. Changing
+  the hold between two non-zero values keeps sessions resumable. Turning it on or off swaps the
+  route's TLS config, so clients of that route do one full handshake. An invalid value (a hold that
+  is negative, over `600000` or not a number; a jitter outside 0–1) serves the route without the
+  hold and counts it in `failingRoutes`.
 - **Failover.** The hold happens on the node that terminates the connection. A route that checks
   after the handshake never connects to its upstream early, so, like a route that requires a client
   certificate, it loses the one connection that finds its upstream dead. A connection forwarded to
@@ -1187,7 +1200,7 @@ proxy.updateConfig({
 });
 ```
 
-**What can be hot-swapped:** routes (destinations, TLS certs, suspension state, `failover`, `mtls.failureHoldMs`), per-listener protection (CIDR allowlist/blocklist, JA3 blocklist, rate limits, sustained rate limits, penalty box, concurrency caps, `maxHeldConnections`, handshake timeout, requireSni), and a failover ingress listener's `trustedSources`.
+**What can be hot-swapped:** routes (destinations, TLS certs, suspension state, `failover`, `mtls.failureHoldMs`/`failureHoldJitter`), per-listener protection (CIDR allowlist/blocklist, JA3 blocklist, rate limits, sustained rate limits, penalty box, concurrency caps, `maxHeldConnections`, handshake timeout, requireSni), and a failover ingress listener's `trustedSources`.
 
 **What requires a restart:** bind address, port, idle timeout, worker threads. When calling `updateConfig()` directly, protection presence (None↔Some) cannot change at runtime — the listener must be restarted. The `symphony-server` bin handles this automatically via seamless recreate.
 

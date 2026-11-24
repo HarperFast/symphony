@@ -444,24 +444,22 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 				inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, kind);
 				// Without a slot the stream is dropped, closing it at once: with nothing left of
 				// the handshake to fail, no alert is owed.
-				let held = match accepted {
-					Ok(Ok(tls_stream)) => crate::tarpit::HeldSlot::acquire(
+				if let Ok(Ok(tls_stream)) = accepted {
+					if let Some(slot) = crate::tarpit::HeldSlot::acquire(
 						&ctx.listener_metrics,
 						ctx.max_held_connections(),
-					)
-					.map(|slot| {
+					) {
 						let client = tls_stream.into_inner().0;
-						let deadline = Instant::now() + hold;
+						let deadline = Instant::now() + hold.draw();
 						let released = ctx.holds_released.clone();
-						Box::pin(async move {
-							let _slot = slot;
+						// Its own task, so a held socket keeps what still counts it and nothing of
+						// this connection's state (the route-table snapshot included).
+						let counted = (_active_guard, _route_active_guard, slot);
+						tokio::spawn(async move {
+							let _counted = counted;
 							crate::tarpit::hold_silently(client, deadline, released).await
-						})
-					}),
-					_ => None,
-				};
-				if let Some(held) = held {
-					held.await;
+						});
+					}
 				}
 				return;
 			}

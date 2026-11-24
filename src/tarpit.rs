@@ -1,13 +1,79 @@
 use crate::metrics::ListenerMetrics;
 use std::sync::atomic::Ordering;
-use tokio::io::AsyncReadExt;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, Interest};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
 /// What a held client may send before the hold stops reading it, so a client that keeps writing
-/// costs reads only up to here. Past it the hold just waits out its deadline.
+/// costs reads only up to here.
 const DISCARD_BUDGET: usize = 64 * 1024;
+
+/// How soon a client past `DISCARD_BUDGET` is seen to have closed.
+const CLOSE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A hold longer than any client's connect timeout only holds a socket its client has abandoned.
+pub const MAX_FAILURE_HOLD_MS: f64 = 600_000.0;
+
+pub const DEFAULT_FAILURE_HOLD_JITTER: f64 = 0.5;
+
+/// How long a client whose certificate is rejected is held: `hold` scaled by a uniform draw from
+/// `[1 - jitter, 1 + jitter]`, so clients rejected together (a restart, a traffic shift) do not all
+/// come back together.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FailureHold {
+	pub hold: Duration,
+	pub jitter: f64,
+}
+
+impl FailureHold {
+	pub const OFF: Self = Self {
+		hold: Duration::ZERO,
+		jitter: 0.0,
+	};
+
+	/// `failureHoldMs` (whole ms; zero, unset or under 1 ms keeps today's alert) and
+	/// `failureHoldJitter`.
+	pub fn parse(hold_ms: Option<f64>, jitter: Option<f64>) -> Result<Self, String> {
+		let jitter = match jitter {
+			None => DEFAULT_FAILURE_HOLD_JITTER,
+			Some(j) if (0.0..=1.0).contains(&j) => j,
+			Some(j) => return Err(format!("mtls.failureHoldJitter must be in [0, 1], got {j}")),
+		};
+		match hold_ms {
+			Some(ms) if !(0.0..=MAX_FAILURE_HOLD_MS).contains(&ms) => Err(format!(
+				"mtls.failureHoldMs must be a number of ms in [0, {MAX_FAILURE_HOLD_MS}], got {ms}"
+			)),
+			Some(ms) if ms >= 1.0 => Ok(Self {
+				hold: Duration::from_millis(ms as u64),
+				jitter,
+			}),
+			_ => Ok(Self::OFF),
+		}
+	}
+
+	pub fn is_off(&self) -> bool {
+		self.hold.is_zero()
+	}
+
+	pub fn draw(&self) -> Duration {
+		self.scaled(random_unit())
+	}
+
+	/// `unit` is in `[0, 1)`.
+	fn scaled(&self, unit: f64) -> Duration {
+		self.hold
+			.mul_f64(1.0 - self.jitter + 2.0 * self.jitter * unit)
+	}
+}
+
+fn random_unit() -> f64 {
+	ring::rand::generate::<[u8; 8]>(&ring::rand::SystemRandom::new())
+		.map(|bytes| (u64::from_le_bytes(bytes.expose()) >> 11) as f64 / (1u64 << 53) as f64)
+		.unwrap_or(0.5)
+}
 
 /// The listener default for `maxHeldConnections`.
 const DEFAULT_MAX_HELD_CONNECTIONS: u32 = 10_000;
@@ -22,13 +88,13 @@ pub fn default_max_held(max_connections: u32) -> u32 {
 }
 
 /// One of a listener's `maxHeldConnections` slots, released on drop.
-pub struct HeldSlot<'a> {
-	held: &'a std::sync::atomic::AtomicU64,
+pub struct HeldSlot {
+	metrics: Arc<ListenerMetrics>,
 }
 
-impl<'a> HeldSlot<'a> {
+impl HeldSlot {
 	/// `None` once `cap` slots are taken. A lowered cap applies to new acquisitions only.
-	pub fn acquire(metrics: &'a ListenerMetrics, cap: u32) -> Option<Self> {
+	pub fn acquire(metrics: &Arc<ListenerMetrics>, cap: u32) -> Option<Self> {
 		metrics
 			.held_connections
 			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
@@ -36,14 +102,16 @@ impl<'a> HeldSlot<'a> {
 			})
 			.ok()
 			.map(|_| Self {
-				held: &metrics.held_connections,
+				metrics: metrics.clone(),
 			})
 	}
 }
 
-impl Drop for HeldSlot<'_> {
+impl Drop for HeldSlot {
 	fn drop(&mut self) {
-		self.held.fetch_sub(1, Ordering::Relaxed);
+		self.metrics
+			.held_connections
+			.fetch_sub(1, Ordering::Relaxed);
 	}
 }
 
@@ -55,19 +123,27 @@ pub async fn hold_silently(
 	deadline: Instant,
 	mut stop: watch::Receiver<()>,
 ) {
-	let discard = async {
-		let mut sink = [0u8; 512];
-		let mut left = DISCARD_BUDGET;
-		while left > 0 {
-			match client.read(&mut sink).await {
-				Ok(0) | Err(_) => return,
-				Ok(n) => left = left.saturating_sub(n),
+	let until_closed = async {
+		{
+			let mut sink = [0u8; 512];
+			let mut left = DISCARD_BUDGET;
+			while left > 0 {
+				match client.read(&mut sink).await {
+					Ok(0) | Err(_) => return,
+					Ok(n) => left = left.saturating_sub(n),
+				}
 			}
 		}
-		std::future::pending::<()>().await
+		// The bytes now stay unread, and a close behind them shows only in the reactor's readiness.
+		loop {
+			tokio::time::sleep(CLOSE_CHECK_INTERVAL).await;
+			if crate::upstream::read_closed(client.ready(Interest::READABLE)) {
+				return;
+			}
+		}
 	};
 	tokio::select! {
-		_ = discard => {}
+		_ = until_closed => {}
 		_ = tokio::time::sleep_until(deadline) => {}
 		_ = stop.changed() => {}
 	}
@@ -170,9 +246,85 @@ mod tests {
 		hold.await.unwrap();
 	}
 
+	#[tokio::test]
+	async fn a_client_past_the_discard_budget_that_closes_ends_its_hold() {
+		let (mut client, server) = pair().await;
+		let (_stop_tx, stop) = watch::channel(());
+		let hold = tokio::spawn(hold_silently(
+			server,
+			Instant::now() + Duration::from_secs(30),
+			stop,
+		));
+		client
+			.write_all(&vec![0u8; DISCARD_BUDGET + 4096])
+			.await
+			.unwrap();
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		drop(client);
+		tokio::time::timeout(CLOSE_CHECK_INTERVAL * 3, hold)
+			.await
+			.expect("the hold must end once its client closes, read or not")
+			.unwrap();
+	}
+
+	#[test]
+	fn the_hold_is_drawn_from_its_jitter_range() {
+		let hold = FailureHold {
+			hold: Duration::from_secs(10),
+			jitter: 0.5,
+		};
+		assert_eq!(hold.scaled(0.0), Duration::from_secs(5));
+		assert_eq!(hold.scaled(0.5), Duration::from_secs(10));
+		assert!(hold.scaled(0.999_999) < Duration::from_secs(15));
+		let draws: Vec<_> = (0..64).map(|_| hold.draw()).collect();
+		assert!(draws
+			.iter()
+			.all(|d| (Duration::from_secs(5)..Duration::from_secs(15)).contains(d)));
+		assert!(
+			draws.iter().any(|d| *d != draws[0]),
+			"draws must differ, or clients come back together"
+		);
+		let fixed = FailureHold {
+			jitter: 0.0,
+			..hold
+		};
+		assert!((0..16).all(|_| fixed.draw() == Duration::from_secs(10)));
+	}
+
+	#[test]
+	fn failure_hold_settings_are_validated() {
+		assert_eq!(FailureHold::parse(None, None), Ok(FailureHold::OFF));
+		assert_eq!(FailureHold::parse(Some(0.5), None), Ok(FailureHold::OFF));
+		assert_eq!(
+			FailureHold::parse(Some(5000.0), None),
+			Ok(FailureHold {
+				hold: Duration::from_secs(5),
+				jitter: DEFAULT_FAILURE_HOLD_JITTER
+			})
+		);
+		assert_eq!(
+			FailureHold::parse(Some(5000.0), Some(0.0)).unwrap().jitter,
+			0.0
+		);
+		for (hold, jitter) in [
+			(Some(-1.0), None),
+			(Some(MAX_FAILURE_HOLD_MS + 1.0), None),
+			(Some(f64::NAN), None),
+			(Some(f64::INFINITY), None),
+			(Some(5000.0), Some(1.5)),
+			(Some(5000.0), Some(-0.1)),
+			(Some(5000.0), Some(f64::NAN)),
+		] {
+			assert!(
+				FailureHold::parse(hold, jitter).is_err(),
+				"{hold:?} {jitter:?}"
+			);
+		}
+	}
+
 	#[test]
 	fn the_cap_bounds_concurrent_slots_and_drop_releases_them() {
-		let metrics = ListenerMetrics::default();
+		let metrics = Arc::new(ListenerMetrics::default());
 		let slots: Vec<_> = (0..5)
 			.filter_map(|_| HeldSlot::acquire(&metrics, 3))
 			.collect();
@@ -186,7 +338,7 @@ mod tests {
 
 	#[test]
 	fn racing_acquisitions_never_exceed_the_cap() {
-		let metrics = ListenerMetrics::default();
+		let metrics = Arc::new(ListenerMetrics::default());
 		let taken = std::sync::atomic::AtomicU32::new(0);
 		std::thread::scope(|scope| {
 			for _ in 0..8 {

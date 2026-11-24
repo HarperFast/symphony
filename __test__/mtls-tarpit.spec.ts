@@ -212,7 +212,7 @@ describe('mtls.failureHoldMs', () => {
 		let held: () => number;
 		before(async () => {
 			({ port, proxy, held } = await startProxy([
-				route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS }),
+				route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS, failureHoldJitter: 0 }),
 			]));
 		});
 		after(async () => {
@@ -280,6 +280,45 @@ describe('mtls.failureHoldMs', () => {
 			);
 		});
 
+		it('spreads holds across the jitter range', async () => {
+			const { port: jitterPort, proxy: jitterProxy } = await startProxy([
+				route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: 1000 }),
+			]);
+			try {
+				const attempts = await Promise.all(Array.from({ length: 6 }, () => attempt(jitterPort, { cert: expired })));
+				const holds = attempts.map((a) => a.closedAt - a.secureAt!);
+				for (const hold of holds) {
+					assert.ok(hold >= 450 && hold <= 1500 + 500, `each hold falls in 1000ms × [0.5, 1.5], got ${holds}`);
+				}
+				assert.ok(Math.max(...holds) - Math.min(...holds) >= 100, `holds must not all be equal, got ${holds}`);
+			} finally {
+				await jitterProxy.stop();
+			}
+		});
+
+		it('releases a hold as soon as its client closes', async () => {
+			const { port: longPort, proxy: longProxy } = await startProxy([
+				route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: 30_000 }),
+			]);
+			try {
+				const socket = tls.connect({
+					host: '127.0.0.1',
+					port: longPort,
+					servername: 'localhost',
+					rejectUnauthorized: false,
+					cert: expired.cert,
+					key: expired.key,
+				});
+				socket.on('error', () => {});
+				await new Promise((resolve) => socket.once('secureConnect', resolve));
+				await waitFor(() => longProxy.metrics().listeners[0].heldConnections === 1, 'the hold');
+				socket.destroy();
+				await waitFor(() => longProxy.metrics().listeners[0].heldConnections === 0, 'the slot to be released', 1000);
+			} finally {
+				await longProxy.stop();
+			}
+		});
+
 		it('ends every hold when the proxy stops', async () => {
 			const { port: longPort, proxy: longProxy } = await startProxy([
 				route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: 30_000 }),
@@ -299,7 +338,7 @@ describe('mtls.failureHoldMs', () => {
 		let proxy: SymphonyProxy;
 		before(async () => {
 			({ port, proxy } = await startProxy([
-				route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS }),
+				route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS, failureHoldJitter: 0 }),
 			]));
 		});
 		after(async () => {
@@ -350,7 +389,7 @@ describe('mtls.failureHoldMs', () => {
 			} finally {
 				await proxy.updateConfig({
 					routes: [
-						route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS }),
+						route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS, failureHoldJitter: 0 }),
 					],
 				});
 			}
@@ -374,7 +413,7 @@ describe('mtls.failureHoldMs', () => {
 
 		it('closes at once without an alert past maxHeldConnections, and the cap hot-swaps', async () => {
 			const { port, proxy, held } = await startProxy(
-				[route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS })],
+				[route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS, failureHoldJitter: 0 })],
 				{ maxHeldConnections: 1 }
 			);
 			try {
@@ -396,7 +435,7 @@ describe('mtls.failureHoldMs', () => {
 
 		it('counts a held connection toward maxConcurrentPerIp', async () => {
 			const { port, proxy, held } = await startProxy(
-				[route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS })],
+				[route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS, failureHoldJitter: 0 })],
 				{ maxConcurrentPerIp: 1 }
 			);
 			try {
@@ -416,7 +455,7 @@ describe('mtls.failureHoldMs', () => {
 
 		it('on an optional-certificate route, proxies a client with no certificate and holds a bad one', async () => {
 			const { port, proxy } = await startProxy([
-				route(upstream.port, { clientCaCert: ca.cert, requireClientCert: false, failureHoldMs: HOLD_MS }),
+				route(upstream.port, { clientCaCert: ca.cert, requireClientCert: false, failureHoldMs: HOLD_MS, failureHoldJitter: 0 }),
 			]);
 			try {
 				assert.ok((await attempt(port)).bytes > 0, 'no certificate is still allowed');
@@ -430,7 +469,7 @@ describe('mtls.failureHoldMs', () => {
 			const unusedPeer = await getFreePort();
 			const { port, proxy } = await startProxy([
 				{
-					...route(upstream.port, { clientCaCert: ca.cert, requireClientCert: false, failureHoldMs: HOLD_MS }),
+					...route(upstream.port, { clientCaCert: ca.cert, requireClientCert: false, failureHoldMs: HOLD_MS, failureHoldJitter: 0 }),
 					failover: { peers: [{ host: '127.0.0.1', port: unusedPeer }] },
 				},
 			]);
@@ -451,7 +490,7 @@ describe('mtls.failureHoldMs', () => {
 					{ ...route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true }), sni: 'own.test' },
 				],
 				undefined,
-				{ clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS }
+				{ clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS, failureHoldJitter: 0 }
 			);
 			try {
 				assertHeld(await attempt(port, { cert: expired, servername: 'inherits.test' }));
@@ -466,7 +505,7 @@ describe('mtls.failureHoldMs', () => {
 			try {
 				assertPromptAlert(await attempt(port, { cert: expired }), /certificate expired/i);
 				await proxy.updateConfig({
-					routes: [route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS })],
+					routes: [route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs: HOLD_MS, failureHoldJitter: 0 })],
 				});
 				assertHeld(await attempt(port, { cert: expired }));
 			} finally {
@@ -514,7 +553,7 @@ describe('mtls.failureHoldMs', () => {
 					upstream: { kind: 'tcp', host: '127.0.0.1', port: upstream.port },
 					terminateTls: true,
 					cert: { certChain: server.cert, privateKey: server.key },
-					mtls: { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs },
+					mtls: { clientCaCert: ca.cert, requireClientCert: true, failureHoldMs, failureHoldJitter: 0 },
 				});
 			});
 			await proxy.start();
@@ -551,7 +590,7 @@ describe('mtls.failureHoldMs', () => {
 						routes: [
 							{
 								...route(upstream.port, undefined),
-								mtls: { clientCaCertFile: caFile, requireClientCert: true, failureHoldMs: HOLD_MS },
+								mtls: { clientCaCertFile: caFile, requireClientCert: true, failureHoldMs: HOLD_MS, failureHoldJitter: 0 },
 							},
 						],
 					},

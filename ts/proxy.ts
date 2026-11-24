@@ -89,6 +89,7 @@ function toJsMtls(m: MtlsConfig): JsMtlsConfig {
 		clientCaCert: m.clientCaCert,
 		requireClientCert: m.requireClientCert,
 		failureHoldMs: m.failureHoldMs,
+		failureHoldJitter: m.failureHoldJitter,
 	};
 }
 

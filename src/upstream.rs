@@ -28,7 +28,9 @@ impl UpstreamStream {
 	}
 }
 
-fn read_closed(ready: impl std::future::Future<Output = std::io::Result<Ready>>) -> bool {
+pub(crate) fn read_closed(
+	ready: impl std::future::Future<Output = std::io::Result<Ready>>,
+) -> bool {
 	let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
 	match std::pin::pin!(ready).poll(&mut cx) {
 		std::task::Poll::Ready(result) => result.map_or(true, |ready| ready.is_read_closed()),

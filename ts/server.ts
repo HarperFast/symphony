@@ -38,6 +38,7 @@ interface FileMtlsConfig {
 	clientCaCertFile?: string;
 	requireClientCert?: boolean;
 	failureHoldMs?: number;
+	failureHoldJitter?: number;
 }
 
 type FileRouteConfig = Omit<RouteConfig, 'cert' | 'mtls'> & {
@@ -98,7 +99,12 @@ function resolveMtls(m: FileMtlsConfig, baseDir: string): MtlsConfig {
 	if (clientCaCert === undefined) {
 		throw new Error('route mtls requires a client CA (clientCaCert/clientCaCertFile)');
 	}
-	return { clientCaCert, requireClientCert: m.requireClientCert, failureHoldMs: m.failureHoldMs };
+	return {
+		clientCaCert,
+		requireClientCert: m.requireClientCert,
+		failureHoldMs: m.failureHoldMs,
+		failureHoldJitter: m.failureHoldJitter,
+	};
 }
 
 // A cert the Rust layer is guaranteed to reject at build time (empty PEM → "no

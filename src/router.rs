@@ -1,6 +1,7 @@
 use crate::balancer::{SlotHealth, UdsBalancer, UdsSlotSpec};
 use crate::failover::{Failover, FailoverRoute, FailoverSpec};
 use crate::metrics::RouteMetrics;
+use crate::tarpit::FailureHold;
 use crate::tls::{sha256, CertSpec, MtlsSpec, TlsConfigCache, TlsTermination};
 use arc_swap::ArcSwap;
 use ipnetwork::{IpNetwork, Ipv4Network};
@@ -529,9 +530,10 @@ pub struct RouteSpec {
 	pub key_pem: Option<Vec<u8>>,
 	pub mtls_ca_pem: Option<Vec<u8>>,
 	pub require_client_cert: bool,
-	/// Unvalidated: an invalid value serves the route without the hold rather than failing the whole
-	/// config.
+	/// Unvalidated, like the jitter: an invalid value serves the route without the hold rather than
+	/// failing the whole config.
 	pub mtls_failure_hold_ms: Option<f64>,
+	pub mtls_failure_hold_jitter: Option<f64>,
 	pub suspended: bool,
 	pub suspend_timeout_ms: u64,
 	/// Optional global rate limit (connections per second) for this route.
@@ -564,6 +566,7 @@ pub struct ListenerTlsSpec {
 	pub mtls_ca_pem: Option<Vec<u8>>,
 	pub require_client_cert: bool,
 	pub mtls_failure_hold_ms: Option<f64>,
+	pub mtls_failure_hold_jitter: Option<f64>,
 }
 
 impl ListenerTlsSpec {
@@ -574,6 +577,7 @@ impl ListenerTlsSpec {
 			mtls_ca_pem: None,
 			require_client_cert: true,
 			mtls_failure_hold_ms: None,
+			mtls_failure_hold_jitter: None,
 		}
 	}
 }
@@ -584,6 +588,7 @@ struct EffectiveMtls<'a> {
 	ca: &'a [u8],
 	required: bool,
 	failure_hold_ms: Option<f64>,
+	failure_hold_jitter: Option<f64>,
 }
 
 fn effective_mtls<'a>(
@@ -595,28 +600,14 @@ fn effective_mtls<'a>(
 			ca,
 			required: spec.require_client_cert,
 			failure_hold_ms: spec.mtls_failure_hold_ms,
+			failure_hold_jitter: spec.mtls_failure_hold_jitter,
 		}),
 		None => listener_tls.mtls_ca_pem.as_deref().map(|ca| EffectiveMtls {
 			ca,
 			required: listener_tls.require_client_cert,
 			failure_hold_ms: listener_tls.mtls_failure_hold_ms,
+			failure_hold_jitter: listener_tls.mtls_failure_hold_jitter,
 		}),
-	}
-}
-
-/// A hold longer than any client's connect timeout only holds a socket its client has abandoned.
-pub const MAX_FAILURE_HOLD_MS: f64 = 600_000.0;
-
-/// `failureHoldMs` in whole milliseconds; zero (unset, or under 1 ms) keeps today's alert.
-pub(crate) fn parse_failure_hold(ms: Option<f64>) -> Result<Duration, String> {
-	match ms {
-		None => Ok(Duration::ZERO),
-		Some(ms) if ms.is_finite() && (0.0..=MAX_FAILURE_HOLD_MS).contains(&ms) => {
-			Ok(Duration::from_millis(ms as u64))
-		}
-		Some(ms) => Err(format!(
-			"mtls.failureHoldMs must be a number of ms in [0, {MAX_FAILURE_HOLD_MS}], got {ms}"
-		)),
 	}
 }
 
@@ -823,9 +814,9 @@ pub fn build_route_table(
 		// The hold only changes how a rejected client is answered, so a bad value keeps the route.
 		let failure_hold = match effective_mtls(spec, listener_tls)
 			.filter(|_| spec.terminate_tls)
-			.map(|mtls| parse_failure_hold(mtls.failure_hold_ms))
+			.map(|mtls| FailureHold::parse(mtls.failure_hold_ms, mtls.failure_hold_jitter))
 		{
-			None => Duration::ZERO,
+			None => FailureHold::OFF,
 			Some(Ok(hold)) => hold,
 			Some(Err(e)) => {
 				let newly_invalid = previous.is_none_or(|p| !p.invalid_hold.contains(name));
@@ -836,7 +827,7 @@ pub fn build_route_table(
 						spec.sni
 					);
 				}
-				Duration::ZERO
+				FailureHold::OFF
 			}
 		};
 
@@ -1112,7 +1103,7 @@ struct Inherit<'a> {
 fn build_route(
 	spec: &RouteSpec,
 	listener_tls: &ListenerTlsSpec,
-	failure_hold: Duration,
+	failure_hold: FailureHold,
 	cache: &mut TlsConfigCache,
 	inherit: Inherit,
 ) -> crate::error::Result<Route> {
@@ -1460,6 +1451,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			mtls_ca_pem: None,
 			require_client_cert: false,
 			mtls_failure_hold_ms: None,
+			mtls_failure_hold_jitter: None,
 			suspended: false,
 			suspend_timeout_ms: 100,
 			max_cps: None,
@@ -2566,7 +2558,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	fn deferred_hold(table: &RouteTable, sni: &str) -> Option<Duration> {
 		let route = table.resolve(Some(sni)).expect("route present");
 		let termination = route.tls_config.as_ref().expect("terminating");
-		termination.deferred.as_ref().map(|d| d.hold)
+		termination.deferred.as_ref().map(|d| d.hold.hold)
 	}
 
 	#[test]
@@ -2607,6 +2599,13 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			assert_eq!(table.failing_route_count(), 1, "{bad}");
 			assert_eq!(deferred_hold(&table, "tenant.example.com"), None, "{bad}");
 		}
+		let bad_jitter = RouteSpec {
+			mtls_failure_hold_jitter: Some(2.0),
+			..holding(tls_route("tenant.example.com", CERT_A, KEY_A), 1000.0)
+		};
+		let table = build(&[bad_jitter], &listener, None);
+		assert_eq!(table.failing_route_count(), 1);
+		assert_eq!(deferred_hold(&table, "tenant.example.com"), None);
 		let mut passthrough = holding(tls_route("pass.example.com", CERT_A, KEY_A), -1.0);
 		passthrough.terminate_tls = false;
 		let table = build(&[passthrough], &listener, None);

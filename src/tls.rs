@@ -1,9 +1,9 @@
 use crate::error::{Result, SymphonyError};
 use crate::mtls::SymphonyClientVerifier;
+use crate::tarpit::FailureHold;
 use rustls::ServerConfig;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 use zeroize::Zeroizing;
 
 /// Inputs for building a ServerConfig, used as a deduplication key.
@@ -18,14 +18,14 @@ pub struct CertSpec {
 pub struct MtlsSpec {
 	pub client_ca_pem: Vec<u8>,
 	pub require_client_cert: bool,
-	/// How long a client whose certificate fails verification is held instead of alerted. Non-zero
+	/// How long a client whose certificate fails verification is held instead of alerted. Any hold
 	/// moves the chain check out of the handshake (`TlsTermination::deferred`).
-	pub failure_hold: Duration,
+	pub failure_hold: FailureHold,
 }
 
 impl MtlsSpec {
 	fn defers_chain_check(&self) -> bool {
-		!self.failure_hold.is_zero()
+		!self.failure_hold.is_off()
 	}
 }
 
@@ -41,7 +41,7 @@ pub struct TlsTermination {
 pub struct DeferredClientAuth {
 	/// The verifier inside `config`, so the check runs against the roots the handshake used.
 	pub verifier: Arc<SymphonyClientVerifier>,
-	pub hold: Duration,
+	pub hold: FailureHold,
 }
 
 struct CachedConfig {
@@ -189,7 +189,7 @@ impl TlsConfigCache {
 			deferred: cached.deferring_verifier.as_ref().map(|verifier| {
 				Arc::new(DeferredClientAuth {
 					verifier: verifier.clone(),
-					hold: mtls.map_or(Duration::ZERO, |m| m.failure_hold),
+					hold: mtls.map_or(FailureHold::OFF, |m| m.failure_hold),
 				})
 			}),
 		};

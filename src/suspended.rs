@@ -2,11 +2,11 @@ use crate::balancer::{UdsBalancer, UdsSlotSpec};
 use crate::router::{
 	Destination, ForwardFingerprint, RouteProtocol, SourceAddressMode, SourceAllowlist,
 };
+use crate::tarpit::FailureHold;
 use crate::tls::{CertSpec, MtlsSpec, TlsConfigCache, TlsTermination};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::sync::oneshot;
 
 /// The resolved route sent back from JS via `resolveConnection()`.
@@ -78,7 +78,7 @@ pub struct ResolveSpec {
 	pub key_pem: Option<Vec<u8>>,
 	pub mtls_ca_pem: Option<Vec<u8>>,
 	pub require_client_cert: bool,
-	pub mtls_failure_hold: Duration,
+	pub mtls_failure_hold: FailureHold,
 	pub source_address_mode: SourceAddressMode,
 	pub forward_fingerprint: ForwardFingerprint,
 	pub http2: bool,
@@ -171,6 +171,14 @@ mod tests {
 	use crate::router::tests::{CERT_A, KEY_A, KEY_B};
 	use crate::router::{build_route_table, ListenerTlsSpec, RouteSpec};
 	use rustls::ServerConfig;
+	use std::time::Duration;
+
+	fn hold_of(ms: u64) -> FailureHold {
+		FailureHold {
+			hold: Duration::from_millis(ms),
+			jitter: 0.0,
+		}
+	}
 
 	fn resolve_spec(key: &[u8]) -> ResolveSpec {
 		ResolveSpec {
@@ -180,7 +188,7 @@ mod tests {
 			key_pem: Some(key.to_vec()),
 			mtls_ca_pem: None,
 			require_client_cert: false,
-			mtls_failure_hold: Duration::ZERO,
+			mtls_failure_hold: FailureHold::OFF,
 			source_address_mode: SourceAddressMode::None,
 			forward_fingerprint: ForwardFingerprint::NONE,
 			http2: false,
@@ -231,7 +239,7 @@ mod tests {
 		let mut mtls_holding = resolve_spec(KEY_A);
 		mtls_holding.mtls_ca_pem = Some(CERT_A.to_vec());
 		mtls_holding.require_client_cert = true;
-		mtls_holding.mtls_failure_hold = Duration::from_secs(1);
+		mtls_holding.mtls_failure_hold = hold_of(1000);
 		let mut h2 = resolve_spec(KEY_A);
 		h2.http2 = true;
 
@@ -268,7 +276,7 @@ mod tests {
 		let holding = |ms| {
 			let mut spec = resolve_spec(KEY_A);
 			spec.mtls_ca_pem = Some(CERT_A.to_vec());
-			spec.mtls_failure_hold = Duration::from_millis(ms);
+			spec.mtls_failure_hold = hold_of(ms);
 			build_resolved_route(&spec, &cache)
 				.unwrap()
 				.tls_config
@@ -278,10 +286,7 @@ mod tests {
 		assert!(Arc::ptr_eq(&short.config, &long.config));
 		let (short, long) = (short.deferred.unwrap(), long.deferred.unwrap());
 		assert!(Arc::ptr_eq(&short.verifier, &long.verifier));
-		assert_eq!(
-			(short.hold, long.hold),
-			(Duration::from_secs(1), Duration::from_secs(30))
-		);
+		assert_eq!((short.hold, long.hold), (hold_of(1_000), hold_of(30_000)));
 	}
 
 	#[test]

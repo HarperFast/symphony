@@ -88,7 +88,7 @@ TCP accept (SO_REUSEPORT per worker thread)
 | `src/ingress.rs` | Failover ingress listener: `trustedSources` gate, the PROXY v2 reader, the load-query wire format |
 | `src/tls.rs` | rustls ServerConfig builder; SHA-256 deduplication cache |
 | `src/mtls.rs` | SymphonyClientVerifier wrapping WebPkiClientVerifier; its deferred (post-handshake) chain check; client-cert rejection reasons |
-| `src/tarpit.rs` | Holding a connection whose client certificate was rejected: `HeldSlot` (the `maxHeldConnections` cap), `hold_silently` |
+| `src/tarpit.rs` | Holding a connection whose client certificate was rejected: `FailureHold` (hold + jitter), `HeldSlot` (the `maxHeldConnections` cap), `hold_silently` |
 | `src/proxy_conn.rs` | Per-connection handler: the full 7-step flow |
 | `src/protection.rs` | IP rate limiting, concurrency, CIDR lists, JA3 blocking |
 | `src/suspended.rs` | Pending-connection registry (DashMap + oneshot channels) |
@@ -174,8 +174,13 @@ through a deferring `ServerConfig` reaches no upstream (no connect, no byte) unl
   are still alerted inside the handshake (counted `client_cert_missing` / `client_cert_untrusted`).
 - **The held count lives on `ListenerMetrics`** (`held_connections`, taken by `tarpit::HeldSlot`), and
   only the cap on the protection snapshot: a protection hot-swap replaces the snapshot, and a listener
-  without protection still holds (`ConnContext::default_max_held`). `ActiveGuard` stays alive through the
-  hold, so held sockets count toward `maxConcurrentPerIp` and `maxConnections` (owner decision).
+  without protection still holds (`ConnContext::default_max_held`).
+- **The hold runs in its own task**, given only the socket (rustls state dropped), its `HeldSlot`, and
+  the connection's `ActiveGuard`/`RouteActiveGuard`, so a held socket costs ~3 KiB instead of the whole
+  connection future and pins no route-table snapshot. Moving the guards keeps held sockets counted
+  toward `maxConcurrentPerIp` and `maxConnections` (owner decision).
+- **A hold ends on client close**: on EOF/error while reading, and past the 64 KiB discard budget (no
+  more reads) through the reactor's read-closed readiness, polled each second (`upstream::read_closed`).
 - **`stop()` drops `release_holds`**, a `watch` sender; a hold that starts after that sees it closed.
 - **An invalid `failureHoldMs` is isolated per route** (`invalid_hold`, served strict, in `failingRoutes`),
   validated on the effective value so the listener level is covered too.
