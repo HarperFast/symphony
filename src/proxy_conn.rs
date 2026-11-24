@@ -13,6 +13,7 @@ use crate::router::{
 };
 use crate::sni::{self, PeekInfo};
 use crate::suspended::SuspendedRegistry;
+use crate::tls::TlsTermination;
 use crate::upstream::{self, UpstreamStream};
 use napi::threadsafe_function::ThreadsafeFunction;
 use std::marker::Unpin;
@@ -99,6 +100,10 @@ pub struct ConnContext {
 	pub tls_buffer_limit: Option<usize>,
 	/// `Some` on a failover ingress listener.
 	pub ingress: Option<Arc<IngressState>>,
+	/// `maxHeldConnections` when protection does not set it.
+	pub default_max_held: u32,
+	/// Closed by `stop()`, which ends every hold.
+	pub holds_released: tokio::sync::watch::Receiver<()>,
 	pub js_emit: Arc<ThreadsafeFunction<JsEvent>>,
 }
 
@@ -108,6 +113,13 @@ impl ConnContext {
 			.as_ref()
 			.map(|p| p.config.load().tls_handshake_timeout())
 			.unwrap_or(Duration::from_secs(10))
+	}
+
+	fn max_held_connections(&self) -> u32 {
+		self.protection
+			.as_ref()
+			.and_then(|p| p.config.load().max_held_connections)
+			.unwrap_or(self.default_max_held)
 	}
 }
 
@@ -372,14 +384,20 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 	// would leave nothing.
 	let peers = peers.map(move |failover| (failover, Instant::now() + hs_timeout));
 	let upstream_result = if effective_route.terminate_tls {
-		if let Some(tls_cfg) = effective_route.tls_config.take() {
+		if let Some(TlsTermination {
+			config: tls_cfg,
+			deferred,
+		}) = effective_route.tls_config.take()
+		{
 			let predicted_h2 = predicts_h2(&tls_cfg, peek_info.offers_h2);
 			let mut upstream: Option<UpstreamStream> = None;
 			// Connected while the hello is unread, so a peer can still take the connection. An
 			// incomplete hello can't be forwarded, so connecting early could only lose a connection
-			// the handshake-first path would serve. A route requiring a client certificate lets no
-			// client reach its upstream before the certificate is verified.
-			if let Some(peers) = peers.filter(|_| peek_info.complete && !route.requires_client_cert)
+			// the handshake-first path would serve. A route requiring a client certificate, or
+			// checking it only after the handshake, lets no client reach its upstream before the
+			// certificate is verified.
+			if let Some(peers) = peers
+				.filter(|_| peek_info.complete && !route.requires_client_cert && deferred.is_none())
 			{
 				upstream = connect_or_forward(
 					&mut stream,
@@ -399,14 +417,57 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 				hs_timeout = peers.1.saturating_duration_since(Instant::now());
 			}
 			let acceptor = TlsAcceptor::from(tls_cfg);
-			// By reference: binding or passing the stream by value would leave a dead copy of it
-			// in the connection's future.
-			match &mut timeout(
+			let mut accepted = timeout(
 				hs_timeout,
 				tls_accept(&acceptor, stream, ctx.tls_buffer_limit),
 			)
-			.await
-			{
+			.await;
+			// Before anything else reads the accepted stream: under a deferring verifier this is
+			// the client certificate's only verification, resumed sessions included.
+			let rejected = match (&accepted, &deferred) {
+				(Ok(Ok(tls_stream)), Some(deferred)) => deferred
+					.verifier
+					.verify_presented(
+						tls_stream.get_ref().1.peer_certificates(),
+						rustls_pki_types::UnixTime::now(),
+					)
+					.err()
+					.map(|e| {
+						tracing::debug!("client certificate rejected for {peer_ip}: {e}");
+						let kind = crate::mtls::client_cert_rejection(&e)
+							.unwrap_or(ErrorKind::ClientCertUntrusted);
+						(kind, deferred.hold)
+					}),
+				_ => None,
+			};
+			if let Some((kind, hold)) = rejected {
+				inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, kind);
+				// Without a slot the stream is dropped, closing it at once: with nothing left of
+				// the handshake to fail, no alert is owed.
+				let held = match accepted {
+					Ok(Ok(tls_stream)) => crate::tarpit::HeldSlot::acquire(
+						&ctx.listener_metrics,
+						ctx.max_held_connections(),
+					)
+					.map(|slot| {
+						let client = tls_stream.into_inner().0;
+						let deadline = Instant::now() + hold;
+						let released = ctx.holds_released.clone();
+						Box::pin(async move {
+							let _slot = slot;
+							crate::tarpit::hold_silently(client, deadline, released).await
+						})
+					}),
+					_ => None,
+				};
+				if let Some(held) = held {
+					held.await;
+				}
+				return;
+			}
+			// By reference: binding or passing the stream by value would leave a dead copy of it
+			// in the connection's future.
+			match &mut accepted {
 				Ok(Ok(tls_stream)) => {
 					// Route by negotiated protocol: h2 connections go to the route's
 					// h2-marked upstreams (e.g. Harper's `-h2.sock` mirror) when present.
@@ -443,11 +504,12 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 				}
 				Ok(Err(e)) => {
 					tracing::debug!("TLS handshake error from {peer_ip}: {e}");
-					inc_route_error(
-						&ctx.listener_metrics,
-						&route.metric_identity.counters,
-						ErrorKind::TlsHandshake,
-					);
+					let kind = e
+						.get_ref()
+						.and_then(|inner| inner.downcast_ref::<rustls::Error>())
+						.and_then(crate::mtls::client_cert_rejection)
+						.unwrap_or(ErrorKind::TlsHandshake);
+					inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, kind);
 					return;
 				}
 				Err(_) => {
@@ -814,15 +876,15 @@ struct TlsForward {
 	cipher: Option<String>,
 	alpn: Option<Vec<u8>>,
 	/// Client certificate chain (DER, leaf first). Non-empty only when the client
-	/// presented a certificate and the route's verifier accepted it — rustls aborts
-	/// the handshake otherwise, so presence implies verification.
+	/// presented a certificate that passed verification — in the handshake, or on a route
+	/// with `failureHoldMs` in the check `handle` runs before any upstream use — so
+	/// presence implies verification.
 	client_cert_chain: Vec<Vec<u8>>,
 }
 
 /// PP2_TYPE_SSL value: client(1) verify(4 BE) sub-TLVs (version, cipher).
 /// Per spec, verify is zero only when the client presented a certificate AND it
-/// was successfully verified — rustls only completes the handshake when the
-/// configured verifier accepted the cert, so cert presence implies verified.
+/// was successfully verified — cert presence implies verified (see `TlsForward`).
 fn build_ssl_tlv(tls: &TlsForward) -> Vec<u8> {
 	let has_cert = !tls.client_cert_chain.is_empty();
 	let mut ssl: Vec<u8> = Vec::with_capacity(32);
@@ -1007,7 +1069,7 @@ struct EffectiveRoute {
 	destination: Destination,
 	/// Destination for ALPN-h2 connections, when the route has h2-marked upstreams.
 	destination_h2: Option<Destination>,
-	tls_config: Option<Arc<rustls::ServerConfig>>,
+	tls_config: Option<TlsTermination>,
 	terminate_tls: bool,
 	source_address_mode: SourceAddressMode,
 	forward_fingerprint: ForwardFingerprint,
@@ -1225,7 +1287,8 @@ mod tests {
 		};
 		let server_cfg = TlsConfigCache::new()
 			.get_or_build(&cert, None, false)
-			.unwrap();
+			.unwrap()
+			.config;
 		let client_cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
 			.with_safe_default_protocol_versions()
 			.unwrap()
@@ -1346,7 +1409,8 @@ mod tests {
 		for http2 in [false, true] {
 			let server = crate::tls::TlsConfigCache::new()
 				.get_or_build(&cert_spec(), None, http2)
-				.unwrap();
+				.unwrap()
+				.config;
 			for version in [&TLS12, &TLS13] {
 				for offer in offers {
 					let client = client_config(&[version], ring_kx(), offer);
@@ -1371,7 +1435,8 @@ mod tests {
 		use rustls::version::{TLS12, TLS13};
 		let server = crate::tls::TlsConfigCache::new()
 			.get_or_build(&cert_spec(), None, true)
-			.unwrap();
+			.unwrap()
+			.config;
 		for version in [&TLS12, &TLS13] {
 			let client = client_config(&[version], ring_kx(), &[H1, H2]);
 			predict_and_negotiate(server.clone(), client.clone()).await;

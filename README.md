@@ -152,10 +152,14 @@ Both fields accept PEM-encoded strings or `Buffer`. The cert chain may include i
 ### `MtlsConfig`
 
 ```typescript
-{ clientCaCert: string | Buffer, requireClientCert?: boolean }
+{ clientCaCert: string | Buffer, requireClientCert?: boolean, failureHoldMs?: number }
 ```
 
 `requireClientCert` defaults to `true`. Set to `false` to accept connections without a client cert while still validating those that do present one.
+
+`failureHoldMs` (default `0`, at most `600000`) holds a client whose certificate fails verification
+silently for that long instead of answering with a TLS alert. See
+[Holding clients whose certificate fails](#holding-clients-whose-certificate-fails).
 
 ### `ProtectionConfig`
 
@@ -171,6 +175,7 @@ Both fields accept PEM-encoded strings or `Buffer`. The cert chain may include i
 | `ja4Blocklist` | `string[]` | `[]` | JA4 TLS fingerprints to block (36-char strings; see [JA4 blocking](#ja4-blocking)) |
 | `tlsHandshakeTimeoutMs` | `number` | `10000` | Abort slow TLS handshakes |
 | `requireSni` | `boolean` | `false` | Reject connections without an SNI extension |
+| `maxHeldConnections` | `number` | `10000`, or half of `maxConnections` if lower | Connections held at once after a client-certificate rejection (`mtls.failureHoldMs`); further rejections close at once. `0` holds none |
 
 A dual-stack (`[::]`) listener reports an IPv4 client as `::ffff:a.b.c.d`. Protection treats it as
 `a.b.c.d`: only IPv4 `allowlist`/`blocklist` entries match it (`::/0` does not; use `0.0.0.0/0`
@@ -221,6 +226,65 @@ const proxy = new SymphonyProxy({
   ],
 });
 ```
+
+### Holding clients whose certificate fails
+
+Some clients reconnect the moment a handshake fails, forever: devices with a long-expired or
+unknown-CA certificate that nobody can fix. Each attempt costs a full handshake. Per-IP rate limits
+can't slow them without also blocking the valid devices behind the same NAT address.
+
+Set `mtls.failureHoldMs` on a terminating route (or on the listener's `mtls`, which a route without
+its own `mtls` inherits along with the CA). A client that presents a certificate that fails
+verification (expired, not yet valid, unknown issuer, bad signature, wrong key usage) then gets no
+alert. Its handshake completes, symphony sends nothing and discards what it sends for
+`failureHoldMs`, then closes the connection. A client that waits for an application response (an
+MQTT CONNACK, an HTTP 101) waits until its own timeout or the hold ends. A client with a 30 s
+connect timeout and no backoff then retries about twice a minute instead of continuously.
+
+```typescript
+mtls: { clientCaCert: caPem, requireClientCert: true, failureHoldMs: 30_000 }
+```
+
+How it works, and what follows from it:
+
+- **Verification moves out of the handshake.** With a hold set, the route's TLS config accepts any
+  presented certificate during the handshake, and symphony verifies the chain right after it,
+  before it connects to the upstream. A client that fails is never connected upstream. This works
+  for TLS 1.3, where the client's handshake is finished before the server checks anything, and for
+  TLS 1.2, where the server's Finished now goes out before the check. The hold relies on the client
+  waiting for an application-level reply after its handshake completes. A client that gives up at
+  the TLS layer on its own timer is not slowed.
+- **Resumed sessions are checked too.** rustls never re-checks a resumed session's certificate,
+  and a session issued under the hold was issued before its check ran. So on a holding route every
+  connection is checked, including resumptions. A certificate that expired after its session was
+  issued is held, not resumed into the upstream. Each resumption on a holding route costs one
+  chain verification. Failing clients are issued the usual session tickets (TLS 1.2 clients may
+  also take session-cache entries), and when they resume they are held again.
+- **Not held:** a client that presents no certificate where one is required, or whose key doesn't
+  match its certificate (CertificateVerify fails). These, cipher mismatches, handshake timeouts and
+  scanners still get today's immediate failure.
+- **The cap.** `protection.maxHeldConnections` (per listener, default `10000`, or half of the
+  listener's `maxConnections` when that is lower) bounds the sockets held at once. Past it, a
+  failing client is closed at once without an alert: by then there is no handshake left to fail.
+  `0` holds none. A lowered cap applies to new holds only. A listener without `protection` uses the
+  default. A held socket uses one file descriptor and no upstream connection, and it is released
+  when its hold ends, its client closes, or `stop()` is called.
+- **Held sockets are open connections.** They count toward `maxConnections`, the active-connection
+  gauges, and `maxConcurrentPerIp`. With a per-IP limit, failing devices behind a NAT address take
+  slots its valid devices would otherwise use, so size the limit for both.
+- **Changing it.** `failureHoldMs` hot-swaps through `updateConfig`. Changing it between two
+  non-zero values keeps sessions resumable. Turning it on or off swaps the route's TLS config, so
+  clients of that route do one full handshake. An invalid value (negative, over `600000`, not a
+  number) serves the route without the hold and counts it in `failingRoutes`.
+- **Failover.** The hold happens on the node that terminates the connection. A route that checks
+  after the handshake never connects to its upstream early, so, like a route that requires a client
+  certificate, it loses the one connection that finds its upstream dead. A connection forwarded to
+  a peer is held by the peer only if the peer's route sets `failureHoldMs` too. The forwarding
+  node's tunnel ends at its own `idleTimeoutMs`.
+
+Metrics: rejections count under `client_cert_expired`, `client_cert_untrusted` and
+`client_cert_missing` (with or without a hold), and `heldConnections` /
+`symphony_listener_held_connections` is the number held right now.
 
 ### TLS passthrough
 
@@ -955,6 +1019,7 @@ const m = proxy.metrics();
 for (const l of m.listeners) {
   // l.address, l.mode ('tls' | 'http')
   // l.activeConnections, l.accepted
+  // l.heldConnections — subset of activeConnections held after a client-certificate rejection
   // l.bytesReceived — bytes read from clients   (client → upstream)
   // l.bytesSent     — bytes written to clients  (upstream → client)
   //   Counted where the proxy sees the bytes. On a terminated-TLS route that is the plaintext
@@ -997,8 +1062,9 @@ label cardinality bounded by configuration. Counters survive route hot reloads w
 and `metricsGroup` are unchanged; changing the group starts a new series rather than moving
 historical counters between tenants.
 Removing or rejecting a route removes its series; adding that route again starts fresh counters.
-`tls_handshake` and `route_rate_limited` are attributed after SNI selection but before client
-authentication, so they describe traffic aimed at a route rather than confirmed tenant sessions.
+`tls_handshake`, `client_cert_*` and `route_rate_limited` are attributed after SNI selection but
+before (or instead of) client authentication, so they describe traffic aimed at a route rather than
+confirmed tenant sessions.
 Creating route metric objects and rendering them are linear in configured routes (four base
 samples per route); deployments with thousands of routes should size their scrape interval
 accordingly.
@@ -1009,12 +1075,22 @@ accordingly.
 `symphony_route_blocked_total`).
 
 **Error reasons:** `no_route`, `route_rate_limited`, `suspend_unresolved`, `tls_handshake`,
-`tls_missing_cert`, `upstream_connect`, `idle_timeout`, `half_closed`, `peer_timeout`, `stream`,
-`http_header`.
+`client_cert_expired`, `client_cert_untrusted`, `client_cert_missing`, `tls_missing_cert`,
+`upstream_connect`, `idle_timeout`, `half_closed`, `peer_timeout`, `stream`, `http_header`.
+
+A rejected client certificate counts under its own reason rather than `tls_handshake`:
+`client_cert_expired` (past its `notAfter`), `client_cert_untrusted` (any other verification
+failure: unknown issuer, a bad signature, not yet valid, wrong key usage, malformed) and
+`client_cert_missing` (none presented where one is required). Earlier releases counted all three as
+`tls_handshake`, so an alert keyed on that reason no longer sees them.
 
 `symphony_listener_half_closed_connections` is a gauge alongside the active one, counting the
 subset of active connections whose upstream half has closed. A rising floor there is a retention
 leak while it is still measured in connections — see [Dead-peer detection](#dead-peer-detection).
+
+`symphony_listener_held_connections` counts the subset of active connections held after a
+client-certificate rejection. A value sitting at `maxHeldConnections` means rejections past the cap
+are being closed at once — see [Holding clients whose certificate fails](#holding-clients-whose-certificate-fails).
 
 > `idle_timeout` counts terminations by `idleTimeoutMs`, which today is a *total duration* cap
 > rather than an idleness one — see [#34](https://github.com/HarperFast/symphony/issues/34). Busy
@@ -1111,7 +1187,7 @@ proxy.updateConfig({
 });
 ```
 
-**What can be hot-swapped:** routes (destinations, TLS certs, suspension state, `failover`), per-listener protection (CIDR allowlist/blocklist, JA3 blocklist, rate limits, sustained rate limits, penalty box, concurrency caps, handshake timeout, requireSni), and a failover ingress listener's `trustedSources`.
+**What can be hot-swapped:** routes (destinations, TLS certs, suspension state, `failover`, `mtls.failureHoldMs`), per-listener protection (CIDR allowlist/blocklist, JA3 blocklist, rate limits, sustained rate limits, penalty box, concurrency caps, `maxHeldConnections`, handshake timeout, requireSni), and a failover ingress listener's `trustedSources`.
 
 **What requires a restart:** bind address, port, idle timeout, worker threads. When calling `updateConfig()` directly, protection presence (None↔Some) cannot change at runtime — the listener must be restarted. The `symphony-server` bin handles this automatically via seamless recreate.
 

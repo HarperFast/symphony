@@ -59,6 +59,8 @@ TCP accept (SO_REUSEPORT per worker thread)
   └─ [failover route on a client listener, complete hello: upstream.rs connect() now;
                   failure → forward_to_peers (Down)]
   └─ tls.rs       TlsAcceptor::accept() with handshake timeout (if terminate_tls)
+  └─ [route with mtls.failureHoldMs: verify the session's client chain (mtls.rs) → on failure
+                  count, then hold silently (tarpit.rs) or close; never connect]
   └─ upstream.rs  connect(Destination, peer_ip) → UpstreamStream, unless already connected
                   to the destination the negotiated ALPN selects
   └─ tokio::io::copy_bidirectional_with_sizes wrapped in idle_timeout
@@ -85,7 +87,8 @@ TCP accept (SO_REUSEPORT per worker thread)
 | `src/failover.rs` | Peer failover: policy parsing, per-(route, peer) cooldown, `decide`/`forward_to_peers`, the recovery probe + `routeHealth`, the spill controller + peer load poll |
 | `src/ingress.rs` | Failover ingress listener: `trustedSources` gate, the PROXY v2 reader, the load-query wire format |
 | `src/tls.rs` | rustls ServerConfig builder; SHA-256 deduplication cache |
-| `src/mtls.rs` | SymphonyClientVerifier wrapping WebPkiClientVerifier |
+| `src/mtls.rs` | SymphonyClientVerifier wrapping WebPkiClientVerifier; its deferred (post-handshake) chain check; client-cert rejection reasons |
+| `src/tarpit.rs` | Holding a connection whose client certificate was rejected: `HeldSlot` (the `maxHeldConnections` cap), `hold_silently` |
 | `src/proxy_conn.rs` | Per-connection handler: the full 7-step flow |
 | `src/protection.rs` | IP rate limiting, concurrency, CIDR lists, JA3 blocking |
 | `src/suspended.rs` | Pending-connection registry (DashMap + oneshot channels) |
@@ -151,6 +154,34 @@ answering challenges for any `Host` could validate certificates for names it doe
 the same reason a `failover` policy on the default route is treated as invalid (served without
 failover): every peer's ingress would refuse what it forwarded.
 `RouteTable::resolve` is test-only so production lookups state that choice.
+
+### Holding clients whose certificate fails (`mtls.failureHoldMs`)
+The hold needs the rejection to send no alert, and tokio-rustls writes the alert before `Accept`
+returns. So a holding route's verifier defers the chain check (`SymphonyClientVerifier`
+`defer_chain_check`): the handshake completes, and `handle` runs `verify_presented` over
+`peer_certificates()` before anything else touches the stream. The invariant: **a connection accepted
+through a deferring `ServerConfig` reaches no upstream (no connect, no byte) unless that check passed.**
+
+- **The config and its check are one value** (`tls::TlsTermination { config, deferred }`), and the cache
+  hands out a deferring verifier only with its config. Carry-forward clones the route whole, hold
+  duration included, so a deferring config is never carried without its check. `ClientAuth` ignores
+  deferral: a deferring config plus its check admits exactly who the strict config admits.
+- **Every connection is checked, resumed ones included.** rustls never re-verifies a resumed session,
+  and a session issued under deferral was issued before the check ran. The cache key's mTLS hash
+  covers the defer flag, so such a session can never resume on a strict config.
+- **Early connect is off for a deferring route** (beside `!route.requires_client_cert` in `handle`).
+- **Only a presented chain that fails is held.** Mandatory-without-cert and a failed CertificateVerify
+  are still alerted inside the handshake (counted `client_cert_missing` / `client_cert_untrusted`).
+- **The held count lives on `ListenerMetrics`** (`held_connections`, taken by `tarpit::HeldSlot`), and
+  only the cap on the protection snapshot: a protection hot-swap replaces the snapshot, and a listener
+  without protection still holds (`ConnContext::default_max_held`). `ActiveGuard` stays alive through the
+  hold, so held sockets count toward `maxConcurrentPerIp` and `maxConnections` (owner decision).
+- **`stop()` drops `release_holds`**, a `watch` sender; a hold that starts after that sees it closed.
+- **An invalid `failureHoldMs` is isolated per route** (`invalid_hold`, served strict, in `failingRoutes`),
+  validated on the effective value so the listener level is covered too.
+- The rustls error behind an `Accept` failure is `io::Error::get_ref()` downcast to `rustls::Error`
+  (tokio-rustls wraps it as `InvalidData`); `mtls::client_cert_rejection` maps it to a reason, else
+  `tls_handshake`.
 
 ### Per-route `allowedSources` (`router.rs::SourceAllowlist`)
 A route attribute, not a protection check: protection runs before route selection and is
@@ -458,6 +489,7 @@ instead.
 - **`mtls.spec.ts`** — mTLS termination + PROXY v2 TLV forwarding of the client cert chain (0xE2, SSL TLV 0x20); skips without openssl
 - **`metrics.spec.ts`** — per-listener breakdown and byte counting, `renderPrometheus` output shape, the admin endpoint over UDS + TCP, and stale-socket reclaim after a `SIGKILL`
 - **`failover.spec.ts`** — peer failover across two or three proxies in one process (UDS upstreams that record the PROXY v1 source and count what they accept); the client binds 127.0.0.2 so the forwarded client address differs from the forwarding node's (macOS has it only through an `lo0` alias, which CI adds; without one the suite skips). `markDown` drives a route down through its ingress listener, where a TLS-terminating route still connects after the handshake and never forwards, so no peer's counters move. The first-connection cases run for both passthrough and TLS-terminating routes. Upstreams that accept before they serve use `startClosingUpstream` and `startDockerProxy`, which closes with the client's bytes unread, as docker-proxy does. The hanging-connect cases (Linux) use a TCP port whose accept queue is full (`startHangingUpstream`). The unreachable-TCP-upstream case (Linux only) points a passthrough route at `255.255.255.255`, which Linux fails with `ENETUNREACH` at once. Spill-over tests (Linux) serve the upstream from a child process whose busy main thread is the slot's `pid`/`tid`, so the load is real thread CPU; the PID-namespace case runs that child under `bwrap --unshare-pid` (CI installs bubblewrap) and skips without it
+- **`mtls-tarpit.spec.ts`** — `mtls.failureHoldMs` end to end: held clients (TLS 1.2/1.3, expired, unknown issuer) see a completed handshake, no bytes and no alert for the hold, then a close, with zero upstream accepts; resumed sessions whose cert expired after issuance; the cap and its hot-swap; per-IP accounting; listener inheritance; `resolveConnection`; `symphony-server` passthrough. Its PKI is built in-test by `util.ts::issueCert` (DER X.509 via `node:crypto`), not `openssl`, so validity windows are exact on every platform
 - **`liveness.spec.ts`** — the half-close bound over a real passthrough proxy. Its client uses `allowHalfOpen: true` (otherwise Node answers the proxy's FIN with its own and there is no half-close to bound) and a synthetic `clientHello()` from `util.ts` (otherwise `peek()` blocks for its 5s reassembly timeout and a no-SNI connection resolves to no route)
 
 The Rust toolchain is pinned to `1.94.1` in `rust-toolchain.toml`. Ensure rustup's

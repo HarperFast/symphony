@@ -1,10 +1,9 @@
 use crate::balancer::{SlotHealth, UdsBalancer, UdsSlotSpec};
 use crate::failover::{Failover, FailoverRoute, FailoverSpec};
 use crate::metrics::RouteMetrics;
-use crate::tls::{sha256, CertSpec, MtlsSpec, TlsConfigCache};
+use crate::tls::{sha256, CertSpec, MtlsSpec, TlsConfigCache, TlsTermination};
 use arc_swap::ArcSwap;
 use ipnetwork::{IpNetwork, Ipv4Network};
-use rustls::ServerConfig;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -237,7 +236,7 @@ pub struct Route {
 	/// has h2-marked upstreams. None = all protocols share `destination`.
 	pub destination_h2: Option<Destination>,
 	/// None = TLS passthrough (no termination)
-	pub tls_config: Option<Arc<ServerConfig>>,
+	pub tls_config: Option<TlsTermination>,
 	pub terminate_tls: bool,
 	pub suspended: bool,
 	pub suspend_timeout: Duration,
@@ -340,6 +339,8 @@ pub struct RouteTable {
 	invalid_failover: HashSet<Arc<str>>,
 	/// SNIs whose failover is served without spill-over because its `spill` policy is invalid.
 	invalid_spill: HashSet<Arc<str>>,
+	/// SNIs served without a failure hold because their effective `mtls.failureHoldMs` is invalid.
+	invalid_hold: HashSet<Arc<str>>,
 	/// Exact SNIs dropped with no last-good route to carry forward (a subset of `failing_snis` —
 	/// this excludes SNIs whose last-good route IS still present in `exact`/`wildcard` and
 	/// serving traffic). `resolve()` must fail closed for these rather than falling through to a
@@ -367,12 +368,13 @@ impl RouteTable {
 	}
 
 	/// Number of SNIs rejected in this table — dropped, serving a carried-forward last-good cert, or
-	/// serving without an invalid `failover` (or `failover.spill`) policy. Non-zero means a config
-	/// needs attention.
+	/// serving without an invalid `failover` (or `failover.spill`) policy or `mtls.failureHoldMs`.
+	/// Non-zero means a config needs attention.
 	pub fn failing_route_count(&self) -> usize {
 		let mut failing: HashSet<&Arc<str>> = self.failing_snis.iter().collect();
 		failing.extend(&self.invalid_failover);
 		failing.extend(&self.invalid_spill);
+		failing.extend(&self.invalid_hold);
 		failing.len()
 	}
 
@@ -527,6 +529,9 @@ pub struct RouteSpec {
 	pub key_pem: Option<Vec<u8>>,
 	pub mtls_ca_pem: Option<Vec<u8>>,
 	pub require_client_cert: bool,
+	/// Unvalidated: an invalid value serves the route without the hold rather than failing the whole
+	/// config.
+	pub mtls_failure_hold_ms: Option<f64>,
 	pub suspended: bool,
 	pub suspend_timeout_ms: u64,
 	/// Optional global rate limit (connections per second) for this route.
@@ -558,6 +563,7 @@ pub struct ListenerTlsSpec {
 	pub key_pem: Option<Vec<u8>>,
 	pub mtls_ca_pem: Option<Vec<u8>>,
 	pub require_client_cert: bool,
+	pub mtls_failure_hold_ms: Option<f64>,
 }
 
 impl ListenerTlsSpec {
@@ -567,20 +573,50 @@ impl ListenerTlsSpec {
 			key_pem: None,
 			mtls_ca_pem: None,
 			require_client_cert: true,
+			mtls_failure_hold_ms: None,
 		}
 	}
+}
+
+/// A route's client-certificate settings, all from the one level (route or listener) that supplies
+/// the CA.
+struct EffectiveMtls<'a> {
+	ca: &'a [u8],
+	required: bool,
+	failure_hold_ms: Option<f64>,
 }
 
 fn effective_mtls<'a>(
 	spec: &'a RouteSpec,
 	listener_tls: &'a ListenerTlsSpec,
-) -> Option<(&'a [u8], bool)> {
+) -> Option<EffectiveMtls<'a>> {
 	match spec.mtls_ca_pem.as_deref() {
-		Some(ca) => Some((ca, spec.require_client_cert)),
-		None => listener_tls
-			.mtls_ca_pem
-			.as_deref()
-			.map(|ca| (ca, listener_tls.require_client_cert)),
+		Some(ca) => Some(EffectiveMtls {
+			ca,
+			required: spec.require_client_cert,
+			failure_hold_ms: spec.mtls_failure_hold_ms,
+		}),
+		None => listener_tls.mtls_ca_pem.as_deref().map(|ca| EffectiveMtls {
+			ca,
+			required: listener_tls.require_client_cert,
+			failure_hold_ms: listener_tls.mtls_failure_hold_ms,
+		}),
+	}
+}
+
+/// A hold longer than any client's connect timeout only holds a socket its client has abandoned.
+pub const MAX_FAILURE_HOLD_MS: f64 = 600_000.0;
+
+/// `failureHoldMs` in whole milliseconds; zero (unset, or under 1 ms) keeps today's alert.
+pub(crate) fn parse_failure_hold(ms: Option<f64>) -> Result<Duration, String> {
+	match ms {
+		None => Ok(Duration::ZERO),
+		Some(ms) if ms.is_finite() && (0.0..=MAX_FAILURE_HOLD_MS).contains(&ms) => {
+			Ok(Duration::from_millis(ms as u64))
+		}
+		Some(ms) => Err(format!(
+			"mtls.failureHoldMs must be a number of ms in [0, {MAX_FAILURE_HOLD_MS}], got {ms}"
+		)),
 	}
 }
 
@@ -605,9 +641,9 @@ impl ClientAuth {
 		}
 		match effective_mtls(spec, listener_tls) {
 			None => Self::NoClientCert,
-			Some((ca, required)) => Self::ClientCert {
-				ca_sha256: sha256(ca),
-				required,
+			Some(mtls) => Self::ClientCert {
+				ca_sha256: sha256(mtls.ca),
+				required: mtls.required,
 			},
 		}
 	}
@@ -656,6 +692,7 @@ pub fn build_route_table(
 	let mut failing_snis: HashSet<Arc<str>> = HashSet::new();
 	let mut invalid_failover: HashSet<Arc<str>> = HashSet::new();
 	let mut invalid_spill: HashSet<Arc<str>> = HashSet::new();
+	let mut invalid_hold: HashSet<Arc<str>> = HashSet::new();
 	let mut configured_wildcards = HashSet::with_capacity(specs.len());
 	let mut dropped_exact: HashSet<Arc<str>> = HashSet::new();
 	let mut dropped_wildcard: Vec<Arc<str>> = Vec::new();
@@ -783,6 +820,25 @@ pub fn build_route_table(
 		};
 
 		let requested_auth = ClientAuth::of(spec, listener_tls);
+		// The hold only changes how a rejected client is answered, so a bad value keeps the route.
+		let failure_hold = match effective_mtls(spec, listener_tls)
+			.filter(|_| spec.terminate_tls)
+			.map(|mtls| parse_failure_hold(mtls.failure_hold_ms))
+		{
+			None => Duration::ZERO,
+			Some(Ok(hold)) => hold,
+			Some(Err(e)) => {
+				let newly_invalid = previous.is_none_or(|p| !p.invalid_hold.contains(name));
+				invalid_hold.insert(Arc::from(name));
+				if newly_invalid {
+					eprintln!(
+						"symphony: route '{}': {e}; serving it without the hold",
+						spec.sni
+					);
+				}
+				Duration::ZERO
+			}
+		};
 
 		// Isolate per-route failures: a single route whose cert can't be built (e.g. a
 		// rotated key no longer matching an inlined chain → rustls KeyMismatch) must not
@@ -798,7 +854,7 @@ pub fn build_route_table(
 			refuse_new: previous_down,
 		};
 		let mut carried = false;
-		let mut route = match build_route(spec, listener_tls, cache, inherit) {
+		let mut route = match build_route(spec, listener_tls, failure_hold, cache, inherit) {
 			Ok(route) => route,
 			Err(e) => {
 				// Log only on the good→bad transition: a persistently-broken cert would
@@ -963,6 +1019,7 @@ pub fn build_route_table(
 		failing_snis,
 		invalid_failover,
 		invalid_spill,
+		invalid_hold,
 		dropped_exact,
 		dropped_wildcard,
 		client_auth,
@@ -1055,6 +1112,7 @@ struct Inherit<'a> {
 fn build_route(
 	spec: &RouteSpec,
 	listener_tls: &ListenerTlsSpec,
+	failure_hold: Duration,
 	cache: &mut TlsConfigCache,
 	inherit: Inherit,
 ) -> crate::error::Result<Route> {
@@ -1084,11 +1142,11 @@ fn build_route(
 			private_key_pem: key_pem.to_vec().into(),
 		};
 
-		let mtls_spec =
-			effective_mtls(spec, listener_tls).map(|(ca, require_client_cert)| MtlsSpec {
-				client_ca_pem: ca.to_vec(),
-				require_client_cert,
-			});
+		let mtls_spec = effective_mtls(spec, listener_tls).map(|mtls| MtlsSpec {
+			client_ca_pem: mtls.ca.to_vec(),
+			require_client_cert: mtls.required,
+			failure_hold,
+		});
 
 		Some(cache.get_or_build(&cert_spec, mtls_spec.as_ref(), spec.http2)?)
 	} else {
@@ -1149,7 +1207,7 @@ fn build_route(
 		allowed_sources: None,
 		failover: None,
 		requires_client_cert: spec.terminate_tls
-			&& effective_mtls(spec, listener_tls).is_some_and(|(_, required)| required),
+			&& effective_mtls(spec, listener_tls).is_some_and(|mtls| mtls.required),
 	})
 }
 
@@ -1304,6 +1362,7 @@ pub async fn evict_affinity_periodically(
 pub(crate) mod tests {
 	use super::*;
 	use crate::failover::SpillSpec;
+	use rustls::ServerConfig;
 
 	// A self-signed cert (CERT_A) and its matching key (KEY_A), plus an unrelated key
 	// (KEY_B). Pairing CERT_A with KEY_B reproduces the production rustls KeyMismatch a
@@ -1400,6 +1459,7 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 			key_pem: Some(key.to_vec()),
 			mtls_ca_pem: None,
 			require_client_cert: false,
+			mtls_failure_hold_ms: None,
 			suspended: false,
 			suspend_timeout_ms: 100,
 			max_cps: None,
@@ -1415,12 +1475,13 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 
 	fn config_ptr(table: &RouteTable, sni: &str) -> *const ServerConfig {
 		Arc::as_ptr(
-			table
+			&table
 				.resolve(Some(sni))
 				.expect("route present")
 				.tls_config
 				.as_ref()
-				.unwrap(),
+				.unwrap()
+				.config,
 		)
 	}
 
@@ -1882,7 +1943,15 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 	fn default_route_carries_forward_only_under_the_same_client_cert_policy() {
 		let listener = ListenerTlsSpec::empty();
 		let default_config = |table: &RouteTable| {
-			Arc::as_ptr(table.resolve(None).unwrap().tls_config.as_ref().unwrap())
+			Arc::as_ptr(
+				&table
+					.resolve(None)
+					.unwrap()
+					.tls_config
+					.as_ref()
+					.unwrap()
+					.config,
+			)
 		};
 		let live = build(&[tls_route("", CERT_A, KEY_A)], &listener, None);
 
@@ -2485,6 +2554,114 @@ UlqL1DcgX6Szi9w/p7B4BZO9iA==
 		let optional = with_client_ca(tls_route(sni, CERT_A, KEY_B), CERT_A, false);
 		let dropped = build(&[optional], &listener, Some(&live));
 		assert!(dropped.resolve(Some(sni)).is_none());
+	}
+
+	fn holding(spec: RouteSpec, hold_ms: f64) -> RouteSpec {
+		RouteSpec {
+			mtls_failure_hold_ms: Some(hold_ms),
+			..with_client_ca(spec, CERT_A, true)
+		}
+	}
+
+	fn deferred_hold(table: &RouteTable, sni: &str) -> Option<Duration> {
+		let route = table.resolve(Some(sni)).expect("route present");
+		let termination = route.tls_config.as_ref().expect("terminating");
+		termination.deferred.as_ref().map(|d| d.hold)
+	}
+
+	#[test]
+	fn a_hold_defers_the_chain_check_and_zero_keeps_it_in_the_handshake() {
+		let listener = ListenerTlsSpec::empty();
+		let table = build(
+			&[
+				holding(tls_route("held.example.com", CERT_A, KEY_A), 1500.0),
+				holding(tls_route("strict.example.com", CERT_A, KEY_A), 0.0),
+				holding(tls_route("sub-ms.example.com", CERT_A, KEY_A), 0.5),
+			],
+			&listener,
+			None,
+		);
+		assert_eq!(
+			deferred_hold(&table, "held.example.com"),
+			Some(Duration::from_millis(1500))
+		);
+		assert_eq!(deferred_hold(&table, "strict.example.com"), None);
+		assert_eq!(deferred_hold(&table, "sub-ms.example.com"), None);
+		assert_ne!(
+			config_ptr(&table, "held.example.com"),
+			config_ptr(&table, "strict.example.com"),
+			"a deferring config must not share session state with a strict one"
+		);
+		assert_eq!(table.failing_route_count(), 0);
+	}
+
+	#[test]
+	fn an_invalid_hold_serves_the_route_without_it() {
+		let listener = ListenerTlsSpec::empty();
+		for bad in [-1.0, 600_001.0, f64::NAN, f64::INFINITY] {
+			let table = build(
+				&[holding(tls_route("tenant.example.com", CERT_A, KEY_A), bad)],
+				&listener,
+				None,
+			);
+			assert_eq!(table.failing_route_count(), 1, "{bad}");
+			assert_eq!(deferred_hold(&table, "tenant.example.com"), None, "{bad}");
+		}
+		let mut passthrough = holding(tls_route("pass.example.com", CERT_A, KEY_A), -1.0);
+		passthrough.terminate_tls = false;
+		let table = build(&[passthrough], &listener, None);
+		assert_eq!(
+			table.failing_route_count(),
+			0,
+			"a passthrough route ignores mtls"
+		);
+	}
+
+	#[test]
+	fn the_hold_comes_from_the_level_that_supplies_the_ca() {
+		let listener = ListenerTlsSpec {
+			mtls_ca_pem: Some(CERT_A.to_vec()),
+			require_client_cert: true,
+			mtls_failure_hold_ms: Some(2000.0),
+			..ListenerTlsSpec::empty()
+		};
+		let table = build(
+			&[
+				tls_route("inherits.example.com", CERT_A, KEY_A),
+				with_client_ca(tls_route("own.example.com", CERT_A, KEY_A), CERT_A, true),
+			],
+			&listener,
+			None,
+		);
+		assert_eq!(
+			deferred_hold(&table, "inherits.example.com"),
+			Some(Duration::from_secs(2))
+		);
+		assert_eq!(deferred_hold(&table, "own.example.com"), None);
+	}
+
+	#[test]
+	fn a_carried_forward_route_keeps_its_config_and_deferred_check_together() {
+		let listener = ListenerTlsSpec::empty();
+		let sni = "tenant.example.com";
+		let live = build(
+			&[holding(tls_route(sni, CERT_A, KEY_A), 1000.0)],
+			&listener,
+			None,
+		);
+		for requested in [2000.0, 0.0] {
+			let carried = build(
+				&[holding(tls_route(sni, CERT_A, KEY_B), requested)],
+				&listener,
+				Some(&live),
+			);
+			assert_eq!(config_ptr(&carried, sni), config_ptr(&live, sni));
+			assert_eq!(
+				deferred_hold(&carried, sni),
+				Some(Duration::from_secs(1)),
+				"the deferring config is carried with its check, until it heals"
+			);
+		}
 	}
 
 	#[test]

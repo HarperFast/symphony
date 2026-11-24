@@ -50,6 +50,15 @@ export interface MtlsConfig {
 	clientCaCert: string | Buffer;
 	/** Whether to reject clients that do not present a certificate. Default: false (optional client cert). */
 	requireClientCert?: boolean;
+	/**
+	 * Hold a client whose presented certificate fails verification (expired, unknown issuer, bad
+	 * signature, wrong usage) silently for this many ms, then close it, instead of answering with a
+	 * TLS alert, so a client that reconnects at once after every rejection is slowed to about one
+	 * attempt per hold. 0 (default) keeps the immediate alert; at most 600000. Terminating routes
+	 * only. A client that presents no certificate is never held. See the README's "Holding clients
+	 * whose certificate fails".
+	 */
+	failureHoldMs?: number;
 }
 
 // ── Route config ──────────────────────────────────────────────────────────────
@@ -322,6 +331,13 @@ export interface ProtectionConfig {
 	tlsHandshakeTimeoutMs?: number;
 	/** Reject connections that present no SNI. Default: false. */
 	requireSni?: boolean;
+	/**
+	 * Connections this listener holds at once after a client-certificate rejection
+	 * (`mtls.failureHoldMs`); further rejections are closed at once, without an alert. 0 holds none.
+	 * Default: 10000, or half of the listener's `maxConnections` when that is lower. Held
+	 * connections count toward `maxConnections` and `maxConcurrentPerIp`.
+	 */
+	maxHeldConnections?: number;
 }
 
 // ── Listener config ───────────────────────────────────────────────────────────
@@ -475,6 +491,8 @@ export interface ListenerMetrics {
 	activeConnections: number;
 	/** Subset of `activeConnections` whose write half to the client is shut down, awaiting its FIN. */
 	halfClosedConnections: number;
+	/** Subset of `activeConnections` held silently after a client-certificate rejection (`mtls.failureHoldMs`). */
+	heldConnections: number;
 	accepted: number;
 	blocked: number;
 	errors: number;

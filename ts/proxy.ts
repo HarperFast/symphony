@@ -88,6 +88,7 @@ function toJsMtls(m: MtlsConfig): JsMtlsConfig {
 	return {
 		clientCaCert: m.clientCaCert,
 		requireClientCert: m.requireClientCert,
+		failureHoldMs: m.failureHoldMs,
 	};
 }
 
@@ -144,6 +145,7 @@ function toJsProtectionConfig(p: ProtectionConfig) {
 		ja4Blocklist: p.ja4Blocklist,
 		tlsHandshakeTimeoutMs: p.tlsHandshakeTimeoutMs,
 		requireSni: p.requireSni,
+		maxHeldConnections: p.maxHeldConnections,
 	};
 }
 
@@ -339,6 +341,7 @@ export class SymphonyProxy extends EventEmitter {
 				mode: l.mode as 'tls' | 'http',
 				activeConnections: l.activeConnections,
 				halfClosedConnections: l.halfClosedConnections,
+				heldConnections: l.heldConnections,
 				accepted: l.accepted,
 				blocked: l.blocked,
 				errors: l.errors,
