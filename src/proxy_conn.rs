@@ -1285,8 +1285,6 @@ mod tests {
 		}
 	}
 
-	/// Plaintext the server accepts from one write loop before `Pending`, against a client that
-	/// completed the handshake and then never reads: rustls' queue plus the 4 KiB transport.
 	/// What a real `Accept` failure is counted as, so a change in how tokio-rustls reports it fails
 	/// here rather than quietly moving certificate rejections back into `tls_handshake`.
 	async fn handshake_failure_kind(
@@ -1388,6 +1386,8 @@ mod tests {
 		assert_eq!(kind, ErrorKind::TlsHandshake);
 	}
 
+	/// Plaintext the server accepts from one write loop before `Pending`, against a client that
+	/// completed the handshake and then never reads: rustls' queue plus the 4 KiB transport.
 	async fn accepted_while_client_stalls(buffer_limit: Option<usize>) -> usize {
 		use crate::router::tests::{CERT_A, KEY_A};
 		use crate::tls::{CertSpec, TlsConfigCache};

@@ -290,9 +290,9 @@ How it works, and what follows from it:
 - **Held sockets are open connections.** They count toward `maxConnections`, the active-connection
   gauges, and `maxConcurrentPerIp`. With a per-IP limit, failing devices behind a NAT address take
   slots its valid devices would otherwise use, so size the limit for both.
-- **Changing it.** `failureHoldMs` (whole milliseconds; under 1 keeps the alert) and
-  `failureHoldJitter` hot-swap through `updateConfig`. Changing a route's hold between two non-zero
-  values keeps sessions resumable. Turning it on or off swaps the route's TLS config, so clients of
+- **Changing it.** `failureHoldMs` (whole milliseconds: a fraction is dropped, and under 1 keeps
+  the alert) and `failureHoldJitter` hot-swap through `updateConfig`. Changing a route's hold
+  between two non-zero values keeps sessions resumable. Turning it on or off swaps the route's TLS config, so clients of
   that route do one full handshake. An invalid value (a hold that is negative, over `600000` or not
   a number; a jitter outside 0–1; in a `symphony-server` config file, a value of the wrong type)
   serves the route without the hold and counts it in `failingRoutes`. A route serving its last-good config because its cert
