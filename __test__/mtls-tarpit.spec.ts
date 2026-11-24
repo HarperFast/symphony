@@ -121,7 +121,6 @@ function attempt(
 		socket.on('data', (d: Buffer) => {
 			mark();
 			result.bytes += d.length;
-			// An upstream echo answers the request; nothing more is needed from it.
 			socket.end();
 		});
 		socket.on('error', (e) => {

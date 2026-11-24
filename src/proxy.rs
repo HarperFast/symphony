@@ -186,7 +186,7 @@ pub struct JsProtectionConfig {
 	pub require_sni: Option<bool>,
 	/// Connections held across the proxy after a client-certificate rejection (`mtls.failureHoldMs`)
 	/// before this listener closes further rejections at once. 0 holds none. Default: 10000, or half
-	/// of `maxConnections` when that is lower.
+	/// of the smallest `maxConnections` among the proxy's listeners when that is lower.
 	pub max_held_connections: Option<f64>,
 }
 
@@ -715,6 +715,8 @@ impl SymphonyProxyWrap {
 
 		let (tx, _) = broadcast::channel(1);
 		let (release_holds, holds_released) = watch::channel(());
+		let default_max_held =
+			crate::tarpit::default_max_held(self.listeners.iter().map(|l| l.max_connections));
 		*shutdown_tx = Some((tx.clone(), release_holds));
 		drop(shutdown_tx);
 
@@ -743,7 +745,7 @@ impl SymphonyProxyWrap {
 				upstream_read_buffer_size: self.upstream_read_buffer_size,
 				tls_buffer_limit: self.tls_buffer_limit,
 				ingress: state.ingress.clone(),
-				default_max_held: crate::tarpit::default_max_held(listener.max_connections),
+				default_max_held,
 				holds_released: holds_released.clone(),
 				js_emit: self.js_emit.clone(),
 			});

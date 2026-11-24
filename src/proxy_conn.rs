@@ -442,9 +442,11 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 			};
 			if let Some((kind, hold)) = rejected {
 				inc_route_error(&ctx.listener_metrics, &route.metric_identity.counters, kind);
-				// Without a slot the stream is dropped, closing it at once: with nothing left of
-				// the handshake to fail, no alert is owed. A missing certificate is never held.
-				let slot = (kind != ErrorKind::ClientCertMissing)
+				// Past the handshake there is no alert left to send. Scanners present no certificate,
+				// so a missing one is never held, and neither is anything once the proxy has stopped.
+				let holdable = kind != ErrorKind::ClientCertMissing
+					&& ctx.holds_released.has_changed().is_ok();
+				let slot = holdable
 					.then(|| {
 						crate::tarpit::HeldSlot::acquire(
 							&ctx.global_metrics,

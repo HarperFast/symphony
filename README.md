@@ -175,7 +175,7 @@ default `0.5`). See [Holding clients whose certificate fails](#holding-clients-w
 | `ja4Blocklist` | `string[]` | `[]` | JA4 TLS fingerprints to block (36-char strings; see [JA4 blocking](#ja4-blocking)) |
 | `tlsHandshakeTimeoutMs` | `number` | `10000` | Abort slow TLS handshakes |
 | `requireSni` | `boolean` | `false` | Reject connections without an SNI extension |
-| `maxHeldConnections` | `number` | `10000`, or half of `maxConnections` if lower | Connections held at once, across the proxy, after a client-certificate rejection (`mtls.failureHoldMs`); further rejections on this listener close at once. `0` holds none |
+| `maxHeldConnections` | `number` | `10000`, or half of the smallest `maxConnections` if lower | Connections held at once, across the proxy, after a client-certificate rejection (`mtls.failureHoldMs`); further rejections on this listener close at once. `0` holds none |
 
 A dual-stack (`[::]`) listener reports an IPv4 client as `::ffff:a.b.c.d`. Protection treats it as
 `a.b.c.d`: only IPv4 `allowlist`/`blocklist` entries match it (`::/0` does not; use `0.0.0.0/0`
@@ -272,10 +272,10 @@ How it works, and what follows from it:
 - **Not held:** a client that presents no certificate where one is required, or whose key doesn't
   match its certificate (CertificateVerify fails). These, cipher mismatches, handshake timeouts and
   scanners still get today's immediate failure.
-- **The cap.** `protection.maxHeldConnections` (default `10000`, or half of the listener's
-  `maxConnections` when that is lower) bounds the sockets held at once. Like `maxConnections`, a
-  listener compares its value with the count across the whole proxy, so held sockets never take more
-  than half of the accept budget by default. Past it, a failing client is closed at once without an
+- **The cap.** `protection.maxHeldConnections` (default `10000`, or half of the smallest
+  `maxConnections` among the proxy's listeners when that is lower) bounds the sockets held at once.
+  Like `maxConnections`, a listener compares its value with the count across the whole proxy, so by
+  default held sockets never take more than half of any listener's accept budget. Past it, a failing client is closed at once without an
   alert: by then there is no handshake left to fail. `0` holds none. A lowered cap applies to new
   holds only. A listener without `protection` uses the default. One route's failing clients can use
   up the cap for every route on the proxy; those past it are closed, never let through.

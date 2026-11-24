@@ -44,7 +44,7 @@ pub struct ProtectionConfig {
 	/// Max simultaneous connections per IP (0 = unlimited).
 	pub max_concurrent_per_ip: u32,
 	/// Max connections held after a client-certificate rejection (`mtls.failureHoldMs`); 0 holds none.
-	/// `None` takes the listener default (`tarpit::default_max_held`).
+	/// `None` takes the proxy's default (`tarpit::default_max_held`).
 	pub max_held_connections: Option<u32>,
 	/// JA3 fingerprints to block (raw 16-byte MD5).
 	pub ja3_blocklist: HashSet<[u8; 16]>,

@@ -7,8 +7,7 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-/// What a held client may send before the hold stops reading it, so a client that keeps writing
-/// costs reads only up to here.
+/// Bounds the reads a client that keeps writing can cost its hold.
 const DISCARD_BUDGET: usize = 64 * 1024;
 
 /// How soon a client past `DISCARD_BUDGET` is seen to have closed.
@@ -78,13 +77,17 @@ fn random_unit() -> f64 {
 /// The listener default for `maxHeldConnections`.
 const DEFAULT_MAX_HELD_CONNECTIONS: u32 = 10_000;
 
-/// The default leaves at least half of a listener's `maxConnections` to connections that are not
-/// held, since held sockets count toward it. Both compare against counts across the whole proxy.
-pub fn default_max_held(max_connections: u32) -> u32 {
-	match max_connections {
-		0 => DEFAULT_MAX_HELD_CONNECTIONS,
-		limit => DEFAULT_MAX_HELD_CONNECTIONS.min(limit / 2),
-	}
+/// The default leaves at least half of every listener's `maxConnections` to connections that are
+/// not held: each accept gate compares the proxy-wide active count, held sockets included, with its
+/// own limit, so the smallest limit is the one holds can exhaust.
+pub fn default_max_held(max_connections: impl IntoIterator<Item = u32>) -> u32 {
+	max_connections
+		.into_iter()
+		.filter(|&limit| limit > 0)
+		.min()
+		.map_or(DEFAULT_MAX_HELD_CONNECTIONS, |limit| {
+			DEFAULT_MAX_HELD_CONNECTIONS.min(limit / 2)
+		})
 }
 
 /// A held connection, counted proxy-wide (what `maxHeldConnections` caps) and on its listener's
@@ -383,8 +386,13 @@ mod tests {
 
 	#[test]
 	fn the_default_cap_leaves_half_of_max_connections() {
-		assert_eq!(default_max_held(0), DEFAULT_MAX_HELD_CONNECTIONS);
-		assert_eq!(default_max_held(500), 250);
-		assert_eq!(default_max_held(1_000_000), DEFAULT_MAX_HELD_CONNECTIONS);
+		assert_eq!(default_max_held([0]), DEFAULT_MAX_HELD_CONNECTIONS);
+		assert_eq!(default_max_held([500]), 250);
+		assert_eq!(default_max_held([1_000_000]), DEFAULT_MAX_HELD_CONNECTIONS);
+		assert_eq!(
+			default_max_held([1000, 0, 200]),
+			100,
+			"the smallest limit any listener's gate applies"
+		);
 	}
 }

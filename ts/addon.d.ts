@@ -161,7 +161,7 @@ export interface JsProtectionConfig {
   /**
    * Connections held across the proxy after a client-certificate rejection (`mtls.failureHoldMs`)
    * before this listener closes further rejections at once. 0 holds none. Default: 10000, or half
-   * of `maxConnections` when that is lower.
+   * of the smallest `maxConnections` among the proxy's listeners when that is lower.
    */
   maxHeldConnections?: number
 }
