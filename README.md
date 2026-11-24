@@ -155,7 +155,9 @@ Both fields accept PEM-encoded strings or `Buffer`. The cert chain may include i
 { clientCaCert: string | Buffer, requireClientCert?: boolean, failureHoldMs?: number, failureHoldJitter?: number }
 ```
 
-`requireClientCert` defaults to `true`. Set to `false` to accept connections without a client cert while still validating those that do present one.
+`requireClientCert` defaults to `true` on a listener's `mtls` and to `false` on a route's or a
+`resolveConnection()` route's. `false` accepts connections without a client cert while still
+validating those that do present one, so a route that should refuse certless clients must set it.
 
 `failureHoldMs` (default `0`, at most `600000`) holds a client whose certificate fails verification
 silently for that long instead of answering with a TLS alert, spread by `failureHoldJitter` (0–1,
@@ -285,7 +287,8 @@ How it works, and what follows from it:
   process memory (measured with 2,000 and 8,000 held sockets; the TLS state is freed when the hold
   starts), plus the kernel's own per-socket memory. The default cap bounds holds at roughly 30 MB of
   process memory. The default cap is also at most half of the process's file-descriptor limit
-  (symphony raises that limit only when `maxConnections` is set). A hold ends at its deadline, as soon as its client closes or resets
+  (symphony raises that limit only when `maxConnections` is set). That bound is per proxy: with
+  several port-sets in one `symphony-server`, set `maxHeldConnections` so their sum fits. A hold ends at its deadline, as soon as its client closes or resets
   the connection (within a second if the client has sent more than 64 KiB, which symphony stops
   reading), or when `stop()` is called.
 - **Held sockets are open connections.** They count toward `maxConnections`, the active-connection

@@ -294,6 +294,7 @@ describe('mtls.failureHoldMs', () => {
 				for (const hold of holds) {
 					assert.ok(hold >= 450 && hold <= 1500 + 500, `each hold falls in 1000ms × [0.5, 1.5], got ${holds}`);
 				}
+				// Six uniform draws over 1000 ms all within 20 ms of each other: about 2e-8.
 				assert.ok(Math.max(...holds) - Math.min(...holds) >= 20, `holds must not all be equal, got ${holds}`);
 			} finally {
 				await jitterProxy.stop();
