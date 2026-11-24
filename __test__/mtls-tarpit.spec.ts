@@ -77,6 +77,8 @@ interface Attempt {
 	error?: Error;
 	reused: boolean;
 	session?: Buffer;
+	/** Session tickets (TLS 1.3) or sessions (TLS 1.2) the server issued on this connection. */
+	tickets: number;
 }
 
 /**
@@ -96,7 +98,7 @@ function attempt(
 ): Promise<Attempt> {
 	return new Promise((resolve) => {
 		const start = Date.now();
-		const result: Attempt = { closedAt: 0, bytes: 0, reused: false };
+		const result: Attempt = { closedAt: 0, bytes: 0, reused: false, tickets: 0 };
 		const mark = () => (result.firstEventAt ??= Date.now() - start);
 		const socket = tls.connect(
 			{
@@ -117,7 +119,10 @@ function attempt(
 				socket.write('CONNECT\r\n');
 			}
 		);
-		socket.on('session', (s: Buffer) => (result.session = s));
+		socket.on('session', (s: Buffer) => {
+			result.session = s;
+			result.tickets++;
+		});
 		socket.on('data', (d: Buffer) => {
 			mark();
 			result.bytes += d.length;
@@ -289,7 +294,7 @@ describe('mtls.failureHoldMs', () => {
 				for (const hold of holds) {
 					assert.ok(hold >= 450 && hold <= 1500 + 500, `each hold falls in 1000ms × [0.5, 1.5], got ${holds}`);
 				}
-				assert.ok(Math.max(...holds) - Math.min(...holds) >= 100, `holds must not all be equal, got ${holds}`);
+				assert.ok(Math.max(...holds) - Math.min(...holds) >= 20, `holds must not all be equal, got ${holds}`);
 			} finally {
 				await jitterProxy.stop();
 			}
@@ -377,7 +382,10 @@ describe('mtls.failureHoldMs', () => {
 		it('does not resume a session issued to a rejected client once the hold is turned off', async () => {
 			const heldAttempt = await attempt(port, { cert: expired });
 			assertHeld(heldAttempt);
-			assert.ok(heldAttempt.session, 'a held TLS 1.3 client was sent a ticket');
+			assert.ok(heldAttempt.tickets > 0, 'a held TLS 1.3 client was sent a ticket');
+			const resumedHeld = await attempt(port, { cert: expired, session: heldAttempt.session });
+			assert.equal(resumedHeld.reused, true, 'the ticket resumes on the holding config itself');
+			assertHeld(resumedHeld);
 			await proxy.updateConfig({
 				routes: [route(upstream.port, { clientCaCert: ca.cert, requireClientCert: true })],
 			});

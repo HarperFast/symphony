@@ -175,7 +175,7 @@ default `0.5`). See [Holding clients whose certificate fails](#holding-clients-w
 | `ja4Blocklist` | `string[]` | `[]` | JA4 TLS fingerprints to block (36-char strings; see [JA4 blocking](#ja4-blocking)) |
 | `tlsHandshakeTimeoutMs` | `number` | `10000` | Abort slow TLS handshakes |
 | `requireSni` | `boolean` | `false` | Reject connections without an SNI extension |
-| `maxHeldConnections` | `number` | `10000`, or half of the smallest `maxConnections` if lower | Connections held at once, across the proxy, after a client-certificate rejection (`mtls.failureHoldMs`); further rejections on this listener close at once. `0` holds none |
+| `maxHeldConnections` | `number` | `10000`, or half of the smallest `maxConnections` or of the fd limit if lower | Connections held at once, across the proxy, after a client-certificate rejection (`mtls.failureHoldMs`); further rejections on this listener close at once. `0` holds none |
 
 A dual-stack (`[::]`) listener reports an IPv4 client as `::ffff:a.b.c.d`. Protection treats it as
 `a.b.c.d`: only IPv4 `allowlist`/`blocklist` entries match it (`::/0` does not; use `0.0.0.0/0`
@@ -274,7 +274,8 @@ How it works, and what follows from it:
   match its certificate (CertificateVerify fails). These, cipher mismatches, handshake timeouts and
   scanners still get today's immediate failure.
 - **The cap.** `protection.maxHeldConnections` (default `10000`, or half of the smallest
-  `maxConnections` among the proxy's listeners when that is lower) bounds the sockets held at once.
+  `maxConnections` among the proxy's listeners or of the process's file-descriptor limit, when
+  lower) bounds the sockets held at once.
   Like `maxConnections`, a listener compares its value with the count across the whole proxy, so by
   default held sockets never take more than half of any listener's accept budget. Past it, a failing client is closed at once without an
   alert: by then there is no handshake left to fail. `0` holds none. A lowered cap applies to new
@@ -283,8 +284,8 @@ How it works, and what follows from it:
 - **What a held socket costs.** One file descriptor, no upstream connection, and about 3 KiB of
   process memory (measured with 2,000 and 8,000 held sockets; the TLS state is freed when the hold
   starts), plus the kernel's own per-socket memory. The default cap bounds holds at roughly 30 MB of
-  process memory. symphony raises the process's file-descriptor limit only when `maxConnections` is
-  set, so without it make sure the limit covers the held sockets too. A hold ends at its deadline, as soon as its client closes or resets
+  process memory. The default cap is also at most half of the process's file-descriptor limit
+  (symphony raises that limit only when `maxConnections` is set). A hold ends at its deadline, as soon as its client closes or resets
   the connection (within a second if the client has sent more than 64 KiB, which symphony stops
   reading), or when `stop()` is called.
 - **Held sockets are open connections.** They count toward `maxConnections`, the active-connection
@@ -294,8 +295,8 @@ How it works, and what follows from it:
   the alert) and `failureHoldJitter` hot-swap through `updateConfig`. Changing a route's hold
   between two non-zero values keeps sessions resumable. Turning it on or off swaps the route's TLS config, so clients of
   that route do one full handshake. An invalid value (a hold that is negative, over `600000` or not
-  a number; a jitter outside 0–1; in a `symphony-server` config file, a value of the wrong type)
-  serves the route without the hold and counts it in `failingRoutes`. A route serving its last-good config because its cert
+  a number; a jitter outside 0–1; in a `symphony-server` config file, a value of the wrong type,
+  where `null` counts as unset) serves the route without the hold and counts it in `failingRoutes`. A route serving its last-good config because its cert
   failed to rebuild keeps its previous hold setting, like its cert and upstreams, until it rebuilds.
 - **Failover.** The hold happens on the node that terminates the connection. A route that checks
   after the handshake never connects to its upstream early, so, like a route that requires a client

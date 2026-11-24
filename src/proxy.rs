@@ -186,7 +186,7 @@ pub struct JsProtectionConfig {
 	pub require_sni: Option<bool>,
 	/// Connections held across the proxy after a client-certificate rejection (`mtls.failureHoldMs`)
 	/// before this listener closes further rejections at once. 0 holds none. Default: 10000, or half
-	/// of the smallest `maxConnections` among the proxy's listeners when that is lower.
+	/// of the smallest `maxConnections` among the proxy's listeners or of the fd limit, when lower.
 	pub max_held_connections: Option<f64>,
 }
 
@@ -715,8 +715,10 @@ impl SymphonyProxyWrap {
 
 		let (tx, _) = broadcast::channel(1);
 		let (release_holds, holds_released) = watch::channel(());
-		let default_max_held =
-			crate::tarpit::default_max_held(self.listeners.iter().map(|l| l.max_connections));
+		let default_max_held = crate::tarpit::default_max_held(
+			self.listeners.iter().map(|l| l.max_connections),
+			crate::listener::nofile_soft_limit(),
+		);
 		*shutdown_tx = Some((tx.clone(), release_holds));
 		drop(shutdown_tx);
 
@@ -1429,11 +1431,12 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 
 	let allowed_sources = SourceAllowlist::parse(r.allowed_sources.as_deref().unwrap_or(&[]))
 		.map_err(napi::Error::from_reason)?;
-	let mtls_failure_hold = crate::tarpit::FailureHold::parse(
-		r.mtls.as_ref().and_then(|m| m.failure_hold_ms),
-		r.mtls.as_ref().and_then(|m| m.failure_hold_jitter),
-	)
-	.map_err(|e| napi::Error::from_reason(format!("resolveConnection: {e}")))?;
+	// A passthrough resolution never uses its mtls, so a bad hold there must not close it.
+	let mtls_failure_hold = match r.mtls.as_ref().filter(|_| r.terminate_tls) {
+		None => crate::tarpit::FailureHold::OFF,
+		Some(m) => crate::tarpit::FailureHold::parse(m.failure_hold_ms, m.failure_hold_jitter)
+			.map_err(|e| napi::Error::from_reason(format!("resolveConnection: {e}")))?,
+	};
 
 	Ok(ResolveSpec {
 		upstream,

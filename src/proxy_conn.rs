@@ -100,7 +100,6 @@ pub struct ConnContext {
 	pub tls_buffer_limit: Option<usize>,
 	/// `Some` on a failover ingress listener.
 	pub ingress: Option<Arc<IngressState>>,
-	/// `maxHeldConnections` when protection does not set it.
 	pub default_max_held: u32,
 	/// Closed by `stop()`, which ends every hold.
 	pub holds_released: tokio::sync::watch::Receiver<()>,
@@ -451,7 +450,7 @@ pub async fn handle(mut stream: TcpStream, mut peer_addr: SocketAddr, ctx: Arc<C
 						crate::tarpit::HeldSlot::acquire(
 							&ctx.global_metrics,
 							&ctx.listener_metrics,
-							ctx.max_held_connections(),
+							|| ctx.max_held_connections(),
 						)
 					})
 					.flatten();

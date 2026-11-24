@@ -176,7 +176,8 @@ through a deferring `ServerConfig` reaches no upstream (no connect, no byte) unl
   `tarpit::HeldSlot`), like the count `maxConnections` caps at accept, because the accept gate compares
   the proxy-wide active count with each listener's limit; `ListenerMetrics::held_connections` is only
   the gauge. Only the cap lives on the protection snapshot, which a hot-swap replaces; a listener
-  without protection uses `ConnContext::default_max_held`.
+  without protection uses `ConnContext::default_max_held` (half of the smallest `maxConnections` or
+  of the fd limit, at most 10000). `HeldSlot::acquire` reads the cap inside its CAS.
 - **The hold runs in its own task**, given only the socket (rustls state dropped), its `HeldSlot`, and
   the connection's `ActiveGuard`/`RouteActiveGuard`, so a held socket costs ~3 KiB instead of the whole
   connection future and pins no route-table snapshot. Moving the guards keeps held sockets counted

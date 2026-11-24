@@ -74,20 +74,23 @@ fn random_unit() -> f64 {
 		.unwrap_or(0.5)
 }
 
-/// The listener default for `maxHeldConnections`.
 const DEFAULT_MAX_HELD_CONNECTIONS: u32 = 10_000;
 
-/// The default leaves at least half of every listener's `maxConnections` to connections that are
-/// not held: each accept gate compares the proxy-wide active count, held sockets included, with its
-/// own limit, so the smallest limit is the one holds can exhaust.
-pub fn default_max_held(max_connections: impl IntoIterator<Item = u32>) -> u32 {
-	max_connections
+/// The default leaves at least half of every listener's `maxConnections`, and of the process's
+/// file descriptors, to connections that are not held. Each accept gate compares the proxy-wide
+/// active count, held sockets included, with its own limit, so the smallest limit is the one holds
+/// can exhaust.
+pub fn default_max_held(
+	max_connections: impl IntoIterator<Item = u32>,
+	fd_limit: Option<u64>,
+) -> u32 {
+	let smallest = max_connections.into_iter().filter(|&limit| limit > 0).min();
+	let fds = fd_limit.map(|fds| u32::try_from(fds).unwrap_or(u32::MAX));
+	[smallest, fds]
 		.into_iter()
-		.filter(|&limit| limit > 0)
-		.min()
-		.map_or(DEFAULT_MAX_HELD_CONNECTIONS, |limit| {
-			DEFAULT_MAX_HELD_CONNECTIONS.min(limit / 2)
-		})
+		.flatten()
+		.map(|limit| limit / 2)
+		.fold(DEFAULT_MAX_HELD_CONNECTIONS, u32::min)
 }
 
 /// A held connection, counted proxy-wide (what `maxHeldConnections` caps) and on its listener's
@@ -98,17 +101,17 @@ pub struct HeldSlot {
 }
 
 impl HeldSlot {
-	/// `None` once `cap` connections are held across the proxy. A lowered cap applies to new
-	/// acquisitions only.
+	/// `None` once `cap()` connections are held across the proxy. The cap is read on every attempt,
+	/// so one lowered meanwhile applies; holds already taken run out.
 	pub fn acquire(
 		global: &Arc<GlobalMetrics>,
 		listener: &Arc<ListenerMetrics>,
-		cap: u32,
+		cap: impl Fn() -> u32,
 	) -> Option<Self> {
 		global
 			.held_connections
 			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
-				(held < u64::from(cap)).then_some(held + 1)
+				(held < u64::from(cap())).then_some(held + 1)
 			})
 			.ok()?;
 		listener.held_connections.fetch_add(1, Ordering::Relaxed);
@@ -155,10 +158,12 @@ pub async fn hold_silently(
 			}
 		}
 	};
+	// Biased so that once the deadline or a stop is due, no more of the client's bytes are read.
 	tokio::select! {
-		_ = until_closed => {}
-		_ = tokio::time::sleep_until(deadline) => {}
+		biased;
 		_ = stop.changed() => {}
+		_ = tokio::time::sleep_until(deadline) => {}
+		_ = until_closed => {}
 	}
 }
 
@@ -344,21 +349,21 @@ mod tests {
 		);
 		let held = |m: &ListenerMetrics| m.held_connections.load(Ordering::Relaxed);
 		let mut slots: Vec<_> = (0..2)
-			.filter_map(|_| HeldSlot::acquire(&global, &a, 3))
+			.filter_map(|_| HeldSlot::acquire(&global, &a, || 3))
 			.collect();
-		slots.extend((0..2).filter_map(|_| HeldSlot::acquire(&global, &b, 3)));
+		slots.extend((0..2).filter_map(|_| HeldSlot::acquire(&global, &b, || 3)));
 		assert_eq!(
 			slots.len(),
 			3,
 			"the cap counts the whole proxy, as maxConnections does"
 		);
 		assert_eq!((held(&a), held(&b)), (2, 1));
-		assert!(HeldSlot::acquire(&global, &a, 0).is_none());
+		assert!(HeldSlot::acquire(&global, &a, || 0).is_none());
 		assert_eq!(held(&a), 2, "a refused slot leaves the gauge alone");
 		drop(slots);
 		assert_eq!(global.held_connections.load(Ordering::Relaxed), 0);
 		assert_eq!((held(&a), held(&b)), (0, 0));
-		assert!(HeldSlot::acquire(&global, &b, 1).is_some());
+		assert!(HeldSlot::acquire(&global, &b, || 1).is_some());
 	}
 
 	#[test]
@@ -370,7 +375,7 @@ mod tests {
 			for _ in 0..8 {
 				scope.spawn(|| {
 					for _ in 0..1000 {
-						if let Some(slot) = HeldSlot::acquire(&global, &metrics, 4) {
+						if let Some(slot) = HeldSlot::acquire(&global, &metrics, || 4) {
 							let now = taken.fetch_add(1, Ordering::SeqCst) + 1;
 							assert!(now <= 4, "{now} slots held under a cap of 4");
 							taken.fetch_sub(1, Ordering::SeqCst);
@@ -386,13 +391,26 @@ mod tests {
 
 	#[test]
 	fn the_default_cap_leaves_half_of_max_connections() {
-		assert_eq!(default_max_held([0]), DEFAULT_MAX_HELD_CONNECTIONS);
-		assert_eq!(default_max_held([500]), 250);
-		assert_eq!(default_max_held([1_000_000]), DEFAULT_MAX_HELD_CONNECTIONS);
+		assert_eq!(default_max_held([0], None), DEFAULT_MAX_HELD_CONNECTIONS);
+		assert_eq!(default_max_held([500], None), 250);
 		assert_eq!(
-			default_max_held([1000, 0, 200]),
+			default_max_held([1_000_000], None),
+			DEFAULT_MAX_HELD_CONNECTIONS
+		);
+		assert_eq!(
+			default_max_held([1000, 0, 200], None),
 			100,
 			"the smallest limit any listener's gate applies"
+		);
+		assert_eq!(
+			default_max_held([0], Some(1024)),
+			512,
+			"half the file descriptors"
+		);
+		assert_eq!(default_max_held([300], Some(1024)), 150);
+		assert_eq!(
+			default_max_held([0], Some(u64::MAX)),
+			DEFAULT_MAX_HELD_CONNECTIONS
 		);
 	}
 }

@@ -340,7 +340,7 @@ export interface ProtectionConfig {
 	 * Connections held at once after a client-certificate rejection (`mtls.failureHoldMs`), counted
 	 * across the proxy like `maxConnections`; past it this listener closes rejections at once, without
 	 * an alert. 0 holds none. Default: 10000, or half of the smallest `maxConnections` among the proxy's
-	 * listeners when that is lower. Held connections count toward `maxConnections` and
+	 * listeners or of the process's file-descriptor limit, when that is lower. Held connections count toward `maxConnections` and
 	 * `maxConcurrentPerIp`.
 	 */
 	maxHeldConnections?: number;

@@ -114,6 +114,16 @@ pub(crate) fn make_reuseport_socket(
 	Ok(socket.into())
 }
 
+/// The process's soft file-descriptor limit, `None` when unlimited or unknown.
+pub(crate) fn nofile_soft_limit() -> Option<libc::rlim_t> {
+	let mut rlim = libc::rlimit {
+		rlim_cur: 0,
+		rlim_max: 0,
+	};
+	let ret = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
+	(ret == 0 && rlim.rlim_cur != libc::RLIM_INFINITY).then_some(rlim.rlim_cur)
+}
+
 pub(crate) fn set_rlimit_nofile(desired: u64) -> crate::error::Result<()> {
 	use libc::{getrlimit, rlimit, setrlimit, RLIMIT_NOFILE};
 
