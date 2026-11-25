@@ -222,6 +222,13 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 				l.halfClosedConnections,
 				tags
 			);
+			out.sample(
+				'symphony_listener_held_connections',
+				'gauge',
+				'Connections held silently after their client certificate was rejected (mtls.failureHoldMs).',
+				l.heldConnections,
+				tags
+			);
 			out.sample('symphony_listener_accepted_total', 'counter', 'Connections accepted for proxying.', l.accepted, tags);
 			out.sample(
 				'symphony_listener_bytes_received_total',

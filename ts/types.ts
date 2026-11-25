@@ -50,6 +50,20 @@ export interface MtlsConfig {
 	clientCaCert: string | Buffer;
 	/** Whether to reject clients that do not present a certificate. Default: false (optional client cert). */
 	requireClientCert?: boolean;
+	/**
+	 * Hold a client whose presented certificate fails verification (expired, unknown issuer, bad
+	 * signature, wrong usage) silently for this many ms, then close it, instead of answering with a
+	 * TLS alert, so a client that reconnects at once after every rejection is slowed to about one
+	 * attempt per hold. 0 (default) keeps the immediate alert; at most 600000. Terminating routes
+	 * only. A client that presents no certificate is never held. See the README's "Holding clients
+	 * whose certificate fails".
+	 */
+	failureHoldMs?: number;
+	/**
+	 * Spread of each hold: `failureHoldMs` scaled by a uniform draw from `[1 - jitter, 1 + jitter]`,
+	 * so clients rejected together don't all retry together. 0..1, default 0.5.
+	 */
+	failureHoldJitter?: number;
 }
 
 // ── Route config ──────────────────────────────────────────────────────────────
@@ -322,6 +336,14 @@ export interface ProtectionConfig {
 	tlsHandshakeTimeoutMs?: number;
 	/** Reject connections that present no SNI. Default: false. */
 	requireSni?: boolean;
+	/**
+	 * Connections held at once after a client-certificate rejection (`mtls.failureHoldMs`), counted
+	 * across the proxy like `maxConnections`; past it this listener closes rejections at once, without
+	 * an alert. 0 holds none. Default: 10000, or half of the smallest `maxConnections` among the proxy's
+	 * listeners or of the process's file-descriptor limit, when that is lower. Held connections count toward `maxConnections` and
+	 * `maxConcurrentPerIp`.
+	 */
+	maxHeldConnections?: number;
 }
 
 // ── Listener config ───────────────────────────────────────────────────────────
@@ -475,6 +497,8 @@ export interface ListenerMetrics {
 	activeConnections: number;
 	/** Subset of `activeConnections` whose write half to the client is shut down, awaiting its FIN. */
 	halfClosedConnections: number;
+	/** Subset of `activeConnections` held silently after a client-certificate rejection (`mtls.failureHoldMs`). */
+	heldConnections: number;
 	accepted: number;
 	blocked: number;
 	errors: number;

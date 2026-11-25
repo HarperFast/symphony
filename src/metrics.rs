@@ -82,8 +82,16 @@ labeled_enum!(ErrorKind {
 	RouteRateLimited => "route_rate_limited",
 	/// A suspended connection was never resolved — timed out or rejected by JS.
 	SuspendUnresolved => "suspend_unresolved",
-	/// TLS handshake failed or timed out.
+	/// TLS handshake failed or timed out, other than a rejected client certificate.
 	TlsHandshake => "tls_handshake",
+	/// The client certificate is past its `notAfter`: rejected in the handshake, or after it on a
+	/// route with `failureHoldMs`.
+	ClientCertExpired => "client_cert_expired",
+	/// Any other client-certificate verification failure: unknown issuer, a bad signature on the
+	/// chain or on CertificateVerify, not yet valid, wrong key usage, malformed.
+	ClientCertUntrusted => "client_cert_untrusted",
+	/// A route that requires a client certificate got none.
+	ClientCertMissing => "client_cert_missing",
 	/// Route asks for TLS termination but has no usable cert (e.g. cert build failed).
 	TlsMissingCert => "tls_missing_cert",
 	/// Could not establish the upstream connection — locally, or, on a failover route, to any peer.
@@ -139,6 +147,9 @@ pub struct ListenerMetrics {
 	/// A rising floor here is the leak in issue #45 becoming visible while it is still counted
 	/// in connections rather than gigabytes.
 	pub half_closed_connections: AtomicU64,
+	/// Subset of `active_connections` held silently after their client certificate was rejected
+	/// (`failureHoldMs`).
+	pub held_connections: AtomicU64,
 	pub total_accepted: AtomicU64,
 	/// Bytes read from clients on this listener (client → upstream), counted where the proxy
 	/// sees them. On a terminated-TLS route that is the plaintext stream — the handshake happens
@@ -159,6 +170,7 @@ impl Default for ListenerMetrics {
 		Self {
 			active_connections: AtomicU64::new(0),
 			half_closed_connections: AtomicU64::new(0),
+			held_connections: AtomicU64::new(0),
 			total_accepted: AtomicU64::new(0),
 			bytes_in: AtomicU64::new(0),
 			bytes_out: AtomicU64::new(0),
@@ -375,6 +387,9 @@ pub fn total_of(counts: &[(&'static str, u64)]) -> u64 {
 #[derive(Default)]
 pub struct GlobalMetrics {
 	pub active_connections: AtomicU64,
+	/// Connections held after a client-certificate rejection, across listeners: the count each
+	/// listener's `maxHeldConnections` caps, as `maxConnections` caps `active_connections`.
+	pub held_connections: AtomicU64,
 	pub pending_suspended: AtomicU64,
 	/// Suspended connections that JS resolved with a route.
 	pub suspended_resolved: AtomicU64,

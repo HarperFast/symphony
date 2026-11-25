@@ -1,5 +1,6 @@
 use crate::error::{Result, SymphonyError};
 use crate::mtls::SymphonyClientVerifier;
+use crate::tarpit::FailureHold;
 use rustls::ServerConfig;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -17,9 +18,39 @@ pub struct CertSpec {
 pub struct MtlsSpec {
 	pub client_ca_pem: Vec<u8>,
 	pub require_client_cert: bool,
+	/// How long a client whose certificate fails verification is held instead of alerted. Any hold
+	/// moves the chain check out of the handshake (`TlsTermination::deferred`).
+	pub failure_hold: FailureHold,
 }
 
-/// key: (cert_sha256, mtls_sha256_or_zeros, http2)
+impl MtlsSpec {
+	fn defers_chain_check(&self) -> bool {
+		!self.failure_hold.is_off()
+	}
+}
+
+/// A route's TLS termination. The config and its deferred check are one value so that nothing can
+/// hold a deferring config without the check every connection accepted through it must pass.
+#[derive(Clone)]
+pub struct TlsTermination {
+	pub config: Arc<ServerConfig>,
+	/// `Some` exactly when `config`'s verifier defers the chain check.
+	pub deferred: Option<Arc<DeferredClientAuth>>,
+}
+
+pub struct DeferredClientAuth {
+	/// The verifier inside `config`, so the check runs against the roots the handshake used.
+	pub verifier: Arc<SymphonyClientVerifier>,
+	pub hold: FailureHold,
+}
+
+struct CachedConfig {
+	config: Arc<ServerConfig>,
+	deferring_verifier: Option<Arc<SymphonyClientVerifier>>,
+}
+
+/// key: (cert_sha256, mtls_sha256_or_zeros, http2). The mTLS hash covers whether the chain check is
+/// deferred, so a session issued without that check can never resume on a config that relies on it.
 type CacheKey = ([u8; 32], [u8; 32], bool);
 
 /// Builds and deduplicates Arc<ServerConfig> instances.
@@ -38,7 +69,7 @@ type CacheKey = ([u8; 32], [u8; 32], bool);
 /// live by refcount alone: kept while a connection holds one, dropped by the next build's
 /// `clear_used` or by an insert past `evict_at` — whichever comes first.
 pub struct TlsConfigCache {
-	cache: HashMap<CacheKey, Arc<ServerConfig>>,
+	cache: HashMap<CacheKey, CachedConfig>,
 	/// Keys touched since the last `retain_used()` — the mark half of mark-and-sweep.
 	used: HashSet<CacheKey>,
 	evict_at: usize,
@@ -70,7 +101,7 @@ impl TlsConfigCache {
 	pub fn retain_used(&mut self) {
 		let used = std::mem::take(&mut self.used);
 		self.cache
-			.retain(|k, config| used.contains(k) || Arc::strong_count(config) > 1);
+			.retain(|k, cached| used.contains(k) || Arc::strong_count(&cached.config) > 1);
 	}
 
 	/// Discard marks and cache-only configs from a route table that was never committed.
@@ -84,7 +115,8 @@ impl TlsConfigCache {
 	/// Drop every config only the cache holds. A route table or a live connection holding one
 	/// keeps it, so the cost is one full handshake per returning client of an idle resolved route.
 	fn evict_unreferenced(&mut self) {
-		self.cache.retain(|_, config| Arc::strong_count(config) > 1);
+		self.cache
+			.retain(|_, cached| Arc::strong_count(&cached.config) > 1);
 		// Doubling keeps the scan amortised O(1) per insert even when referenced configs alone
 		// exceed the floor; shrinking keeps it so after a large referenced set drains, since
 		// `retain` walks the allocation, not just the live entries.
@@ -108,11 +140,11 @@ impl TlsConfigCache {
 		cert: &CertSpec,
 		mtls: Option<&MtlsSpec>,
 		http2: bool,
-	) -> Result<Arc<ServerConfig>> {
-		let (cache_key, cfg) = self.lookup_or_build(cert, mtls, http2)?;
+	) -> Result<TlsTermination> {
+		let (cache_key, termination) = self.lookup_or_build(cert, mtls, http2)?;
 		// A hit is exactly as much "still in use" as a miss.
 		self.used.insert(cache_key);
-		Ok(cfg)
+		Ok(termination)
 	}
 
 	/// For `resolveConnection`: no table will hold the result, so marking it would only add a key
@@ -122,8 +154,9 @@ impl TlsConfigCache {
 		cert: &CertSpec,
 		mtls: Option<&MtlsSpec>,
 		http2: bool,
-	) -> Result<Arc<ServerConfig>> {
-		self.lookup_or_build(cert, mtls, http2).map(|(_, cfg)| cfg)
+	) -> Result<TlsTermination> {
+		self.lookup_or_build(cert, mtls, http2)
+			.map(|(_, termination)| termination)
 	}
 
 	fn lookup_or_build(
@@ -131,7 +164,7 @@ impl TlsConfigCache {
 		cert: &CertSpec,
 		mtls: Option<&MtlsSpec>,
 		http2: bool,
-	) -> Result<(CacheKey, Arc<ServerConfig>)> {
+	) -> Result<(CacheKey, TlsTermination)> {
 		// Hash both chain and private key so routes sharing a cert but using different
 		// keys (e.g. mid-rotation) get distinct ServerConfig allocations.
 		let cert_key = sha256(
@@ -145,21 +178,32 @@ impl TlsConfigCache {
 			.map(|m| {
 				let mut buf = m.client_ca_pem.clone();
 				buf.push(m.require_client_cert as u8);
+				buf.push(m.defers_chain_check() as u8);
 				sha256(&buf)
 			})
 			.unwrap_or([0u8; 32]);
 
 		let cache_key = (cert_key, mtls_key, http2);
-		if let Some(cfg) = self.cache.get(&cache_key) {
-			return Ok((cache_key, cfg.clone()));
+		let termination = |cached: &CachedConfig| TlsTermination {
+			config: cached.config.clone(),
+			deferred: cached.deferring_verifier.as_ref().map(|verifier| {
+				Arc::new(DeferredClientAuth {
+					verifier: verifier.clone(),
+					hold: mtls.map_or(FailureHold::OFF, |m| m.failure_hold),
+				})
+			}),
+		};
+		if let Some(cached) = self.cache.get(&cache_key) {
+			return Ok((cache_key, termination(cached)));
 		}
 
-		let cfg = build_server_config(cert, mtls, http2)?;
-		self.cache.insert(cache_key, cfg.clone());
+		let cached = build_server_config(cert, mtls, http2)?;
+		let built = termination(&cached);
+		self.cache.insert(cache_key, cached);
 		if self.cache.len() > self.evict_at {
 			self.evict_unreferenced();
 		}
-		Ok((cache_key, cfg))
+		Ok((cache_key, built))
 	}
 }
 
@@ -167,7 +211,7 @@ fn build_server_config(
 	cert: &CertSpec,
 	mtls: Option<&MtlsSpec>,
 	http2: bool,
-) -> Result<Arc<ServerConfig>> {
+) -> Result<CachedConfig> {
 	// Parse certificate chain
 	let certs: Vec<_> = {
 		let mut reader = std::io::BufReader::new(cert.cert_chain_pem.as_slice());
@@ -189,8 +233,16 @@ fn build_server_config(
 			.ok_or_else(|| SymphonyError::Config("private key PEM contains no key".into()))?
 	};
 
+	let mut deferring_verifier = None;
 	let mut cfg = if let Some(m) = mtls {
-		let verifier = SymphonyClientVerifier::build(&m.client_ca_pem, m.require_client_cert)?;
+		let verifier = SymphonyClientVerifier::build(
+			&m.client_ca_pem,
+			m.require_client_cert,
+			m.defers_chain_check(),
+		)?;
+		if m.defers_chain_check() {
+			deferring_verifier = Some(verifier.clone());
+		}
 		ServerConfig::builder()
 			.with_client_cert_verifier(verifier)
 			.with_single_cert(certs, key)
@@ -227,7 +279,10 @@ fn build_server_config(
 	cfg.session_storage = rustls::server::ServerSessionMemoryCache::new(1024);
 	cfg.ticketer = rustls::crypto::ring::Ticketer::new().map_err(SymphonyError::Tls)?;
 
-	Ok(Arc::new(cfg))
+	Ok(CachedConfig {
+		config: Arc::new(cfg),
+		deferring_verifier,
+	})
 }
 
 pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
@@ -261,6 +316,7 @@ mod tests {
 				cache
 					.get_or_build_unmarked(&distinct_cert(n), None, false)
 					.unwrap()
+					.config
 			})
 			.collect();
 
@@ -284,6 +340,7 @@ mod tests {
 					&cache
 						.get_or_build_unmarked(&distinct_cert(n), None, false)
 						.unwrap()
+						.config
 				),
 				"a referenced config must survive pressure eviction"
 			);

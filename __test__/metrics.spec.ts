@@ -413,6 +413,7 @@ describe('renderPrometheus', () => {
 							mode: 'tls',
 							activeConnections: 3,
 							halfClosedConnections: 1,
+							heldConnections: 2,
 							accepted: 10,
 							blocked: 2,
 							errors: 1,
@@ -512,6 +513,13 @@ describe('renderPrometheus', () => {
 			lines.includes(
 				'symphony_listener_half_closed_connections{proxy="80,443",listener="0.0.0.0:443",mode="tls"} 1'
 			),
+			output
+		);
+	});
+
+	it('emits the held-connections gauge', () => {
+		assert.ok(
+			lines.includes('symphony_listener_held_connections{proxy="80,443",listener="0.0.0.0:443",mode="tls"} 2'),
 			output
 		);
 	});

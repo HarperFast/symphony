@@ -282,6 +282,114 @@ export function generateClientCa(other = false): ClientCa {
 	return other ? OTHER_CLIENT_CA : CLIENT_CA;
 }
 
+// ── In-test PKI (DER X.509 built with node:crypto) ───────────────────────────
+
+export interface IssuedCert {
+	/** PEM certificate. */
+	cert: string;
+	/** PEM PKCS#8 private key. */
+	key: string;
+	notAfter: Date;
+	privateKey: crypto.KeyObject;
+	subject: string;
+}
+
+function derLength(n: number): Buffer {
+	if (n < 0x80) return Buffer.from([n]);
+	const bytes: number[] = [];
+	for (let left = n; left > 0; left = Math.floor(left / 256)) bytes.unshift(left & 0xff);
+	return Buffer.from([0x80 | bytes.length, ...bytes]);
+}
+
+function der(tag: number, ...content: Buffer[]): Buffer {
+	const body = Buffer.concat(content);
+	return Buffer.concat([Buffer.from([tag]), derLength(body.length), body]);
+}
+
+const derSequence = (...content: Buffer[]) => der(0x30, ...content);
+
+function derOid(dotted: string): Buffer {
+	const [first, second, ...rest] = dotted.split('.').map(Number);
+	const bytes = [first * 40 + second];
+	for (const arc of rest) {
+		const encoded = [arc & 0x7f];
+		for (let left = Math.floor(arc / 128); left > 0; left = Math.floor(left / 128)) encoded.unshift(0x80 | (left & 0x7f));
+		bytes.push(...encoded);
+	}
+	return der(0x06, Buffer.from(bytes));
+}
+
+/** UTCTime through 2049, GeneralizedTime after, as RFC 5280 requires. */
+function derTime(date: Date): Buffer {
+	const digits = date.toISOString().slice(0, 19).replace(/[-:T]/g, '');
+	const year = date.getUTCFullYear();
+	return year >= 1950 && year < 2050 ? der(0x17, Buffer.from(`${digits.slice(2)}Z`)) : der(0x18, Buffer.from(`${digits}Z`));
+}
+
+const derName = (cn: string) => derSequence(der(0x31, derSequence(derOid('2.5.4.3'), der(0x0c, Buffer.from(cn)))));
+
+function derExtension(id: string, critical: boolean, value: Buffer): Buffer {
+	return derSequence(derOid(id), ...(critical ? [der(0x01, Buffer.from([0xff]))] : []), der(0x04, value));
+}
+
+const toPem = (label: string, body: Buffer) =>
+	`-----BEGIN ${label}-----\n${body.toString('base64').match(/.{1,64}/g)!.join('\n')}\n-----END ${label}-----\n`;
+
+/**
+ * Issue a P-256 certificate with chosen validity, signed by `issuer` (self-signed without one).
+ * Built here rather than with `openssl`, whose flags and output vary by build (macOS LibreSSL emits
+ * CA certs webpki rejects), so a test can make an expired, not-yet-valid or short-lived cert anywhere.
+ */
+export function issueCert(opts: {
+	subject: string;
+	issuer?: IssuedCert;
+	/** A CA may sign other certs; otherwise the cert is a client (end-entity) cert. */
+	ca?: boolean;
+	notBefore?: Date;
+	notAfter?: Date;
+}): IssuedCert {
+	const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+	const now = Date.now();
+	const notBefore = opts.notBefore ?? new Date(now - 3_600_000);
+	const notAfter = opts.notAfter ?? new Date(now + 86_400_000);
+	const ecdsaWithSha256 = derSequence(derOid('1.2.840.10045.4.3.2'));
+	const serial = crypto.randomBytes(16);
+	serial[0] &= 0x7f;
+	serial[0] |= 0x01;
+	const extensions = opts.ca
+		? [
+				derExtension('2.5.29.19', true, derSequence(der(0x01, Buffer.from([0xff])))),
+				// keyCertSign | cRLSign
+				derExtension('2.5.29.15', true, der(0x03, Buffer.from([0x01, 0x06]))),
+			]
+		: [
+				derExtension('2.5.29.19', true, derSequence()),
+				// digitalSignature
+				derExtension('2.5.29.15', true, der(0x03, Buffer.from([0x07, 0x80]))),
+				// clientAuth
+				derExtension('2.5.29.37', false, derSequence(derOid('1.3.6.1.5.5.7.3.2'))),
+			];
+	const tbs = derSequence(
+		der(0xa0, der(0x02, Buffer.from([0x02]))),
+		der(0x02, serial),
+		ecdsaWithSha256,
+		derName(opts.issuer?.subject ?? opts.subject),
+		derSequence(derTime(notBefore), derTime(notAfter)),
+		derName(opts.subject),
+		publicKey.export({ type: 'spki', format: 'der' }),
+		der(0xa3, derSequence(...extensions))
+	);
+	const signature = crypto.sign('sha256', tbs, opts.issuer?.privateKey ?? privateKey);
+	const certDer = derSequence(tbs, ecdsaWithSha256, der(0x03, Buffer.from([0x00]), signature));
+	return {
+		cert: toPem('CERTIFICATE', certDer),
+		key: privateKey.export({ type: 'pkcs8', format: 'pem' }) as string,
+		notAfter,
+		privateKey,
+		subject: opts.subject,
+	};
+}
+
 // ── Free port helper ───────────────────────────────────────────────────────────
 
 /** Obtain a free TCP port on localhost. */

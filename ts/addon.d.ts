@@ -27,6 +27,16 @@ export interface JsCertConfig {
 export interface JsMtlsConfig {
   clientCaCert: string | Buffer
   requireClientCert?: boolean
+  /**
+   * Hold a client whose presented certificate fails verification silently for this many ms,
+   * then close it, instead of answering with a TLS alert. Default 0: alert at once.
+   */
+  failureHoldMs?: number
+  /**
+   * Each hold is `failureHoldMs` scaled by a uniform draw from [1 - jitter, 1 + jitter], 0..=1.
+   * Default 0.5.
+   */
+  failureHoldJitter?: number
 }
 export interface JsRouteConfig {
   sni: string
@@ -148,6 +158,12 @@ export interface JsProtectionConfig {
   ja4Blocklist?: Array<string>
   tlsHandshakeTimeoutMs?: number
   requireSni?: boolean
+  /**
+   * Connections held across the proxy after a client-certificate rejection (`mtls.failureHoldMs`)
+   * before this listener closes further rejections at once. 0 holds none. Default: 10000, or half
+   * of the smallest `maxConnections` among the proxy's listeners or of the fd limit, when lower.
+   */
+  maxHeldConnections?: number
 }
 export interface JsListenerConfig {
   host?: string
@@ -235,6 +251,8 @@ export interface JsListenerMetrics {
   activeConnections: number
   /** Subset of `activeConnections` whose write half to the client is shut down, awaiting its FIN. */
   halfClosedConnections: number
+  /** Subset of `activeConnections` held silently after a client-certificate rejection. */
+  heldConnections: number
   accepted: number
   blocked: number
   errors: number

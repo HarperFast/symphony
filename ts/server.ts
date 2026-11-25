@@ -37,6 +37,8 @@ interface FileMtlsConfig {
 	clientCaCert?: string;
 	clientCaCertFile?: string;
 	requireClientCert?: boolean;
+	failureHoldMs?: number;
+	failureHoldJitter?: number;
 }
 
 type FileRouteConfig = Omit<RouteConfig, 'cert' | 'mtls'> & {
@@ -97,7 +99,20 @@ function resolveMtls(m: FileMtlsConfig, baseDir: string): MtlsConfig {
 	if (clientCaCert === undefined) {
 		throw new Error('route mtls requires a client CA (clientCaCert/clientCaCertFile)');
 	}
-	return { clientCaCert, requireClientCert: m.requireClientCert };
+	return {
+		clientCaCert,
+		requireClientCert: m.requireClientCert,
+		failureHoldMs: asNumber(m.failureHoldMs),
+		failureHoldJitter: asNumber(m.failureHoldJitter),
+	};
+}
+
+// A hold setting of the wrong JSON type reaches the native layer as NaN, so that one route is
+// served without the hold, as for any invalid value, instead of the type error failing the
+// whole port-set.
+function asNumber(value: unknown): number | undefined {
+	if (value === undefined || value === null) return undefined;
+	return typeof value === 'number' ? value : Number.NaN;
 }
 
 // A cert the Rust layer is guaranteed to reject at build time (empty PEM → "no

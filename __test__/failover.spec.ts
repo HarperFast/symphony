@@ -1277,7 +1277,7 @@ describe('a TLS-terminating failover route', { skip: noClientAddress, timeout: S
 			assert.equal(await tryEcho({ port: a.publicPort }), null);
 			await sleep(50);
 			assert.equal(upstreamA.accepted, 0);
-			assert.equal(count(routeMetrics(nodeA).errorsByReason, 'tls_handshake'), 1);
+			assert.equal(count(routeMetrics(nodeA).errorsByReason, 'client_cert_missing'), 1);
 
 			assert.equal(await tryEcho({ port: a.publicPort, clientCert: ca.clientCert, clientKey: ca.clientKey }), 'ping');
 			assert.equal(upstreamA.accepted, 1);

@@ -2,9 +2,9 @@ use crate::balancer::{UdsBalancer, UdsSlotSpec};
 use crate::router::{
 	Destination, ForwardFingerprint, RouteProtocol, SourceAddressMode, SourceAllowlist,
 };
-use crate::tls::{CertSpec, MtlsSpec, TlsConfigCache};
+use crate::tarpit::FailureHold;
+use crate::tls::{CertSpec, MtlsSpec, TlsConfigCache, TlsTermination};
 use dashmap::DashMap;
-use rustls::ServerConfig;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 /// The resolved route sent back from JS via `resolveConnection()`.
 pub struct ResolvedRoute {
 	pub destination: Destination,
-	pub tls_config: Option<Arc<ServerConfig>>,
+	pub tls_config: Option<TlsTermination>,
 	pub terminate_tls: bool,
 	pub source_address_mode: SourceAddressMode,
 	pub forward_fingerprint: ForwardFingerprint,
@@ -78,6 +78,7 @@ pub struct ResolveSpec {
 	pub key_pem: Option<Vec<u8>>,
 	pub mtls_ca_pem: Option<Vec<u8>>,
 	pub require_client_cert: bool,
+	pub mtls_failure_hold: FailureHold,
 	pub source_address_mode: SourceAddressMode,
 	pub forward_fingerprint: ForwardFingerprint,
 	pub http2: bool,
@@ -121,6 +122,7 @@ pub fn build_resolved_route(
 		let mtls_spec = spec.mtls_ca_pem.as_deref().map(|ca| MtlsSpec {
 			client_ca_pem: ca.to_vec(),
 			require_client_cert: spec.require_client_cert,
+			failure_hold: spec.mtls_failure_hold,
 		});
 
 		let mut cache = tls_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -168,6 +170,15 @@ mod tests {
 	use super::*;
 	use crate::router::tests::{CERT_A, KEY_A, KEY_B};
 	use crate::router::{build_route_table, ListenerTlsSpec, RouteSpec};
+	use rustls::ServerConfig;
+	use std::time::Duration;
+
+	fn hold_of(ms: u64) -> FailureHold {
+		FailureHold {
+			hold: Duration::from_millis(ms),
+			jitter: 0.0,
+		}
+	}
 
 	fn resolve_spec(key: &[u8]) -> ResolveSpec {
 		ResolveSpec {
@@ -177,6 +188,7 @@ mod tests {
 			key_pem: Some(key.to_vec()),
 			mtls_ca_pem: None,
 			require_client_cert: false,
+			mtls_failure_hold: FailureHold::OFF,
 			source_address_mode: SourceAddressMode::None,
 			forward_fingerprint: ForwardFingerprint::NONE,
 			http2: false,
@@ -190,6 +202,7 @@ mod tests {
 			.expect("resolve")
 			.tls_config
 			.expect("terminating route")
+			.config
 	}
 
 	/// A committed route-table reload, as `update_config` runs it.
@@ -222,10 +235,15 @@ mod tests {
 		mtls_required.require_client_cert = true;
 		let mut mtls_optional = resolve_spec(KEY_A);
 		mtls_optional.mtls_ca_pem = Some(CERT_A.to_vec());
+		// A deferring config issues sessions before the chain check runs.
+		let mut mtls_holding = resolve_spec(KEY_A);
+		mtls_holding.mtls_ca_pem = Some(CERT_A.to_vec());
+		mtls_holding.require_client_cert = true;
+		mtls_holding.mtls_failure_hold = hold_of(1000);
 		let mut h2 = resolve_spec(KEY_A);
 		h2.http2 = true;
 
-		let configs: Vec<_> = [&plain, &mtls_required, &mtls_optional, &h2]
+		let configs: Vec<_> = [&plain, &mtls_required, &mtls_optional, &mtls_holding, &h2]
 			.into_iter()
 			.map(|spec| tls_config(spec, &cache))
 			.collect();
@@ -244,11 +262,40 @@ mod tests {
 		let table_config = table
 			.resolve(Some("tenant.example.com"))
 			.and_then(|r| r.tls_config.clone())
-			.expect("route config");
+			.expect("route config")
+			.config;
 		assert!(Arc::ptr_eq(
 			&table_config,
 			&tls_config(&resolve_spec(KEY_A), &cache)
 		));
+	}
+
+	#[test]
+	fn the_hold_duration_does_not_key_a_separate_config() {
+		let cache = Mutex::new(TlsConfigCache::new());
+		let holding = |ms| {
+			let mut spec = resolve_spec(KEY_A);
+			spec.mtls_ca_pem = Some(CERT_A.to_vec());
+			spec.mtls_failure_hold = hold_of(ms);
+			build_resolved_route(&spec, &cache)
+				.unwrap()
+				.tls_config
+				.unwrap()
+		};
+		let (short, long) = (holding(1_000), holding(30_000));
+		assert!(Arc::ptr_eq(&short.config, &long.config));
+		let (short, long) = (short.deferred.unwrap(), long.deferred.unwrap());
+		assert!(Arc::ptr_eq(&short.verifier, &long.verifier));
+		assert_eq!((short.hold, long.hold), (hold_of(1_000), hold_of(30_000)));
+	}
+
+	#[test]
+	fn a_strict_config_carries_no_deferred_check() {
+		let cache = Mutex::new(TlsConfigCache::new());
+		let mut spec = resolve_spec(KEY_A);
+		spec.mtls_ca_pem = Some(CERT_A.to_vec());
+		let resolved = build_resolved_route(&spec, &cache).unwrap();
+		assert!(resolved.tls_config.unwrap().deferred.is_none());
 	}
 
 	#[test]

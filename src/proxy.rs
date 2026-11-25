@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::{Handle as RtHandle, Runtime};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 // ── JS-facing config types (in / out of NAPI boundary only) ──────────────────
 
@@ -53,6 +53,12 @@ pub struct JsCertConfig {
 pub struct JsMtlsConfig {
 	pub client_ca_cert: Either<String, Buffer>,
 	pub require_client_cert: Option<bool>,
+	/// Hold a client whose presented certificate fails verification silently for this many ms,
+	/// then close it, instead of answering with a TLS alert. Default 0: alert at once.
+	pub failure_hold_ms: Option<f64>,
+	/// Each hold is `failureHoldMs` scaled by a uniform draw from [1 - jitter, 1 + jitter], 0..=1.
+	/// Default 0.5.
+	pub failure_hold_jitter: Option<f64>,
 }
 
 #[napi(object)]
@@ -178,6 +184,10 @@ pub struct JsProtectionConfig {
 	pub ja4_blocklist: Option<Vec<String>>,
 	pub tls_handshake_timeout_ms: Option<f64>,
 	pub require_sni: Option<bool>,
+	/// Connections held across the proxy after a client-certificate rejection (`mtls.failureHoldMs`)
+	/// before this listener closes further rejections at once. 0 holds none. Default: 10000, or half
+	/// of the smallest `maxConnections` among the proxy's listeners or of the fd limit, when lower.
+	pub max_held_connections: Option<f64>,
 }
 
 #[napi(object)]
@@ -271,6 +281,8 @@ pub struct JsListenerMetrics {
 	pub active_connections: f64,
 	/// Subset of `activeConnections` whose write half to the client is shut down, awaiting its FIN.
 	pub half_closed_connections: f64,
+	/// Subset of `activeConnections` held silently after a client-certificate rejection.
+	pub held_connections: f64,
 	pub accepted: f64,
 	pub blocked: f64,
 	pub errors: f64,
@@ -453,8 +465,9 @@ pub struct SymphonyProxyWrap {
 	suspended_registry: Arc<SuspendedRegistry>,
 	global_metrics: Arc<GlobalMetrics>,
 	listener_states: Vec<ListenerState>,
-	// Interior mutability for start/stop
-	shutdown_tx: Mutex<Option<broadcast::Sender<()>>>,
+	// Interior mutability for start/stop. The watch sender is only ever dropped: that ends every
+	// hold, and a hold that starts afterwards sees it closed.
+	shutdown_tx: Mutex<Option<(broadcast::Sender<()>, watch::Sender<()>)>>,
 	// Outlives every route-table build so an unchanged cert keeps the same ServerConfig — and
 	// with it the TLS session cache and ticket keys — across hot-swaps.
 	tls_cache: Mutex<TlsConfigCache>,
@@ -701,7 +714,12 @@ impl SymphonyProxyWrap {
 		};
 
 		let (tx, _) = broadcast::channel(1);
-		*shutdown_tx = Some(tx.clone());
+		let (release_holds, holds_released) = watch::channel(());
+		let default_max_held = crate::tarpit::default_max_held(
+			self.listeners.iter().map(|l| l.max_connections),
+			crate::listener::nofile_soft_limit(),
+		);
+		*shutdown_tx = Some((tx.clone(), release_holds));
 		drop(shutdown_tx);
 
 		for ((i, listener), sockets) in self.listeners.iter().enumerate().zip(bound) {
@@ -729,6 +747,8 @@ impl SymphonyProxyWrap {
 				upstream_read_buffer_size: self.upstream_read_buffer_size,
 				tls_buffer_limit: self.tls_buffer_limit,
 				ingress: state.ingress.clone(),
+				default_max_held,
+				holds_released: holds_released.clone(),
 				js_emit: self.js_emit.clone(),
 			});
 
@@ -804,7 +824,7 @@ impl SymphonyProxyWrap {
 
 	#[napi]
 	pub async fn stop(&self, timeout_ms: Option<f64>) -> Result<()> {
-		if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
+		if let Some((tx, _release_holds)) = self.shutdown_tx.lock().unwrap().take() {
 			let _ = tx.send(());
 		}
 		let ms = timeout_ms.unwrap_or(100.0).min(5_000.0) as u64;
@@ -922,16 +942,8 @@ impl SymphonyProxyWrap {
 			None
 		};
 
-		// All validation passed — apply atomically (routes then protection, neither applied on any error above).
-		if let Some(table) = new_route_table {
-			self.route_table.swap(table);
-			// Committed — now retire the ServerConfigs (and their session state) that no route
-			// in the new table asked for, i.e. rotated-out certs.
-			self.tls_cache
-				.lock()
-				.unwrap_or_else(|e| e.into_inner())
-				.retain_used();
-		}
+		// All validation passed — apply (protection then routes, neither applied on any error above).
+		// Protection first, so a route's new hold is never taken under the cap the update replaces.
 		if let Some((protection_updates, parsed)) = validated_protection {
 			// Phase 3: store all (infallible — validation above guarantees each port is valid).
 			for (update, cfg) in protection_updates.iter().zip(parsed) {
@@ -943,6 +955,15 @@ impl SymphonyProxyWrap {
 					.expect("validated above");
 				prot.config.store(Arc::new(cfg));
 			}
+		}
+		if let Some(table) = new_route_table {
+			self.route_table.swap(table);
+			// Committed — now retire the ServerConfigs (and their session state) that no route
+			// in the new table asked for, i.e. rotated-out certs.
+			self.tls_cache
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.retain_used();
 		}
 		for (state, trusted) in validated_ingress.into_iter().flatten() {
 			state.set_trusted(trusted);
@@ -979,6 +1000,7 @@ impl SymphonyProxyWrap {
 						.metrics
 						.half_closed_connections
 						.load(Ordering::Relaxed) as f64,
+					held_connections: state.metrics.held_connections.load(Ordering::Relaxed) as f64,
 					accepted: state.metrics.total_accepted.load(Ordering::Relaxed) as f64,
 					blocked: total_of(&blocked_by_reason) as f64,
 					errors: total_of(&errors_by_reason) as f64,
@@ -1229,6 +1251,8 @@ fn parse_route_spec(r: &JsRouteConfig) -> Result<RouteSpec> {
 			.as_ref()
 			.and_then(|m| m.require_client_cert)
 			.unwrap_or(false),
+		mtls_failure_hold_ms: r.mtls.as_ref().and_then(|m| m.failure_hold_ms),
+		mtls_failure_hold_jitter: r.mtls.as_ref().and_then(|m| m.failure_hold_jitter),
 		suspended: r.suspended.unwrap_or(false),
 		suspend_timeout_ms: r.suspend_timeout_ms.unwrap_or(30_000.0) as u64,
 		max_cps: r.max_connections_per_second,
@@ -1407,6 +1431,12 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 
 	let allowed_sources = SourceAllowlist::parse(r.allowed_sources.as_deref().unwrap_or(&[]))
 		.map_err(napi::Error::from_reason)?;
+	// A passthrough resolution never uses its mtls, so a bad hold there must not close it.
+	let mtls_failure_hold = match r.mtls.as_ref().filter(|_| r.terminate_tls) {
+		None => crate::tarpit::FailureHold::OFF,
+		Some(m) => crate::tarpit::FailureHold::parse(m.failure_hold_ms, m.failure_hold_jitter)
+			.map_err(|e| napi::Error::from_reason(format!("resolveConnection: {e}")))?,
+	};
 
 	Ok(ResolveSpec {
 		upstream,
@@ -1419,6 +1449,7 @@ fn parse_resolve_spec(r: &JsResolveRoute) -> Result<ResolveSpec> {
 			.as_ref()
 			.and_then(|m| m.require_client_cert)
 			.unwrap_or(false),
+		mtls_failure_hold,
 		source_address_mode,
 		forward_fingerprint,
 		http2,
@@ -1502,6 +1533,20 @@ fn parse_protection_config(
 
 	cfg.tls_handshake_timeout_ms = prot.tls_handshake_timeout_ms.unwrap_or(0.0) as u64;
 	cfg.require_sni = prot.require_sni.unwrap_or(false);
+	cfg.max_held_connections = prot
+		.max_held_connections
+		.map(|max| {
+			// napi's own u32 coercion would turn -1 into 4294967295 and NaN into 0.
+			if max.is_finite() && max.fract() == 0.0 && (0.0..=u32::MAX as f64).contains(&max) {
+				Ok(max as u32)
+			} else {
+				Err(napi::Error::from_reason(format!(
+					"maxHeldConnections must be a whole number in [0, {}], got {max}",
+					u32::MAX
+				)))
+			}
+		})
+		.transpose()?;
 
 	cfg.allowlist = prot
 		.allowlist
@@ -1537,6 +1582,8 @@ fn listener_tls_spec(l: &JsListenerConfig) -> ListenerTlsSpec {
 			.as_ref()
 			.and_then(|m| m.require_client_cert)
 			.unwrap_or(true),
+		mtls_failure_hold_ms: l.mtls.as_ref().and_then(|m| m.failure_hold_ms),
+		mtls_failure_hold_jitter: l.mtls.as_ref().and_then(|m| m.failure_hold_jitter),
 	}
 }
 
@@ -1792,7 +1839,31 @@ mod tests {
 			ja4_blocklist: None,
 			tls_handshake_timeout_ms: None,
 			require_sni: None,
+			max_held_connections: None,
 		}
+	}
+
+	#[test]
+	fn max_held_connections_must_be_a_whole_u32() {
+		let parse = |max| {
+			parse_protection_config(&JsProtectionConfig {
+				max_held_connections: Some(max),
+				..no_rate_limit_prot()
+			})
+			.map(|cfg| cfg.max_held_connections)
+		};
+		for bad in [-1.0, 1.5, f64::NAN, f64::INFINITY, u32::MAX as f64 + 1.0] {
+			assert!(parse(bad).is_err(), "{bad}");
+		}
+		assert_eq!(parse(0.0).unwrap(), Some(0));
+		assert_eq!(parse(250.0).unwrap(), Some(250));
+		assert_eq!(
+			parse_protection_config(&no_rate_limit_prot())
+				.unwrap()
+				.max_held_connections,
+			None,
+			"unset takes the listener default"
+		);
 	}
 
 	#[test]
